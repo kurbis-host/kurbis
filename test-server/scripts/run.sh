@@ -4,13 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME="$ROOT/runtime"
 SERVER="$RUNTIME/server"
-PUMPKIN="$RUNTIME/pumpkin"
 CONTROLLER="$ROOT/target/debug/vibe-controller"
-PUMPKIN_BIN="$PUMPKIN/target/debug/pumpkin"
+PUMPKIN_BIN="$RUNTIME/bin/pumpkin"
 
 if [[ ! -x "$CONTROLLER" || ! -x "$PUMPKIN_BIN" || ! -f "$SERVER/plugins/vibe-bridge.wasm" ]]; then
   "$ROOT/scripts/bootstrap.sh"
 fi
+
+"$ROOT/scripts/download-pumpkin.sh"
 
 "$CONTROLLER" --runtime "$RUNTIME" &
 CONTROLLER_PID=$!

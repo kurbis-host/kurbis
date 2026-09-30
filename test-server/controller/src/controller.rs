@@ -1,5 +1,4 @@
 use std::{
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -201,7 +200,7 @@ impl Controller {
             reset_plugin_workspace(&plugin_dir).await?;
             return Err(error);
         }
-        self.deploy_artifact(&request.plugin, &artifact).await?;
+        self.install_artifact(&request.plugin, &artifact).await?;
         let revision = git_commit(&plugin_dir, &request.id.to_string()).await?;
         self.archive_artifact(&request.plugin, &revision, &artifact)
             .await?;
@@ -210,8 +209,8 @@ impl Controller {
         self.write_result(JobResult {
             id: request.id,
             plugin: request.plugin,
-            state: JobState::Deployed,
-            message: format!("deployed revision {revision}"),
+            state: JobState::Installed,
+            message: format!("installed revision {revision}; restart Pumpkin to activate"),
             updated_unix_ms: now_ms(),
         })
         .await?;
@@ -230,14 +229,14 @@ impl Controller {
         validate_wasm(&archived).await?;
 
         git_status(&plugin_dir, &["reset", "--hard", &target_revision]).await?;
-        self.deploy_artifact(&request.plugin, &archived).await?;
+        self.install_artifact(&request.plugin, &archived).await?;
         self.refresh_plugin_index().await?;
 
         self.write_result(JobResult {
             id: request.id,
             plugin: request.plugin,
-            state: JobState::Deployed,
-            message: format!("reverted to {target_revision}"),
+            state: JobState::Installed,
+            message: format!("restored revision {target_revision}; restart Pumpkin to activate"),
             updated_unix_ms: now_ms(),
         })
         .await?;
@@ -279,11 +278,11 @@ impl Controller {
         Ok(dir)
     }
 
-    async fn deploy_artifact(&self, plugin: &str, source: &Path) -> anyhow::Result<()> {
-        let destination = self.paths.deployed_plugin(plugin);
+    async fn install_artifact(&self, plugin: &str, source: &Path) -> anyhow::Result<()> {
+        let destination = self.paths.installed_plugin(plugin);
         let temp = self
             .paths
-            .deployed_plugins()
+            .installed_plugins()
             .join(format!(".{plugin}.{}.tmp", Uuid::new_v4()));
         fs::copy(source, &temp).await?;
         std::fs::OpenOptions::new()
@@ -291,7 +290,6 @@ impl Controller {
             .open(&temp)?
             .sync_all()?;
         fs::rename(&temp, &destination).await?;
-        notify_pumpkin_hot_reload(&destination)?;
         Ok(())
     }
 
@@ -322,7 +320,7 @@ impl Controller {
                 Ok(revision) => revision,
                 Err(_) => continue,
             };
-            let deployed = self.paths.deployed_plugin(&name);
+            let deployed = self.paths.installed_plugin(&name);
             let Ok(metadata) = fs::metadata(&deployed).await else {
                 continue;
             };
@@ -409,23 +407,6 @@ async fn validate_wasm(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn notify_pumpkin_hot_reload(path: &Path) -> anyhow::Result<()> {
-    // Pumpkin's watcher handles file creation and data modifications, but an atomic
-    // rename can be reported only as a name-change event. Rewriting the existing
-    // magic byte to the same value preserves the artifact while emitting a data
-    // modification event after the atomic install is complete.
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    let mut byte = [0_u8; 1];
-    file.read_exact(&mut byte)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&byte)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 async fn git_commit(plugin_dir: &Path, job: &str) -> anyhow::Result<String> {
     git_status(plugin_dir, &["add", "-A"]).await?;
     let status = Command::new("git")
@@ -436,7 +417,7 @@ async fn git_commit(plugin_dir: &Path, job: &str) -> anyhow::Result<String> {
             "user.email=pumpkin-vibe@localhost",
             "commit",
             "-m",
-            &format!("feat: deploy vibe job {job}"),
+            &format!("feat: install vibe job {job}"),
         ])
         .current_dir(plugin_dir)
         .stdin(Stdio::null())
@@ -533,7 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_index_only_lists_deployed_artifacts() {
+    async fn plugin_index_only_lists_installed_artifacts() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::new(temp.path());
         paths.create_dirs().await.expect("runtime dirs");
@@ -572,7 +553,7 @@ mod tests {
                 .expect("parse empty index");
         assert!(index.plugins.is_empty());
 
-        fs::write(paths.deployed_plugin("demo"), b"wasm")
+        fs::write(paths.installed_plugin("demo"), b"wasm")
             .await
             .expect("deployed artifact");
         controller
@@ -588,18 +569,6 @@ mod tests {
         assert_eq!(index.plugins.len(), 1);
         assert_eq!(index.plugins[0].name, "demo");
         assert_eq!(index.plugins[0].artifact_bytes, 4);
-    }
-
-    #[test]
-    fn hot_reload_notification_preserves_artifact_bytes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = temp.path().join("plugin.wasm");
-        let bytes = b"\0asmfixture";
-        std::fs::write(&artifact, bytes).expect("fixture");
-
-        notify_pumpkin_hot_reload(&artifact).expect("notify hot reload");
-
-        assert_eq!(std::fs::read(&artifact).expect("artifact"), bytes);
     }
 
     #[tokio::test]
@@ -655,6 +624,129 @@ mod tests {
             git_output(&plugin_dir, &["status", "--porcelain"])
                 .await
                 .expect("git status")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_and_revert_stage_revisions_and_reject_invalid_updates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(temp.path().join("runtime"));
+        paths.create_dirs().await.expect("runtime");
+        let worker = temp.path().join("worker");
+        fs::write(
+            &worker,
+            r#"#!/bin/sh
+cd "$2" || exit 1
+cat > job.txt
+mkdir -p target/wasm32-wasip2/release
+printf '\000asm\015\000\001\000' > target/wasm32-wasip2/release/demo.wasm
+"#,
+        )
+        .await
+        .expect("worker");
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
+            .expect("executable worker");
+        let controller = Controller::new(
+            paths.clone(),
+            worker.to_string_lossy().into_owned(),
+            Duration::from_secs(5),
+        );
+
+        async fn submit(
+            controller: &Controller,
+            paths: &RuntimePaths,
+            action: JobAction,
+            prompt: &str,
+        ) -> JobResult {
+            let request = JobRequest {
+                id: Uuid::new_v4(),
+                plugin: "demo".into(),
+                action,
+                prompt: prompt.into(),
+                player: "Operator".into(),
+                created_unix_ms: now_ms(),
+            };
+            atomic_json_write(
+                &paths.requests().join(format!("{}.json", request.id)),
+                &request,
+            )
+            .await
+            .expect("queue job");
+            let _ = controller.run_once().await;
+            serde_json::from_slice(
+                &fs::read(paths.results().join(format!("{}.json", request.id)))
+                    .await
+                    .expect("result"),
+            )
+            .expect("parse result")
+        }
+
+        let first = submit(&controller, &paths, JobAction::Code, "first version").await;
+        assert_eq!(first.state, JobState::Installed);
+        assert!(first.message.contains("restart Pumpkin to activate"));
+        let plugin = paths.plugin_workspace("demo");
+        let first_revision = git_output(&plugin, &["rev-parse", "HEAD"])
+            .await
+            .expect("revision");
+        let first_bytes = fs::read(paths.installed_plugin("demo"))
+            .await
+            .expect("installed");
+        let second = submit(&controller, &paths, JobAction::Code, "second version").await;
+        assert_eq!(second.state, JobState::Installed);
+        assert_ne!(
+            git_output(&plugin, &["rev-parse", "HEAD"])
+                .await
+                .expect("revision"),
+            first_revision
+        );
+        let reverted = submit(&controller, &paths, JobAction::Revert, "").await;
+        assert_eq!(reverted.state, JobState::Installed);
+        assert!(reverted.message.contains("restart Pumpkin to activate"));
+        assert_eq!(
+            git_output(&plugin, &["rev-parse", "HEAD"])
+                .await
+                .expect("revision"),
+            first_revision
+        );
+        assert_eq!(
+            fs::read(paths.installed_plugin("demo"))
+                .await
+                .expect("restored"),
+            first_bytes
+        );
+
+        fs::write(
+            &worker,
+            r#"#!/bin/sh
+cd "$2" || exit 1
+cat > job.txt
+printf broken > target/wasm32-wasip2/release/demo.wasm
+"#,
+        )
+        .await
+        .expect("invalid worker");
+        let failed = submit(&controller, &paths, JobAction::Code, "invalid version").await;
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(
+            fs::read(paths.installed_plugin("demo"))
+                .await
+                .expect("preserved"),
+            first_bytes
+        );
+        assert_eq!(
+            git_output(&plugin, &["rev-parse", "HEAD"])
+                .await
+                .expect("revision"),
+            first_revision
+        );
+        assert!(
+            git_output(&plugin, &["status", "--porcelain"])
+                .await
+                .expect("clean")
                 .is_empty()
         );
     }

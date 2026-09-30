@@ -209,7 +209,7 @@ impl CommandHandler for ListHandler {
             Err(error) => return Err(command_failure(error.to_string())),
         };
         if index.plugins.is_empty() {
-            sender.send_message(TextComponent::text("No vibe-coded plugins deployed."));
+            sender.send_message(TextComponent::text("No vibe-coded plugins installed."));
         } else {
             let lines = index
                 .plugins

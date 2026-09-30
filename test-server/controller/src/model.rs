@@ -28,7 +28,7 @@ pub enum JobState {
     Queued,
     Running,
     Validating,
-    Deployed,
+    Installed,
     Failed,
     Cancelled,
 }

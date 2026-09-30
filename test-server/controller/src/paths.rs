@@ -54,12 +54,12 @@ impl RuntimePaths {
         self.root.join("workspace/artifacts").join(plugin)
     }
 
-    pub fn deployed_plugins(&self) -> PathBuf {
+    pub fn installed_plugins(&self) -> PathBuf {
         self.server().join("plugins")
     }
 
-    pub fn deployed_plugin(&self, plugin: &str) -> PathBuf {
-        self.deployed_plugins().join(format!("{plugin}.wasm"))
+    pub fn installed_plugin(&self, plugin: &str) -> PathBuf {
+        self.installed_plugins().join(format!("{plugin}.wasm"))
     }
 
     pub async fn create_dirs(&self) -> anyhow::Result<()> {
@@ -69,7 +69,7 @@ impl RuntimePaths {
             self.results(),
             self.cancel(),
             self.workspace_plugins(),
-            self.deployed_plugins(),
+            self.installed_plugins(),
         ] {
             tokio::fs::create_dir_all(dir).await?;
         }
