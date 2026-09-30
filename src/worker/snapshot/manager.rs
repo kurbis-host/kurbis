@@ -1,42 +1,31 @@
-use std::{
-    path::{Path as FsPath, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path as FsPath, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path};
-use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::{
     config::ObjectStoreConfig,
     model::{SERVER_STORAGE_BYTES, SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason, SnapshotRecord},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotManifest {
-    pub server_id: Uuid,
-    pub generation: i64,
-    pub files: Vec<ManifestFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestFile {
-    pub path: String,
-    pub size: u64,
-    pub blake3: String,
-}
-
-#[derive(Clone)]
-pub struct SnapshotManager {
-    pool: PgPool,
-    store: Arc<dyn ObjectStore>,
-}
+use super::files::{collect_files, safe_relative_path};
+use super::{ManifestFile, SnapshotManager, SnapshotManifest};
 
 impl SnapshotManager {
+    pub(super) async fn storage_guard(&self, exclusive: bool) -> Result<PoolConnection<Postgres>> {
+        let mut connection = self.pool.acquire().await?;
+        connection.close_on_drop();
+        let query = if exclusive {
+            "SELECT pg_advisory_lock(724515, 0)"
+        } else {
+            "SELECT pg_advisory_lock_shared(724515, 0)"
+        };
+        sqlx::query(query).execute(&mut *connection).await?;
+        Ok(connection)
+    }
     pub async fn new(pool: PgPool, config: &ObjectStoreConfig) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = match config {
             ObjectStoreConfig::Local { root } => {
@@ -72,7 +61,20 @@ impl SnapshotManager {
         root: &FsPath,
         reason: SnapshotReason,
     ) -> Result<SnapshotRecord> {
-        let generation = self.allocate_generation(server_id, reason).await?;
+        // Serialize allocation, upload, publication and retention across workers.
+        // Releasing the allocator lock before upload allowed older uploads to
+        // overwrite the current pointer and race retention of their manifests.
+        let mut publication_guard = self.storage_guard(false).await?;
+        // A session lock survives the short transactions that persist partial
+        // metadata. Always close this connection on drop, including cancellation
+        // and errors, so no advisory lock can leak into the connection pool.
+        sqlx::query("SELECT pg_advisory_lock(724514, hashtext($1))")
+            .bind(server_id.to_string())
+            .execute(&mut *publication_guard)
+            .await?;
+        let generation = self
+            .allocate_generation(&mut publication_guard, server_id, reason)
+            .await?;
         let root = root.to_path_buf();
         let files = tokio::task::spawn_blocking(move || collect_files(&root))
             .await
@@ -109,11 +111,15 @@ impl SnapshotManager {
                 }
                 Err(error) => return Err(error.into()),
             }
-            manifest_files.push(ManifestFile {
+            let manifest_file = ManifestFile {
                 path: file.relative,
                 size,
                 blake3: hash,
-            });
+            };
+            // Existence alone cannot prove a reused or newly uploaded chunk is
+            // intact. Validate stored bytes before making this generation usable.
+            self.read_verified_chunk(&manifest_file).await?;
+            manifest_files.push(manifest_file);
         }
         manifest_files.sort_by(|a, b| a.path.cmp(&b.path));
         let manifest = SnapshotManifest {
@@ -134,7 +140,7 @@ impl SnapshotManager {
             .await?;
 
         let total_bytes = i64::try_from(total_bytes)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = publication_guard.begin().await?;
         sqlx::query("SELECT id FROM servers WHERE id = $1 FOR UPDATE")
             .bind(server_id)
             .fetch_one(&mut *tx)
@@ -153,7 +159,7 @@ impl SnapshotManager {
         .await?;
         sqlx::query(
             "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3, updated_at = now()
-             WHERE id = $1",
+             WHERE id = $1 AND (current_snapshot_generation IS NULL OR current_snapshot_generation < $2)",
         )
         .bind(server_id)
         .bind(generation)
@@ -162,42 +168,77 @@ impl SnapshotManager {
         .await?;
         tx.commit().await?;
 
-        if let Err(error) = self.prune_old_generations(server_id).await {
+        if let Err(error) = self
+            .prune_old_generations(&mut publication_guard, server_id)
+            .await
+        {
             tracing::warn!(%server_id, ?error, "failed to prune old snapshot generations");
         }
 
-        Ok(sqlx::query_as::<_, SnapshotRecord>(
+        let snapshot = sqlx::query_as::<_, SnapshotRecord>(
             "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, created_at
              FROM snapshots WHERE server_id = $1 AND generation = $2",
         )
         .bind(server_id)
         .bind(generation)
-        .fetch_one(&self.pool)
-        .await?)
+        .fetch_one(&mut *publication_guard)
+        .await?;
+        Ok(snapshot)
+    }
+
+    async fn read_verified_chunk(&self, file: &ManifestFile) -> Result<Bytes> {
+        let bytes = self
+            .store
+            .get(&Path::from(format!("chunks/{}", file.blake3)))
+            .await?
+            .bytes()
+            .await?;
+        if bytes.len() as u64 != file.size || blake3::hash(&bytes).to_hex().as_str() != file.blake3
+        {
+            bail!(
+                "snapshot chunk failed integrity validation for {}",
+                file.path
+            );
+        }
+        Ok(bytes)
     }
 
     pub async fn restore_latest(&self, server_id: Uuid, root: &FsPath) -> Result<Option<i64>> {
-        let Some((snapshot, manifest)) = self.current_manifest(server_id).await? else {
+        let mut guard = self.storage_guard(false).await?;
+        let Some((snapshot, manifest)) = self.current_manifest(&mut guard, server_id).await? else {
             return Ok(None);
         };
+        self.restore_manifest(root, manifest).await?;
+        Ok(Some(snapshot.generation))
+    }
 
+    pub async fn restore_generation(
+        &self,
+        server_id: Uuid,
+        generation: i64,
+        root: &FsPath,
+    ) -> Result<i64> {
+        let mut guard = self.storage_guard(false).await?;
+        let snapshot = sqlx::query_as::<_, SnapshotRecord>(
+            "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, created_at
+             FROM snapshots
+             WHERE server_id = $1 AND generation = $2 AND complete",
+        )
+        .bind(server_id)
+        .bind(generation)
+        .fetch_optional(&mut *guard)
+        .await?
+        .context("requested snapshot is not retained or complete")?;
+        let manifest = self.read_manifest(&snapshot).await?;
+        self.restore_manifest(root, manifest).await?;
+        Ok(snapshot.generation)
+    }
+
+    async fn restore_manifest(&self, root: &FsPath, manifest: SnapshotManifest) -> Result<()> {
         tokio::fs::create_dir_all(root).await?;
         for file in manifest.files {
             let relative = safe_relative_path(&file.path)?;
-            let bytes = self
-                .store
-                .get(&Path::from(format!("chunks/{}", file.blake3)))
-                .await?
-                .bytes()
-                .await?;
-            if bytes.len() as u64 != file.size
-                || blake3::hash(&bytes).to_hex().as_str() != file.blake3
-            {
-                bail!(
-                    "snapshot chunk failed integrity validation for {}",
-                    file.path
-                );
-            }
+            let bytes = self.read_verified_chunk(&file).await?;
             let target = root.join(relative);
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -206,17 +247,18 @@ impl SnapshotManager {
             tokio::fs::write(&temp, &bytes).await?;
             tokio::fs::rename(temp, target).await?;
         }
-        Ok(Some(snapshot.generation))
+        Ok(())
     }
 
     async fn current_manifest(
         &self,
+        connection: &mut PgConnection,
         server_id: Uuid,
     ) -> Result<Option<(SnapshotRecord, SnapshotManifest)>> {
         let current_generation: Option<i64> =
             sqlx::query_scalar("SELECT current_snapshot_generation FROM servers WHERE id = $1")
                 .bind(server_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *connection)
                 .await?;
         let Some(current_generation) = current_generation else {
             return Ok(None);
@@ -228,9 +270,17 @@ impl SnapshotManager {
         )
         .bind(server_id)
         .bind(current_generation)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await?
         .context("published snapshot metadata is missing or incomplete")?;
+        let manifest = self.read_manifest(&snapshot).await?;
+        Ok(Some((snapshot, manifest)))
+    }
+
+    pub(super) async fn read_manifest(
+        &self,
+        snapshot: &SnapshotRecord,
+    ) -> Result<SnapshotManifest> {
         let manifest_bytes = self
             .store
             .get(&Path::from(snapshot.manifest_key.clone()))
@@ -242,16 +292,17 @@ impl SnapshotManager {
             bail!("snapshot manifest checksum mismatch");
         }
         let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
-        if manifest.server_id != server_id || manifest.generation != snapshot.generation {
+        if manifest.server_id != snapshot.server_id || manifest.generation != snapshot.generation {
             bail!("snapshot manifest identity mismatch");
         }
 
-        Ok(Some((snapshot, manifest)))
+        Ok(manifest)
     }
 
     /// A database cache hint alone cannot prove disposable local disk contents.
     pub async fn local_matches_current(&self, server_id: Uuid, root: &FsPath) -> Result<bool> {
-        let Some((_, manifest)) = self.current_manifest(server_id).await? else {
+        let mut guard = self.storage_guard(false).await?;
+        let Some((_, manifest)) = self.current_manifest(&mut guard, server_id).await? else {
             return Ok(false);
         };
         let root = root.to_path_buf();
@@ -315,7 +366,11 @@ impl SnapshotManager {
         Ok(())
     }
 
-    async fn prune_old_generations(&self, server_id: Uuid) -> Result<()> {
+    async fn prune_old_generations(
+        &self,
+        connection: &mut PgConnection,
+        server_id: Uuid,
+    ) -> Result<()> {
         let stale: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, manifest_key
              FROM snapshots
@@ -326,11 +381,17 @@ impl SnapshotManager {
                  ORDER BY generation DESC
                  LIMIT $2
                )
+               AND NOT EXISTS (
+                 SELECT 1 FROM operations o
+                 WHERE o.server_id = snapshots.server_id AND o.kind = 'restore'
+                   AND o.status IN ('pending', 'running')
+                   AND o.payload->>'target_generation' = snapshots.generation::text
+               )
              ORDER BY generation ASC",
         )
         .bind(server_id)
         .bind(SNAPSHOT_RETENTION_GENERATIONS)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await?;
         for (snapshot_id, manifest_key) in stale {
             match self.store.delete(&Path::from(manifest_key)).await {
@@ -339,18 +400,19 @@ impl SnapshotManager {
             }
             sqlx::query("DELETE FROM snapshots WHERE id = $1")
                 .bind(snapshot_id)
-                .execute(&self.pool)
+                .execute(&mut *connection)
                 .await?;
         }
         Ok(())
     }
 
-    async fn allocate_generation(&self, server_id: Uuid, reason: SnapshotReason) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(server_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+    async fn allocate_generation(
+        &self,
+        connection: &mut PgConnection,
+        server_id: Uuid,
+        reason: SnapshotReason,
+    ) -> Result<i64> {
+        let mut tx = connection.begin().await?;
         let generation: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM snapshots WHERE server_id = $1",
         )
@@ -369,77 +431,5 @@ impl SnapshotManager {
         .await?;
         tx.commit().await?;
         Ok(generation)
-    }
-}
-
-struct ScannedFile {
-    relative: String,
-    absolute: PathBuf,
-    size: u64,
-}
-
-fn collect_files(root: &FsPath) -> Result<Vec<ScannedFile>> {
-    let mut files = Vec::new();
-    if !root.exists() {
-        return Ok(files);
-    }
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let relative = entry.path().strip_prefix(root)?;
-        if should_exclude(relative) {
-            continue;
-        }
-        let relative = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        files.push(ScannedFile {
-            relative,
-            absolute: entry.path().to_path_buf(),
-            size: entry.metadata()?.len(),
-        });
-    }
-    Ok(files)
-}
-
-fn should_exclude(relative: &FsPath) -> bool {
-    let name = relative
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default();
-    matches!(
-        name,
-        "pumpkin.toml" | "advanced_config.toml" | "nethernet-key.der"
-    ) || relative
-        .components()
-        .next()
-        .is_some_and(|v| v.as_os_str() == "logs")
-}
-
-fn safe_relative_path(value: &str) -> Result<PathBuf> {
-    let path = FsPath::new(value);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
-    {
-        bail!("snapshot contains unsafe path");
-    }
-    Ok(path.to_path_buf())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_snapshot_path_traversal() {
-        assert!(safe_relative_path("../secret").is_err());
-        assert!(safe_relative_path("/etc/passwd").is_err());
-        assert!(safe_relative_path("world/region/r.0.0.mca").is_ok());
     }
 }
