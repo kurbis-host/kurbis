@@ -78,6 +78,10 @@ impl RouteCache {
         }
     }
 
+    pub fn accepts_server_address(&self, hostname: &str) -> bool {
+        subdomain_for(hostname, &self.root_domain).is_some()
+    }
+
     pub async fn invalidate_all(&self) {
         let mut cache = self.cache.write().await;
         cache.revision = cache.revision.wrapping_add(1);
@@ -92,7 +96,10 @@ impl RouteCache {
 
     pub async fn listen_for_invalidations(self, mut listener: PgListener) -> Result<()> {
         loop {
-            listener.recv().await?;
+            // recv() hides reconnection gaps; notifications can be lost while
+            // disconnected. try_recv() exposes that gap as None, which also
+            // invalidates all previously cached routing decisions.
+            listener.try_recv().await?;
             self.invalidate_all().await;
         }
     }

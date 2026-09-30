@@ -9,7 +9,7 @@ use tokio::{
 
 use crate::{
     config::GatewayConfig,
-    gateway::{routes::RouteCache, wake::request_wake},
+    gateway::routes::RouteCache,
     model::{ObservedState, RouteTarget},
 };
 
@@ -47,10 +47,17 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
             return Ok(());
         }
     };
-    let target = routes.resolve(&handshake.hostname).await?;
     match handshake.next_state {
-        1 => handle_status(&mut client, &handshake, target.as_ref()).await,
-        2 => handle_login(client, config, handshake, target).await,
+        1 => {
+            let target = routes.resolve(&handshake.hostname).await?;
+            handle_status(&mut client, &handshake, target.as_ref()).await
+        }
+        2 => {
+            if !routes.accepts_server_address(&handshake.hostname) {
+                return send_login_disconnect(&mut client, "Unknown server address").await;
+            }
+            handle_login(client, config, handshake).await
+        }
         _ => Ok(()),
     }
 }
@@ -59,99 +66,20 @@ async fn handle_login(
     mut client: TcpStream,
     config: &GatewayConfig,
     handshake: Handshake,
-    target: Option<RouteTarget>,
 ) -> Result<()> {
-    let Some(target) = target else {
-        return send_login_disconnect(&mut client, "Unknown server address").await;
-    };
-
-    if target.account_suspended {
-        return send_login_disconnect(
-            &mut client,
-            "Server suspended. Contact the hosting operator.",
-        )
-        .await;
-    }
-
-    if target.state == ObservedState::Online {
-        if target.worker_address.is_none() {
-            return send_login_disconnect(
-                &mut client,
-                "Server is temporarily unavailable because its worker is unreachable.",
-            )
-            .await;
-        }
-    } else {
-        if target.state == ObservedState::Failed {
-            return send_login_disconnect(
-                &mut client,
-                "Server failed to start. Retry it from the panel.",
-            )
-            .await;
-        }
-        if target.worker_healthy == Some(false)
-            && matches!(
-                target.state,
-                ObservedState::Restoring
-                    | ObservedState::Starting
-                    | ObservedState::Stopping
-                    | ObservedState::Snapshotting
-            )
-        {
-            return send_login_disconnect(
-                &mut client,
-                "Server is temporarily unavailable because its assigned worker is unreachable.",
-            )
-            .await;
-        }
-        if matches!(
-            target.state,
-            ObservedState::Sleeping
-                | ObservedState::Queued
-                | ObservedState::Stopping
-                | ObservedState::Snapshotting
-        ) && let Err(error) = request_wake(config, &handshake.hostname).await
-        {
-            tracing::warn!(?error, "gateway wake request failed");
-            return send_login_disconnect(
-                &mut client,
-                "Server is temporarily unavailable. Please reconnect shortly.",
-            )
-            .await;
-        }
-        let mut waiting = match connect_backend(config.waiting_java_address).await {
-            Ok(waiting) => waiting,
-            Err(error) => {
-                tracing::warn!(?error, "waiting server is unreachable");
-                return send_login_disconnect(
-                    &mut client,
-                    "Waiting server is temporarily unavailable. Please reconnect shortly.",
-                )
-                .await;
-            }
-        };
-        waiting.write_all(&handshake.framed).await?;
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut waiting).await?;
-        return Ok(());
-    }
-
-    let address = target
-        .worker_address
-        .context("online route has no worker address")?;
-    let port = target.java_port.context("online route has no Java port")?;
-    let mut backend = match connect_backend((address.as_str(), port)).await {
-        Ok(backend) => backend,
+    let mut waiting = match connect_backend(config.waiting_java_address).await {
+        Ok(waiting) => waiting,
         Err(error) => {
-            tracing::warn!(?error, "assigned backend is unreachable");
+            tracing::warn!(?error, "waiting server is unreachable");
             return send_login_disconnect(
                 &mut client,
-                "Server is temporarily unavailable. Please reconnect shortly.",
+                "Waiting server is temporarily unavailable. Please reconnect shortly.",
             )
             .await;
         }
     };
-    backend.write_all(&handshake.framed).await?;
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    waiting.write_all(&handshake.framed).await?;
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut waiting).await?;
     Ok(())
 }
 
@@ -334,76 +262,116 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn login_failures_receive_protocol_disconnects() {
+    async fn login_is_authenticated_by_the_waiting_runtime_before_transfer() {
+        let waiting_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = GatewayConfig {
             common: crate::config::CommonConfig {
                 database_url: String::new(),
             },
             java_listen: "127.0.0.1:0".parse().unwrap(),
             bedrock_listen: "127.0.0.1:0".parse().unwrap(),
-            waiting_java_address: "127.0.0.1:0".parse().unwrap(),
+            waiting_java_address: waiting_listener.local_addr().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:0".parse().unwrap(),
             waiting_control_socket: "/nonexistent/control.sock".into(),
             waiting_control_token: "test".into(),
             control_plane_url: "http://127.0.0.1:0".into(),
             internal_token: "test".into(),
             root_domain: "example.test".into(),
             wake_timeout: std::time::Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
         };
-        for (state, suspended, expected) in [
-            (
-                ObservedState::Sleeping,
-                true,
-                "Server suspended. Contact the hosting operator.",
-            ),
-            (
-                ObservedState::Online,
-                false,
-                "Server is temporarily unavailable. Please reconnect shortly.",
-            ),
-            (
-                ObservedState::Sleeping,
-                false,
-                "Server is temporarily unavailable. Please reconnect shortly.",
-            ),
-            (
-                ObservedState::Starting,
-                false,
-                "Waiting server is temporarily unavailable. Please reconnect shortly.",
-            ),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(public_listener.local_addr().unwrap());
+        let (accepted, client) = tokio::join!(public_listener.accept(), client);
+        let (accepted, _) = accepted.unwrap();
+        let mut client = client.unwrap();
+
+        let mut handshake_body = Vec::new();
+        write_varint(0, &mut handshake_body);
+        write_varint(777, &mut handshake_body);
+        write_string("friends.example.test", &mut handshake_body).unwrap();
+        handshake_body.extend_from_slice(&25565_u16.to_be_bytes());
+        write_varint(2, &mut handshake_body);
+        let mut framed = Vec::new();
+        write_varint(handshake_body.len() as i32, &mut framed);
+        framed.extend_from_slice(&handshake_body);
+        let expected_handshake = framed.clone();
+        let handshake = Handshake {
+            protocol: 777,
+            hostname: "friends.example.test".into(),
+            next_state: 2,
+            framed,
+        };
+
+        let waiting = tokio::spawn(async move {
+            let (mut backend, _) = waiting_listener.accept().await.unwrap();
+            let received = read_frame(&mut backend, MAX_HANDSHAKE_FRAME).await.unwrap();
+            let mut received_framed = Vec::new();
+            write_varint(received.len() as i32, &mut received_framed);
+            received_framed.extend_from_slice(&received);
+            assert_eq!(received_framed, expected_handshake);
+            send_login_disconnect(&mut backend, "waiting fixture response")
                 .await
                 .unwrap();
-            let (accepted, _) = listener.accept().await.unwrap();
-            let target = RouteTarget {
-                server_id: uuid::Uuid::new_v4(),
-                subdomain: "suspended".into(),
-                state,
-                account_suspended: suspended,
-                worker_healthy: None,
-                worker_valid_until: None,
-                worker_address: Some("127.0.0.1".into()),
-                java_port: Some(0),
-                bedrock_port: None,
-            };
-            let handshake = Handshake {
-                protocol: 777,
-                hostname: "suspended.example.test".into(),
-                next_state: 2,
-                framed: Vec::new(),
-            };
-            handle_login(accepted, &config, handshake, Some(target))
-                .await
-                .unwrap();
-            let packet = read_frame(&mut client, 1024).await.unwrap();
-            let mut cursor = 0;
-            assert_eq!(read_varint(&packet, &mut cursor).unwrap(), 0);
-            let message: serde_json::Value =
-                serde_json::from_str(&read_string(&packet, &mut cursor, 255).unwrap()).unwrap();
-            assert_eq!(message["text"], expected);
-            assert_eq!(cursor, packet.len());
-        }
+            backend.shutdown().await.unwrap();
+        });
+        client.shutdown().await.unwrap();
+        handle_login(accepted, &config, handshake).await.unwrap();
+        waiting.await.unwrap();
+
+        let packet = read_frame(&mut client, 1024).await.unwrap();
+        let mut cursor = 0;
+        assert_eq!(read_varint(&packet, &mut cursor).unwrap(), 0);
+        let message: serde_json::Value =
+            serde_json::from_str(&read_string(&packet, &mut cursor, 255).unwrap()).unwrap();
+        assert_eq!(message["text"], "waiting fixture response");
+        assert_eq!(cursor, packet.len());
+    }
+
+    #[tokio::test]
+    async fn unavailable_waiting_runtime_returns_a_protocol_disconnect() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let config = GatewayConfig {
+            common: crate::config::CommonConfig {
+                database_url: String::new(),
+            },
+            java_listen: "127.0.0.1:0".parse().unwrap(),
+            bedrock_listen: "127.0.0.1:0".parse().unwrap(),
+            waiting_java_address: address,
+            waiting_bedrock_address: "127.0.0.1:0".parse().unwrap(),
+            waiting_control_socket: "/nonexistent/control.sock".into(),
+            waiting_control_token: "test".into(),
+            control_plane_url: "http://127.0.0.1:0".into(),
+            internal_token: "test".into(),
+            root_domain: "example.test".into(),
+            wake_timeout: std::time::Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        };
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(public_listener.local_addr().unwrap());
+        let (accepted, client) = tokio::join!(public_listener.accept(), client);
+        let (accepted, _) = accepted.unwrap();
+        let mut client = client.unwrap();
+        let handshake = Handshake {
+            protocol: 777,
+            hostname: "friends.example.test".into(),
+            next_state: 2,
+            framed: Vec::new(),
+        };
+
+        handle_login(accepted, &config, handshake).await.unwrap();
+
+        let packet = read_frame(&mut client, 1024).await.unwrap();
+        let mut cursor = 0;
+        assert_eq!(read_varint(&packet, &mut cursor).unwrap(), 0);
+        let message: serde_json::Value =
+            serde_json::from_str(&read_string(&packet, &mut cursor, 255).unwrap()).unwrap();
+        assert_eq!(
+            message["text"],
+            "Waiting server is temporarily unavailable. Please reconnect shortly."
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -20,18 +20,50 @@ pub enum PlayerEdition {
     Bedrock,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerifiedMinecraftIdentity {
+    Java { uuid: Uuid },
+    Bedrock { xuid: String },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WaitingPlayer {
+    pub connection_id: Uuid,
     pub id: Uuid,
     pub name: String,
     pub edition: PlayerEdition,
     pub server_address: String,
+    pub ready_for_transfer: bool,
+    #[serde(default)]
+    pub verified_identity: Option<VerifiedMinecraftIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WhitelistEntry {
+    #[serde(rename = "uuid")]
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug)]
+pub struct PlayerStatus {
+    pub players: usize,
+    pub activity_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnlineAuthentication {
+    java: bool,
+    bedrock: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct Response {
     ok: bool,
     players: Option<usize>,
+    activity_revision: Option<u64>,
+    online_authentication: Option<OnlineAuthentication>,
     waiting_players: Option<Vec<WaitingPlayer>>,
     error: Option<String>,
 }
@@ -50,9 +82,24 @@ impl PumpkinControl {
         &self.token
     }
 
-    pub async fn status(&self, socket: &Path) -> Result<usize> {
+    pub async fn status(&self, socket: &Path) -> Result<PlayerStatus> {
         let response = self.request(socket, json!({"action":"status"})).await?;
-        response.players.context("status response omitted players")
+        Ok(PlayerStatus {
+            players: response
+                .players
+                .context("status response omitted players")?,
+            activity_revision: response
+                .activity_revision
+                .context("status response omitted activity_revision")?,
+        })
+    }
+
+    pub async fn online_authentication(&self, socket: &Path) -> Result<(bool, bool)> {
+        let response = self.request(socket, json!({"action":"status"})).await?;
+        let status = response
+            .online_authentication
+            .context("status response omitted online_authentication")?;
+        Ok((status.java, status.bedrock))
     }
 
     pub async fn players(&self, socket: &Path) -> Result<Vec<WaitingPlayer>> {
@@ -60,6 +107,24 @@ impl PumpkinControl {
         response
             .waiting_players
             .context("players response omitted waiting_players")
+    }
+
+    pub async fn replace_whitelist(
+        &self,
+        socket: &Path,
+        enabled: bool,
+        entries: &[WhitelistEntry],
+    ) -> Result<()> {
+        self.request(
+            socket,
+            json!({
+                "action":"whitelist_replace",
+                "enabled":enabled,
+                "whitelist_entries":entries,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn message(&self, socket: &Path, player_id: Uuid, message: &str) -> Result<()> {
@@ -145,5 +210,64 @@ impl PumpkinControl {
             );
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_control_reports_verified_java_and_bedrock_identities_per_connection() {
+        let connection_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let java_uuid = Uuid::new_v4();
+        let java: WaitingPlayer = serde_json::from_value(json!({
+            "connection_id": connection_id,
+            "id": player_id,
+            "name": "Java Player",
+            "edition": "java",
+            "server_address": "alpha.mc.example.test",
+            "ready_for_transfer": true,
+            "verified_identity": {"kind":"java","uuid":java_uuid}
+        }))
+        .unwrap();
+        assert_eq!(java.connection_id, connection_id);
+        assert_eq!(
+            java.verified_identity,
+            Some(VerifiedMinecraftIdentity::Java { uuid: java_uuid })
+        );
+
+        let bedrock: WaitingPlayer = serde_json::from_value(json!({
+            "connection_id": Uuid::new_v4(),
+            "id": Uuid::new_v4(),
+            "name": "Bedrock Player",
+            "edition": "bedrock",
+            "server_address": "alpha.mc.example.test",
+            "ready_for_transfer": true,
+            "verified_identity": {"kind":"bedrock","xuid":"2533274790395904"}
+        }))
+        .unwrap();
+        assert_eq!(
+            bedrock.verified_identity,
+            Some(VerifiedMinecraftIdentity::Bedrock {
+                xuid: "2533274790395904".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn offline_runtime_report_has_no_verified_identity() {
+        let player: WaitingPlayer = serde_json::from_value(json!({
+            "connection_id": Uuid::new_v4(),
+            "id": Uuid::new_v4(),
+            "name": "Offline Player",
+            "edition": "java",
+            "server_address": "alpha.mc.example.test",
+            "ready_for_transfer": true,
+            "verified_identity": null
+        }))
+        .unwrap();
+        assert_eq!(player.verified_identity, None);
     }
 }

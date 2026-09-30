@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let invalidation_routes = routes.clone();
     tokio::try_join!(
         java::run(config.clone(), routes.clone()),
-        bedrock::run(config.clone(), routes.clone()),
+        bedrock::run(config.clone()),
         waiting::run(config, routes),
         invalidation_routes.listen_for_invalidations(listener)
     )?;

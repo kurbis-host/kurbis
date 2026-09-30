@@ -1,6 +1,6 @@
 mod common;
 
-use common::test_pool;
+use common::{create_user, test_pool};
 use kurbis_hoster::{
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_start, healthy_worker_template, heartbeat_worker,
@@ -14,7 +14,11 @@ use uuid::Uuid;
 static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn clean_routes(pool: &PgPool) {
-    sqlx::query("DELETE FROM users WHERE oauth_provider = 'route-test'")
+    sqlx::query(
+        "DELETE FROM users WHERE id IN (
+             SELECT user_id FROM identities WHERE provider = 'google' AND subject LIKE 'route-test-%'
+         )",
+    )
         .execute(pool)
         .await
         .unwrap();
@@ -25,11 +29,17 @@ async fn clean_routes(pool: &PgPool) {
 }
 
 async fn server(pool: &PgPool) -> (Uuid, Uuid, String) {
-    let owner = Uuid::new_v4();
     let id = Uuid::new_v4();
     let subdomain = format!("route-{}", &id.simple().to_string()[..12]);
-    sqlx::query("INSERT INTO users(id, oauth_provider, oauth_subject, display_name) VALUES($1, 'route-test', $2, 'Route test')")
-        .bind(owner).bind(owner.to_string()).execute(pool).await.unwrap();
+    let owner = create_user(
+        pool,
+        "google",
+        &format!("route-test-{id}"),
+        "Route test",
+        "active",
+        None,
+    )
+    .await;
     sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
         .bind(id)
         .bind(owner)
@@ -270,6 +280,95 @@ async fn cached_route_expires_at_the_worker_deadline_without_a_notification() {
         .unwrap();
     sqlx::query("DELETE FROM workers WHERE id = $1")
         .bind(worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn listener_reconnection_invalidates_routes_changed_during_a_notification_gap() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_routes(&pool).await;
+    let (owner, _, subdomain) = server(&pool).await;
+    let routes = RouteCache::new(pool.clone(), "example.test".into());
+    let host = format!("{subdomain}.example.test");
+    let mut listener = routes.invalidation_listener().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut listener)
+        .await
+        .unwrap();
+    // Suppress actual subscription delivery while keeping PgListener's desired
+    // channels, as during a network gap. Its reconnect will restore LISTEN.
+    sqlx::query("UNLISTEN *")
+        .execute(&mut listener)
+        .await
+        .unwrap();
+    assert!(
+        !routes
+            .resolve(&host)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_suspended
+    );
+    sqlx::query("UPDATE users SET account_status = 'suspended' WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !routes
+            .resolve(&host)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_suspended
+    );
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(terminated);
+    let watched = routes.clone();
+    let task = tokio::spawn(async move { watched.listen_for_invalidations(listener).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !routes
+            .resolve(&host)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_suspended
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Prove the replacement connection resubscribed and remains supervised.
+    sqlx::query("UPDATE users SET account_status = 'active' WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while routes
+            .resolve(&host)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_suspended
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner)
         .execute(&pool)
         .await
         .unwrap();

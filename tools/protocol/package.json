@@ -1,0 +1,14 @@
+{
+  "name": "melon-hoster-protocol-verification",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Real Java and RakNet Bedrock clients for local lifecycle verification",
+  "type": "module",
+  "scripts": {
+    "verify": "node verify.mjs"
+  },
+  "dependencies": {
+    "bedrock-protocol": "3.59.0",
+    "minecraft-protocol": "1.67.0"
+  }
+}

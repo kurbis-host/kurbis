@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -8,7 +9,7 @@ use crate::{
     config::GatewayConfig,
     gateway::{routes::RouteCache, wake::request_wake},
     model::{ObservedState, RouteTarget},
-    pumpkin_control::{PlayerEdition, PumpkinControl, WaitingPlayer},
+    pumpkin_control::{PlayerEdition, PumpkinControl, VerifiedMinecraftIdentity, WaitingPlayer},
 };
 
 struct WaitingState {
@@ -16,6 +17,7 @@ struct WaitingState {
     last_notice: Option<String>,
     last_wake: Option<Instant>,
     transfer_sent: bool,
+    login_link_sent: bool,
 }
 
 impl WaitingState {
@@ -25,6 +27,7 @@ impl WaitingState {
             last_notice: None,
             last_wake: None,
             transfer_sent: false,
+            login_link_sent: false,
         }
     }
 
@@ -47,7 +50,21 @@ impl WaitingState {
 
 pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
     let control = PumpkinControl::new(config.waiting_control_token.clone());
-    control.status(&config.waiting_control_socket).await?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let (java_online_authentication, bedrock_online_authentication) = control
+        .online_authentication(&config.waiting_control_socket)
+        .await?;
+    let authentication_enabled = java_online_authentication && bedrock_online_authentication;
+    if !authentication_enabled
+        && !(cfg!(debug_assertions) && config.allow_offline_waiting_for_tests)
+    {
+        bail!("waiting Pumpkin must require online Java and Bedrock authentication");
+    }
+    if !authentication_enabled {
+        tracing::warn!("offline waiting authentication is enabled for a disposable test fixture");
+    }
     tracing::info!(
         control_socket = %config.waiting_control_socket.display(),
         bedrock_listen = %config.bedrock_listen,
@@ -60,13 +77,15 @@ pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
             Ok(players) => {
                 let present = players
                     .iter()
-                    .map(|player| player.id)
+                    .map(|player| player.connection_id)
                     .collect::<std::collections::HashSet<_>>();
                 states.retain(|id, _| present.contains(id));
                 for player in players {
-                    let state = states.entry(player.id).or_insert_with(WaitingState::new);
+                    let state = states
+                        .entry(player.connection_id)
+                        .or_insert_with(WaitingState::new);
                     if let Err(error) =
-                        handle_player(&config, &routes, &control, &player, state).await
+                        handle_player(&config, &routes, &control, &http, &player, state).await
                     {
                         tracing::warn!(player_id = %player.id, ?error, "failed to route waiting player");
                     }
@@ -82,13 +101,20 @@ async fn handle_player(
     config: &GatewayConfig,
     routes: &RouteCache,
     control: &PumpkinControl,
+    http: &reqwest::Client,
     player: &WaitingPlayer,
     state: &mut WaitingState,
 ) -> Result<()> {
     if state.transfer_sent {
         return Ok(());
     }
-    let Some(target) = routes.resolve(&player.server_address).await? else {
+    // Bedrock exposes its player before resource-pack/world initialization is
+    // complete. Sending a disconnect or notice at that point can race login.
+    // Apply the same readiness boundary to all outbound routing actions.
+    if !player.ready_for_transfer {
+        return Ok(());
+    }
+    if !routes.accepts_server_address(&player.server_address) {
         control
             .kick(
                 &config.waiting_control_socket,
@@ -97,9 +123,14 @@ async fn handle_player(
             )
             .await?;
         return Ok(());
-    };
+    }
 
-    if target.account_suspended {
+    let target = routes.resolve(&player.server_address).await?;
+
+    if target
+        .as_ref()
+        .is_some_and(|target| target.account_suspended)
+    {
         control
             .kick(
                 &config.waiting_control_socket,
@@ -109,6 +140,31 @@ async fn handle_player(
             .await?;
         return Ok(());
     }
+
+    if !state.login_link_sent
+        && let Some(identity) = player.verified_identity.as_ref()
+    {
+        let url = create_minecraft_login_link(config, http, identity, &player.name).await?;
+        control
+            .message(
+                &config.waiting_control_socket,
+                player.id,
+                &format!("Sign in to kurbis: {url}"),
+            )
+            .await?;
+        state.login_link_sent = true;
+    }
+
+    let Some(target) = target else {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Unknown or deleted server address.",
+            )
+            .await?;
+        return Ok(());
+    };
 
     if target.state == ObservedState::Failed {
         control
@@ -120,6 +176,7 @@ async fn handle_player(
             .await?;
         return Ok(());
     }
+
     if target.worker_healthy == Some(false)
         && matches!(
             target.state,
@@ -176,6 +233,41 @@ async fn handle_player(
             .await?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct MinecraftLinkRequest<'a> {
+    identity: &'a VerifiedMinecraftIdentity,
+    display_name: &'a str,
+}
+
+#[derive(Deserialize)]
+struct MinecraftLinkResponse {
+    url: String,
+}
+
+async fn create_minecraft_login_link(
+    config: &GatewayConfig,
+    http: &reqwest::Client,
+    identity: &VerifiedMinecraftIdentity,
+    display_name: &str,
+) -> Result<String> {
+    let response = http
+        .post(format!(
+            "{}/internal/minecraft-login-links",
+            config.control_plane_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&config.internal_token)
+        .json(&MinecraftLinkRequest {
+            identity,
+            display_name,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<MinecraftLinkResponse>()
+        .await?;
+    Ok(response.url)
 }
 
 async fn transfer(
