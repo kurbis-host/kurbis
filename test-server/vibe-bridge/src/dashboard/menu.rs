@@ -427,11 +427,18 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
         }
     }
     // Opening a GUI closes the previous one. Publish state after that close callback.
-    player.open_gui(menu.gui);
-    state()
+    let id = key(player);
+    let next_window = state()
         .lock()
         .unwrap()
-        .menus
-        .insert(key(player), menu.actions);
+        .windows
+        .get(&id)
+        .copied()
+        .flatten()
+        .map(|current| current % 100 + 1);
+    player.open_gui(menu.gui);
+    let mut state = state().lock().unwrap();
+    state.windows.insert(id.clone(), next_window);
+    state.menus.insert(id, menu.actions);
     Ok(())
 }

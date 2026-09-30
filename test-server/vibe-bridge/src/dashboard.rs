@@ -49,6 +49,7 @@ enum Input {
 #[derive(Default)]
 struct State {
     menus: HashMap<String, HashMap<i16, Action>>,
+    windows: HashMap<String, Option<i32>>,
     inputs: HashMap<String, (Input, u128)>,
     watches: HashMap<String, (Uuid, u64)>,
 }
@@ -70,6 +71,7 @@ pub fn watch(player: &Player, job: Uuid) {
         .insert(key(player), (job, 0));
 }
 mod menu;
+pub(crate) mod spectator;
 pub use menu::open;
 pub struct Click;
 impl EventHandler<InventoryClickEvent> for Click {
@@ -188,7 +190,10 @@ impl EventHandler<InventoryCloseEvent> for Close {
         _server: Server,
         event: EventData<InventoryCloseEvent>,
     ) -> EventData<InventoryCloseEvent> {
-        state().lock().unwrap().menus.remove(&key(&event.player));
+        let id = key(&event.player);
+        let mut state = state().lock().unwrap();
+        state.menus.remove(&id);
+        state.windows.remove(&id);
         event
     }
 }
@@ -292,6 +297,7 @@ impl EventHandler<PlayerLeaveEvent> for Leave {
         let key = key(&event.player);
         let mut state = state().lock().unwrap();
         state.menus.remove(&key);
+        state.windows.remove(&key);
         state.inputs.remove(&key);
         state.watches.remove(&key);
         event

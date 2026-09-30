@@ -57,6 +57,10 @@ impl CodexRunner {
             })
             .arg("-c")
             .arg("sandbox_workspace_write.network_access=true")
+            // Keep all config overrides in one CLI scope. An exec-level -c
+            // replaces the root override list, silently dropping network access.
+            .arg("-c")
+            .arg(format!("model_reasoning_effort={:?}", settings.reasoning))
             .arg("-a")
             .arg("never")
             .arg("exec")
@@ -64,9 +68,6 @@ impl CodexRunner {
         if let Some(thread) = resume {
             command.arg("resume").arg(thread.to_string());
         }
-        command
-            .arg("-c")
-            .arg(format!("model_reasoning_effort={:?}", settings.reasoning));
         if !settings.model.is_empty() {
             command.arg("-m").arg(&settings.model);
         }

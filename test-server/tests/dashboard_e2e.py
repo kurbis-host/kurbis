@@ -63,6 +63,7 @@ class Client:
         self.window = self.revision = 0
         self.state = "login"
         self.error = None
+        self.gamemode = None
         self.send(0, vi(777) + string("localhost") + struct.pack(">H", port) + vi(2))
         self.send(0, string(name) + bytes(16))
         threading.Thread(target=self.read, daemon=True).start()
@@ -119,6 +120,8 @@ class Client:
                         self.state = "play"
                 elif self.state == "play":
                     self.packets.append((packet, body))
+                    if packet == 39 and body[0] == 3:
+                        self.gamemode = int(struct.unpack(">f", body[1:5])[0])
                     if packet == 45:
                         self.send(28, body)
                     elif packet == 62:
@@ -144,8 +147,8 @@ class Client:
     def chat(self, text):
         self.send(9, string(text) + struct.pack(">qq", int(time.time() * 1000), 0) + b"\x00" + vi(0) + bytes(4))
 
-    def click(self, slot, mode=0, button=0):
-        self.send(18, vi(self.window) + vi(self.revision) + struct.pack(">hb", slot, button) + vi(mode) + vi(0) + b"\x00")
+    def click(self, slot, mode=0, button=0, window=None):
+        self.send(18, vi(self.window if window is None else window) + vi(self.revision) + struct.pack(">hb", slot, button) + vi(mode) + vi(0) + b"\x00")
 
     def close(self):
         self.send(19, vi(self.window))
@@ -162,14 +165,13 @@ class Client:
         return start
 
 
-def run(runtime, port):
+def run(runtime, port, gamemode):
     server_dir = runtime / "server"
     (server_dir / "plugins").mkdir(parents=True)
     (server_dir / "plugins/vibe-bridge.wasm").write_bytes((ROOT / "runtime/server/plugins/vibe-bridge.wasm").read_bytes())
     config = (ROOT / "runtime/server/pumpkin.toml").read_text()
     config = config.replace("127.0.0.1:25565", f"127.0.0.1:{port}").replace("view_distance = 16", "view_distance = 2").replace("simulation_distance = 10", "simulation_distance = 2")
     config = config.replace("[networking.java.compression]\nenabled = true", "[networking.java.compression]\nenabled = false")
-    config = config.replace("default_op_level = 0", "default_op_level = 4")
     config = config.replace("[telemetry]\nenabled = true", "[telemetry]\nenabled = false")
     (server_dir / "pumpkin.toml").write_text(config)
     worker = runtime / "fixture-codex"
@@ -204,11 +206,25 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         server.stdin.write("op VibeTester\n")
         server.stdin.flush()
         time.sleep(1)
+        server.stdin.write("gamemode creative VibeTester\n")
+        server.stdin.flush()
+        eventually(lambda: op.gamemode == 1)
+        server.stdin.write(f"gamemode {gamemode} VibeTester\n")
+        server.stdin.flush()
+        eventually(lambda: op.gamemode == (3 if gamemode == "spectator" else 0))
         op.menu("Workshop", lambda: op.command("vibe"))
         assert op.seen("Create or edit a plugin") and op.seen("Conversations")
+        old_window = op.window
         op.menu("Settings", lambda: op.click(33))
         data = server_dir / "plugins/data/vibe-bridge"
         settings = lambda: json.loads((data / "settings.json").read_text())
+        op.click(22, window=old_window)
+        time.sleep(0.2)
+        assert settings()["reasoning"] == "medium", "Stale chest click changed settings"
+        if gamemode == "spectator":
+            op.click(22, mode=5)
+            time.sleep(0.2)
+            assert settings()["reasoning"] == "medium", "Drag activated a spectator button"
         op.menu("Settings", lambda: op.click(22))
         assert settings()["reasoning"] == "high"
         op.menu("Settings", lambda: op.click(24))
@@ -273,6 +289,18 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         op.menu("Settings", lambda: op.click(33))
         assert settings()["model"] == "" and settings()["timeout_seconds"] == 900
         assert "medium" == settings()["reasoning"]
+        # Changing gamemode while a chest is open must keep its buttons usable.
+        alternate = "survival" if gamemode == "spectator" else "spectator"
+        server.stdin.write(f"gamemode {alternate} VibeTester\n")
+        server.stdin.flush()
+        eventually(lambda: op.gamemode == (3 if alternate == "spectator" else 0))
+        op.menu("Settings", lambda: op.click(22))
+        assert settings()["reasoning"] == "high"
+        op.menu("Settings", lambda: op.click(33))
+        assert settings()["reasoning"] == "medium"
+        server.stdin.write(f"gamemode {gamemode} VibeTester\n")
+        server.stdin.flush()
+        eventually(lambda: op.gamemode == (3 if gamemode == "spectator" else 0))
         # Settings buttons and pending prompts must recheck permission after de-op.
         op.click(20)
         time.sleep(0.2)
@@ -299,7 +327,8 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         eventually(lambda: op.seen("Prompt cancelled."))
         op.chat("normal-chat-after-cancel")
         eventually(lambda: guest.seen("normal-chat-after-cancel"))
-        print("PASS: official binary, OP gate, menu navigation, persisted settings, private chat, full events, log pagination/details, session resume, defaults")
+        assert op.gamemode == (3 if gamemode == "spectator" else 0), "Workshop changed gamemode"
+        print(f"PASS ({gamemode}): official binary, OP gate, menu navigation, persisted settings, private chat, full events, log pagination/details, session resume, defaults")
     finally:
         for client in clients:
             client.socket.close()
@@ -317,16 +346,17 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
 
 
 if __name__ == "__main__":
-    # Select an available local port without taking over the normal test server.
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    with tempfile.TemporaryDirectory(prefix="pumpkin-vibe-e2e-") as temp:
-        try:
-            run(pathlib.Path(temp), port)
-        except Exception:
-            for filename in ("server.log", "controller.log"):
-                path = pathlib.Path(temp) / filename
-                if path.exists():
-                    print(f"{filename}:\n{path.read_text()[-10000:]}")
-            raise
+    for gamemode in ("survival", "spectator"):
+        # Select an available port without taking over the normal test server.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        with tempfile.TemporaryDirectory(prefix="pumpkin-vibe-e2e-") as temp:
+            try:
+                run(pathlib.Path(temp), port, gamemode)
+            except Exception:
+                for filename in ("server.log", "controller.log"):
+                    path = pathlib.Path(temp) / filename
+                    if path.exists():
+                        print(f"{filename}:\n{path.read_text()[-10000:]}")
+                raise

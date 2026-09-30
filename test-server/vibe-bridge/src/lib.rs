@@ -6,7 +6,7 @@ use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata,
     events::{
         EventPriority, InventoryClickEvent, InventoryCloseEvent, InventoryDragEvent,
-        PlayerChatEvent, PlayerLeaveEvent,
+        PacketReceivedEvent, PlayerChatEvent, PlayerLeaveEvent,
     },
     permission::{Permission, PermissionDefault, PermissionLevel},
     permissions, register_plugin,
@@ -60,6 +60,11 @@ impl Plugin for VibeBridge {
         )?;
         context.register_event_handler::<PlayerLeaveEvent, _>(
             dashboard::Leave,
+            EventPriority::High,
+            true,
+        )?;
+        context.register_event_handler::<PacketReceivedEvent, _>(
+            dashboard::spectator::Received,
             EventPriority::High,
             true,
         )?;

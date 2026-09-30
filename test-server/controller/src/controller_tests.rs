@@ -340,6 +340,21 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
     assert!(args.contains(&serde_json::json!("read-only")));
     assert!(args.contains(&serde_json::json!("test-model")));
     assert!(args.contains(&serde_json::json!("model_reasoning_effort=\"high\"")));
+    let exec = args.iter().position(|a| a == "exec").unwrap();
+    let config_positions: Vec<_> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| **a == "-c")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(config_positions.len(), 2);
+    assert!(
+        config_positions.iter().all(|index| *index < exec),
+        "exec-level config drops global network override"
+    );
+    assert!(args.contains(&serde_json::json!(
+        "sandbox_workspace_write.network_access=true"
+    )));
     let resume = args.iter().position(|a| a == "resume").unwrap();
     assert_eq!(args[resume + 1], thread.to_string());
     let sessions: Sessions = vibe_protocol::read_json(&sessions_path).unwrap();

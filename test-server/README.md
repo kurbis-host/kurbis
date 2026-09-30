@@ -24,7 +24,7 @@ Grant yourself operator status from the Pumpkin console with `op <minecraft-name
 - **Ask Codex:** use the same input flow for a discussion in the plugin's workspace. These turns run in Codex's read-only sandbox and do not install an artifact.
 - **Settings:** enter a model ID (or `default` for your CLI configuration), cycle reasoning effort and timeout, toggle live chat progress, or restore defaults. Defaults: CLI model, medium effort, 15-minute timeout, chat progress on. Model/effort availability depends on your configured Codex provider.
 
-Menu input consumes your next chat message privately. Type `cancel` to abort; prompts expire after two minutes. Permissions are checked again on clicks and submission, including if you lose OP while a menu is open. Closing or leaving cleans up menu state; leaving also clears pending input and watches. Menu items cannot be moved into your inventory.
+Menu input consumes your next chat message privately. Type `cancel` to abort; prompts expire after two minutes. Permissions are checked again on clicks and submission, including if you lose OP while a menu is open. Closing or leaving cleans up menu state; leaving also clears pending input and watches. Menu items cannot be moved into your inventory. The workshop works in spectator mode without changing your gamemode; it handles spectator clicks through Pumpkin's packet event API because the stock server skips inventory click events for spectators.
 
 Settings persist on disk. Execution settings apply when the next queued job starts. Live chat progress can be toggled immediately; full disk logging stays enabled. Timeouts cycle through 5/15/30/60 minutes; the command interface permits 30–3600 seconds. The controller's optional `--timeout-seconds` sets an upper limit, defaulting to one hour.
 
@@ -78,9 +78,10 @@ After bootstrap:
 
 ```sh
 cargo test --manifest-path Cargo.toml --workspace
+cargo test --manifest-path vibe-bridge/Cargo.toml --lib
 cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
 cargo clippy --manifest-path vibe-bridge/Cargo.toml --target wasm32-wasip2 -- -D warnings
 python3 tests/dashboard_e2e.py
 ```
 
-The end-to-end test runs the official binary and bridge in an isolated temporary runtime with real protocol clients and a deterministic Codex event fixture. It checks permissions, chest navigation, settings, private prompts, log browsing, and continuation across controller restart. Backend tests cover installation/restoration, invalid artifacts, complete large outputs, thread mismatch, FIFO ordering, cancellation, timeout, and settings validation.
+The end-to-end test runs the official binary and bridge in an isolated temporary runtime with real protocol clients and a deterministic Codex event fixture. It checks permissions, chest navigation in survival and spectator mode, gamemode changes with an open menu, stale-window rejection, drag suppression, settings, private prompts, log browsing, and continuation across controller restart. Backend tests cover installation/restoration, invalid artifacts, complete large outputs, thread mismatch, FIFO ordering, cancellation, timeout, and settings validation. Bridge unit tests cover truncated and invalid click headers. The Codex argument regression keeps network and reasoning overrides together before `exec`, preventing exec-local configuration from silently disabling network access.
