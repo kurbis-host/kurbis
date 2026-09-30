@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use sqlx::PgPool;
@@ -53,4 +53,19 @@ pub async fn prepare_server_data(
         .await?;
     }
     Ok(directory)
+}
+
+/// Files managed by orchestration rather than persistent Minecraft world data.
+pub(crate) fn is_runtime_file(relative: &Path) -> bool {
+    let name = relative
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "pumpkin.toml" | "advanced_config.toml" | "nethernet-key.der" | "whitelist.json"
+    ) || relative
+        .components()
+        .next()
+        .is_some_and(|v| matches!(v.as_os_str().to_str(), Some("logs" | "run")))
 }

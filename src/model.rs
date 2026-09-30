@@ -41,6 +41,7 @@ pub enum OperationKind {
     Stop,
     Restart,
     Snapshot,
+    Restore,
     Delete,
 }
 
@@ -62,6 +63,7 @@ pub enum SnapshotReason {
     Periodic,
     Shutdown,
     Manual,
+    Restore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

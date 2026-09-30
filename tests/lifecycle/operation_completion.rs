@@ -1,3 +1,4 @@
+use super::publish_final_snapshot;
 use super::{
     DB_TEST_LOCK, Lifecycle, ObservedState, claim_operation, clean_test_rows,
     cleanup_test_entities, complete_start, complete_stop, create_test_server, create_test_worker,
@@ -21,6 +22,7 @@ async fn replayed_stop_preserves_other_servers_capacity_and_snapshot_pointer() {
     complete_start(&pool, &start, 11).await.unwrap();
     lifecycle.request_stop(server_a, "test").await.unwrap();
     let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    publish_final_snapshot(&pool, &stop, 1, 12).await;
     complete_stop(&pool, &stop, 1, 12).await.unwrap();
     lifecycle.request_start(server_b, "test").await.unwrap();
     // Both concurrent and delayed delivery of the same stop result are no-ops.
@@ -181,6 +183,7 @@ async fn suspension_during_claimed_start_enqueues_one_clean_shutdown() {
     .unwrap();
     assert_eq!(stops, 1);
     let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    publish_final_snapshot(&pool, &stop, 1, 0).await;
     complete_stop(&pool, &stop, 1, 0).await.unwrap();
     let state: ObservedState =
         sqlx::query_scalar("SELECT observed_state FROM servers WHERE id = $1")
@@ -189,5 +192,381 @@ async fn suspension_during_claimed_start_enqueues_one_clean_shutdown() {
             .await
             .unwrap();
     assert_eq!(state, ObservedState::Sleeping);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn stop_requires_a_current_complete_final_snapshot_before_releasing_capacity() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-final-snapshot", 31600).await;
+    let (owner, server) = create_test_server(&pool, "final-snapshot").await;
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle.request_start(server, "test").await.unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 0).await.unwrap();
+    lifecycle.request_stop(server, "test").await.unwrap();
+    let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert!(complete_stop(&pool, &stop, 1, 100).await.is_err());
+    publish_final_snapshot(&pool, &stop, 1, 100).await;
+    for mutation in [
+        "UPDATE snapshots SET complete = false WHERE server_id = $1",
+        "UPDATE snapshots SET complete = true, reason = 'periodic' WHERE server_id = $1",
+        "UPDATE snapshots SET reason = 'shutdown', created_at = now() - interval '1 day' WHERE server_id = $1",
+        "UPDATE snapshots SET created_at = now(), size_bytes = 101 WHERE server_id = $1",
+    ] {
+        sqlx::query(mutation)
+            .bind(server)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(complete_stop(&pool, &stop, 1, 100).await.is_err());
+        let (active, reserved, status): (bool, i64, OperationStatus) = sqlx::query_as(
+            "SELECT p.active, w.reserved_memory_bytes, o.status
+             FROM placements p JOIN workers w ON w.id = p.worker_id
+             JOIN operations o ON o.server_id = p.server_id WHERE o.id = $1",
+        )
+        .bind(stop.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (active, reserved, status),
+            (true, SERVER_MEMORY_BYTES, OperationStatus::Running)
+        );
+    }
+    sqlx::query("UPDATE snapshots SET size_bytes = 100 WHERE server_id = $1")
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A newer published generation cannot be replaced by an older worker result.
+    publish_final_snapshot(&pool, &stop, 2, 200).await;
+    assert!(complete_stop(&pool, &stop, 1, 100).await.is_err());
+    complete_stop(&pool, &stop, 2, 200).await.unwrap();
+    let (state, current, size, reserved): (ObservedState, i64, i64, i64) = sqlx::query_as(
+        "SELECT s.observed_state, s.current_snapshot_generation, s.storage_bytes, w.reserved_memory_bytes
+         FROM servers s JOIN placements p ON p.server_id = s.id JOIN workers w ON w.id = p.worker_id WHERE s.id = $1",
+    ).bind(server).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        (state, current, size, reserved),
+        (ObservedState::Sleeping, 2, 200, 0)
+    );
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn shutdown_stage_recovery_rejects_old_claim_and_completed_payload_writes() {
+    use kurbis_hoster::control_plane::lifecycle::update_operation_payload;
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-stage-fence", 31700).await;
+    let (owner, server) = create_test_server(&pool, "stage-fence").await;
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle.request_start(server, "test").await.unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 0).await.unwrap();
+    lifecycle.request_stop(server, "test").await.unwrap();
+    let old = claim_operation(&pool, worker).await.unwrap().unwrap();
+    update_operation_payload(&pool, &old, serde_json::json!({"stage":"saved"}))
+        .await
+        .unwrap();
+    recover_running_operations(&pool, worker).await.unwrap();
+    let current = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(current.payload["stage"], "saved");
+    assert!(
+        update_operation_payload(&pool, &old, serde_json::json!({"stage":"stopped"}))
+            .await
+            .is_err()
+    );
+    update_operation_payload(&pool, &current, serde_json::json!({"stage":"stopped"}))
+        .await
+        .unwrap();
+    publish_final_snapshot(&pool, &current, 1, 0).await;
+    complete_stop(&pool, &current, 1, 0).await.unwrap();
+    assert!(
+        update_operation_payload(&pool, &current, serde_json::json!({"stage":"saved"}))
+            .await
+            .is_err()
+    );
+    let stage: String =
+        sqlx::query_scalar("SELECT payload->>'stage' FROM operations WHERE id = $1")
+            .bind(current.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage, "stopped");
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn delete_recovery_fences_cleanup_admission_and_durable_deletion() {
+    use kurbis_hoster::control_plane::lifecycle::{complete_delete, validate_delete};
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-delete-fence", 31800).await;
+    let (owner, server) = create_test_server(&pool, "delete-fence").await;
+    Lifecycle::new(pool.clone())
+        .request_delete(server)
+        .await
+        .unwrap();
+    let old = claim_operation(&pool, worker).await.unwrap().unwrap();
+    validate_delete(&pool, &old).await.unwrap();
+    recover_running_operations(&pool, worker).await.unwrap();
+    let current = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert!(validate_delete(&pool, &old).await.is_err());
+    assert!(complete_delete(&pool, &old).await.is_err());
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)")
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(exists);
+    let mut wrong_generation = current.clone();
+    wrong_generation.generation += 1;
+    assert!(validate_delete(&pool, &wrong_generation).await.is_err());
+    validate_delete(&pool, &current).await.unwrap();
+    complete_delete(&pool, &current).await.unwrap();
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)")
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!exists);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn manual_snapshot_completion_requires_current_claim_and_published_manual_generation() {
+    use kurbis_hoster::control_plane::lifecycle::{complete_snapshot, enqueue_operation};
+    use kurbis_hoster::model::OperationKind;
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-snapshot-fence", 31900).await;
+    let (owner, server) = create_test_server(&pool, "snapshot-fence").await;
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle.request_start(server, "test").await.unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 0).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    enqueue_operation(
+        &mut tx,
+        server,
+        Some(worker),
+        OperationKind::Snapshot,
+        start.generation,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let old = claim_operation(&pool, worker).await.unwrap().unwrap();
+    recover_running_operations(&pool, worker).await.unwrap();
+    let current = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert!(complete_snapshot(&pool, &current, 1).await.is_err());
+    publish_final_snapshot(&pool, &current, 1, 12).await;
+    assert!(complete_snapshot(&pool, &current, 1).await.is_err());
+    sqlx::query("UPDATE snapshots SET reason = 'manual' WHERE server_id = $1")
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(complete_snapshot(&pool, &old, 1).await.is_err());
+    complete_snapshot(&pool, &current, 1).await.unwrap();
+    complete_snapshot(&pool, &current, 999).await.unwrap();
+    let status: OperationStatus = sqlx::query_scalar("SELECT status FROM operations WHERE id = $1")
+        .bind(current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, OperationStatus::Succeeded);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn duplicate_manual_snapshot_requests_share_one_live_operation() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-snapshot-duplicate", 32000).await;
+    let (owner, server) = create_test_server(&pool, "snapshot-duplicate").await;
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle.request_start(server, "test").await.unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 0).await.unwrap();
+
+    assert_eq!(
+        lifecycle.request_snapshot(server).await.unwrap(),
+        ObservedState::Online
+    );
+    let duplicate = lifecycle.request_snapshot(server).await.unwrap_err();
+    assert!(
+        duplicate
+            .to_string()
+            .contains("manual snapshot already in progress")
+    );
+    let live_snapshots: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations
+         WHERE server_id = $1 AND kind = 'snapshot' AND status IN ('pending','running')",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_snapshots, 1);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn restoring_an_older_snapshot_requires_a_new_authoritative_generation() {
+    use kurbis_hoster::control_plane::lifecycle::complete_restore;
+
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-restore-monotonic", 32150).await;
+    let (owner, server) = create_test_server(&pool, "restore-monotonic").await;
+    for generation in 1_i64..=2 {
+        sqlx::query(
+            "INSERT INTO snapshots(
+                id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete
+             ) VALUES($1,$2,$3,$4,$5,$6,'shutdown',true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(server)
+        .bind(generation)
+        .bind(format!("source-{generation}"))
+        .bind(generation * 10)
+        .bind(format!("checksum-{generation}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 2, storage_bytes = 20 WHERE id = $1",
+    )
+    .bind(server)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lifecycle = Lifecycle::new(pool.clone());
+    assert_eq!(
+        lifecycle.request_restore(server, 1).await.unwrap(),
+        ObservedState::Restoring
+    );
+    let restore = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(restore.kind, kurbis_hoster::model::OperationKind::Restore);
+
+    sqlx::query(
+        "INSERT INTO snapshots(
+            id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, created_at
+         ) VALUES($1,$2,3,'restored-3',11,'restored-checksum','restore',true,now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 3, storage_bytes = 11 WHERE id = $1",
+    )
+    .bind(server)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    complete_restore(&pool, &restore, 1, 3, 11).await.unwrap();
+    let state: (ObservedState, Option<i64>, i64) = sqlx::query_as(
+        "SELECT observed_state, current_snapshot_generation, storage_bytes
+         FROM servers WHERE id = $1",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, (ObservedState::Sleeping, Some(3), 11));
+    let reasons: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, reason::text FROM snapshots
+         WHERE server_id = $1 AND complete ORDER BY generation",
+    )
+    .bind(server)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reasons,
+        vec![
+            (1, "shutdown".to_owned()),
+            (2, "shutdown".to_owned()),
+            (3, "restore".to_owned()),
+        ]
+    );
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn restore_admission_waits_for_snapshot_publication_before_pinning_source() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let (owner, server) = create_test_server(&pool, "restore-pin").await;
+    let worker = create_test_worker(&pool, "worker-restore-pin", 33000).await;
+    sqlx::query("INSERT INTO snapshots(id,server_id,generation,manifest_key,size_bytes,checksum,reason,complete)
+        VALUES($1,$2,1,'retained-source',1,'verified-checksum','shutdown',true)")
+        .bind(Uuid::new_v4()).bind(server).execute(&pool).await.unwrap();
+    let mut publication = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
+        .bind(server.to_string())
+        .execute(&mut *publication)
+        .await
+        .unwrap();
+    let lifecycle = Lifecycle::new(pool.clone());
+    let restore = tokio::spawn(async move { lifecycle.request_restore(server, 1).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks
+                WHERE locktype='advisory' AND classid=724514
+                AND objid=(hashtext($1)::bigint & 4294967295) AND NOT granted)",
+            )
+            .bind(server.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A publisher can expire the source before admission. Acceptance must then
+    // reject the missing generation instead of enqueuing an unusable restore.
+    sqlx::query("DELETE FROM snapshots WHERE server_id=$1")
+        .bind(server)
+        .execute(&mut *publication)
+        .await
+        .unwrap();
+    publication.commit().await.unwrap();
+    assert!(
+        restore
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot not found")
+    );
+    let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM operations WHERE server_id=$1")
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(operations, 0);
     cleanup_test_entities(&pool, owner, &[worker]).await;
 }

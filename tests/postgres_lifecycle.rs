@@ -1,6 +1,6 @@
 mod common;
 
-use common::test_pool;
+use common::{create_user, test_pool};
 use kurbis_hoster::{
     control_plane::api::resolve_subdomain,
     control_plane::lifecycle::{
@@ -16,7 +16,11 @@ use uuid::Uuid;
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn clean_test_rows(pool: &PgPool) {
-    sqlx::query("DELETE FROM users WHERE oauth_provider = 'test'")
+    sqlx::query(
+        "DELETE FROM users WHERE id IN (
+             SELECT user_id FROM identities WHERE provider = 'google' AND subject LIKE 'lifecycle-test-%'
+         )",
+    )
         .execute(pool)
         .await
         .unwrap();
@@ -30,17 +34,17 @@ async fn clean_test_rows(pool: &PgPool) {
 }
 
 async fn create_test_server(pool: &PgPool, prefix: &str) -> (Uuid, Uuid) {
-    let user_id = Uuid::new_v4();
+    let identity_subject = Uuid::new_v4();
     let server_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO users(id, oauth_provider, oauth_subject, display_name)
-         VALUES($1, 'test', $2, 'Lifecycle Test')",
+    let user_id = create_user(
+        pool,
+        "google",
+        &format!("lifecycle-test-{identity_subject}"),
+        "Lifecycle Test",
+        "active",
+        None,
     )
-    .bind(user_id)
-    .bind(user_id.to_string())
-    .execute(pool)
-    .await
-    .unwrap();
+    .await;
     sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
         .bind(server_id)
         .bind(user_id)
@@ -70,6 +74,25 @@ async fn create_test_worker(pool: &PgPool, prefix: &str, port_min: i32) -> Uuid 
     worker_id
 }
 
+async fn publish_final_snapshot(
+    pool: &PgPool,
+    op: &kurbis_hoster::model::OperationRecord,
+    generation: i64,
+    size: i64,
+) {
+    sqlx::query("INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete) VALUES($1,$2,$3,'fixture-manifest',$4,'fixture-checksum','shutdown',true)")
+        .bind(Uuid::new_v4()).bind(op.server_id).bind(generation).bind(size).execute(pool).await.unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3 WHERE id = $1",
+    )
+    .bind(op.server_id)
+    .bind(generation)
+    .bind(size)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn cleanup_test_entities(pool: &PgPool, user_id: Uuid, worker_ids: &[Uuid]) {
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
@@ -91,18 +114,17 @@ async fn runtime_loss_deactivates_the_placement() {
     let pool = test_pool().await;
     clean_test_rows(&pool).await;
 
-    let user_id = Uuid::new_v4();
     let server_id = Uuid::new_v4();
     let worker_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO users(id, oauth_provider, oauth_subject, display_name)
-         VALUES($1, 'test', $2, 'Runtime Loss Test')",
+    let user_id = create_user(
+        &pool,
+        "google",
+        &format!("lifecycle-test-{server_id}"),
+        "Runtime Loss Test",
+        "active",
+        None,
     )
-    .bind(user_id)
-    .bind(user_id.to_string())
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
     sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
         .bind(server_id)
         .bind(user_id)
@@ -172,18 +194,17 @@ async fn lifecycle_start_and_stop_release_worker_capacity() {
     let pool = test_pool().await;
     clean_test_rows(&pool).await;
 
-    let user_id = Uuid::new_v4();
     let server_id = Uuid::new_v4();
     let worker_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO users(id, oauth_provider, oauth_subject, display_name)
-         VALUES($1, 'test', $2, 'Lifecycle Test')",
+    let user_id = create_user(
+        &pool,
+        "google",
+        &format!("lifecycle-test-{server_id}"),
+        "Lifecycle Test",
+        "active",
+        None,
     )
-    .bind(user_id)
-    .bind(user_id.to_string())
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
     sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
         .bind(server_id)
         .bind(user_id)
@@ -249,6 +270,7 @@ async fn lifecycle_start_and_stop_release_worker_capacity() {
         .unwrap()
         .expect("stop operation");
     assert_eq!(stop.kind, OperationKind::Stop);
+    publish_final_snapshot(&pool, &stop, 1, 456).await;
     complete_stop(&pool, &stop, 1, 456).await.unwrap();
 
     let (state, active, reserved_memory, reserved_disk, reserved_cpu): (
@@ -371,6 +393,7 @@ async fn start_during_stop_requests_restart_without_reassigning_the_active_place
         .await
         .unwrap()
         .expect("stop operation");
+    publish_final_snapshot(&pool, &stop, 1, 0).await;
     complete_stop(&pool, &stop, 1, 0).await.unwrap();
     let state: ObservedState =
         sqlx::query_scalar("SELECT observed_state FROM servers WHERE id = $1")
@@ -643,6 +666,7 @@ async fn online_delete_finishes_shutdown_then_exposes_cleanup_to_any_worker() {
         .unwrap()
         .expect("stop operation");
     assert_eq!(stop.kind, OperationKind::Stop);
+    publish_final_snapshot(&pool, &stop, 1, 42).await;
     complete_stop(&pool, &stop, 1, 42).await.unwrap();
 
     let (desired, state, active): (kurbis_hoster::model::DesiredState, ObservedState, bool) =
@@ -733,6 +757,7 @@ async fn stopped_server_ports_are_reused_without_losing_its_cached_placement() {
     );
     lifecycle.request_stop(server_a, "test").await.unwrap();
     let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    publish_final_snapshot(&pool, &stop, 1, 42).await;
     complete_stop(&pool, &stop, 1, 42).await.unwrap();
     assert_eq!(lifecycle.drain_queue_once().await.unwrap(), 1);
     let assignments: Vec<(Uuid, bool, i32, i32)> = sqlx::query_as(
@@ -815,6 +840,7 @@ async fn new_join_cannot_overtake_queued_wakes_when_capacity_returns() {
     assert!(next_time >= original);
     lifecycle.request_stop(server_a, "idle").await.unwrap();
     let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    publish_final_snapshot(&pool, &stop, 1, 0).await;
     complete_stop(&pool, &stop, 1, 0).await.unwrap();
     assert_eq!(lifecycle.drain_queue_once().await.unwrap(), 1);
     let next = claim_operation(&pool, worker).await.unwrap().unwrap();

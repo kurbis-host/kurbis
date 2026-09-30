@@ -1,0 +1,7 @@
+.git
+.env*
+target
+**/node_modules
+web/.next
+output
+test-server

@@ -68,7 +68,12 @@ impl StorageManager {
         }
         if self.mode == StorageMode::LoopbackExt4 {
             let image = self.image_path(server_id);
-            match fs::remove_file(image).await {
+            match fs::remove_file(&image).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            match fs::remove_file(image.with_extension("ext4.initializing")).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -101,21 +106,26 @@ impl StorageManager {
             fs::create_dir_all(&volumes).await?;
             let image = self.image_path(server_id);
             if !fs::try_exists(&image).await? {
+                // Publish only a formatted filesystem. An interrupted first
+                // attempt must not leave an unformatted image that all retries
+                // mistake for a usable volume.
+                let initializing = image.with_extension("ext4.initializing");
                 run(
                     Command::new("truncate")
                         .arg("-s")
                         .arg(SERVER_STORAGE_BYTES.to_string())
-                        .arg(&image),
+                        .arg(&initializing),
                     "create quota image",
                 )
                 .await?;
                 run(
                     Command::new("mkfs.ext4")
                         .args(["-F", "-m", "0"])
-                        .arg(&image),
+                        .arg(&initializing),
                     "format quota image",
                 )
                 .await?;
+                fs::rename(&initializing, &image).await?;
             }
             run(
                 Command::new("mount")
@@ -179,10 +189,10 @@ async fn collect_volume_ids(root: &Path, ids: &mut HashSet<Uuid>) -> Result<()> 
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("ext4") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|value| value.to_str())
+        if let Some(name) = path.file_name().and_then(|value| value.to_str())
+            && let Some(stem) = name
+                .strip_suffix(".ext4")
+                .or_else(|| name.strip_suffix(".ext4.initializing"))
             && let Ok(id) = Uuid::parse_str(stem)
         {
             ids.insert(id);
@@ -192,16 +202,23 @@ async fn collect_volume_ids(root: &Path, ids: &mut HashSet<Uuid>) -> Result<()> 
 }
 
 async fn is_mountpoint(path: &Path) -> Result<bool> {
+    if !fs::try_exists(path).await? {
+        return Ok(false);
+    }
     let status = Command::new("mountpoint")
         .arg("-q")
         .arg(path)
         .status()
         .await
         .context("failed to execute mountpoint")?;
-    match status.code() {
+    mountpoint_result(status.code())
+}
+
+fn mountpoint_result(code: Option<i32>) -> Result<bool> {
+    match code {
         Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!("mountpoint failed with {status}"),
+        Some(32) => Ok(false),
+        _ => bail!("mountpoint failed with exit code {code:?}"),
     }
 }
 
@@ -219,6 +236,34 @@ async fn run(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mountpoint_distinguishes_an_unmounted_directory_from_system_failure() {
+        assert!(mountpoint_result(Some(0)).unwrap());
+        assert!(!mountpoint_result(Some(32)).unwrap());
+        for code in [Some(1), Some(2), None] {
+            assert!(mountpoint_result(code).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_format_is_discovered_and_removed_without_a_mount_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageManager::new(temp.path().to_path_buf(), StorageMode::LoopbackExt4);
+        let id = Uuid::new_v4();
+        fs::create_dir_all(temp.path().join("volumes"))
+            .await
+            .unwrap();
+        let pending = manager.image_path(id).with_extension("ext4.initializing");
+        fs::write(&pending, b"incomplete filesystem").await.unwrap();
+        assert_eq!(
+            manager.managed_server_ids().await.unwrap(),
+            HashSet::from([id])
+        );
+        manager.remove(id).await.unwrap();
+        assert!(!pending.exists());
+        assert!(manager.managed_server_ids().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn directory_mode_reset_stays_inside_server_root() {

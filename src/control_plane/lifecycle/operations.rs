@@ -91,7 +91,7 @@ pub async fn fail_operation(pool: &PgPool, op: &OperationRecord, error: &str) ->
     if server.generation != op.generation {
         bail!("stale failed operation generation");
     }
-    if !lock_claim(&mut tx, op, OperationStatus::Failed).await? {
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Failed)).await? {
         tx.commit().await?;
         return Ok(());
     }
@@ -112,16 +112,24 @@ pub async fn fail_operation(pool: &PgPool, op: &OperationRecord, error: &str) ->
     .bind(op.generation)
     .execute(&mut *tx)
     .await?;
-    if op.kind == OperationKind::Start
-        && let Some(placement) = placement
-    {
-        validate_placement(op, &placement)?;
-        // Failed readiness does not prove the container is absent. Keep the
-        // reservation and routing fence until worker cleanup confirms removal.
-        sqlx::query("UPDATE placements SET active = true, updated_at = now() WHERE server_id = $1")
+    if let Some(placement) = placement {
+        if op.kind == OperationKind::Start {
+            validate_placement(op, &placement)?;
+            // Failed readiness does not prove the container is absent. Keep the
+            // reservation and routing fence until worker cleanup confirms removal.
+            sqlx::query(
+                "UPDATE placements SET active = true, updated_at = now() WHERE server_id = $1",
+            )
             .bind(op.server_id)
             .execute(&mut *tx)
             .await?;
+        } else if op.kind == OperationKind::Restore {
+            validate_placement(op, &placement)?;
+            if placement.active {
+                bail!("failed restore unexpectedly has an active placement");
+            }
+            release_placement_resources(&mut tx, &placement).await?;
+        }
     }
     tx.commit().await?;
     Ok(())
@@ -136,7 +144,7 @@ pub async fn complete_start(pool: &PgPool, op: &OperationRecord, storage_bytes: 
     if op.kind != OperationKind::Start {
         bail!("start completion requires a start operation");
     }
-    if !lock_claim(&mut tx, op, OperationStatus::Succeeded).await? {
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Succeeded)).await? {
         tx.commit().await?;
         return Ok(());
     }
@@ -208,7 +216,7 @@ pub async fn complete_stop(
     if !matches!(op.kind, OperationKind::Stop | OperationKind::Restart) {
         bail!("stop completion requires a stop or restart operation");
     }
-    if !lock_claim(&mut tx, op, OperationStatus::Succeeded).await? {
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Succeeded)).await? {
         tx.commit().await?;
         return Ok(());
     }
@@ -216,6 +224,23 @@ pub async fn complete_stop(
         .await?
         .context("stopped server lost placement")?;
     validate_placement(op, &placement)?;
+    // Only the snapshot publisher owns the recovery pointer. A worker report
+    // cannot invent a generation, accept a partial upload, or rewind it.
+    let valid_final_snapshot: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM snapshots
+         WHERE server_id = $1 AND generation = $2 AND complete
+           AND reason = 'shutdown' AND size_bytes = $3
+           AND manifest_key <> '' AND checksum <> '' AND created_at >= $4)",
+    )
+    .bind(op.server_id)
+    .bind(snapshot_generation)
+    .bind(storage_bytes)
+    .bind(op.created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    if server.current_snapshot_generation != Some(snapshot_generation) || !valid_final_snapshot {
+        bail!("stop completion requires the current complete final snapshot for this shutdown");
+    }
     release_placement_resources(&mut tx, &placement).await?;
     sqlx::query("UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = $1")
         .bind(op.id)
@@ -227,13 +252,10 @@ pub async fn complete_stop(
         DesiredState::Deleted => ObservedState::Deleted,
     };
     sqlx::query(
-        "UPDATE servers SET observed_state = $4, storage_bytes = $2,
-            current_snapshot_generation = $3, last_error = NULL, updated_at = now()
+        "UPDATE servers SET observed_state = $2, last_error = NULL, updated_at = now()
          WHERE id = $1",
     )
     .bind(op.server_id)
-    .bind(storage_bytes)
-    .bind(snapshot_generation)
     .bind(next_state)
     .execute(&mut *tx)
     .await?;
@@ -265,12 +287,212 @@ pub async fn complete_stop(
     Ok(())
 }
 
+/// Persist a resumable operation stage only for the current running claim.
+pub async fn update_operation_payload(
+    pool: &PgPool,
+    op: &OperationRecord,
+    patch: serde_json::Value,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if server.generation != op.generation {
+        bail!("stale operation generation");
+    }
+    lock_claim(&mut tx, op, None).await?;
+    sqlx::query("UPDATE operations SET payload = payload || $2, updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .bind(patch)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn complete_snapshot(pool: &PgPool, op: &OperationRecord, generation: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if op.kind != OperationKind::Snapshot || server.generation != op.generation {
+        bail!("snapshot completion requires the current snapshot operation");
+    }
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Succeeded)).await? {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let placement = lock_placement(&mut tx, op.server_id)
+        .await?
+        .context("snapshot lost placement")?;
+    validate_placement(op, &placement)?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2
+         AND complete AND reason = 'manual' AND created_at >= $3
+         AND manifest_key <> '' AND checksum <> '')",
+    )
+    .bind(op.server_id)
+    .bind(generation)
+    .bind(op.created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !placement.active || server.current_snapshot_generation != Some(generation) || !valid {
+        bail!("snapshot completion requires a published complete manual snapshot");
+    }
+    sqlx::query("UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn complete_restore(
+    pool: &PgPool,
+    op: &OperationRecord,
+    target_generation: i64,
+    snapshot_generation: i64,
+    storage_bytes: i64,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if op.kind != OperationKind::Restore || server.generation != op.generation {
+        bail!("restore completion requires the current restore operation");
+    }
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Succeeded)).await? {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let placement = lock_placement(&mut tx, op.server_id)
+        .await?
+        .context("restore lost placement")?;
+    validate_placement(op, &placement)?;
+    if placement.active {
+        bail!("restore placement unexpectedly became active");
+    }
+    let source_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM snapshots
+            WHERE server_id = $1 AND generation = $2 AND complete
+              AND manifest_key <> '' AND checksum <> ''
+         )",
+    )
+    .bind(op.server_id)
+    .bind(target_generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    let restored_snapshot_valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM snapshots
+            WHERE server_id = $1 AND generation = $2 AND complete
+              AND reason = 'restore' AND size_bytes = $3
+              AND manifest_key <> '' AND checksum <> '' AND created_at >= $4
+         )",
+    )
+    .bind(op.server_id)
+    .bind(snapshot_generation)
+    .bind(storage_bytes)
+    .bind(op.created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !source_exists
+        || snapshot_generation <= target_generation
+        || server.current_snapshot_generation != Some(snapshot_generation)
+        || !restored_snapshot_valid
+    {
+        bail!("restore completion requires a new monotonic published snapshot");
+    }
+
+    release_placement_resources(&mut tx, &placement).await?;
+    sqlx::query("UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .execute(&mut *tx)
+        .await?;
+    let next_state = match server.desired_state {
+        DesiredState::Running => ObservedState::Queued,
+        DesiredState::Stopped => ObservedState::Sleeping,
+        DesiredState::Deleted => ObservedState::Deleted,
+    };
+    sqlx::query(
+        "UPDATE servers SET observed_state = $2, last_error = NULL, updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(op.server_id)
+    .bind(next_state)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
+         VALUES($1,$2,$3)
+         ON CONFLICT(worker_id, server_id) DO UPDATE
+           SET generation = EXCLUDED.generation, updated_at = now()",
+    )
+    .bind(placement.worker_id)
+    .bind(op.server_id)
+    .bind(snapshot_generation)
+    .execute(&mut *tx)
+    .await?;
+    match server.desired_state {
+        DesiredState::Running => {
+            sqlx::query(
+                "INSERT INTO start_requests(server_id, reason) VALUES($1, 'restore_complete')
+                 ON CONFLICT(server_id) DO UPDATE
+                   SET reason = EXCLUDED.reason, requested_at = now()",
+            )
+            .bind(op.server_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        DesiredState::Deleted => {
+            enqueue_delete(&mut tx, op.server_id, op.generation).await?;
+        }
+        DesiredState::Stopped => {}
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+// Physical cleanup is idempotent and runs without holding database row locks.
+// Revalidate both before cleanup and before deleting the durable records.
+async fn lock_delete(tx: &mut Transaction<'_, Postgres>, op: &OperationRecord) -> Result<()> {
+    let server = lock_server(tx, op.server_id).await?;
+    if op.kind != OperationKind::Delete
+        || server.generation != op.generation
+        || server.desired_state != DesiredState::Deleted
+        || server.observed_state != ObservedState::Deleted
+    {
+        bail!("delete requires the current operation and a deleted server");
+    }
+    lock_claim(tx, op, None).await?;
+    if lock_placement(tx, op.server_id)
+        .await?
+        .is_some_and(|p| p.active)
+    {
+        bail!("refusing to delete server data while placement is active");
+    }
+    Ok(())
+}
+
+pub async fn validate_delete(pool: &PgPool, op: &OperationRecord) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    lock_delete(&mut tx, op).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn complete_delete(pool: &PgPool, op: &OperationRecord) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    lock_delete(&mut tx, op).await?;
+    sqlx::query("DELETE FROM servers WHERE id = $1")
+        .bind(op.server_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 // Caller locks the server first, preserving lifecycle lock order. The
 // persisted claim, rather than a worker-supplied DTO, authorizes each mutation.
 async fn lock_claim(
     tx: &mut Transaction<'_, Postgres>,
     claim: &OperationRecord,
-    terminal: OperationStatus,
+    terminal: Option<OperationStatus>,
 ) -> Result<bool> {
     let stored = sqlx::query_as::<_, OperationRecord>(
         "SELECT id, server_id, worker_id, kind, status, generation, attempt, payload,
@@ -288,7 +510,7 @@ async fn lock_claim(
     {
         bail!("stale operation claim identity or attempt");
     }
-    if stored.status == terminal {
+    if Some(stored.status) == terminal {
         return Ok(false);
     }
     if stored.status != OperationStatus::Running {

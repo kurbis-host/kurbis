@@ -1,6 +1,6 @@
 mod common;
 
-use common::test_pool;
+use common::{create_user, test_pool};
 use kurbis_hoster::{
     config::ObjectStoreConfig,
     model::{SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason},
@@ -13,17 +13,16 @@ use uuid::Uuid;
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn create_server(pool: &PgPool) -> (Uuid, Uuid) {
-    let user_id = Uuid::new_v4();
     let server_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO users(id, oauth_provider, oauth_subject, display_name)
-         VALUES($1, 'snapshot-test', $2, 'Snapshot Test')",
+    let user_id = create_user(
+        pool,
+        "google",
+        &format!("snapshot-test-{server_id}"),
+        "Snapshot Test",
+        "active",
+        None,
     )
-    .bind(user_id)
-    .bind(user_id.to_string())
-    .execute(pool)
-    .await
-    .unwrap();
+    .await;
     sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
         .bind(server_id)
         .bind(user_id)
@@ -62,6 +61,18 @@ async fn published_snapshot_restores_and_keeps_a_bounded_recovery_window() {
     tokio::fs::create_dir_all(source.path().join("world"))
         .await
         .unwrap();
+    tokio::fs::create_dir_all(source.path().join("run"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        source.path().join("run/private-runtime-data"),
+        b"not world data",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(source.path().join("pumpkin.toml"), b"managed configuration")
+        .await
+        .unwrap();
     let total = SNAPSHOT_RETENTION_GENERATIONS + 2;
     for generation in 1..=total {
         tokio::fs::write(
@@ -97,6 +108,8 @@ async fn published_snapshot_restores_and_keeps_a_bounded_recovery_window() {
         .await
         .unwrap();
     assert_eq!(restored, Some(total));
+    assert!(!restore.path().join("run").exists());
+    assert!(!restore.path().join("pumpkin.toml").exists());
     assert_eq!(
         tokio::fs::read_to_string(restore.path().join("world/level.dat"))
             .await
@@ -196,3 +209,9 @@ async fn incomplete_newer_generation_is_never_selected_for_restore() {
 
 #[path = "persistence/cache_restore.rs"]
 mod cache_restore;
+
+#[path = "persistence/publication.rs"]
+mod publication;
+
+#[path = "persistence/garbage_collection.rs"]
+mod garbage_collection;

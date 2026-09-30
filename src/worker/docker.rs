@@ -4,12 +4,11 @@ use std::{
     time::Duration,
 };
 
+use super::runtime::{ServerRuntime, settings::render_pumpkin_config};
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde_json::Value;
-use tokio::{
-    process::Command,
-    time::{sleep, timeout},
-};
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
@@ -30,8 +29,18 @@ impl DockerRuntime {
             host_control: PumpkinControl::new(host_control_token),
         }
     }
+}
 
-    pub async fn start(
+#[async_trait]
+impl ServerRuntime for DockerRuntime {
+    fn control(&self) -> &PumpkinControl {
+        &self.host_control
+    }
+    fn socket_path(&self, server_dir: &Path) -> Result<PathBuf> {
+        Ok(server_dir.join("run/host-control.sock"))
+    }
+
+    async fn start(
         &self,
         server_id: Uuid,
         placement: &PlacementRecord,
@@ -41,7 +50,9 @@ impl DockerRuntime {
         let name = container_name(server_id);
         match self.running_generation(&name).await? {
             Some(generation) if generation == placement.generation => {
-                return self.wait_ready(server_dir, Duration::from_secs(120)).await;
+                return self
+                    .wait_ready(server_id, server_dir, Duration::from_secs(120))
+                    .await;
             }
             Some(generation) => {
                 bail!(
@@ -55,14 +66,13 @@ impl DockerRuntime {
         tokio::fs::create_dir_all(server_dir.join("run")).await?;
         tokio::fs::write(
             server_dir.join("pumpkin.toml"),
-            render_pumpkin_config(settings),
+            render_pumpkin_config(settings, 25565, 19132),
         )
         .await?;
         ensure_pumpkin_ownership(server_dir).await?;
 
         let java = format!("{}:25565/tcp", placement.java_port);
         let bedrock_udp = format!("{}:19132/udp", placement.bedrock_port);
-        let bedrock_tcp = format!("{}:19132/tcp", placement.bedrock_port);
         let volume = format!("{}:/pumpkin", server_dir.display());
         let generation_label = format!("kurbis.generation={}", placement.generation);
         let lease_label = format!("kurbis.lease={}", placement.lease_token);
@@ -105,8 +115,6 @@ impl DockerRuntime {
                 &java,
                 "--publish",
                 &bedrock_udp,
-                "--publish",
-                &bedrock_tcp,
                 "--volume",
                 &volume,
                 &self.image,
@@ -119,47 +127,31 @@ impl DockerRuntime {
         if !status.success() {
             bail!("docker failed to start {name} with status {status}");
         }
-        self.wait_ready(server_dir, Duration::from_secs(120)).await
-    }
-
-    pub async fn player_count(&self, server_dir: &Path) -> Result<usize> {
-        self.host_control.status(&socket_path(server_dir)).await
-    }
-
-    pub async fn save(&self, server_dir: &Path) -> Result<()> {
-        self.host_control.save(&socket_path(server_dir)).await
-    }
-
-    pub async fn graceful_stop(&self, server_id: Uuid, server_dir: &Path) -> Result<()> {
-        let name = container_name(server_id);
-        self.host_control.shutdown(&socket_path(server_dir)).await?;
-        let wait = async {
-            loop {
-                if !self.is_running(&name).await? {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                sleep(Duration::from_millis(250)).await;
-            }
-        };
-        timeout(Duration::from_secs(60), wait)
+        if let Err(error) = self
+            .wait_ready(server_id, server_dir, Duration::from_secs(120))
             .await
-            .context("Pumpkin did not exit within 60 seconds")??;
+        {
+            let logs = Command::new("docker")
+                .args(["logs", "--tail", "80", &name])
+                .output()
+                .await
+                .ok()
+                .map(|output| {
+                    let mut bytes = output.stdout;
+                    bytes.extend_from_slice(&output.stderr);
+                    String::from_utf8_lossy(&bytes).into_owned()
+                })
+                .unwrap_or_else(|| "unable to read container logs".into());
+            bail!("Pumpkin readiness failed: {error}; container logs:\n{logs}");
+        }
         Ok(())
     }
 
-    pub async fn is_running(&self, name: &str) -> Result<bool> {
-        Ok(self.running_generation(name).await?.is_some())
-    }
-
-    pub async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>> {
+    async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>> {
         self.running_generation(&container_name(server_id)).await
     }
 
-    pub async fn server_is_running(&self, server_id: Uuid) -> Result<bool> {
-        self.is_running(&container_name(server_id)).await
-    }
-
-    pub async fn logs_since(&self, server_id: Uuid, since: &str) -> Result<Vec<String>> {
+    async fn logs_since(&self, server_id: Uuid, since: &str) -> Result<Vec<String>> {
         let output = Command::new("docker")
             .args([
                 "logs",
@@ -181,7 +173,7 @@ impl DockerRuntime {
             .collect())
     }
 
-    pub async fn abort_start(&self, server_id: Uuid) -> Result<()> {
+    async fn abort_start(&self, server_id: Uuid) -> Result<()> {
         let output = Command::new("docker")
             .args(["rm", "-f", &container_name(server_id)])
             .output()
@@ -196,21 +188,9 @@ impl DockerRuntime {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
 
-    async fn wait_ready(&self, server_dir: &Path, max_wait: Duration) -> Result<()> {
-        let started = tokio::time::Instant::now();
-        loop {
-            match self.host_control.status(&socket_path(server_dir)).await {
-                Ok(_) => return Ok(()),
-                Err(error) if started.elapsed() < max_wait => {
-                    tracing::debug!(?error, "waiting for Pumpkin host-control readiness");
-                    sleep(Duration::from_millis(500)).await;
-                }
-                Err(error) => return Err(error).context("Pumpkin did not become ready"),
-            }
-        }
-    }
-
+impl DockerRuntime {
     async fn running_generation(&self, name: &str) -> Result<Option<i64>> {
         let output = Command::new("docker")
             .args([
@@ -252,64 +232,8 @@ impl DockerRuntime {
     }
 }
 
-fn socket_path(server_dir: &Path) -> PathBuf {
-    server_dir.join("run/host-control.sock")
-}
-
 fn container_name(server_id: Uuid) -> String {
     format!("kurbis-{server_id}")
-}
-
-fn render_pumpkin_config(settings: &Value) -> String {
-    let motd = setting_str(settings, "motd", "Hosted by kurbis");
-    let difficulty = setting_str(settings, "difficulty", "Normal");
-    let gamemode = setting_str(settings, "gamemode", "Survival");
-    let view_distance = setting_u64(settings, "view_distance", 12).clamp(2, 32);
-    let simulation_distance = setting_u64(settings, "simulation_distance", 8).clamp(2, 32);
-    let hardcore = setting_bool(settings, "hardcore", false);
-    let whitelist = setting_bool(settings, "whitelist", false);
-    format!(
-        "default_difficulty = {difficulty}\n\
-         default_gamemode = {gamemode}\n\
-         hardcore = {hardcore}\n\
-         white_list = {whitelist}\n\
-         enforce_whitelist = {whitelist}\n\
-         accepts_transfers = true\n\
-         [networking.java]\n\
-         enabled = true\n\
-         address = \"0.0.0.0:25565\"\n\
-         max_players = 0\n\
-         motd = {motd}\n\
-         view_distance = {view_distance}\n\
-         simulation_distance = {simulation_distance}\n\
-         [networking.bedrock]\n\
-         enabled = true\n\
-         max_players = 0\n\
-         motd = {motd}\n\
-         view_distance = {view_distance}\n\
-         simulation_distance = {simulation_distance}\n\
-         [networking.bedrock.nethernet]\n\
-         enabled = true\n\
-         address = \"0.0.0.0:19132\"\n",
-        difficulty = serde_json::to_string(difficulty).expect("string serialization cannot fail"),
-        gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
-        motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
-    )
-}
-
-fn setting_str<'a>(settings: &'a Value, key: &str, default: &'a str) -> &'a str {
-    settings.get(key).and_then(Value::as_str).unwrap_or(default)
-}
-
-fn setting_u64(settings: &Value, key: &str, default: u64) -> u64 {
-    settings.get(key).and_then(Value::as_u64).unwrap_or(default)
-}
-
-fn setting_bool(settings: &Value, key: &str, default: bool) -> bool {
-    settings
-        .get(key)
-        .and_then(Value::as_bool)
-        .unwrap_or(default)
 }
 
 async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<()> {
@@ -335,7 +259,11 @@ mod tests {
 
     #[test]
     fn config_has_no_player_limit_and_escapes_strings() {
-        let config = render_pumpkin_config(&json!({"motd":"hello \"kurbis\"","view_distance":8}));
+        let config = render_pumpkin_config(
+            &json!({"motd":"hello \"kurbis\"","view_distance":8}),
+            25565,
+            19132,
+        );
         assert!(config.contains("max_players = 0"));
         assert!(config.contains("motd = \"hello \\\"kurbis\\\"\""));
         assert!(config.contains("view_distance = 8"));
