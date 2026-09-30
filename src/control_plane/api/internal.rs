@@ -51,6 +51,15 @@ pub(super) async fn wake(
     Ok(Json(ServerActionResponse { observed_state }))
 }
 
+pub(super) async fn mint_minecraft_link(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Json<auth::MinecraftLinkRequest>,
+) -> Result<Json<auth::MinecraftLinkResponse>, ApiError> {
+    require_internal(&state, &headers)?;
+    auth::create_minecraft_link(State(state), request).await
+}
+
 pub async fn resolve_subdomain(
     pool: &PgPool,
     subdomain: &str,
@@ -186,7 +195,8 @@ pub(super) async fn owned_server(
     sqlx::query_as(
         "SELECT id, owner_id, subdomain, desired_state, observed_state, settings, storage_bytes,
                 generation, current_snapshot_generation, last_error, created_at, updated_at
-         FROM servers WHERE owner_id = $1",
+         FROM servers WHERE owner_id = $1
+         ORDER BY is_default DESC, created_at, id LIMIT 1",
     )
     .bind(owner_id)
     .fetch_optional(pool)

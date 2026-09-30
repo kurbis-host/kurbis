@@ -6,15 +6,16 @@ use super::types::{ServerSettings, ServerSettingsPatch};
 use super::{AppState, router};
 use axum::{
     body::{Body, to_bytes},
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
 };
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
-    config::{CommonConfig, ControlPlaneConfig, OAuthConfig},
+    config::{CommonConfig, ControlPlaneConfig, OAuthConfig, OAuthProviderConfig},
     control_plane::lifecycle::Lifecycle,
     db,
 };
@@ -45,13 +46,22 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
             root_domain: "mc.example".to_owned(),
             internal_token: "test-internal-token".to_owned(),
             oauth: OAuthConfig {
-                provider: "test".to_owned(),
-                client_id: "client".to_owned(),
-                client_secret: "secret".to_owned(),
-                authorize_url: "https://id.example/authorize".to_owned(),
-                token_url: "https://id.example/token".to_owned(),
-                userinfo_url: "https://id.example/userinfo".to_owned(),
-                scopes: "openid".to_owned(),
+                google: OAuthProviderConfig {
+                    client_id: "google-client".to_owned(),
+                    client_secret: "google-secret".to_owned(),
+                    authorize_url: "https://id.example/authorize".to_owned(),
+                    token_url: "https://id.example/token".to_owned(),
+                    userinfo_url: "https://id.example/userinfo".to_owned(),
+                    scopes: "openid email profile".to_owned(),
+                },
+                discord: OAuthProviderConfig {
+                    client_id: "discord-client".to_owned(),
+                    client_secret: "discord-secret".to_owned(),
+                    authorize_url: "https://id.example/authorize".to_owned(),
+                    token_url: "https://id.example/token".to_owned(),
+                    userinfo_url: "https://id.example/userinfo".to_owned(),
+                    scopes: "identify email".to_owned(),
+                },
             },
         },
         http: reqwest::Client::new(),
@@ -61,25 +71,29 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
 async fn create_user_session(pool: &PgPool, status: &str) -> (Uuid, String) {
     let user_id = Uuid::new_v4();
     let token = format!("api-test-session-{user_id}");
+    sqlx::query("INSERT INTO users(id, display_name, account_status) VALUES($1, 'API Test', $2)")
+        .bind(user_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query(
-        "INSERT INTO users(id, oauth_provider, oauth_subject, display_name, account_status)
-             VALUES($1, 'api-test', $2, 'API Test', $3)",
+        "INSERT INTO identities(id, user_id, provider, subject, display_name)
+         VALUES($1, $2, 'google', $3, 'API Test')",
     )
+    .bind(Uuid::new_v4())
     .bind(user_id)
-    .bind(user_id.to_string())
-    .bind(status)
+    .bind(format!("api-test-{user_id}"))
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO sessions(token_hash, user_id, expires_at)
-             VALUES($1, $2, now() + interval '1 hour')",
-    )
-    .bind(blake3::hash(token.as_bytes()).as_bytes().to_vec())
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO sessions(id, token_hash, user_id) VALUES($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(blake3::hash(token.as_bytes()).as_bytes().to_vec())
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     (user_id, token)
 }
 
@@ -101,6 +115,56 @@ fn authenticated_request(uri: &str, token: &str) -> Request<Body> {
         .header(header::COOKIE, format!("kurbis_session={token}"))
         .body(Body::empty())
         .unwrap()
+}
+
+fn json_request(
+    method: Method,
+    uri: &str,
+    origin: Option<&str>,
+    session: Option<&str>,
+    body: Value,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json");
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
+    }
+    if let Some(session) = session {
+        request = request.header(header::COOKIE, format!("kurbis_session={session}"));
+    }
+    request.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn mint_minecraft_link(app: &axum::Router, identity: Value) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/internal/minecraft-login-links")
+                .header(header::AUTHORIZATION, "Bearer test-internal-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"identity":identity,"display_name":"Minecraft Player"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap()
+}
+
+fn minecraft_token(link: &Value) -> String {
+    let url = reqwest::Url::parse(link["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.path(), "/auth/minecraft");
+    url.fragment()
+        .unwrap()
+        .strip_prefix("token=")
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -289,6 +353,389 @@ async fn durable_event_catch_up_enforces_cursor_owner_and_suspension() {
 
     sqlx::query("DELETE FROM users WHERE id = ANY($1)")
         .bind(vec![owner, other_owner])
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let state = test_state(pool.clone());
+    let app = router(state);
+    let java_uuid = Uuid::new_v4();
+    let link = mint_minecraft_link(&app, serde_json::json!({"kind":"java","uuid":java_uuid})).await;
+    let token = minecraft_token(&link);
+    let token_hash = blake3::hash(token.as_bytes()).as_bytes().to_vec();
+
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/internal/minecraft-login-links")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "identity":{"kind":"java","uuid":Uuid::new_v4()},
+                        "display_name":"Forged Player"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+    for invalid_xuid in ["0", "abc", "000", "123456789012345678901"] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/internal/minecraft-login-links")
+                    .header(header::AUTHORIZATION, "Bearer test-internal-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "identity":{"kind":"bedrock","xuid":invalid_xuid},
+                            "display_name":"Bedrock Player"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/auth/minecraft/redeem")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let cross_origin = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/auth/minecraft/redeem",
+            Some("https://evil.example"),
+            None,
+            serde_json::json!({"token":token}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    let token_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM minecraft_login_tokens WHERE token_hash=$1)",
+    )
+    .bind(&token_hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        token_remains,
+        "an origin rejection must not consume the token"
+    );
+
+    let redeemed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/auth/minecraft/redeem",
+            Some("https://kurbis.example"),
+            None,
+            serde_json::json!({"token":token}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+    let cookie = redeemed
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("kurbis_session="))
+        .unwrap();
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("Secure"));
+    assert!(cookie.contains("SameSite=Lax"));
+    assert!(cookie.contains("Max-Age=2592000"));
+
+    let user_id: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM identities WHERE provider='minecraft_java' AND subject=$1",
+    )
+    .bind(java_uuid.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let account_sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE user_id=$1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(account_sessions, 1);
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/auth/minecraft/redeem",
+            Some("https://kurbis.example"),
+            None,
+            serde_json::json!({"token":minecraft_token(&link)}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+    let expired_link = mint_minecraft_link(
+        &app,
+        serde_json::json!({"kind":"bedrock","xuid":"2533274790395904"}),
+    )
+    .await;
+    let expired_token = minecraft_token(&expired_link);
+    sqlx::query(
+        "UPDATE minecraft_login_tokens SET expires_at=now()-interval '1 second'
+         WHERE token_hash=$1",
+    )
+    .bind(blake3::hash(expired_token.as_bytes()).as_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let expired = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/auth/minecraft/redeem",
+            Some("https://kurbis.example"),
+            None,
+            serde_json::json!({"token":expired_token}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    let bedrock_identity_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identities WHERE provider='minecraft_bedrock'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bedrock_identity_count, 0);
+
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM minecraft_login_tokens")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn signed_in_minecraft_redemption_merges_the_browser_account_and_all_worlds() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (browser_user, browser_token) = create_user_session(&pool, "active").await;
+    let bedrock_xuid = "2533274790395904";
+    let minecraft_user = crate::control_plane::identity::attach_minecraft_identity(
+        &pool,
+        "minecraft_bedrock",
+        bedrock_xuid,
+        "Bedrock Player",
+        None,
+    )
+    .await
+    .unwrap();
+    let browser_server = create_server(&pool, browser_user).await;
+    let minecraft_server = create_server(&pool, minecraft_user).await;
+    let old_session = format!("minecraft-source-{minecraft_user}");
+    sqlx::query("INSERT INTO sessions(id,token_hash,user_id) VALUES($1,$2,$3)")
+        .bind(Uuid::new_v4())
+        .bind(blake3::hash(old_session.as_bytes()).as_bytes().to_vec())
+        .bind(minecraft_user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = router(test_state(pool.clone()));
+    let link = mint_minecraft_link(
+        &app,
+        serde_json::json!({"kind":"bedrock","xuid":bedrock_xuid}),
+    )
+    .await;
+    let redeemed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/auth/minecraft/redeem",
+            Some("https://kurbis.example"),
+            Some(&browser_token),
+            serde_json::json!({"token":minecraft_token(&link)}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+    let owners: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT id, is_default FROM servers WHERE owner_id=$1 ORDER BY id")
+            .bind(browser_user)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owners.len(), 2);
+    assert!(
+        owners
+            .iter()
+            .any(|(id, default)| *id == browser_server && *default)
+    );
+    assert!(
+        owners
+            .iter()
+            .any(|(id, default)| *id == minecraft_server && !*default)
+    );
+    let moved_sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE user_id=$1")
+        .bind(browser_user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(moved_sessions, 2);
+    let source_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)")
+        .bind(minecraft_user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!source_exists);
+
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(browser_user)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn account_sessions_are_persistent_revocable_and_renewed_on_visits() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (user_id, current_token) = create_user_session(&pool, "active").await;
+    let other_token = format!("other-session-{user_id}");
+    let other_session_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO sessions(id,token_hash,user_id) VALUES($1,$2,$3)")
+        .bind(other_session_id)
+        .bind(blake3::hash(other_token.as_bytes()).as_bytes().to_vec())
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET created_at=now()-interval '500 days' WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = router(test_state(pool.clone()));
+
+    let current_session = app
+        .clone()
+        .oneshot(authenticated_request("/api/v1/session", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(current_session.status(), StatusCode::OK);
+    let renewed_cookie = current_session
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("kurbis_session="))
+        .unwrap();
+    assert!(renewed_cookie.contains("Max-Age=2592000"));
+    let last_seen_recent: bool = sqlx::query_scalar(
+        "SELECT last_seen_at > now()-interval '10 seconds' FROM sessions WHERE token_hash=$1",
+    )
+    .bind(blake3::hash(current_token.as_bytes()).as_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(last_seen_recent);
+
+    let account = app
+        .clone()
+        .oneshot(authenticated_request("/api/v1/account", &current_token))
+        .await
+        .unwrap();
+    assert_eq!(account.status(), StatusCode::OK);
+    let account: Value =
+        serde_json::from_slice(&to_bytes(account.into_body(), 8192).await.unwrap()).unwrap();
+    let current = account["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["current"] == true)
+        .unwrap();
+    let current_id = current["id"].as_str().unwrap().to_owned();
+    assert_eq!(account["sessions"].as_array().unwrap().len(), 2);
+
+    let revoked_other = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/account/sessions/{other_session_id}"))
+                .header(header::COOKIE, format!("kurbis_session={current_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_other.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        app.clone()
+            .oneshot(authenticated_request("/api/v1/session", &other_token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let revoked_current = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/account/sessions/{current_id}"))
+                .header(header::COOKIE, format!("kurbis_session={current_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_current.status(), StatusCode::NO_CONTENT);
+    let expired_cookie = revoked_current
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("kurbis_session="))
+        .unwrap();
+    assert!(expired_cookie.contains("Max-Age=0"));
+    assert_eq!(
+        app.oneshot(authenticated_request("/api/v1/session", &current_token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(user_id)
         .execute(&pool)
         .await
         .unwrap();

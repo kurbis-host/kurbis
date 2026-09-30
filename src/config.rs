@@ -1,6 +1,7 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct CommonConfig {
@@ -20,7 +21,6 @@ pub struct ControlPlaneConfig {
     pub common: CommonConfig,
     pub listen: SocketAddr,
     pub public_base_url: String,
-    pub panel_origin: String,
     pub root_domain: String,
     pub internal_token: String,
     pub oauth: OAuthConfig,
@@ -28,7 +28,12 @@ pub struct ControlPlaneConfig {
 
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    pub provider: String,
+    pub google: OAuthProviderConfig,
+    pub discord: OAuthProviderConfig,
+}
+
+#[derive(Clone)]
+pub struct OAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
     pub authorize_url: String,
@@ -37,23 +42,68 @@ pub struct OAuthConfig {
     pub scopes: String,
 }
 
+impl fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthProviderConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("authorize_url", &self.authorize_url)
+            .field("token_url", &self.token_url)
+            .field("userinfo_url", &self.userinfo_url)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OAuthProvider {
+    Google,
+    Discord,
+}
+
+impl OAuthProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Discord => "discord",
+        }
+    }
+}
+
+impl OAuthConfig {
+    pub fn provider(&self, provider: OAuthProvider) -> &OAuthProviderConfig {
+        match provider {
+            OAuthProvider::Google => &self.google,
+            OAuthProvider::Discord => &self.discord,
+        }
+    }
+}
+
 impl ControlPlaneConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             common: CommonConfig::from_env()?,
             listen: value("CONTROL_PLANE_LISTEN", "0.0.0.0:8080").parse()?,
             public_base_url: required("PUBLIC_BASE_URL")?,
-            panel_origin: required("PANEL_ORIGIN")?,
             root_domain: required("ROOT_DOMAIN")?,
             internal_token: required("INTERNAL_TOKEN")?,
             oauth: OAuthConfig {
-                provider: value("OAUTH_PROVIDER", "oidc"),
-                client_id: required("OAUTH_CLIENT_ID")?,
-                client_secret: required("OAUTH_CLIENT_SECRET")?,
-                authorize_url: required("OAUTH_AUTHORIZE_URL")?,
-                token_url: required("OAUTH_TOKEN_URL")?,
-                userinfo_url: required("OAUTH_USERINFO_URL")?,
-                scopes: value("OAUTH_SCOPES", "openid profile email"),
+                google: oauth_provider(
+                    "GOOGLE_OAUTH",
+                    "https://accounts.google.com/o/oauth2/v2/auth",
+                    "https://oauth2.googleapis.com/token",
+                    "https://openidconnect.googleapis.com/v1/userinfo",
+                    "openid email profile",
+                )?,
+                discord: oauth_provider(
+                    "DISCORD_OAUTH",
+                    "https://discord.com/oauth2/authorize",
+                    "https://discord.com/api/oauth2/token",
+                    "https://discord.com/api/v10/users/@me",
+                    "identify email",
+                )?,
             },
         })
     }
@@ -67,7 +117,7 @@ pub struct WorkerConfig {
     pub address: String,
     pub root: PathBuf,
     pub storage_mode: StorageMode,
-    pub pumpkin_image: String,
+    pub runtime: RuntimeConfig,
     pub total_memory_bytes: i64,
     pub total_disk_bytes: i64,
     pub total_cpu_millis: i64,
@@ -81,16 +131,33 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     pub fn from_env() -> Result<Self> {
+        let runtime = RuntimeConfig::from_env()?;
+        let native = matches!(runtime, RuntimeConfig::Native { .. });
+        let id: uuid::Uuid = required("WORKER_ID")?
+            .parse()
+            .context("invalid WORKER_ID")?;
+        let native_root = format!("data/native-worker-{id}");
+        let root = PathBuf::from(value(
+            "WORKER_ROOT",
+            if native {
+                &native_root
+            } else {
+                "/var/lib/kurbis"
+            },
+        ));
+        let root = if root.is_absolute() {
+            root
+        } else {
+            env::current_dir()?.join(root)
+        };
         Ok(Self {
             common: CommonConfig::from_env()?,
-            id: required("WORKER_ID")?
-                .parse()
-                .context("invalid WORKER_ID")?,
+            id,
             name: required("WORKER_NAME")?,
             address: required("WORKER_ADDRESS")?,
-            root: PathBuf::from(value("WORKER_ROOT", "/var/lib/kurbis")),
-            storage_mode: StorageMode::from_env()?,
-            pumpkin_image: value("PUMPKIN_IMAGE", "ghcr.io/pumpkin-mc/pumpkin:nightly"),
+            root,
+            storage_mode: StorageMode::from_env(native)?,
+            runtime,
             total_memory_bytes: gib_env("WORKER_MEMORY_GIB", 16)?,
             total_disk_bytes: gib_env("WORKER_DISK_GIB", 100)?,
             total_cpu_millis: value(
@@ -114,6 +181,34 @@ impl WorkerConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum RuntimeConfig {
+    Docker { image: String },
+    Native { binary: PathBuf },
+}
+
+impl RuntimeConfig {
+    fn from_env() -> Result<Self> {
+        let default = if cfg!(target_os = "macos") {
+            "native"
+        } else {
+            "docker"
+        };
+        match value("WORKER_RUNTIME", default).as_str() {
+            "docker" => Ok(Self::Docker {
+                image: value("PUMPKIN_IMAGE", "melon-pumpkin:host-control"),
+            }),
+            "native" => Ok(Self::Native {
+                binary: PathBuf::from(value(
+                    "PUMPKIN_BINARY",
+                    "output/native-pumpkin/target/debug/pumpkin",
+                )),
+            }),
+            other => bail!("unsupported WORKER_RUNTIME {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
     LoopbackExt4,
@@ -121,8 +216,13 @@ pub enum StorageMode {
 }
 
 impl StorageMode {
-    fn from_env() -> Result<Self> {
-        match value("WORKER_STORAGE_MODE", "loopback_ext4").as_str() {
+    fn from_env(native: bool) -> Result<Self> {
+        match value(
+            "WORKER_STORAGE_MODE",
+            if native { "directory" } else { "loopback_ext4" },
+        )
+        .as_str()
+        {
             "loopback_ext4" => Ok(Self::LoopbackExt4),
             "directory" => Ok(Self::Directory),
             other => bail!("unsupported WORKER_STORAGE_MODE {other:?}"),
@@ -136,12 +236,14 @@ pub struct GatewayConfig {
     pub java_listen: SocketAddr,
     pub bedrock_listen: SocketAddr,
     pub waiting_java_address: SocketAddr,
+    pub waiting_bedrock_address: SocketAddr,
     pub waiting_control_socket: PathBuf,
     pub waiting_control_token: String,
     pub control_plane_url: String,
     pub internal_token: String,
     pub root_domain: String,
     pub wake_timeout: Duration,
+    pub allow_offline_waiting_for_tests: bool,
 }
 
 impl GatewayConfig {
@@ -151,6 +253,7 @@ impl GatewayConfig {
             java_listen: value("JAVA_LISTEN", "0.0.0.0:25565").parse()?,
             bedrock_listen: value("BEDROCK_LISTEN", "0.0.0.0:19132").parse()?,
             waiting_java_address: value("WAITING_JAVA_ADDRESS", "127.0.0.1:25566").parse()?,
+            waiting_bedrock_address: value("WAITING_BEDROCK_ADDRESS", "127.0.0.1:19133").parse()?,
             waiting_control_socket: PathBuf::from(value(
                 "WAITING_CONTROL_SOCKET",
                 "/run/kurbis-gateway/host-control.sock",
@@ -160,6 +263,8 @@ impl GatewayConfig {
             internal_token: required("INTERNAL_TOKEN")?,
             root_domain: required("ROOT_DOMAIN")?,
             wake_timeout: Duration::from_secs(value("WAKE_TIMEOUT_SECONDS", "90").parse()?),
+            allow_offline_waiting_for_tests: value("ALLOW_OFFLINE_WAITING_FOR_TESTS", "false")
+                .parse()?,
         })
     }
 }
@@ -203,6 +308,23 @@ impl ObjectStoreConfig {
 
 fn required(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("missing environment variable {name}"))
+}
+
+fn oauth_provider(
+    prefix: &str,
+    authorize_url: &str,
+    token_url: &str,
+    userinfo_url: &str,
+    scopes: &str,
+) -> Result<OAuthProviderConfig> {
+    Ok(OAuthProviderConfig {
+        client_id: required(&format!("{prefix}_CLIENT_ID"))?,
+        client_secret: required(&format!("{prefix}_CLIENT_SECRET"))?,
+        authorize_url: value(&format!("{prefix}_AUTHORIZE_URL"), authorize_url),
+        token_url: value(&format!("{prefix}_TOKEN_URL"), token_url),
+        userinfo_url: value(&format!("{prefix}_USERINFO_URL"), userinfo_url),
+        scopes: scopes.to_owned(),
+    })
 }
 
 fn value(name: &str, default: &str) -> String {

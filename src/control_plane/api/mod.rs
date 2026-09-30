@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     http::{HeaderValue, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,6 +17,7 @@ use crate::config::ControlPlaneConfig;
 
 use super::{auth, lifecycle::Lifecycle};
 
+mod account;
 mod activity;
 mod events;
 mod internal;
@@ -69,7 +71,11 @@ impl ApiError {
         Self::with_code(status, "request_failed", message)
     }
 
-    fn with_code(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(super) fn with_code(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             status,
             code,
@@ -133,10 +139,17 @@ fn lifecycle_error(error: anyhow::Error) -> ApiError {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/auth/login", get(auth::login))
-        .route("/auth/callback", get(auth::callback))
+        .route("/auth/{provider}/login", get(auth::login))
+        .route("/auth/{provider}/link", get(auth::link_oauth))
+        .route("/auth/{provider}/callback", get(auth::callback))
+        .route("/auth/minecraft/redeem", post(auth::redeem_minecraft))
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/session", get(session::session))
+        .route("/api/v1/account", get(account::account))
+        .route(
+            "/api/v1/account/sessions/{session_id}",
+            axum::routing::delete(account::revoke_session),
+        )
         .route(
             "/api/v1/server",
             get(server::get_server)
@@ -162,6 +175,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/internal/resolve/{hostname}", get(internal::resolve))
         .route("/internal/wake/{hostname}", post(internal::wake))
+        .route(
+            "/internal/minecraft-login-links",
+            post(internal::mint_minecraft_link),
+        )
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -170,7 +187,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::renew_session_cookie,
+        ))
         .with_state(state)
 }
 
