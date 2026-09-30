@@ -14,7 +14,7 @@ PLAN.md remains incomplete. This document replaces conflicting audit entries fro
 - S3-compatible/local object storage, immutable snapshot manifests, content-addressed chunks, integrity validation, and recovery-generation retention.
 - Java hostname gateway with Postgres route caching/invalidation, running-server TCP proxying, and forwarding sleeping clients into a separate Pumpkin waiting server. Waiting-player host-control messages and native transfers are implemented in orchestration code, but the complete client flow is unverified.
 - Bedrock backend ports and edition-specific transfer orchestration exist. The Bedrock gateway module currently only binds UDP and discards datagrams. Its standalone ClientData JSON parser is unused by the network path. This is a placeholder, not a working Bedrock gateway.
-- External hosting Pumpkin fork: `/Users/user/Developer/Developer/games/minecraft/Pumpkin-melon-host-control`. The hoster repository does not yet contain a reproducible deployment of this dependency.
+- External hosting Pumpkin fork: `/Users/user/Developer/Developer/games/minecraft/Pumpkin-kurbis-host-control`. The hoster repository does not yet contain a reproducible deployment of this dependency.
 
 ## Current implementation pass
 
@@ -39,14 +39,14 @@ Regression coverage added this pass:
 Completed checks:
 
 ```text
-TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/melon_hoster_test cargo test --all-targets
+TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/kurbis_hoster_test cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
 All passed: 14 unit tests, 14 lifecycle tests executing against Postgres, and 3 snapshot tests executing against Postgres/local object storage. No browser E2E or real Minecraft/Docker lifecycle tests were run in this pass.
 
-Read-only environment discovery: SSH to respond5 works; Docker 27.3.1 and Dokploy are running. No Melon/Pumpkin hoster runtime appeared in the running-container inventory. No Dokploy MCP tool is currently callable in this session; this does not prevent continuing local implementation or SSH-based runtime investigation.
+Read-only environment discovery: SSH to respond5 works; Docker 27.3.1 and Dokploy are running. No kurbis/Pumpkin hoster runtime appeared in the running-container inventory. No Dokploy MCP tool is currently callable in this session; this does not prevent continuing local implementation or SSH-based runtime investigation.
 
 ## Remaining requirement-matched work
 
@@ -77,7 +77,7 @@ Coverage checklist:
 Final verification passed:
 
 ```text
-TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/melon_hoster_test cargo test --all-targets
+TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/kurbis_hoster_test cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -98,7 +98,7 @@ Regression checklist (Postgres integration): concurrent/repeated stop completion
 Final checks passed:
 
 ```text
-TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/melon_hoster_test cargo test --all-targets
+TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/kurbis_hoster_test cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -121,7 +121,7 @@ These tests execute the production storage preparation helper in directory mode.
 Final checks passed:
 
 ```text
-TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/melon_hoster_test cargo test --all-targets
+TEST_DATABASE_URL=postgres://user@127.0.0.1:55432/kurbis_hoster_test cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```

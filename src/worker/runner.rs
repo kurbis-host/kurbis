@@ -502,7 +502,7 @@ impl WorkerRunner {
 async fn acquire_worker_lease(pool: &PgPool, worker_id: Uuid) -> Result<PoolConnection<Postgres>> {
     let mut connection = pool.acquire().await?;
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-        .bind(format!("melon-worker:{worker_id}"))
+        .bind(format!("kurbis-worker:{worker_id}"))
         .fetch_one(&mut *connection)
         .await?;
     if !acquired {

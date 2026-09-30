@@ -197,7 +197,7 @@ async fn handle_status(
         },
     };
     let status = json!({
-        "version": {"name": format!("Melon ({state})"), "protocol": handshake.protocol},
+        "version": {"name": format!("kurbis ({state})"), "protocol": handshake.protocol},
         "players": {"max": 0, "online": 0, "sample": []},
         "description": {"text": description}
     });

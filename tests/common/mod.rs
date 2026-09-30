@@ -1,4 +1,4 @@
-use melon_hoster::db;
+use kurbis_hoster::db;
 use sqlx::PgPool;
 
 pub async fn test_pool() -> PgPool {

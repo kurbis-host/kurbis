@@ -1,7 +1,7 @@
 mod common;
 
 use common::test_pool;
-use melon_hoster::{
+use kurbis_hoster::{
     config::ObjectStoreConfig,
     model::{SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason},
     worker::snapshot::SnapshotManager,

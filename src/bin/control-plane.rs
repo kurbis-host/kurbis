@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use melon_hoster::{
+use kurbis_hoster::{
     config::ControlPlaneConfig,
     control_plane::{
         api::{AppState, router, spawn_queue_drain},
@@ -12,7 +12,7 @@ use melon_hoster::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing("melon_hoster=info,tower_http=info");
+    init_tracing("kurbis_hoster=info,tower_http=info");
     let config = ControlPlaneConfig::from_env()?;
     let pool = db::connect(&config.common.database_url).await?;
     db::migrate(&pool).await?;

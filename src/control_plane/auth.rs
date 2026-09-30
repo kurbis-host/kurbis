@@ -18,7 +18,7 @@ use crate::config::OAuthConfig;
 
 use super::api::{ApiError, AppState};
 
-const SESSION_COOKIE: &str = "melon_session";
+const SESSION_COOKIE: &str = "kurbis_session";
 const SESSION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

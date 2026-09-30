@@ -250,7 +250,7 @@ mod tests {
     fn online_target() -> RouteTarget {
         RouteTarget {
             server_id: Uuid::new_v4(),
-            subdomain: "melon".into(),
+            subdomain: "kurbis".into(),
             state: ObservedState::Online,
             account_suspended: false,
             worker_healthy: Some(true),

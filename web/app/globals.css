@@ -4,8 +4,8 @@
   --paper-2: #e5e2d8;
   --line: rgba(12, 15, 13, 0.16);
   --muted: #626761;
-  --melon: #79e36b;
-  --melon-deep: #1d6b2c;
+  --kurbis: #79e36b;
+  --kurbis-deep: #1d6b2c;
   --danger: #d94e3d;
   --panel: #151a17;
   --panel-line: rgba(255, 255, 255, 0.12);
@@ -87,7 +87,7 @@ select:focus-visible {
   width: 34px;
   height: 34px;
   background: var(--ink);
-  color: var(--melon);
+  color: var(--kurbis);
   font: 800 18px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -240,7 +240,7 @@ select:focus-visible {
 }
 
 .state-online {
-  background: var(--melon-deep);
+  background: var(--kurbis-deep);
   box-shadow: 0 0 0 6px rgba(29, 107, 44, 0.12);
 }
 
@@ -304,7 +304,7 @@ select:focus-visible {
 }
 
 .primaryButton span {
-  color: var(--melon);
+  color: var(--kurbis);
 }
 
 .secondaryButton {
@@ -400,7 +400,7 @@ select:focus-visible {
 .meter span {
   display: block;
   height: 100%;
-  background: var(--melon-deep);
+  background: var(--kurbis-deep);
   min-width: 2px;
 }
 
@@ -514,7 +514,7 @@ select:focus-visible {
 }
 
 .toggleRow input:checked + i {
-  background: var(--melon-deep);
+  background: var(--kurbis-deep);
 }
 
 .toggleRow input:checked + i::after {
@@ -684,7 +684,7 @@ select:focus-visible {
 }
 
 .principlesCard b {
-  color: var(--melon);
+  color: var(--kurbis);
   font: 700 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -706,7 +706,7 @@ footer {
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--melon-deep);
+  background: var(--kurbis-deep);
 }
 
 .centerStage {
@@ -735,7 +735,7 @@ footer {
   display: block;
   height: 100%;
   width: 42%;
-  background: var(--melon-deep);
+  background: var(--kurbis-deep);
   animation: load 1s ease-in-out infinite alternate;
 }
 
@@ -832,8 +832,8 @@ footer {
 .gridGlyph i:nth-child(21),
 .gridGlyph i:nth-child(26),
 .gridGlyph i:nth-child(27) {
-  background: var(--melon);
-  border-color: var(--melon);
+  background: var(--kurbis);
+  border-color: var(--kurbis);
 }
 
 @media (max-width: 920px) {

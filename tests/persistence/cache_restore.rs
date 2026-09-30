@@ -2,7 +2,7 @@ use super::{
     DB_TEST_LOCK, ObjectStoreConfig, SnapshotManager, SnapshotReason, cleanup, create_server,
     test_pool,
 };
-use melon_hoster::{
+use kurbis_hoster::{
     config::StorageMode,
     control_plane::lifecycle::{healthy_worker_template, heartbeat_worker},
     worker::{persistence::prepare_server_data, storage::StorageManager},

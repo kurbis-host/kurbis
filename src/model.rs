@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn subdomain_validation_is_strict_and_dns_safe() {
-        assert!(validate_subdomain("melon-42"));
+        assert!(validate_subdomain("kurbis-42"));
         assert!(!validate_subdomain("ab"));
         assert!(!validate_subdomain("UPPER"));
         assert!(!validate_subdomain("-edge"));

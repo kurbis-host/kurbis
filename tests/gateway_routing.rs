@@ -1,7 +1,7 @@
 mod common;
 
 use common::test_pool;
-use melon_hoster::{
+use kurbis_hoster::{
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_start, healthy_worker_template, heartbeat_worker,
     },

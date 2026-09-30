@@ -1,7 +1,7 @@
 mod common;
 
 use common::test_pool;
-use melon_hoster::{
+use kurbis_hoster::{
     control_plane::api::resolve_subdomain,
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_start, complete_stop, healthy_worker_template,
@@ -136,7 +136,7 @@ async fn runtime_loss_deactivates_the_placement() {
     let (state, active, desired, reserved_memory): (
         ObservedState,
         bool,
-        melon_hoster::model::DesiredState,
+        kurbis_hoster::model::DesiredState,
         i64,
     ) = sqlx::query_as(
         "SELECT s.observed_state, p.active, s.desired_state, w.reserved_memory_bytes
@@ -150,7 +150,7 @@ async fn runtime_loss_deactivates_the_placement() {
     .await
     .unwrap();
     assert_eq!(state, ObservedState::Failed);
-    assert_eq!(desired, melon_hoster::model::DesiredState::Stopped);
+    assert_eq!(desired, kurbis_hoster::model::DesiredState::Stopped);
     assert!(!active);
     assert_eq!(reserved_memory, 0);
 
@@ -236,9 +236,9 @@ async fn lifecycle_start_and_stop_release_worker_capacity() {
     .unwrap();
     assert_eq!(state, ObservedState::Online);
     assert!(active);
-    assert_eq!(reserved_memory, melon_hoster::model::SERVER_MEMORY_BYTES);
-    assert_eq!(reserved_disk, melon_hoster::model::SERVER_STORAGE_BYTES);
-    assert_eq!(reserved_cpu, melon_hoster::model::SERVER_CPU_MILLIS);
+    assert_eq!(reserved_memory, kurbis_hoster::model::SERVER_MEMORY_BYTES);
+    assert_eq!(reserved_disk, kurbis_hoster::model::SERVER_STORAGE_BYTES);
+    assert_eq!(reserved_cpu, kurbis_hoster::model::SERVER_CPU_MILLIS);
 
     assert_eq!(
         lifecycle.request_stop(server_id, "test").await.unwrap(),
@@ -327,9 +327,9 @@ async fn simultaneous_start_requests_create_one_start_and_one_reservation() {
     .await
     .unwrap();
     assert_eq!(live_ops, 1);
-    assert_eq!(reserved_memory, melon_hoster::model::SERVER_MEMORY_BYTES);
-    assert_eq!(reserved_disk, melon_hoster::model::SERVER_STORAGE_BYTES);
-    assert_eq!(reserved_cpu, melon_hoster::model::SERVER_CPU_MILLIS);
+    assert_eq!(reserved_memory, kurbis_hoster::model::SERVER_MEMORY_BYTES);
+    assert_eq!(reserved_disk, kurbis_hoster::model::SERVER_STORAGE_BYTES);
+    assert_eq!(reserved_cpu, kurbis_hoster::model::SERVER_CPU_MILLIS);
 
     cleanup_test_entities(&pool, user_id, &[worker_id]).await;
 }
@@ -359,13 +359,13 @@ async fn start_during_stop_requests_restart_without_reassigning_the_active_place
             .unwrap(),
         ObservedState::Stopping
     );
-    let desired: melon_hoster::model::DesiredState =
+    let desired: kurbis_hoster::model::DesiredState =
         sqlx::query_scalar("SELECT desired_state FROM servers WHERE id = $1")
             .bind(server_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(desired, melon_hoster::model::DesiredState::Running);
+    assert_eq!(desired, kurbis_hoster::model::DesiredState::Running);
 
     let stop = claim_operation(&pool, worker_id)
         .await
@@ -543,7 +543,7 @@ async fn failed_operation_retry_is_delayed_and_preserves_the_fenced_placement() 
             .unwrap()
     );
     assert!(claim_operation(&pool, worker_id).await.unwrap().is_none());
-    let (status, delayed, active): (melon_hoster::model::OperationStatus, bool, bool) =
+    let (status, delayed, active): (kurbis_hoster::model::OperationStatus, bool, bool) =
         sqlx::query_as(
             "SELECT o.status, o.next_attempt_at > now(), p.active
              FROM operations o
@@ -554,7 +554,7 @@ async fn failed_operation_retry_is_delayed_and_preserves_the_fenced_placement() 
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, melon_hoster::model::OperationStatus::Pending);
+    assert_eq!(status, kurbis_hoster::model::OperationStatus::Pending);
     assert!(delayed);
     assert!(!active);
 
@@ -578,7 +578,7 @@ async fn delete_cancels_an_unclaimed_start_and_releases_its_reservation() {
         ObservedState::Deleted
     );
     let (desired, state, active, reserved_memory): (
-        melon_hoster::model::DesiredState,
+        kurbis_hoster::model::DesiredState,
         ObservedState,
         bool,
         i64,
@@ -593,7 +593,7 @@ async fn delete_cancels_an_unclaimed_start_and_releases_its_reservation() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(desired, melon_hoster::model::DesiredState::Deleted);
+    assert_eq!(desired, kurbis_hoster::model::DesiredState::Deleted);
     assert_eq!(state, ObservedState::Deleted);
     assert!(!active);
     assert_eq!(reserved_memory, 0);
@@ -645,7 +645,7 @@ async fn online_delete_finishes_shutdown_then_exposes_cleanup_to_any_worker() {
     assert_eq!(stop.kind, OperationKind::Stop);
     complete_stop(&pool, &stop, 1, 42).await.unwrap();
 
-    let (desired, state, active): (melon_hoster::model::DesiredState, ObservedState, bool) =
+    let (desired, state, active): (kurbis_hoster::model::DesiredState, ObservedState, bool) =
         sqlx::query_as(
             "SELECT s.desired_state, s.observed_state, p.active
              FROM servers s JOIN placements p ON p.server_id = s.id WHERE s.id = $1",
@@ -654,7 +654,7 @@ async fn online_delete_finishes_shutdown_then_exposes_cleanup_to_any_worker() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(desired, melon_hoster::model::DesiredState::Deleted);
+    assert_eq!(desired, kurbis_hoster::model::DesiredState::Deleted);
     assert_eq!(state, ObservedState::Deleted);
     assert!(!active);
 
@@ -689,13 +689,13 @@ async fn runtime_loss_preserves_delete_intent_and_schedules_cleanup() {
     mark_runtime_lost(&pool, runtime_worker, server_id, "worker disappeared")
         .await
         .unwrap();
-    let (desired, state): (melon_hoster::model::DesiredState, ObservedState) =
+    let (desired, state): (kurbis_hoster::model::DesiredState, ObservedState) =
         sqlx::query_as("SELECT desired_state, observed_state FROM servers WHERE id = $1")
             .bind(server_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(desired, melon_hoster::model::DesiredState::Deleted);
+    assert_eq!(desired, kurbis_hoster::model::DesiredState::Deleted);
     assert_eq!(state, ObservedState::Deleted);
     let delete = claim_operation(&pool, cleanup_worker)
         .await
@@ -785,7 +785,7 @@ async fn new_join_cannot_overtake_queued_wakes_when_capacity_returns() {
     let worker = create_test_worker(&pool, "worker-queue-one", 29200).await;
     sqlx::query("UPDATE workers SET total_memory_bytes = $2 WHERE id = $1")
         .bind(worker)
-        .bind(melon_hoster::model::SERVER_MEMORY_BYTES)
+        .bind(kurbis_hoster::model::SERVER_MEMORY_BYTES)
         .execute(&pool)
         .await
         .unwrap();

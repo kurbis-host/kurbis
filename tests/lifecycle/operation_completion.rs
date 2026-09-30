@@ -3,8 +3,8 @@ use super::{
     cleanup_test_entities, complete_start, complete_stop, create_test_server, create_test_worker,
     recover_running_operations, retry_operation, test_pool,
 };
-use melon_hoster::control_plane::lifecycle::fail_operation;
-use melon_hoster::model::{OperationStatus, SERVER_MEMORY_BYTES};
+use kurbis_hoster::control_plane::lifecycle::fail_operation;
+use kurbis_hoster::model::{OperationStatus, SERVER_MEMORY_BYTES};
 use uuid::Uuid;
 
 #[tokio::test]

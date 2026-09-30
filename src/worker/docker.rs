@@ -64,9 +64,9 @@ impl DockerRuntime {
         let bedrock_udp = format!("{}:19132/udp", placement.bedrock_port);
         let bedrock_tcp = format!("{}:19132/tcp", placement.bedrock_port);
         let volume = format!("{}:/pumpkin", server_dir.display());
-        let generation_label = format!("melon.generation={}", placement.generation);
-        let lease_label = format!("melon.lease={}", placement.lease_token);
-        let server_label = format!("melon.server_id={server_id}");
+        let generation_label = format!("kurbis.generation={}", placement.generation);
+        let lease_label = format!("kurbis.lease={}", placement.lease_token);
+        let server_label = format!("kurbis.server_id={server_id}");
         let memory = SERVER_MEMORY_BYTES.to_string();
         let status = Command::new("docker")
             .args([
@@ -216,7 +216,7 @@ impl DockerRuntime {
             .args([
                 "inspect",
                 "--format",
-                "{{if .State.Running}}{{index .Config.Labels \"melon.generation\"}}{{end}}",
+                "{{if .State.Running}}{{index .Config.Labels \"kurbis.generation\"}}{{end}}",
                 name,
             ])
             .output()
@@ -235,7 +235,7 @@ impl DockerRuntime {
         Ok(Some(
             value
                 .parse()
-                .context("invalid melon.generation Docker label")?,
+                .context("invalid kurbis.generation Docker label")?,
         ))
     }
 
@@ -257,11 +257,11 @@ fn socket_path(server_dir: &Path) -> PathBuf {
 }
 
 fn container_name(server_id: Uuid) -> String {
-    format!("melon-{server_id}")
+    format!("kurbis-{server_id}")
 }
 
 fn render_pumpkin_config(settings: &Value) -> String {
-    let motd = setting_str(settings, "motd", "Hosted by Melon");
+    let motd = setting_str(settings, "motd", "Hosted by kurbis");
     let difficulty = setting_str(settings, "difficulty", "Normal");
     let gamemode = setting_str(settings, "gamemode", "Survival");
     let view_distance = setting_u64(settings, "view_distance", 12).clamp(2, 32);
@@ -335,9 +335,9 @@ mod tests {
 
     #[test]
     fn config_has_no_player_limit_and_escapes_strings() {
-        let config = render_pumpkin_config(&json!({"motd":"hello \"melon\"","view_distance":8}));
+        let config = render_pumpkin_config(&json!({"motd":"hello \"kurbis\"","view_distance":8}));
         assert!(config.contains("max_players = 0"));
-        assert!(config.contains("motd = \"hello \\\"melon\\\"\""));
+        assert!(config.contains("motd = \"hello \\\"kurbis\\\"\""));
         assert!(config.contains("view_distance = 8"));
     }
 }

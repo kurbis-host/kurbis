@@ -88,7 +88,7 @@ impl WorkerConfig {
                 .context("invalid WORKER_ID")?,
             name: required("WORKER_NAME")?,
             address: required("WORKER_ADDRESS")?,
-            root: PathBuf::from(value("WORKER_ROOT", "/var/lib/melon")),
+            root: PathBuf::from(value("WORKER_ROOT", "/var/lib/kurbis")),
             storage_mode: StorageMode::from_env()?,
             pumpkin_image: value("PUMPKIN_IMAGE", "ghcr.io/pumpkin-mc/pumpkin:nightly"),
             total_memory_bytes: gib_env("WORKER_MEMORY_GIB", 16)?,
@@ -153,7 +153,7 @@ impl GatewayConfig {
             waiting_java_address: value("WAITING_JAVA_ADDRESS", "127.0.0.1:25566").parse()?,
             waiting_control_socket: PathBuf::from(value(
                 "WAITING_CONTROL_SOCKET",
-                "/run/melon-gateway/host-control.sock",
+                "/run/kurbis-gateway/host-control.sock",
             )),
             waiting_control_token: required("PUMPKIN_GATEWAY_CONTROL_TOKEN")?,
             control_plane_url: required("CONTROL_PLANE_URL")?,
@@ -185,7 +185,7 @@ impl ObjectStoreConfig {
             "local" => Ok(Self::Local {
                 root: PathBuf::from(value(
                     "OBJECT_STORE_LOCAL_ROOT",
-                    "/var/lib/melon/object-store",
+                    "/var/lib/kurbis/object-store",
                 )),
             }),
             "s3" => Ok(Self::S3 {

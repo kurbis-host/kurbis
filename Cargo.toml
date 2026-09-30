@@ -1,11 +1,11 @@
 [package]
-name = "melon-hoster"
+name = "kurbis-hoster"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 
 [lib]
-name = "melon_hoster"
+name = "kurbis_hoster"
 path = "src/lib.rs"
 
 [dependencies]

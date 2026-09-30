@@ -61,10 +61,10 @@ mod tests {
 
     #[test]
     fn extracts_bedrock_server_address_from_client_data() {
-        let payload = br#"{"ServerAddress":"melon.example.com"}"#;
+        let payload = br#"{"ServerAddress":"kurbis.example.com"}"#;
         assert_eq!(
             server_address_from_client_data(payload).unwrap(),
-            "melon.example.com"
+            "kurbis.example.com"
         );
     }
 }

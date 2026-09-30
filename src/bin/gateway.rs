@@ -1,5 +1,5 @@
 use anyhow::Result;
-use melon_hoster::{
+use kurbis_hoster::{
     config::GatewayConfig,
     db,
     gateway::{bedrock, java, routes::RouteCache, waiting},
@@ -8,7 +8,7 @@ use melon_hoster::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing("melon_hoster=info");
+    init_tracing("kurbis_hoster=info");
     let config = GatewayConfig::from_env()?;
     let pool = db::connect(&config.common.database_url).await?;
     let routes = RouteCache::new(pool, config.root_domain.clone());

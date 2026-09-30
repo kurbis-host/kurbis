@@ -22,7 +22,7 @@ impl Plugin for VibeBridge {
         PluginMetadata {
             name: "vibe-bridge".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            authors: vec!["Melon Hoster".into()],
+            authors: vec!["kurbis Hoster".into()],
             description: "Codex workshop: settings, sessions and live progress for operators."
                 .into(),
             dependencies: vec![],

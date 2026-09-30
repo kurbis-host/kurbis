@@ -202,7 +202,7 @@ impl SnapshotManager {
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let temp = target.with_extension(format!("melon-restore-{}", Uuid::new_v4()));
+            let temp = target.with_extension(format!("kurbis-restore-{}", Uuid::new_v4()));
             tokio::fs::write(&temp, &bytes).await?;
             tokio::fs::rename(temp, target).await?;
         }
