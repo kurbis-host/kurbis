@@ -8,7 +8,7 @@ Build a free single-region Minecraft hosting platform around Pumpkin with:
 - Next.js public panel.
 - Docker-isolated Pumpkin instance per hosted server.
 - Java and Bedrock support matching Pumpkin.
-- One free server per account.
+- One free server for a newly created account; identity merges retain every existing world and select one default.
 - 2 GiB RAM, 5 GiB persistent storage, no explicit player-count limit.
 - Automatic sleep after 5 minutes with zero players.
 - Wake-on-join with a waiting experience, then Minecraft-native transfer to the real backend.
@@ -38,7 +38,9 @@ Use one Rust/Axum service with Postgres as the durable source of truth.
 
 Core entities:
 
-- users: OAuth identity and account status.
+- users: account status and display name.
+- identities: provider and verified subject for Google, Discord, Minecraft Java, or Minecraft Bedrock.
+- sessions: opaque, revocable browser sessions.
 - servers: owner, subdomain, desired state, observed state, configuration, storage usage.
 - workers: capacity, health heartbeat, resource reservations, draining state.
 - placements: current server-to-worker assignment and generation/lease metadata.
@@ -50,8 +52,10 @@ Use transactions, row locks, advisory locks where useful, and explicit generatio
 
 Public API/panel supports:
 
-- OAuth login.
-- Create/delete one server.
+- Google/Discord OAuth login and explicit provider linking.
+- Verified Minecraft Java/Bedrock sign-in and linking through one-use browser redemption links.
+- Account identity listing, browser-session listing/revocation, preserved-world/default-world selection, and logout.
+- Create/delete one server for a new account; preserve all worlds when identities merge.
 - Select/change an available subdomain while stopped.
 - Start/stop/restart.
 - Current state: sleeping, queued, restoring, starting, online, stopping, snapshotting, failed.
@@ -64,7 +68,7 @@ No payments, arbitrary binaries, plugin uploads, or unrestricted file manager in
 
 ### Workers, scheduling, and persistence
 
-Each machine runs a Rust worker agent with access to Docker, local server storage, and object storage.
+Each machine runs a Rust worker agent with access to a runtime, local server storage, and object storage. Production workers use Docker isolation; local development on macOS or Linux can run the same Pumpkin host-control build as a native process without Docker.
 
 Placement uses resource-aware bin packing:
 
@@ -122,6 +126,18 @@ Add only a small stable host-control interface where polling or external control
 
 The worker owns Docker/container state. Pumpkin must not communicate directly with Postgres or schedule itself.
 
+The native development runtime shares worker leases, lifecycle operations, storage manifests, snapshots, recovery, and gateway transfers with Docker workers. It is intended for trusted local development and does not provide hard memory or filesystem isolation. Linux container tests remain required to verify production quota enforcement.
+
+### Identity and account linking
+
+Use a provider-neutral identities table rather than provider columns on users. Link Google and Discord identities automatically only when both providers confirm the same email; normalize verified email by trimming whitespace and lowercasing. Preserve legacy provider identities during migration without treating an email as verified when its original provider-verification status was not stored.
+
+Minecraft login links are issued only for identities proven by successful online Java authentication or validated Bedrock Xbox authentication. Bind links to the authenticated game connection, store only a hash of a random single-use token, and expire it after 15 minutes. Show the link privately in the waiting session. Redeem it through a same-origin POST; a GET never changes account state. Signed-out redemption creates or resumes the Minecraft account. Signed-in redemption merges the Minecraft account into the browser account.
+
+An account merge moves identities, sessions, and server ownership transactionally. Preserve snapshots, operations, logs, events, player history, whitelist data, and all other records attached to the existing server IDs. A suspended source or destination leaves the merged account suspended. Keep the browser account's selected default world; if it has none, choose the oldest surviving world. There remains one default world after each merge.
+
+Browser sessions use random opaque tokens stored as hashes in Postgres and Secure, HttpOnly, SameSite cookies. Renew cookie retention during visits; support listing and revoking individual sessions. Keep in-game management commands outside this scope.
+
 ## Test Plan
 
 Test the complete lifecycle rather than isolated smoke tests:
@@ -140,14 +156,17 @@ Test the complete lifecycle rather than isolated smoke tests:
 - 2 GiB memory and 5 GiB storage quotas are enforced under real container load.
 - Unknown/invalid subdomains, failed restores, corrupt snapshots, object-store outage, full workers, and Pumpkin startup failure produce deterministic states and recoverable retries.
 - Browser E2E tests cover OAuth, server creation, address selection, lifecycle controls, queue state, logs, and deletion.
+- Identity tests cover legacy-data migration, normalized verified-email linking under concurrency, suspended-account merges, preservation of all server-linked history, and default-world selection.
+- Browser security tests cover OAuth provider linking, signed-in and signed-out Minecraft redemption, one-use/15-minute tokens, cross-origin rejection, forged or offline identity rejection, persistent sessions, revocation, and logout.
+- Native end-to-end tests use real Java and Bedrock clients to cover authenticated waiting, wake, queueing, transfer, snapshots, recovery, and worker fencing. Use Linux containers separately for hard memory and disk quota tests.
 
 ## Assumptions
 
 - V1 is one region with redundant gateway/control-plane processes but a single logical Postgres cluster.
-- One account owns at most one hosted server.
-- OAuth-only authentication; provider selection can be configured without changing the account model.
+- A new account can create one hosted server. Merging identities may retain multiple existing worlds under one account.
+- Google and Discord OAuth and verified Minecraft identities are supported. The provider-neutral identity model allows adding providers without changing account ownership.
 - Pumpkin is the only supported server runtime in v1.
 - No explicit player limit is imposed beyond what 2 GiB RAM and Pumpkin itself can sustain.
-- Bedrock hostname routing is implemented at the Minecraft login layer using ServerAddress; validating this against the exact Pumpkin-supported Bedrock protocol version is an early gateway milestone before building the rest of the Bedrock waiting flow.
+- Bedrock hostname routing is implemented at the Minecraft login layer using ServerAddress and is verified against the pinned Pumpkin-supported protocol in native integration tests.
 - Migrations occur only when a server is empty/stopped; active-player live migration is outside v1.
 - Object storage is the cross-worker persistence authority; local worker disks are disposable performance caches.
