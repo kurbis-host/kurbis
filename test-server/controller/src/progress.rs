@@ -41,6 +41,13 @@ impl Recorder {
         let message = describe(&raw);
         self.record(kind, message, raw)
     }
+    pub fn prompt(&mut self, player: &str, prompt: &str) -> anyhow::Result<()> {
+        self.record(
+            "user.prompt".into(),
+            prompt.into(),
+            json!({"player":player, "prompt":prompt}),
+        )
+    }
     pub fn step(&mut self, message: &str) -> anyhow::Result<()> {
         self.record("controller".into(), message.into(), json!({"text":message}))
     }

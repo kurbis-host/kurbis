@@ -97,10 +97,10 @@ impl EventHandler<InventoryClickEvent> for Click {
         if !event.player.has_permission(PERMISSION) {
             return event;
         }
-        if let Some(action) = action {
-            if let Err(error) = act(&event.player, action) {
-                tell(&event.player, &format!("Vibe: {error}"));
-            }
+        if let Some(action) = action
+            && let Err(error) = act(&event.player, action)
+        {
+            tell(&event.player, &format!("Vibe: {error}"));
         }
         event
     }

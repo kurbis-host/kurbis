@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -11,7 +11,7 @@ use wasmparser::Validator;
 
 use vibe_protocol::{
     JobAction, JobRequest, JobResult, JobState, PluginIndex, PluginIndexEntry, Progress, Session,
-    Sessions, Settings, Turn, validate_request,
+    Sessions, Settings, Turn, now_ms, validate_request, write_json,
 };
 
 use crate::{
@@ -90,11 +90,15 @@ impl Controller {
             if entry.file_type().await?.is_file()
                 && entry.path().extension().is_some_and(|ext| ext == "json")
             {
-                files.push(entry.path());
+                let path = entry.path();
+                let created = serde_json::from_slice::<JobRequest>(&fs::read(&path).await?)
+                    .map(|request| request.created_unix_ms)
+                    .unwrap_or_default();
+                files.push((created, path));
             }
         }
         files.sort();
-        Ok(files.into_iter().next())
+        Ok(files.into_iter().next().map(|(_, path)| path))
     }
 
     async fn recover_processing(&self) -> anyhow::Result<()> {
@@ -103,7 +107,43 @@ impl Controller {
             if !entry.file_type().await?.is_file() {
                 continue;
             }
-            fs::rename(entry.path(), self.paths.requests().join(entry.file_name())).await?;
+            let bytes = fs::read(entry.path()).await?;
+            let request: JobRequest = match serde_json::from_slice(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("Discarding malformed interrupted request: {error}");
+                    fs::remove_file(entry.path()).await?;
+                    continue;
+                }
+            };
+            validate_request(&request)?;
+            let plugin = self.paths.plugin_workspace(&request.plugin);
+            if fs::try_exists(plugin.join(".git")).await? {
+                ensure_owned_plugin_dir(&self.paths.workspace_plugins(), &plugin).await?;
+                reset_plugin_workspace(&plugin).await?;
+            }
+            let session_path = self.paths.bridge_data().join("sessions.json");
+            let mut sessions: Sessions = vibe_protocol::read_json(&session_path)?;
+            let progress: Progress = vibe_protocol::read_json(
+                &self
+                    .paths
+                    .bridge_data()
+                    .join("progress")
+                    .join(format!("{}.json", request.id)),
+            )?;
+            if let Some(session) = sessions
+                .sessions
+                .iter_mut()
+                .find(|s| s.turns.iter().any(|t| t.job_id == request.id))
+            {
+                session.thread_id = session.thread_id.or(progress.thread_id);
+            }
+            vibe_protocol::write_json(&session_path, &sessions)?;
+            self.write_result(JobResult {
+                id: request.id, plugin: request.plugin, state: JobState::Failed,
+                message: "Worker restarted during job; uncommitted changes reset. Continue the saved session to retry.".into(), updated_unix_ms:now_ms(),
+            }).await?;
+            fs::remove_file(entry.path()).await?;
         }
         Ok(())
     }
@@ -222,6 +262,8 @@ impl Controller {
         } else {
             codex_prompt(&request.plugin, &request.player, &request.prompt)
         };
+        crate::progress::Recorder::new(&self.paths.bridge_data(), request.id)?
+            .prompt(&request.player, &request.prompt)?;
         crate::progress::Recorder::new(&self.paths.bridge_data(), request.id)?.step(&format!(
             "Workspace ready: {}; session {session_id}",
             plugin_dir.display()
@@ -231,12 +273,11 @@ impl Controller {
             .codex
             .run(
                 &self.paths,
-                request.id,
+                &request,
                 &plugin_dir,
                 &prompt,
                 resume,
                 &settings,
-                request.action == JobAction::Chat,
             )
             .await;
         let progress: Progress = vibe_protocol::read_json(
@@ -359,7 +400,7 @@ impl Controller {
         fs::write(dir.join("Cargo.toml"), cargo_template(plugin)).await?;
         fs::write(dir.join("src/lib.rs"), TEMPLATE_LIB).await?;
         fs::write(dir.join("AGENTS.md"), agent_rules(plugin)).await?;
-        fs::write(dir.join(".gitignore"), "/target/\n.vibe-last-message\n").await?;
+        fs::write(dir.join(".gitignore"), "/target/\n").await?;
 
         git_status(&dir, &["init"]).await?;
         git_status(&dir, &["add", "-A"]).await?;
@@ -433,21 +474,19 @@ impl Controller {
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        atomic_json_write(
+        write_json(
             &self.paths.plugin_index(),
             &PluginIndex { plugins: entries },
         )
-        .await
     }
 
     async fn write_result(&self, result: JobResult) -> anyhow::Result<()> {
         crate::progress::Recorder::new(&self.paths.bridge_data(), result.id)?
             .step(&result.message)?;
-        atomic_json_write(
+        write_json(
             &self.paths.results().join(format!("{}.json", result.id)),
             &result,
         )
-        .await
     }
 }
 
@@ -582,22 +621,6 @@ async fn ensure_owned_plugin_dir(root: &Path, dir: &Path) -> anyhow::Result<()> 
         "plugin workspace is missing ownership marker"
     );
     Ok(())
-}
-
-async fn atomic_json_write(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
-    let parent = path.parent().context("JSON path has no parent")?;
-    fs::create_dir_all(parent).await?;
-    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    fs::write(&temp, serde_json::to_vec_pretty(value)?).await?;
-    fs::rename(temp, path).await?;
-    Ok(())
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 #[cfg(test)]

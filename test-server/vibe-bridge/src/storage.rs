@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -88,15 +87,5 @@ pub fn jobs() -> anyhow::Result<Vec<JobResult>> {
     Ok(jobs)
 }
 pub fn event_page(id: Uuid, page: usize, size: usize) -> anyhow::Result<Vec<ProgressEvent>> {
-    let file = match fs::File::open(path("events").join(format!("{id}.jsonl"))) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e.into()),
-    };
-    BufReader::new(file)
-        .lines()
-        .skip(page.saturating_mul(size))
-        .take(size)
-        .map(|line| Ok(serde_json::from_str(&line?)?))
-        .collect()
+    vibe_protocol::event_page(&path("events").join(format!("{id}.jsonl")), page, size)
 }

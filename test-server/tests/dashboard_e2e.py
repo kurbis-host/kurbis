@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
-import uuid
+import zlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -57,6 +57,7 @@ class Client:
     def __init__(self, port, name):
         self.socket = socket.create_connection(("127.0.0.1", port))
         self.socket.settimeout(30)
+        self.compression = None
         self.lock = threading.Lock()
         self.packets = []
         self.window = self.revision = 0
@@ -65,10 +66,15 @@ class Client:
         self.send(0, vi(777) + string("localhost") + struct.pack(">H", port) + vi(2))
         self.send(0, string(name) + bytes(16))
         threading.Thread(target=self.read, daemon=True).start()
-        eventually(lambda: self.state == "play")
+        try:
+            eventually(lambda: self.state == "play")
+        except AssertionError:
+            raise AssertionError(f"Login stalled: state={self.state}, error={self.error}, packets={[(p, b[:100]) for p,b in self.packets[:10]]}")
 
     def send(self, packet, body=b""):
         body = vi(packet) + body
+        if self.compression is not None:
+            body = vi(len(body)) + zlib.compress(body) if len(body) >= self.compression else vi(0) + body
         with self.lock:
             self.socket.sendall(vi(len(body)) + body)
 
@@ -89,9 +95,15 @@ class Client:
                     prefix += self.read_exact(1)
                 size, _ = decode(prefix)
                 data = self.read_exact(size)
+                if self.compression is not None:
+                    uncompressed, off = decode(data)
+                    data = zlib.decompress(data[off:]) if uncompressed else data[off:]
                 packet, offset = decode(data)
                 body = data[offset:]
-                if self.state == "login" and packet == 2:
+                if self.state != "play": self.packets.append((packet, body))
+                if self.state == "login" and packet == 3:
+                    self.compression, _ = decode(body)
+                elif self.state == "login" and packet == 2:
                     self.send(3)
                     self.send(0, string("en_us") + b"\x02" + vi(0) + b"\x01\x7f" + vi(1) + b"\x00\x01")
                     self.state = "config"
@@ -112,8 +124,8 @@ class Client:
                     elif packet == 62:
                         self.send(45, body)
                     elif packet == 73:
-                        teleport, _ = decode(body)
-                        self.send(0, vi(teleport))
+                        teleport, off = decode(body)
+                        self.send(0, vi(teleport) + body[off:off + 24] + body[off + 48:off + 56])
                     elif packet == 11:
                         self.send(11, struct.pack(">f", 10))
                     elif packet == 60:
@@ -157,6 +169,7 @@ def run(runtime, port):
     config = (ROOT / "runtime/server/pumpkin.toml").read_text()
     config = config.replace("127.0.0.1:25565", f"127.0.0.1:{port}").replace("view_distance = 16", "view_distance = 2").replace("simulation_distance = 10", "simulation_distance = 2")
     config = config.replace("[networking.java.compression]\nenabled = true", "[networking.java.compression]\nenabled = false")
+    config = config.replace("default_op_level = 0", "default_op_level = 4")
     config = config.replace("[telemetry]\nenabled = true", "[telemetry]\nenabled = false")
     (server_dir / "pumpkin.toml").write_text(config)
     worker = runtime / "fixture-codex"
@@ -180,7 +193,11 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
     controller = subprocess.Popen([str(ROOT / "target/debug/vibe-controller"), "--runtime", str(runtime), "--codex", str(worker)], stdout=controller_log, stderr=subprocess.STDOUT)
     clients = []
     try:
-        eventually(lambda: "Started Java server" in (runtime / "server.log").read_text() or "Listening on" in (runtime / "server.log").read_text())
+        def listening():
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2): return True
+            except OSError: return False
+        eventually(listening)
         op = Client(port, "VibeTester")
         guest = Client(port, "VibeGuest")
         clients.extend([op, guest])
@@ -236,7 +253,9 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         op.menu("Event log", lambda: op.click(50))
         assert op.seen("END-OF-RESPONSE")
         op.menu("Event details", lambda: op.click(10))
-        op.menu("Conversation", lambda: op.command("vibe sessions") or None) if False else None
+        controller.terminate()
+        controller.wait(timeout=10)
+        controller = subprocess.Popen([str(ROOT / "target/debug/vibe-controller"), "--runtime", str(runtime), "--codex", str(worker)], stdout=controller_log, stderr=subprocess.STDOUT)
         op.menu("Sessions", lambda: op.command("vibe sessions"))
         op.menu("Conversation", lambda: op.click(10))
         op.click(51)
@@ -254,6 +273,32 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         op.menu("Settings", lambda: op.click(33))
         assert settings()["model"] == "" and settings()["timeout_seconds"] == 900
         assert "medium" == settings()["reasoning"]
+        # Settings buttons and pending prompts must recheck permission after de-op.
+        op.click(20)
+        time.sleep(0.2)
+        server.stdin.write("deop VibeTester\n")
+        server.stdin.flush()
+        time.sleep(0.5)
+        start = len(guest.packets)
+        op.chat("revoked-model")
+        eventually(lambda: op.seen("Operator access required."))
+        assert settings()["model"] == ""
+        assert not guest.seen("revoked-model", start)
+        op.click(24)
+        time.sleep(0.2)
+        assert settings()["timeout_seconds"] == 900
+        op.close()
+        server.stdin.write("op VibeTester\n")
+        server.stdin.flush()
+        time.sleep(0.5)
+        op.menu("Settings", lambda: op.command("vibe settings"))
+        op.click(20)
+        time.sleep(0.2)
+        op.close()
+        op.chat("cancel")
+        eventually(lambda: op.seen("Prompt cancelled."))
+        op.chat("normal-chat-after-cancel")
+        eventually(lambda: guest.seen("normal-chat-after-cancel"))
         print("PASS: official binary, OP gate, menu navigation, persisted settings, private chat, full events, log pagination/details, session resume, defaults")
     finally:
         for client in clients:

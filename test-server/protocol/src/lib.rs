@@ -117,6 +117,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_pages_do_not_expose_partial_live_records_or_lose_long_unicode_output() {
+        let dir = std::env::temp_dir().join(format!("vibe-events-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        assert!(event_page(&path, 0, 2).unwrap().is_empty());
+        let message = "🎃 full output ".repeat(1000);
+        let records: String = (1..=3)
+            .map(|sequence| {
+                serde_json::to_string(&ProgressEvent {
+                    sequence,
+                    kind: "item.completed".into(),
+                    message: message.clone(),
+                    raw: serde_json::json!({"sequence":sequence}),
+                    unix_ms: 0,
+                })
+                .unwrap()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(&path, records + "{\"sequence\":4").unwrap();
+        let first = event_page(&path, 0, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].message, message);
+        let second = event_page(&path, 1, 2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].sequence, 3);
+        assert!(event_page(&path, usize::MAX, 2).unwrap().is_empty());
+        assert!(event_page(&path, 0, 0).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_reject_invalid_values_and_restore_defaults() {
+        let mut settings = Settings::default();
+        assert!(settings.validate().is_ok());
+        for value in ["model with spaces", "$(touch /tmp/x)", "\n", "a; b"] {
+            settings.model = value.into();
+            assert!(settings.validate().is_err());
+        }
+        settings.model = "provider/model-v2".into();
+        assert!(settings.validate().is_ok());
+        settings.reasoning = "unsupported".into();
+        assert!(settings.validate().is_err());
+        settings = Settings::default();
+        for timeout in [0, 29, 3601, u64::MAX] {
+            settings.timeout_seconds = timeout;
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [30, 900, 1800, 3600] {
+            settings.timeout_seconds = timeout;
+            assert!(settings.validate().is_ok());
+        }
+        let restored: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(restored.timeout_seconds, 900);
+        assert!(restored.chat_progress);
+    }
+
+    #[test]
     fn validates_plugin_slugs() {
         for valid in ["hello", "hello-world", "a1", "plugin-42"] {
             assert!(validate_plugin_name(valid).is_ok(), "{valid}");
@@ -130,6 +188,7 @@ mod tests {
             "hello--world",
             "a_b",
             "a/b",
+            "vibe-bridge",
         ] {
             assert!(validate_plugin_name(invalid).is_err(), "{invalid}");
         }
@@ -233,4 +292,40 @@ pub fn write_json(path: &std::path::Path, value: &impl Serialize) -> anyhow::Res
     std::fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
     std::fs::rename(&temp, path)?;
     Ok(())
+}
+
+/// Read only complete JSONL records, including while a writer appends the next event.
+pub fn event_page(
+    path: &std::path::Path,
+    page: usize,
+    size: usize,
+) -> anyhow::Result<Vec<ProgressEvent>> {
+    use std::io::{BufRead, BufReader};
+    if size == 0 {
+        return Ok(vec![]);
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut events = vec![];
+    let mut line = String::new();
+    let start = page.saturating_mul(size);
+    let mut index = 0;
+    while reader.read_line(&mut line)? > 0 {
+        if !line.ends_with('\n') {
+            break;
+        }
+        if index >= start {
+            events.push(serde_json::from_str(&line)?);
+            if events.len() >= size {
+                break;
+            }
+        }
+        index += 1;
+        line.clear();
+    }
+    Ok(events)
 }

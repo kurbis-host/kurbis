@@ -14,7 +14,7 @@ fn item(material: &str, label: &str, description: &str) -> ItemStack {
     let mut lore = vec![];
     for line in description.lines().take(8) {
         let chars: Vec<char> = line.chars().collect();
-        for part in chars.chunks(48) {
+        for part in chars.chunks(48).take(8) {
             lore.push(TextComponent::from_legacy_string(&format!(
                 "§7{}",
                 part.iter().collect::<String>()
@@ -42,7 +42,7 @@ impl Menu {
             self.actions.insert(slot as i16, action);
         }
     }
-    fn pagination(&mut self, page: usize, previous: View, next: View) {
+    fn pagination(&mut self, page: usize, total: usize, previous: View, next: View) {
         if page > 0 {
             self.button(
                 46,
@@ -52,13 +52,15 @@ impl Menu {
                 Some(Action::Open(previous)),
             );
         }
-        self.button(
-            50,
-            "arrow",
-            "Next page",
-            "Browse more entries",
-            Some(Action::Open(next)),
-        );
+        if page.saturating_add(1).saturating_mul(28) < total {
+            self.button(
+                50,
+                "arrow",
+                "Next page",
+                "Browse more entries",
+                Some(Action::Open(next)),
+            );
+        }
     }
 }
 pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
@@ -90,7 +92,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
         menu.gui.set_item(
             slot,
             item(
-                if slot < 9 || slot >= 45 {
+                if !(9..45).contains(&slot) {
                     "purple_stained_glass_pane"
                 } else {
                     "black_stained_glass_pane"
@@ -239,6 +241,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                index.plugins.len(),
                 View::Plugins(page.saturating_sub(1)),
                 View::Plugins(page.saturating_add(1)),
             );
@@ -271,6 +274,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                sessions.sessions.len(),
                 View::Sessions(page.saturating_sub(1)),
                 View::Sessions(page.saturating_add(1)),
             );
@@ -291,6 +295,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                jobs.len(),
                 View::Jobs(page.saturating_sub(1)),
                 View::Jobs(page.saturating_add(1)),
             );
@@ -328,6 +333,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                session.turns.len(),
                 View::Session(id, page.saturating_sub(1)),
                 View::Session(id, page.saturating_add(1)),
             );
@@ -356,6 +362,8 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                read_json::<Progress>(&storage::path("progress").join(format!("{id}.json")))?
+                    .total_events as usize,
                 View::Job(id, page.saturating_sub(1)),
                 View::Job(id, page.saturating_add(1)),
             );
@@ -405,6 +413,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             }
             menu.pagination(
                 page,
+                chunks.len(),
                 View::Event(id, index, page.saturating_sub(1)),
                 View::Event(id, index, page.saturating_add(1)),
             );

@@ -35,10 +35,24 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tokio::select! {
             result = controller.run() => result,
-            signal = tokio::signal::ctrl_c() => {
+            signal = shutdown_signal() => {
                 signal?;
                 Ok(())
             }
         }
     }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }

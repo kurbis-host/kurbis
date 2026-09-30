@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{paths::RuntimePaths, progress::Recorder};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use vibe_protocol::Settings;
+use vibe_protocol::{JobAction, JobRequest, Settings};
 
 #[derive(Clone, Debug)]
 pub struct CodexRunner {
@@ -31,13 +31,14 @@ impl CodexRunner {
     pub async fn run(
         &self,
         paths: &RuntimePaths,
-        job_id: Uuid,
+        job: &JobRequest,
         plugin_dir: &Path,
         prompt: &str,
         resume: Option<Uuid>,
         settings: &Settings,
-        read_only: bool,
     ) -> anyhow::Result<CodexOutcome> {
+        let job_id = job.id;
+        let read_only = job.action == JobAction::Chat;
         let mut recorder = Recorder::new(&paths.bridge_data(), job_id)?;
         recorder.step(if resume.is_some() {
             "Resuming Codex session"
@@ -146,7 +147,7 @@ impl CodexRunner {
                 };
             }
         };
-        if outcome.is_ok()
+        if matches!(outcome, Ok(CodexOutcome::Completed))
             && let Some(expected) = resume
         {
             let progress: vibe_protocol::Progress = vibe_protocol::read_json(
@@ -160,7 +161,25 @@ impl CodexRunner {
                 "Codex did not resume the requested thread"
             );
         }
-        outcome
+        outcome.map_err(|error| {
+            let progress: vibe_protocol::Progress = vibe_protocol::read_json(
+                &paths
+                    .bridge_data()
+                    .join("progress")
+                    .join(format!("{job_id}.json")),
+            )
+            .unwrap_or_default();
+            if let Some(event) = progress
+                .events
+                .iter()
+                .rev()
+                .find(|e| e.kind == "error" || e.kind == "turn.failed")
+            {
+                error.context(event.message.clone())
+            } else {
+                error
+            }
+        })
     }
 }
 
@@ -232,12 +251,19 @@ wait
         let error = runner
             .run(
                 &paths,
-                Uuid::new_v4(),
+                &JobRequest {
+                    id: Uuid::new_v4(),
+                    session_id: None,
+                    action: JobAction::Code,
+                    plugin: "demo".into(),
+                    prompt: "test prompt".into(),
+                    player: "Tester".into(),
+                    created_unix_ms: 0,
+                },
                 &plugin_dir,
                 "test prompt",
                 None,
                 &Settings::default(),
-                false,
             )
             .await
             .expect_err("job should time out");
@@ -262,5 +288,104 @@ wait
         }
 
         panic!("Codex child process {child_pid} survived timeout");
+    }
+    #[tokio::test]
+    async fn detects_wrong_resume_thread_and_keeps_full_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().join("runtime"));
+        paths.create_dirs().await.unwrap();
+        let worker = temp.path().join("worker");
+        fs::write(&worker, r#"#!/usr/bin/env python3
+import json,sys
+sys.stdin.read()
+print(json.dumps({'type':'thread.started','thread_id':'22222222-2222-4222-8222-222222222222'}))
+for i in range(200):
+ print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':str(i)+'-'+'X'*4000}}))
+print('last stderr line',file=sys.stderr)
+"#).await.unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let job = JobRequest {
+            id: Uuid::new_v4(),
+            session_id: None,
+            action: JobAction::Chat,
+            plugin: "demo".into(),
+            prompt: "hi".into(),
+            player: "Op".into(),
+            created_unix_ms: 0,
+        };
+        let runner = CodexRunner::new(worker.to_string_lossy(), Duration::from_secs(15));
+        let error = runner
+            .run(
+                &paths,
+                &job,
+                temp.path(),
+                "hi",
+                Some(Uuid::nil()),
+                &Settings::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not resume"));
+        let text = fs::read_to_string(
+            paths
+                .bridge_data()
+                .join("events")
+                .join(format!("{}.jsonl", job.id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text.lines().count(), 204);
+        assert!(text.contains(&format!("199-{}", "X".repeat(4000))));
+        assert!(text.contains("last stderr line"));
+    }
+
+    #[tokio::test]
+    async fn active_cancellation_stops_the_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().join("runtime"));
+        paths.create_dirs().await.unwrap();
+        let worker = temp.path().join("worker");
+        fs::write(
+            &worker,
+            "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > \"$2/child.pid\"\nwait\n",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let job = JobRequest {
+            id: Uuid::new_v4(),
+            session_id: None,
+            action: JobAction::Chat,
+            plugin: "demo".into(),
+            prompt: "hi".into(),
+            player: "Op".into(),
+            created_unix_ms: 0,
+        };
+        let cancel = paths.cancel().join(format!("{}.json", job.id));
+        let trigger = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(300)).await;
+            fs::write(cancel, "{}").await.unwrap();
+        });
+        let runner = CodexRunner::new(worker.to_string_lossy(), Duration::from_secs(15));
+        assert!(matches!(
+            runner
+                .run(&paths, &job, temp.path(), "hi", None, &Settings::default())
+                .await
+                .unwrap(),
+            CodexOutcome::Cancelled
+        ));
+        trigger.await.unwrap();
+        let pid = fs::read_to_string(temp.path().join("child.pid"))
+            .await
+            .unwrap();
+        time::sleep(Duration::from_millis(100)).await;
+        let status = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(!status.success());
     }
 }
