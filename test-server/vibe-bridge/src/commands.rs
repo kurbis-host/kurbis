@@ -27,6 +27,7 @@ pub fn command() -> Command {
         .then(with_id("status", "job"))
         .then(with_id("cancel", "job"))
         .then(with_id("revert", "plugin"))
+        .then(with_id("reload", "plugin"))
         .then(
             CommandNode::literal("log").then(
                 string("job")
@@ -97,8 +98,8 @@ impl CommandHandler for Handler {
                         }
                     }
                 }
-                "code" | "chat" | "continue" | "revert" => {
-                    let prompt = if self.0 == "revert" {
+                "code" | "chat" | "continue" | "revert" | "reload" => {
+                    let prompt = if matches!(self.0, "revert" | "reload") {
                         String::new()
                     } else {
                         arg(&args, "prompt")?
@@ -113,6 +114,7 @@ impl CommandHandler for Handler {
                         let action = match self.0 {
                             "chat" => JobAction::Chat,
                             "revert" => JobAction::Revert,
+                            "reload" => JobAction::Reload,
                             _ => JobAction::Code,
                         };
                         storage::enqueue(

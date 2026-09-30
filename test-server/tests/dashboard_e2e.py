@@ -14,6 +14,9 @@ import threading
 import time
 import zlib
 
+import reload_fixture
+import reload_checks
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -165,7 +168,7 @@ class Client:
         return start
 
 
-def run(runtime, port, gamemode):
+def run(runtime, port, gamemode, artifacts):
     server_dir = runtime / "server"
     (server_dir / "plugins").mkdir(parents=True)
     (server_dir / "plugins/vibe-bridge.wasm").write_bytes((ROOT / "runtime/server/plugins/vibe-bridge.wasm").read_bytes())
@@ -174,12 +177,21 @@ def run(runtime, port, gamemode):
     config = config.replace("[networking.java.compression]\nenabled = true", "[networking.java.compression]\nenabled = false")
     config = config.replace("[telemetry]\nenabled = true", "[telemetry]\nenabled = false")
     (server_dir / "pumpkin.toml").write_text(config)
+    (runtime / "fixture-artifacts.json").write_text(json.dumps(artifacts))
     worker = runtime / "fixture-codex"
     worker.write_text('''#!/usr/bin/env python3
 import sys,json,uuid,pathlib
 args=sys.argv[1:]
 pathlib.Path(args[1],"captured-args.json").write_text(json.dumps(args))
 prompt=sys.stdin.read()
+if pathlib.Path(args[1]).name in ("reload-probe", "fresh-probe"):
+ version=prompt.split("PLAYER REQUEST:")[1].strip()
+ artifacts=json.loads((pathlib.Path(args[1]).parents[2]/"fixture-artifacts.json").read_text())
+ target=pathlib.Path(args[1],"target/wasm32-wasip2/release", pathlib.Path(args[1]).name.replace("-","_")+".wasm")
+ target.parent.mkdir(parents=True,exist_ok=True)
+ target.write_bytes(pathlib.Path(artifacts[version]).read_bytes())
+ pathlib.Path(args[1],"revision.txt").write_text(version)
+
 thread=args[args.index("resume")+1] if "resume" in args else str(uuid.uuid4())
 print(json.dumps({"type":"thread.started","thread_id":thread}),flush=True)
 print("fixture stderr diagnostic",file=sys.stderr,flush=True)
@@ -190,7 +202,7 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
 ''')
     worker.chmod(0o755)
     log = (runtime / "server.log").open("w")
-    server = subprocess.Popen([str(ROOT / "runtime/bin/pumpkin")], cwd=server_dir, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
+    server = subprocess.Popen(["python3", str(ROOT / "scripts/server_runner.py"), "--runtime", str(runtime), "--binary", str(ROOT / "runtime/bin/pumpkin")], cwd=server_dir, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
     controller_log = (runtime / "controller.log").open("w")
     controller = subprocess.Popen([str(ROOT / "target/debug/vibe-controller"), "--runtime", str(runtime), "--codex", str(worker)], stdout=controller_log, stderr=subprocess.STDOUT)
     clients = []
@@ -328,7 +340,8 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
         op.chat("normal-chat-after-cancel")
         eventually(lambda: guest.seen("normal-chat-after-cancel"))
         assert op.gamemode == (3 if gamemode == "spectator" else 0), "Workshop changed gamemode"
-        print(f"PASS ({gamemode}): official binary, OP gate, menu navigation, persisted settings, private chat, full events, log pagination/details, session resume, defaults")
+        reload_checks.exercise(op, guest, server_dir / "plugins/data/vibe-bridge", eventually)
+        print(f"PASS ({gamemode}): official binary, OP gate, menu navigation, persisted settings, private chat, full events, log pagination/details, session resume, defaults, live plugin reload and failed-load recovery")
     finally:
         for client in clients:
             client.socket.close()
@@ -346,6 +359,8 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_toke
 
 
 if __name__ == "__main__":
+    fixture_temp = tempfile.TemporaryDirectory(prefix="pumpkin-reload-fixtures-")
+    artifacts = reload_fixture.build(ROOT, pathlib.Path(fixture_temp.name) / "plugin")
     for gamemode in ("survival", "spectator"):
         # Select an available port without taking over the normal test server.
         with socket.socket() as listener:
@@ -353,7 +368,7 @@ if __name__ == "__main__":
             port = listener.getsockname()[1]
         with tempfile.TemporaryDirectory(prefix="pumpkin-vibe-e2e-") as temp:
             try:
-                run(pathlib.Path(temp), port, gamemode)
+                run(pathlib.Path(temp), port, gamemode, artifacts)
             except Exception:
                 for filename in ("server.log", "controller.log"):
                     path = pathlib.Path(temp) / filename

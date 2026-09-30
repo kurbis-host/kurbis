@@ -47,7 +47,7 @@ pub fn enqueue(
             id,
             plugin: request.plugin.clone(),
             state: JobState::Queued,
-            message: "Waiting for the Codex worker".into(),
+            message: "Waiting for the workshop worker".into(),
             updated_unix_ms: now_ms(),
         },
     )?;

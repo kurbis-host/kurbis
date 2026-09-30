@@ -186,7 +186,7 @@ printf '\000asm\015\000\001\000' > target/wasm32-wasip2/release/demo.wasm
 
     let first = submit(&controller, &paths, JobAction::Code, "first version").await;
     assert_eq!(first.state, JobState::Installed);
-    assert!(first.message.contains("restart Pumpkin to activate"));
+    assert!(first.message.contains("reload pending"));
     let plugin = paths.plugin_workspace("demo");
     let first_revision = git_output(&plugin, &["rev-parse", "HEAD"])
         .await
@@ -204,7 +204,7 @@ printf '\000asm\015\000\001\000' > target/wasm32-wasip2/release/demo.wasm
     );
     let reverted = submit(&controller, &paths, JobAction::Revert, "").await;
     assert_eq!(reverted.state, JobState::Installed);
-    assert!(reverted.message.contains("restart Pumpkin to activate"));
+    assert!(reverted.message.contains("reload pending"));
     assert_eq!(
         git_output(&plugin, &["rev-parse", "HEAD"])
             .await

@@ -17,7 +17,7 @@ Grant yourself operator status from the Pumpkin console with `op <minecraft-name
 
 ## Chest workshop
 
-- **Installed plugins:** inspect revisions and sizes; restore the preceding archived revision.
+- **Installed plugins:** inspect revisions and sizes; click a plugin to reload it or restore the preceding archived revision.
 - **Conversations:** browse saved prompts and their responses/tool events; continue the same Codex thread.
 - **Jobs & live logs:** browse every event with previous/next arrows, refresh status, watch privately in chat, or cancel. Click an event to read its complete message and raw JSON in numbered parts.
 - **Create or edit a plugin:** click, close the chest, and type `plugin-name your prompt` in chat.
@@ -43,6 +43,7 @@ Settings persist on disk. Execution settings apply when the next queued job star
 /vibe list
 /vibe cancel <job-uuid>
 /vibe revert hello-world
+/vibe reload hello-world
 /vibe set model default
 /vibe set reasoning high
 /vibe set timeout 1800
@@ -53,9 +54,15 @@ Log pages are zero-based. Console users get text output for logs, sessions, stat
 
 ## Logs and installation
 
-Jobs run serially in creation order. Each plugin has its own Git workspace at `runtime/workspace/plugins/<name>`. Code turns use Codex's `workspace-write` sandbox to edit and build `wasm32-wasip2`. The controller validates and atomically installs the resulting WASM, commits the successful source revision, and archives the artifact for restoration. Failed or cancelled turns reset uncommitted source changes and preserve the previously installed artifact. Queued cancellations never start Codex; active cancellation, timeout, and graceful controller shutdown terminate its process group. Interrupted jobs are marked failed on restart, their source changes reset, and their recorded Codex thread remains available for continuation. Requests are never silently replayed.
+Jobs run serially in creation order. Each plugin has its own Git workspace at `runtime/workspace/plugins/<name>`. Code turns use Codex's `workspace-write` sandbox to edit and build `wasm32-wasip2`. The controller validates and atomically installs the resulting WASM, commits the successful source revision, and archives the artifact for restoration. Failed or cancelled turns reset uncommitted source changes and preserve the previously installed artifact. Queued cancellations never start Codex; active Codex cancellation, timeout, and graceful controller shutdown terminate its process group. Interrupted jobs are marked failed on restart, their source changes reset, and their recorded Codex thread remains available for continuation. Requests are never silently replayed.
 
-**Restart Pumpkin to activate installed or restored plugins.** Stop it with console `stop`, then run `./scripts/run.sh`. Hot reload is disabled because this stock release retains command permissions across plugin unloads.
+**Installed and restored plugins reload automatically without disconnecting players.** `scripts/run.sh` runs the official binary through a companion console runner. The controller waits for confirmed unload/load results and records them in the job log; initialization failure restores and reactivates the previous artifact. Use `/vibe reload <plugin>` or **Installed plugins → plugin → Reload plugin** to reload the current artifact without a Codex turn.
+
+Start the server with `scripts/run.sh` to enable this integration. If the controller runs alone, builds are staged and report `reload pending`; start the runner and use `/vibe reload <plugin>`. The running `vibe-bridge` is protected from self-reload. Stop/start once when upgrading the bridge or switching an existing server to the companion runner; generated plugin changes then activate live.
+
+The stock file watcher stays disabled: it misses atomic rename installations on the tested release. The native load command also rejects paths containing `/`, so the runner uses a temporary hard link in the server directory and removes it after loading. No Pumpkin changes are needed.
+
+Generated plugins use `vibe-plugin-support::register_permission` for repeatable initialization. The stock permission registry survives unloads; the helper accepts only the exact duplicate-node error and preserves all other failures. Existing permission defaults remain unchanged until a server restart. Old generated plugins that register permissions directly must adopt the helper; Codex continuation prompts include this instruction.
 
 The bridge and controller communicate through `runtime/server/plugins/data/vibe-bridge/`:
 
@@ -67,6 +74,7 @@ The bridge and controller communicate through `runtime/server/plugins/data/vibe-
 | `events/<job>.jsonl` | Every exposed Codex JSON event, non-JSON stdout, stderr, user prompt, and controller stage; complete output without truncation |
 | `progress/<job>.json` | Latest 100 event previews for live chat |
 | `plugins.json` | Installed plugin revisions and artifact sizes |
+| `activation/` | Console runner heartbeat and temporary reload handoff |
 
 The controller also prints each event as it arrives. Commands, tool output, file-change events, agent messages, errors, and token usage are retained. Logging covers what Codex CLI emits; it cannot expose private model reasoning or events the CLI does not emit. Chest event previews and live chat abbreviate long output; event detail pages and JSONL files retain the complete data. Refresh the chest to load newly arrived events. If chat falls behind the preview window, it points you to the full job log.
 
@@ -84,4 +92,4 @@ cargo clippy --manifest-path vibe-bridge/Cargo.toml --target wasm32-wasip2 -- -D
 python3 tests/dashboard_e2e.py
 ```
 
-The end-to-end test runs the official binary and bridge in an isolated temporary runtime with real protocol clients and a deterministic Codex event fixture. It checks permissions, chest navigation in survival and spectator mode, gamemode changes with an open menu, stale-window rejection, drag suppression, settings, private prompts, log browsing, and continuation across controller restart. Backend tests cover installation/restoration, invalid artifacts, complete large outputs, thread mismatch, FIFO ordering, cancellation, timeout, and settings validation. Bridge unit tests cover truncated and invalid click headers. The Codex argument regression keeps network and reasoning overrides together before `exec`, preventing exec-local configuration from silently disabling network access.
+The end-to-end test runs the official binary and bridge in an isolated temporary runtime with real protocol clients and a deterministic Codex event fixture. It checks permissions, chest navigation in survival and spectator mode, gamemode changes with an open menu, stale-window rejection, drag suppression, settings, private prompts, log browsing, and continuation across controller restart. Backend tests cover installation/restoration, invalid artifacts, complete large outputs, thread mismatch, FIFO ordering, cancellation, timeout, and settings validation. Reload coverage compiles real WASM revisions, verifies changed command responses on the same connections, exercises the chest Reload button, restores the previous revision, and rejects failed initialization, invalid permission namespaces, protected names, missing plugins, and non-OP requests. It checks rollback bytes, revision metadata, ordered logs, and temporary link cleanup. Bridge unit tests cover truncated and invalid click headers. The Codex argument regression keeps network and reasoning overrides together before `exec`, preventing exec-local configuration from silently disabling network access.

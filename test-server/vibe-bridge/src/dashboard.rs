@@ -21,6 +21,7 @@ pub enum View {
     Home,
     Settings,
     Plugins(usize),
+    Plugin(String),
     Sessions(usize),
     Jobs(usize),
     Session(Uuid, usize),
@@ -37,7 +38,7 @@ enum Action {
     Reset,
     Cancel(Uuid),
     Watch(Uuid),
-    Revert(String),
+    Activate(JobAction, String),
 }
 #[derive(Clone)]
 enum Input {
@@ -139,19 +140,10 @@ fn act(player: &Player, action: Action) -> anyhow::Result<()> {
             storage::cancel(job)?;
             tell(player, "Cancellation requested.");
         }
-        Action::Revert(plugin) => {
-            let id = storage::enqueue(
-                JobAction::Revert,
-                plugin,
-                String::new(),
-                player.get_name(),
-                None,
-            )?;
+        Action::Activate(action, plugin) => {
+            let id = storage::enqueue(action, plugin, String::new(), player.get_name(), None)?;
             watch(player, id);
-            tell(
-                player,
-                &format!("Restore queued: {id}. Restart after installation."),
-            );
+            tell(player, &format!("Plugin activation queued: {id}."));
         }
         setting => {
             let mut settings: Settings = read_json(&storage::path("settings.json"))?;

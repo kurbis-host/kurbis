@@ -8,6 +8,7 @@ pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
 pub enum JobAction {
     Code,
     Revert,
+    Reload,
     Chat,
 }
 
@@ -102,10 +103,10 @@ pub fn validate_request(request: &JobRequest) -> anyhow::Result<()> {
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes"
             );
         }
-        JobAction::Revert => {
+        JobAction::Revert | JobAction::Reload => {
             anyhow::ensure!(
                 request.prompt.is_empty(),
-                "revert requests must not include a prompt"
+                "activation requests must not include a prompt"
             );
         }
     }

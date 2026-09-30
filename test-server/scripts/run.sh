@@ -21,5 +21,4 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cd "$SERVER"
-"$PUMPKIN_BIN"
+python3 "$ROOT/scripts/server_runner.py" --runtime "$RUNTIME" --binary "$PUMPKIN_BIN"

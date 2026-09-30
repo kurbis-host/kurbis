@@ -72,6 +72,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
         View::Home => "Workshop",
         View::Settings => "Settings",
         View::Plugins(_) => "Plugins",
+        View::Plugin(_) => "Plugin controls",
         View::Sessions(_) => "Sessions",
         View::Jobs(_) => "Jobs",
         View::Session(_, _) => "Conversation",
@@ -165,7 +166,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
                 51,
                 "ender_eye",
                 "Activation",
-                "Installed changes activate after server restart",
+                "Builds and restores activate without a restart",
                 None,
             );
         }
@@ -237,7 +238,16 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
                 .iter()
                 .zip(index.plugins.iter().skip(page.saturating_mul(28)).take(28))
             {
-                menu.button(*slot, "chest", &plugin.name, &format!("Revision: {}\nSize: {} bytes\nClick to restore the previous revision\nRestart required to activate", plugin.revision, plugin.artifact_bytes), Some(Action::Revert(plugin.name.clone())));
+                menu.button(
+                    *slot,
+                    "chest",
+                    &plugin.name,
+                    &format!(
+                        "Revision: {}\nSize: {} bytes\nClick to manage reload and restore",
+                        plugin.revision, plugin.artifact_bytes
+                    ),
+                    Some(Action::Open(View::Plugin(plugin.name.clone()))),
+                );
             }
             menu.pagination(
                 page,
@@ -245,6 +255,32 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
                 View::Plugins(page.saturating_sub(1)),
                 View::Plugins(page.saturating_add(1)),
             );
+        }
+        View::Plugin(plugin) => {
+            let index: PluginIndex = read_json(&storage::path("plugins.json"))?;
+            let entry = index
+                .plugins
+                .iter()
+                .find(|p| p.name == plugin)
+                .ok_or_else(|| anyhow::anyhow!("Plugin not found"))?;
+            menu.button(
+                20,
+                "emerald",
+                "Reload plugin",
+                &format!(
+                    "{}\nUnload and load the installed artifact\nPlayers stay connected",
+                    entry.name
+                ),
+                Some(Action::Activate(JobAction::Reload, plugin.clone())),
+            );
+            menu.button(
+                24,
+                "clock",
+                "Restore previous revision",
+                "Restore the previous artifact and reload it",
+                Some(Action::Activate(JobAction::Revert, plugin)),
+            );
+            menu.button(31, "paper", "Installed revision", &entry.revision, None);
         }
         View::Sessions(page) => {
             let mut sessions: Sessions = read_json(&storage::path("sessions.json"))?;
