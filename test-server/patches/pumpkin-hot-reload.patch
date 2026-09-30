@@ -1,0 +1,157 @@
+diff --git a/crates/pumpkin-util/src/permission.rs b/crates/pumpkin-util/src/permission.rs
+index 23b3de03f..3d3db39c0 100644
+--- a/crates/pumpkin-util/src/permission.rs
++++ b/crates/pumpkin-util/src/permission.rs
+@@ -160,6 +160,16 @@ impl PermissionRegistry {
+     pub fn has_permission(&self, node: &str) -> bool {
+         self.permissions.contains_key(node)
+     }
++
++    /// Removes every registered permission owned by a namespace.
++    ///
++    /// Player attachments are intentionally not touched so explicit grants survive a
++    /// plugin hot reload and become active again if the plugin re-registers the node.
++    pub fn unregister_namespace(&self, namespace: &str) {
++        let prefix = format!("{namespace}:");
++        self.permissions
++            .retain(|node, _| !node.starts_with(&prefix));
++    }
+ }
+ 
+ /// Storage for player permissions.
+@@ -452,3 +462,24 @@ impl<'de> Deserialize<'de> for PermissionLvl {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn unregister_namespace_only_removes_owned_permissions() {
++        let registry = PermissionRegistry::new();
++        for node in ["demo:command.one", "demo:command.two", "other:command.one"] {
++            registry
++                .register_permission(Permission::new(node, "test", PermissionDefault::Allow))
++                .expect("register permission");
++        }
++
++        registry.unregister_namespace("demo");
++
++        assert!(!registry.has_permission("demo:command.one"));
++        assert!(!registry.has_permission("demo:command.two"));
++        assert!(registry.has_permission("other:command.one"));
++    }
++}
+diff --git a/crates/pumpkin/src/plugin/api/context.rs b/crates/pumpkin/src/plugin/api/context.rs
+index ece138e98..0ab421780 100644
+--- a/crates/pumpkin/src/plugin/api/context.rs
++++ b/crates/pumpkin/src/plugin/api/context.rs
+@@ -248,6 +248,12 @@ impl Context {
+         self.reload_commands_for_everyone();
+     }
+ 
++    pub(crate) fn unregister_permissions(&self) {
++        self.permission_manager
++            .registry
++            .unregister_namespace(&self.metadata.name);
++    }
++
+     /// Reloads (resends) all commands for all currently online players.
+     pub fn reload_commands_for_everyone(&self) {
+         for world in self.server.worlds.load().iter() {
+diff --git a/crates/pumpkin/src/plugin/mod.rs b/crates/pumpkin/src/plugin/mod.rs
+index 6d596f148..7f4dbeecb 100644
+--- a/crates/pumpkin/src/plugin/mod.rs
++++ b/crates/pumpkin/src/plugin/mod.rs
+@@ -38,6 +38,10 @@ pub const PLUGIN_API_VERSION: u32 = 2;
+ 
+ const PLUGIN_DIR: &str = "./plugins";
+ 
++fn canonical_plugin_path(path: &Path) -> PathBuf {
++    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
++}
++
+ /// A trait for handling events dynamically.
+ ///
+ /// This trait allows for handling events of any type that implements the `Event` trait.
+@@ -324,6 +328,7 @@ impl PluginManager {
+                 match event.kind {
+                     EventKind::Modify(ModifyKind::Data(_)) | EventKind::Create(_) => {
+                         for path in event.paths {
++                            let path = canonical_plugin_path(&path);
+                             if path.extension().is_some_and(|ext| ext == "wasm") {
+                                 debug!("Detected change in plugin: {:?}", path);
+                                 // Give it a small delay to ensure file is completely written
+@@ -691,7 +696,7 @@ impl PluginManager {
+ 
+         for entry in std::fs::read_dir(path)? {
+             let entry = entry?;
+-            let path = entry.path();
++            let path = canonical_plugin_path(&entry.path());
+ 
+             if path.is_dir() {
+                 continue;
+@@ -913,6 +918,7 @@ impl PluginManager {
+         server: &Arc<Server>,
+         path: &Path,
+     ) -> Result<tokio::task::JoinHandle<()>, ManagerError> {
++        let path = canonical_plugin_path(path);
+         if !server.advanced_config.plugins.enabled {
+             return Err(ManagerError::LoaderError(LoaderError::RuntimeError(
+                 "Plugin system is disabled in configuration".to_string(),
+@@ -921,8 +927,8 @@ impl PluginManager {
+ 
+         let loaders = self.loaders.read().await.clone();
+         for loader in &loaders {
+-            if loader.can_load(path) {
+-                let (instance, metadata, loader_data) = loader.load(path).await?;
++            if loader.can_load(&path) {
++                let (instance, metadata, loader_data) = loader.load(&path).await?;
+ 
+                 let plugin_override = server.advanced_config.plugins.overrides.get(&metadata.name);
+ 
+@@ -941,7 +947,7 @@ impl PluginManager {
+                         .extension()
+                         .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+                 {
+-                    let wasm_bytes = std::fs::read(path).unwrap_or_default();
++                    let wasm_bytes = std::fs::read(&path).unwrap_or_default();
+                     if !crate::plugin::loader::wasm::wasm_host::signature::is_wasm_signed(
+                         &wasm_bytes,
+                     ) {
+@@ -958,7 +964,7 @@ impl PluginManager {
+                 let mut cache = cache::PermissionCache::load(&cache_path).await;
+ 
+                 let (allowed, _) = self
+-                    .check_permissions_cached(path, &metadata, &mut cache, &cache_path, server)
++                    .check_permissions_cached(&path, &metadata, &mut cache, &cache_path, server)
+                     .await;
+ 
+                 if !allowed {
+@@ -978,14 +984,14 @@ impl PluginManager {
+                         metadata,
+                         loader_data,
+                         loader.clone(),
+-                        path.to_path_buf(),
++                        path.clone(),
+                     )
+                     .await;
+             }
+         }
+ 
+         // No loader could handle this file, track it for future attempts
+-        self.unloaded_files.write().await.insert(path.to_path_buf());
++        self.unloaded_files.write().await.insert(path.clone());
+ 
+         Err(ManagerError::PluginNotFound(
+             path.to_string_lossy().to_string(),
+@@ -1098,6 +1104,7 @@ impl PluginManager {
+ 
+         self.unregister_handlers(name);
+         plugin.context.unregister_commands();
++        plugin.context.unregister_permissions();
+ 
+         if let Some(instance) = plugin.instance.take() {
+             instance.on_unload(plugin.context.clone()).await.ok();
