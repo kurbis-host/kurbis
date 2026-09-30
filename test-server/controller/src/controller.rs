@@ -9,11 +9,13 @@ use tokio::{fs, process::Command, time};
 use uuid::Uuid;
 use wasmparser::Validator;
 
+use vibe_protocol::{
+    JobAction, JobRequest, JobResult, JobState, PluginIndex, PluginIndexEntry, Progress, Session,
+    Sessions, Settings, Turn, validate_request,
+};
+
 use crate::{
     codex::{CodexOutcome, CodexRunner},
-    model::{
-        JobAction, JobRequest, JobResult, JobState, PluginIndex, PluginIndexEntry, validate_request,
-    },
     paths::RuntimePaths,
 };
 
@@ -139,6 +141,20 @@ impl Controller {
             serde_json::from_slice(&bytes).context("invalid job request JSON")?;
         validate_request(&request)?;
 
+        let cancel = self.paths.cancel().join(format!("{}.json", request.id));
+        if fs::try_exists(&cancel).await? {
+            fs::remove_file(cancel).await?;
+            self.write_result(JobResult {
+                id: request.id,
+                plugin: request.plugin,
+                state: JobState::Cancelled,
+                message: "Cancelled before execution".into(),
+                updated_unix_ms: now_ms(),
+            })
+            .await?;
+            return Ok(());
+        }
+
         self.write_result(JobResult {
             id: request.id,
             plugin: request.plugin.clone(),
@@ -149,20 +165,92 @@ impl Controller {
         .await?;
 
         match request.action {
-            JobAction::Code => self.process_code(request).await,
+            JobAction::Code | JobAction::Chat => self.process_code(request).await,
             JobAction::Revert => self.process_revert(request).await,
         }
     }
 
     async fn process_code(&self, request: JobRequest) -> anyhow::Result<()> {
         let plugin_dir = self.ensure_plugin_workspace(&request.plugin).await?;
-        let prompt = codex_prompt(&request.plugin, &request.player, &request.prompt);
+        let settings: Settings =
+            vibe_protocol::read_json(&self.paths.bridge_data().join("settings.json"))?;
+        settings.validate()?;
+        let session_path = self.paths.bridge_data().join("sessions.json");
+        let mut sessions: Sessions = vibe_protocol::read_json(&session_path)?;
+        let session_id = request.session_id.unwrap_or(request.id);
+        let resume = if request.session_id.is_some() {
+            let session = sessions
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == session_id)
+                .context("session not found")?;
+            anyhow::ensure!(
+                session.plugin == request.plugin && session.action == request.action,
+                "session workspace or mode mismatch"
+            );
+            let thread = session
+                .thread_id
+                .context("session has no resumable Codex thread")?;
+            session.turns.push(Turn {
+                job_id: request.id,
+                prompt: request.prompt.clone(),
+            });
+            session.updated_unix_ms = now_ms();
+            Some(thread)
+        } else {
+            sessions.sessions.push(Session {
+                id: session_id,
+                thread_id: None,
+                plugin: request.plugin.clone(),
+                player: request.player.clone(),
+                action: request.action.clone(),
+                title: request.prompt.chars().take(80).collect(),
+                turns: vec![Turn {
+                    job_id: request.id,
+                    prompt: request.prompt.clone(),
+                }],
+                updated_unix_ms: now_ms(),
+            });
+            None
+        };
+        vibe_protocol::write_json(&session_path, &sessions)?;
+        let prompt = if request.action == JobAction::Chat {
+            format!(
+                "Discuss this Pumpkin plugin request in the current workspace. Answer questions and plan changes, but do not modify files or build artifacts.\n\n{}",
+                request.prompt
+            )
+        } else {
+            codex_prompt(&request.plugin, &request.player, &request.prompt)
+        };
+        crate::progress::Recorder::new(&self.paths.bridge_data(), request.id)?.step(&format!(
+            "Workspace ready: {}; session {session_id}",
+            plugin_dir.display()
+        ))?;
 
-        let codex_outcome = match self
+        let run_result = self
             .codex
-            .run(&self.paths, request.id, &plugin_dir, &prompt)
-            .await
-        {
+            .run(
+                &self.paths,
+                request.id,
+                &plugin_dir,
+                &prompt,
+                resume,
+                &settings,
+                request.action == JobAction::Chat,
+            )
+            .await;
+        let progress: Progress = vibe_protocol::read_json(
+            &self
+                .paths
+                .bridge_data()
+                .join("progress")
+                .join(format!("{}.json", request.id)),
+        )?;
+        if let Some(session) = sessions.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.thread_id = resume.or(progress.thread_id);
+        }
+        vibe_protocol::write_json(&session_path, &sessions)?;
+        let codex_outcome = match run_result {
             Ok(outcome) => outcome,
             Err(error) => {
                 reset_plugin_workspace(&plugin_dir).await?;
@@ -186,6 +274,18 @@ impl Controller {
             CodexOutcome::Completed => {}
         }
 
+        if request.action == JobAction::Chat {
+            reset_plugin_workspace(&plugin_dir).await?;
+            self.write_result(JobResult {
+                id: request.id,
+                plugin: request.plugin,
+                state: JobState::Completed,
+                message: format!("chat completed; session {session_id}"),
+                updated_unix_ms: now_ms(),
+            })
+            .await?;
+            return Ok(());
+        }
         self.write_result(JobResult {
             id: request.id,
             plugin: request.plugin.clone(),
@@ -200,10 +300,15 @@ impl Controller {
             reset_plugin_workspace(&plugin_dir).await?;
             return Err(error);
         }
+        crate::progress::Recorder::new(&self.paths.bridge_data(), request.id)?
+            .step("WASM validated; installing artifact atomically")?;
         self.install_artifact(&request.plugin, &artifact).await?;
         let revision = git_commit(&plugin_dir, &request.id.to_string()).await?;
         self.archive_artifact(&request.plugin, &revision, &artifact)
             .await?;
+        crate::progress::Recorder::new(&self.paths.bridge_data(), request.id)?.step(&format!(
+            "Revision {revision} committed and artifact archived"
+        ))?;
         self.refresh_plugin_index().await?;
 
         self.write_result(JobResult {
@@ -254,11 +359,7 @@ impl Controller {
         fs::write(dir.join("Cargo.toml"), cargo_template(plugin)).await?;
         fs::write(dir.join("src/lib.rs"), TEMPLATE_LIB).await?;
         fs::write(dir.join("AGENTS.md"), agent_rules(plugin)).await?;
-        fs::write(
-            dir.join(".gitignore"),
-            "/target/\n.vibe-codex.log\n.vibe-last-message\n",
-        )
-        .await?;
+        fs::write(dir.join(".gitignore"), "/target/\n.vibe-last-message\n").await?;
 
         git_status(&dir, &["init"]).await?;
         git_status(&dir, &["add", "-A"]).await?;
@@ -313,7 +414,7 @@ impl Controller {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if crate::model::validate_plugin_name(&name).is_err() {
+            if vibe_protocol::validate_plugin_name(&name).is_err() {
                 continue;
             }
             let revision = match git_output(&entry.path(), &["rev-parse", "HEAD"]).await {
@@ -340,6 +441,8 @@ impl Controller {
     }
 
     async fn write_result(&self, result: JobResult) -> anyhow::Result<()> {
+        crate::progress::Recorder::new(&self.paths.bridge_data(), result.id)?
+            .step(&result.message)?;
         atomic_json_write(
             &self.paths.results().join(format!("{}.json", result.id)),
             &result,
@@ -498,256 +601,5 @@ fn now_ms() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn artifact_name_uses_rust_crate_normalization() {
-        let path = artifact_path(Path::new("/tmp/foo"), "hello-world");
-        assert!(path.ends_with("target/wasm32-wasip2/release/hello_world.wasm"));
-    }
-
-    #[test]
-    fn codex_prompt_keeps_request_as_data() {
-        let prompt = codex_prompt("demo", "Player", "add /hello");
-        assert!(prompt.contains("PLAYER REQUEST:\nadd /hello"));
-    }
-
-    #[tokio::test]
-    async fn plugin_index_only_lists_installed_artifacts() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let paths = RuntimePaths::new(temp.path());
-        paths.create_dirs().await.expect("runtime dirs");
-
-        let plugin_dir = paths.plugin_workspace("demo");
-        fs::create_dir_all(&plugin_dir).await.expect("plugin dir");
-        fs::write(plugin_dir.join("README.md"), "demo")
-            .await
-            .expect("plugin file");
-        git_status(&plugin_dir, &["init"]).await.expect("git init");
-        git_status(&plugin_dir, &["add", "-A"])
-            .await
-            .expect("git add");
-        git_status(
-            &plugin_dir,
-            &[
-                "-c",
-                "user.name=Pumpkin Vibe Test",
-                "-c",
-                "user.email=pumpkin-vibe-test@localhost",
-                "commit",
-                "-m",
-                "test fixture",
-            ],
-        )
-        .await
-        .expect("git commit");
-
-        let controller = Controller::new(paths.clone(), "true".into(), Duration::from_secs(1));
-        controller
-            .refresh_plugin_index()
-            .await
-            .expect("refresh empty index");
-        let index: PluginIndex =
-            serde_json::from_slice(&fs::read(paths.plugin_index()).await.expect("empty index"))
-                .expect("parse empty index");
-        assert!(index.plugins.is_empty());
-
-        fs::write(paths.installed_plugin("demo"), b"wasm")
-            .await
-            .expect("deployed artifact");
-        controller
-            .refresh_plugin_index()
-            .await
-            .expect("refresh deployed index");
-        let index: PluginIndex = serde_json::from_slice(
-            &fs::read(paths.plugin_index())
-                .await
-                .expect("deployed index"),
-        )
-        .expect("parse deployed index");
-        assert_eq!(index.plugins.len(), 1);
-        assert_eq!(index.plugins[0].name, "demo");
-        assert_eq!(index.plugins[0].artifact_bytes, 4);
-    }
-
-    #[tokio::test]
-    async fn reset_plugin_workspace_discards_failed_job_changes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let plugin_dir = temp.path().join("plugin");
-        fs::create_dir_all(&plugin_dir).await.expect("plugin dir");
-        fs::write(plugin_dir.join("tracked.txt"), "known good")
-            .await
-            .expect("tracked file");
-        git_status(&plugin_dir, &["init"]).await.expect("git init");
-        git_status(&plugin_dir, &["add", "-A"])
-            .await
-            .expect("git add");
-        git_status(
-            &plugin_dir,
-            &[
-                "-c",
-                "user.name=Pumpkin Vibe Test",
-                "-c",
-                "user.email=pumpkin-vibe-test@localhost",
-                "commit",
-                "-m",
-                "known good",
-            ],
-        )
-        .await
-        .expect("git commit");
-
-        fs::write(plugin_dir.join("tracked.txt"), "failed change")
-            .await
-            .expect("modify tracked file");
-        fs::write(plugin_dir.join("untracked.txt"), "partial output")
-            .await
-            .expect("untracked file");
-
-        reset_plugin_workspace(&plugin_dir)
-            .await
-            .expect("reset workspace");
-
-        assert_eq!(
-            fs::read_to_string(plugin_dir.join("tracked.txt"))
-                .await
-                .expect("tracked content"),
-            "known good"
-        );
-        assert!(
-            !fs::try_exists(plugin_dir.join("untracked.txt"))
-                .await
-                .expect("untracked existence")
-        );
-        assert!(
-            git_output(&plugin_dir, &["status", "--porcelain"])
-                .await
-                .expect("git status")
-                .is_empty()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn installation_and_revert_stage_revisions_and_reject_invalid_updates() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let paths = RuntimePaths::new(temp.path().join("runtime"));
-        paths.create_dirs().await.expect("runtime");
-        let worker = temp.path().join("worker");
-        fs::write(
-            &worker,
-            r#"#!/bin/sh
-cd "$2" || exit 1
-cat > job.txt
-mkdir -p target/wasm32-wasip2/release
-printf '\000asm\015\000\001\000' > target/wasm32-wasip2/release/demo.wasm
-"#,
-        )
-        .await
-        .expect("worker");
-        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
-            .expect("executable worker");
-        let controller = Controller::new(
-            paths.clone(),
-            worker.to_string_lossy().into_owned(),
-            Duration::from_secs(5),
-        );
-
-        async fn submit(
-            controller: &Controller,
-            paths: &RuntimePaths,
-            action: JobAction,
-            prompt: &str,
-        ) -> JobResult {
-            let request = JobRequest {
-                id: Uuid::new_v4(),
-                plugin: "demo".into(),
-                action,
-                prompt: prompt.into(),
-                player: "Operator".into(),
-                created_unix_ms: now_ms(),
-            };
-            atomic_json_write(
-                &paths.requests().join(format!("{}.json", request.id)),
-                &request,
-            )
-            .await
-            .expect("queue job");
-            let _ = controller.run_once().await;
-            serde_json::from_slice(
-                &fs::read(paths.results().join(format!("{}.json", request.id)))
-                    .await
-                    .expect("result"),
-            )
-            .expect("parse result")
-        }
-
-        let first = submit(&controller, &paths, JobAction::Code, "first version").await;
-        assert_eq!(first.state, JobState::Installed);
-        assert!(first.message.contains("restart Pumpkin to activate"));
-        let plugin = paths.plugin_workspace("demo");
-        let first_revision = git_output(&plugin, &["rev-parse", "HEAD"])
-            .await
-            .expect("revision");
-        let first_bytes = fs::read(paths.installed_plugin("demo"))
-            .await
-            .expect("installed");
-        let second = submit(&controller, &paths, JobAction::Code, "second version").await;
-        assert_eq!(second.state, JobState::Installed);
-        assert_ne!(
-            git_output(&plugin, &["rev-parse", "HEAD"])
-                .await
-                .expect("revision"),
-            first_revision
-        );
-        let reverted = submit(&controller, &paths, JobAction::Revert, "").await;
-        assert_eq!(reverted.state, JobState::Installed);
-        assert!(reverted.message.contains("restart Pumpkin to activate"));
-        assert_eq!(
-            git_output(&plugin, &["rev-parse", "HEAD"])
-                .await
-                .expect("revision"),
-            first_revision
-        );
-        assert_eq!(
-            fs::read(paths.installed_plugin("demo"))
-                .await
-                .expect("restored"),
-            first_bytes
-        );
-
-        fs::write(
-            &worker,
-            r#"#!/bin/sh
-cd "$2" || exit 1
-cat > job.txt
-printf broken > target/wasm32-wasip2/release/demo.wasm
-"#,
-        )
-        .await
-        .expect("invalid worker");
-        let failed = submit(&controller, &paths, JobAction::Code, "invalid version").await;
-        assert_eq!(failed.state, JobState::Failed);
-        assert_eq!(
-            fs::read(paths.installed_plugin("demo"))
-                .await
-                .expect("preserved"),
-            first_bytes
-        );
-        assert_eq!(
-            git_output(&plugin, &["rev-parse", "HEAD"])
-                .await
-                .expect("revision"),
-            first_revision
-        );
-        assert!(
-            git_output(&plugin, &["status", "--porcelain"])
-                .await
-                .expect("clean")
-                .is_empty()
-        );
-    }
-}
+#[path = "controller_tests.rs"]
+mod tests;

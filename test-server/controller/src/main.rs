@@ -12,7 +12,7 @@ struct Args {
     #[arg(long, default_value = "codex")]
     codex: String,
 
-    #[arg(long, default_value_t = 900)]
+    #[arg(long, default_value_t = 3600)]
     timeout_seconds: u64,
 
     #[arg(long)]

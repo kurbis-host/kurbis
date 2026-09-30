@@ -1,0 +1,11 @@
+/target/
+/web/.next/
+/web/node_modules/
+/web/*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store
+/data/
+Cargo.lock
+

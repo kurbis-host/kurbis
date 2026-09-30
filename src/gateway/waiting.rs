@@ -1,0 +1,283 @@
+use std::{collections::HashMap, time::Duration};
+
+use anyhow::Result;
+use tokio::time::{Instant, sleep};
+use uuid::Uuid;
+
+use crate::{
+    config::GatewayConfig,
+    gateway::{routes::RouteCache, wake::request_wake},
+    model::{ObservedState, RouteTarget},
+    pumpkin_control::{PlayerEdition, PumpkinControl, WaitingPlayer},
+};
+
+struct WaitingState {
+    startup_since: Option<Instant>,
+    last_notice: Option<String>,
+    last_wake: Option<Instant>,
+    transfer_sent: bool,
+}
+
+impl WaitingState {
+    fn new() -> Self {
+        Self {
+            startup_since: None,
+            last_notice: None,
+            last_wake: None,
+            transfer_sent: false,
+        }
+    }
+
+    fn startup_timed_out(
+        &mut self,
+        observed: ObservedState,
+        now: Instant,
+        limit: Duration,
+    ) -> bool {
+        if observed == ObservedState::Queued {
+            // Capacity waiting has no startup deadline. Give the actual
+            // restore/start flow its full budget when admission succeeds.
+            self.startup_since = None;
+            return false;
+        }
+        let since = self.startup_since.get_or_insert(now);
+        now.duration_since(*since) >= limit
+    }
+}
+
+pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
+    let control = PumpkinControl::new(config.waiting_control_token.clone());
+    control.status(&config.waiting_control_socket).await?;
+    tracing::info!(
+        control_socket = %config.waiting_control_socket.display(),
+        bedrock_listen = %config.bedrock_listen,
+        "waiting Pumpkin gateway is ready for Java and Bedrock players"
+    );
+
+    let mut states = HashMap::<Uuid, WaitingState>::new();
+    loop {
+        match control.players(&config.waiting_control_socket).await {
+            Ok(players) => {
+                let present = players
+                    .iter()
+                    .map(|player| player.id)
+                    .collect::<std::collections::HashSet<_>>();
+                states.retain(|id, _| present.contains(id));
+                for player in players {
+                    let state = states.entry(player.id).or_insert_with(WaitingState::new);
+                    if let Err(error) =
+                        handle_player(&config, &routes, &control, &player, state).await
+                    {
+                        tracing::warn!(player_id = %player.id, ?error, "failed to route waiting player");
+                    }
+                }
+            }
+            Err(error) => tracing::error!(?error, "failed to query waiting Pumpkin players"),
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn handle_player(
+    config: &GatewayConfig,
+    routes: &RouteCache,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+) -> Result<()> {
+    if state.transfer_sent {
+        return Ok(());
+    }
+    let Some(target) = routes.resolve(&player.server_address).await? else {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Unknown or deleted server address.",
+            )
+            .await?;
+        return Ok(());
+    };
+
+    if target.account_suspended {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Server suspended. Contact the hosting operator.",
+            )
+            .await?;
+        return Ok(());
+    }
+
+    if target.state == ObservedState::Failed {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Server failed to start. Retry it from the panel.",
+            )
+            .await?;
+        return Ok(());
+    }
+    if target.worker_healthy == Some(false)
+        && matches!(
+            target.state,
+            ObservedState::Online
+                | ObservedState::Restoring
+                | ObservedState::Starting
+                | ObservedState::Stopping
+                | ObservedState::Snapshotting
+        )
+    {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Server is temporarily unavailable because its assigned worker is unreachable.",
+            )
+            .await?;
+        return Ok(());
+    }
+
+    if target.state == ObservedState::Online {
+        return transfer(config, control, player, state, &target).await;
+    }
+
+    if matches!(
+        target.state,
+        ObservedState::Sleeping
+            | ObservedState::Queued
+            | ObservedState::Stopping
+            | ObservedState::Snapshotting
+    ) && state
+        .last_wake
+        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+    {
+        request_wake(config, &player.server_address).await?;
+        state.last_wake = Some(Instant::now());
+    }
+
+    let notice = notice_for(target.state);
+    if state.last_notice.as_deref() != Some(notice) {
+        control
+            .message(&config.waiting_control_socket, player.id, notice)
+            .await?;
+        state.last_notice = Some(notice.to_owned());
+    }
+
+    if state.startup_timed_out(target.state, Instant::now(), config.wake_timeout) {
+        control
+            .kick(
+                &config.waiting_control_socket,
+                player.id,
+                "Server is taking too long to start. Please reconnect shortly.",
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn transfer(
+    config: &GatewayConfig,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+    target: &RouteTarget,
+) -> Result<()> {
+    let host = target
+        .worker_address
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("online route has no worker address"))?;
+    let port = transfer_port(target, player.edition)
+        .ok_or_else(|| anyhow::anyhow!("online route has no port for player edition"))?;
+    control
+        .transfer(&config.waiting_control_socket, player.id, host, port)
+        .await?;
+    state.transfer_sent = true;
+    tracing::info!(
+        player_id = %player.id,
+        player_name = %player.name,
+        edition = ?player.edition,
+        %host,
+        port,
+        "transferred waiting player to ready backend"
+    );
+    Ok(())
+}
+
+fn notice_for(state: ObservedState) -> &'static str {
+    match state {
+        ObservedState::Queued => "Queued for capacity — your place is reserved.",
+        ObservedState::Restoring => "Restoring your world…",
+        ObservedState::Starting => "Starting your server…",
+        ObservedState::Stopping | ObservedState::Snapshotting => "Saving before restart…",
+        ObservedState::Sleeping => "Waking your server…",
+        _ => "Preparing your server…",
+    }
+}
+
+fn transfer_port(target: &RouteTarget, edition: PlayerEdition) -> Option<u16> {
+    match edition {
+        PlayerEdition::Java => target.java_port,
+        PlayerEdition::Bedrock => target.bedrock_port,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_queue_does_not_consume_the_restore_start_timeout() {
+        let mut state = WaitingState::new();
+        let now = Instant::now();
+        let limit = Duration::from_secs(90);
+        assert!(!state.startup_timed_out(ObservedState::Sleeping, now, limit));
+        assert!(!state.startup_timed_out(ObservedState::Queued, now + limit, limit));
+        let admitted = now + Duration::from_secs(600);
+        assert!(!state.startup_timed_out(ObservedState::Restoring, admitted, limit));
+        assert!(!state.startup_timed_out(
+            ObservedState::Starting,
+            admitted + limit - Duration::from_secs(1),
+            limit
+        ));
+        assert!(state.startup_timed_out(ObservedState::Starting, admitted + limit, limit));
+        assert!(!state.startup_timed_out(ObservedState::Queued, admitted + limit, limit));
+        assert!(!state.startup_timed_out(ObservedState::Restoring, admitted + limit * 2, limit));
+    }
+
+    fn online_target() -> RouteTarget {
+        RouteTarget {
+            server_id: Uuid::new_v4(),
+            subdomain: "melon".into(),
+            state: ObservedState::Online,
+            account_suspended: false,
+            worker_healthy: Some(true),
+            worker_valid_until: None,
+            worker_address: Some("203.0.113.10".into()),
+            java_port: Some(25570),
+            bedrock_port: Some(19140),
+        }
+    }
+
+    #[test]
+    fn transfer_uses_the_edition_specific_backend_port() {
+        let target = online_target();
+        assert_eq!(transfer_port(&target, PlayerEdition::Java), Some(25570));
+        assert_eq!(transfer_port(&target, PlayerEdition::Bedrock), Some(19140));
+    }
+
+    #[test]
+    fn waiting_notices_distinguish_queue_restore_and_start() {
+        assert_eq!(
+            notice_for(ObservedState::Queued),
+            "Queued for capacity — your place is reserved."
+        );
+        assert_eq!(
+            notice_for(ObservedState::Restoring),
+            "Restoring your world…"
+        );
+        assert_eq!(notice_for(ObservedState::Starting), "Starting your server…");
+    }
+}

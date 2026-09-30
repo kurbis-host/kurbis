@@ -488,7 +488,19 @@ dependencies = [
 name = "vibe-bridge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "pumpkin-plugin-api",
+ "serde",
+ "serde_json",
+ "uuid",
+ "vibe-protocol",
+]
+
+[[package]]
+name = "vibe-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
  "uuid",

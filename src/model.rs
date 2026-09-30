@@ -1,0 +1,217 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::Type;
+use uuid::Uuid;
+
+pub const SERVER_MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+pub const SERVER_STORAGE_BYTES: i64 = 5 * 1024 * 1024 * 1024;
+pub const SERVER_CPU_MILLIS: i64 = 1000;
+pub const DEFAULT_IDLE_SECONDS: i64 = 5 * 60;
+pub const SNAPSHOT_RETENTION_GENERATIONS: i64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "server_desired_state", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum DesiredState {
+    Running,
+    Stopped,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "server_observed_state", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedState {
+    Sleeping,
+    Queued,
+    Restoring,
+    Starting,
+    Online,
+    Stopping,
+    Snapshotting,
+    Failed,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "operation_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Start,
+    Stop,
+    Restart,
+    Snapshot,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "operation_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "snapshot_reason", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotReason {
+    Periodic,
+    Shutdown,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ServerRecord {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub subdomain: String,
+    pub desired_state: DesiredState,
+    pub observed_state: ObservedState,
+    pub settings: serde_json::Value,
+    pub storage_bytes: i64,
+    pub generation: i64,
+    pub current_snapshot_generation: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WorkerRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub address: String,
+    pub total_memory_bytes: i64,
+    pub total_disk_bytes: i64,
+    pub total_cpu_millis: i64,
+    pub reserved_memory_bytes: i64,
+    pub reserved_disk_bytes: i64,
+    pub reserved_cpu_millis: i64,
+    pub heartbeat_at: DateTime<Utc>,
+    pub draining: bool,
+    pub port_min: i32,
+    pub port_max: i32,
+}
+
+impl WorkerRecord {
+    pub fn can_fit(&self) -> bool {
+        !self.draining
+            && self.total_memory_bytes - self.reserved_memory_bytes >= SERVER_MEMORY_BYTES
+            && self.total_disk_bytes - self.reserved_disk_bytes >= SERVER_STORAGE_BYTES
+            && self.total_cpu_millis - self.reserved_cpu_millis >= SERVER_CPU_MILLIS
+            && self.port_max - self.port_min >= 2
+    }
+
+    pub fn score(&self, cached_snapshot: bool) -> i128 {
+        let memory_after =
+            self.total_memory_bytes - self.reserved_memory_bytes - SERVER_MEMORY_BYTES;
+        let disk_after = self.total_disk_bytes - self.reserved_disk_bytes - SERVER_STORAGE_BYTES;
+        let cache_bonus: i128 = if cached_snapshot { 1_i128 << 62 } else { 0 };
+        cache_bonus
+            - i128::from(memory_after / (1024 * 1024))
+            - i128::from(disk_after / (1024 * 1024))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PlacementRecord {
+    pub server_id: Uuid,
+    pub worker_id: Uuid,
+    pub generation: i64,
+    pub lease_token: Uuid,
+    pub java_port: i32,
+    pub bedrock_port: i32,
+    pub active: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OperationRecord {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub worker_id: Option<Uuid>,
+    pub kind: OperationKind,
+    pub status: OperationStatus,
+    pub generation: i64,
+    pub attempt: i32,
+    pub payload: serde_json::Value,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SnapshotRecord {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub generation: i64,
+    pub manifest_key: String,
+    pub size_bytes: i64,
+    pub checksum: String,
+    pub reason: SnapshotReason,
+    pub complete: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTarget {
+    pub server_id: Uuid,
+    pub subdomain: String,
+    pub state: ObservedState,
+    pub account_suspended: bool,
+    pub worker_healthy: Option<bool>,
+    pub worker_valid_until: Option<DateTime<Utc>>,
+    pub worker_address: Option<String>,
+    pub java_port: Option<u16>,
+    pub bedrock_port: Option<u16>,
+}
+
+pub fn validate_subdomain(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || bytes.len() > 32 || bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subdomain_validation_is_strict_and_dns_safe() {
+        assert!(validate_subdomain("melon-42"));
+        assert!(!validate_subdomain("ab"));
+        assert!(!validate_subdomain("UPPER"));
+        assert!(!validate_subdomain("-edge"));
+        assert!(!validate_subdomain("edge-"));
+        assert!(!validate_subdomain("edge.example"));
+    }
+
+    #[test]
+    fn cached_worker_wins_bin_pack_score() {
+        let now = Utc::now();
+        let worker = WorkerRecord {
+            id: Uuid::new_v4(),
+            name: "w".into(),
+            address: "127.0.0.1".into(),
+            total_memory_bytes: 16 * 1024 * 1024 * 1024,
+            total_disk_bytes: 100 * 1024 * 1024 * 1024,
+            total_cpu_millis: 8000,
+            reserved_memory_bytes: 0,
+            reserved_disk_bytes: 0,
+            reserved_cpu_millis: 0,
+            heartbeat_at: now,
+            draining: false,
+            port_min: 20000,
+            port_max: 30000,
+        };
+        assert!(worker.score(true) > worker.score(false));
+    }
+}
