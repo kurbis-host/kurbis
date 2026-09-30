@@ -10,12 +10,24 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::model::ObservedState;
+
 use super::{ApiError, AppState, auth, internal::authenticated_user};
 
 #[derive(Debug, Serialize)]
 pub struct Account {
     pub identities: Vec<AccountIdentity>,
     pub sessions: Vec<AccountSession>,
+    pub worlds: Vec<AccountWorld>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AccountWorld {
+    pub id: Uuid,
+    pub subdomain: String,
+    pub observed_state: ObservedState,
+    pub is_default: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -72,10 +84,67 @@ pub(super) async fn account(
         current: current_hash.as_deref() == Some(session.token_hash.as_slice()),
     })
     .collect();
+    let worlds = sqlx::query_as::<_, AccountWorld>(
+        "SELECT id, subdomain, observed_state, is_default, created_at
+         FROM servers WHERE owner_id = $1 AND desired_state <> 'deleted'
+         ORDER BY is_default DESC, created_at, id",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
     Ok(Json(Account {
         identities,
         sessions,
+        worlds,
     }))
+}
+
+pub(super) async fn make_default_world(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = authenticated_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let account_status: Option<String> =
+        sqlx::query_scalar("SELECT account_status FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if account_status.as_deref() != Some("active") {
+        return Err(ApiError::with_code(
+            StatusCode::FORBIDDEN,
+            "account_suspended",
+            "account is suspended",
+        ));
+    }
+    let owned_world: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM servers
+         WHERE id = $1 AND owner_id = $2 AND desired_state <> 'deleted'
+         FOR UPDATE",
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned_world.is_none() {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "world_not_found",
+            "world not found",
+        ));
+    }
+
+    sqlx::query("UPDATE servers SET is_default = false WHERE owner_id = $1 AND is_default")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE servers SET is_default = true WHERE id = $1")
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn revoke_session(

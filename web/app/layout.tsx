@@ -2,8 +2,11 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-	title: "kurbis — Minecraft hosting",
-	description: "A small, fast control panel for your Pumpkin server.",
+	title: {
+		default: "kurbis — Minecraft hosting that sleeps",
+		template: "%s · kurbis",
+	},
+	description: "A Minecraft server that wakes when friends join, sleeps when they leave, and snapshots the world in between.",
 };
 
 export default function RootLayout({
@@ -12,7 +15,7 @@ export default function RootLayout({
 	children: React.ReactNode;
 }>) {
 	return (
-		<html lang="en">
+		<html lang="en" data-scroll-behavior="smooth">
 			<body>{children}</body>
 		</html>
 	);

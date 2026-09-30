@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use reqwest::Client;
 use serde::Serialize;
@@ -146,6 +146,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/session", get(session::session))
         .route("/api/v1/account", get(account::account))
+        .route(
+            "/api/v1/account/worlds/{server_id}/default",
+            put(account::make_default_world),
+        )
         .route(
             "/api/v1/account/sessions/{session_id}",
             axum::routing::delete(account::revoke_session),

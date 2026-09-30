@@ -131,6 +131,32 @@ pub(super) async fn create_server(
         ));
     }
     input.settings.validate()?;
+    let mut tx = state.pool.begin().await?;
+    let account_status: Option<String> =
+        sqlx::query_scalar("SELECT account_status FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if account_status.as_deref() != Some("active") {
+        return Err(ApiError::with_code(
+            StatusCode::FORBIDDEN,
+            "account_suspended",
+            "account is suspended",
+        ));
+    }
+    let has_server: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE owner_id = $1 AND desired_state <> 'deleted')",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_server {
+        return Err(ApiError::with_code(
+            StatusCode::CONFLICT,
+            "account_has_server",
+            "this account already has a hosted world",
+        ));
+    }
     let result = sqlx::query_as::<_, ServerRecord>(
         "INSERT INTO servers(id, owner_id, subdomain, settings)
          VALUES($1,$2,$3,$4)
@@ -141,11 +167,12 @@ pub(super) async fn create_server(
     .bind(user.id)
     .bind(&input.subdomain)
     .bind(input.settings.into_stored())
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await;
     let server = result.map_err(|error| {
         mutation_error(error, "account already has a server or subdomain is taken")
     })?;
+    tx.commit().await?;
     let view = server_view(&state.pool, server, &state.config.root_domain).await?;
     Ok((StatusCode::CREATED, Json(view)))
 }
@@ -167,7 +194,8 @@ pub(super) async fn update_server(
     let current = sqlx::query_as::<_, ServerRecord>(
         "SELECT id, owner_id, subdomain, desired_state, observed_state, settings, storage_bytes,
                 generation, current_snapshot_generation, last_error, created_at, updated_at
-         FROM servers WHERE owner_id = $1 FOR UPDATE",
+         FROM servers WHERE owner_id = $1
+         ORDER BY is_default DESC, created_at, id LIMIT 1 FOR UPDATE",
     )
     .bind(user.id)
     .fetch_optional(&mut *tx)
