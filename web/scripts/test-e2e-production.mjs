@@ -29,7 +29,9 @@ function run(args, extraEnv = {}) {
 
 try {
   run(["run", "build"]);
-  run(["run", "test:e2e", "--", ...process.argv.slice(2)], {
+  const testArgs = process.argv.slice(2);
+  if (testArgs[0] === "--") testArgs.shift();
+  run(["exec", "playwright", "test", ...testArgs], {
     E2E_NEXT_MODE: "production",
   });
 } finally {

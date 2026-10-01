@@ -30,13 +30,14 @@ async function snapshotWorldFile(serverId: string, generation: number) {
     [serverId, generation],
   );
   if (!result.rowCount) return null;
-  const manifest = JSON.parse(await readFile(path.join(objectStoreRoot, result.rows[0].manifest_key), 'utf8'));
+  const serverStore = path.join(objectStoreRoot, "servers", serverId);
+  const manifest = JSON.parse(await readFile(path.join(serverStore, result.rows[0].manifest_key), 'utf8'));
   const file = manifest.files.find((entry: { path: string }) => entry.path === 'world/level.dat');
   return file
-    ? readFile(path.join(objectStoreRoot, 'chunks', file.blake3), 'utf8')
+    ? readFile(path.join(serverStore, 'chunks', file.blake3), 'utf8')
     : null;
 }
-async function captureResponsive(page: Page, route: string, name = route === '/' ? 'landing' : route.replaceAll('/', '-')) {
+async function captureResponsive(page: Page, route: string, name = route === '/' ? 'landing' : route.replaceAll('/', '-'), compareVisual = false, snapshotName = name) {
   for (const width of [1440, 820, 390]) {
     await page.setViewportSize({ width, height: 1000 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${route} at ${width}px`).toBeTruthy();
@@ -54,7 +55,24 @@ async function captureResponsive(page: Page, route: string, name = route === '/'
       expect(metrics.links.every(Boolean), `${route} links are visible at ${width}px`).toBeTruthy();
     }
     await capture(page, `${name}-${width}.png`);
+    if (compareVisual && (width === 1440 || width === 390)) {
+      await page.addStyleTag({ content: "time { visibility: hidden !important; }" });
+      await expect(page).toHaveScreenshot(`${snapshotName.replaceAll('/', '-')}-${width}.png`, {
+        fullPage: true,
+        animations: 'disabled',
+        caret: 'hide',
+        maxDiffPixelRatio: 0.01,
+      });
+    }
   }
+}
+function visualRouteName(route: string) {
+  if (route.endsWith('/console')) return 'console';
+  if (route.endsWith('/backups')) return 'backups';
+  if (route.endsWith('/players')) return 'players';
+  if (route.endsWith('/settings')) return 'settings';
+  if (route === '/app/account') return 'account';
+  return 'overview';
 }
 async function command(request: APIRequestContext, name: string, data?: unknown) {
   const response = await request.post(`${fixture}/fixture/${name}`, { data });
@@ -152,7 +170,23 @@ async function resetFromSettings(page: Page, request: APIRequestContext, id: str
     return result.rows[0]?.observed_state;
   }).toBe('resetting');
   const result = await command(request, 'tick');
-  expect((await result.json()).operation).toBe('reset');
+  const resultBody = await result.text();
+  if (!result.headers()['content-type']?.includes('application/json')) {
+    const diagnostics = await pool.query(
+      `SELECT s.generation, s.current_snapshot_generation, s.storage_bytes,
+              op.created_at AS operation_created_at,
+              snap.generation AS snapshot_generation, snap.size_bytes,
+              snap.reason, snap.complete, snap.created_at AS snapshot_created_at
+       FROM servers s
+       LEFT JOIN operations op ON op.server_id = s.id AND op.kind = 'reset'
+       LEFT JOIN snapshots snap ON snap.server_id = s.id AND snap.reason = 'reset'
+       WHERE s.id = $1
+       ORDER BY op.created_at DESC NULLS LAST, snap.generation DESC NULLS LAST`,
+      [id],
+    );
+    throw new Error(`fixture tick failed: ${resultBody}; diagnostics=${JSON.stringify(diagnostics.rows)}`);
+  }
+  expect((JSON.parse(resultBody) as { operation: string }).operation).toBe('reset');
   await expect.poll(async () => {
     const state = await pool.query('SELECT observed_state FROM servers WHERE id = $1', [id]);
     const operation = await pool.query(
@@ -176,7 +210,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   const publicAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (publicAudit.violations.length) axeResults['/'] = publicAudit.violations;
-  await captureResponsive(page, '/');
+  await captureResponsive(page, '/', 'landing', true);
   await page.goto('/login');
   await expect(page.getByRole('link', { name: 'Continue with Google' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Continue with Discord' })).toBeVisible();
@@ -187,7 +221,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await expect(page).toHaveURL(/\/app\/setup$/);
   const setupAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (setupAudit.violations.length) axeResults['/app/setup'] = setupAudit.violations;
-  await captureResponsive(page, '/app/setup');
+  await captureResponsive(page, '/app/setup', 'setup', true);
   await create(page, 'accessible-world');
   const routes = [
     await serverRoute(page),
@@ -202,7 +236,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
     await expect(page.getByRole('main')).toBeVisible();
     const audit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
     if (audit.violations.length) axeResults[route] = audit.violations;
-    await captureResponsive(page, route, `routes/${route.replaceAll('/', '-')}`);
+    await captureResponsive(page, route, `routes/${route.replaceAll('/', '-')}`, route !== '/app/account', visualRouteName(route));
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
   await expect(page.getByText('Live updates connected')).toBeVisible();
@@ -241,7 +275,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Queued');
   const queuedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (queuedAudit.violations.length) axeResults['/app?state=queued'] = queuedAudit.violations;
-  await captureResponsive(page, await serverRoute(page), 'states/queued');
+  await captureResponsive(page, await serverRoute(page), 'states/queued', true);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await state(page, 'Sleeping');
   await command(request, 'capacity', { available: true });
@@ -252,7 +286,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Online');
   const onlineAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (onlineAudit.violations.length) axeResults['/app?state=online'] = onlineAudit.violations;
-  await captureResponsive(page, await serverRoute(page), 'states/online');
+  await captureResponsive(page, await serverRoute(page), 'states/online', true);
   await pool.query(
     "UPDATE servers SET observed_state = 'failed', last_error = $1 WHERE subdomain = $2",
     ['Fixture visual state: readiness timed out', 'accessible-world'],
@@ -260,7 +294,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Needs attention');
   const failedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (failedAudit.violations.length) axeResults['/app?state=failed'] = failedAudit.violations;
-  await captureResponsive(page, await serverRoute(page), 'states/failed');
+  await captureResponsive(page, await serverRoute(page), 'states/failed', true);
   await testInfo.attach('axe-route-results.json', {
     body: Buffer.from(JSON.stringify(axeResults, null, 2)),
     contentType: 'application/json',
@@ -378,9 +412,13 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await page.goto(await serverRoute(page));
   await page.getByRole('button', { name: 'Restart', exact: true }).click();
   await state(page, 'Stopping');
-  await command(request, 'tick');
-  await command(request, 'tick');
-  await command(request, 'tick');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const tick = await command(request, 'tick');
+    const body = await tick.text();
+    if (!body.trim().startsWith('{')) {
+      throw new Error(`fixture restart tick ${attempt + 1} failed: ${body}`);
+    }
+  }
   await page.reload();
   await state(page, 'Online');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();

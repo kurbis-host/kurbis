@@ -10,6 +10,7 @@ const authPaths = [
   "/auth/discord/link",
   "/auth/discord/callback",
   "/auth/minecraft/redeem",
+  "/auth/server/redeem",
   "/auth/logout",
 ];
 const isProduction = process.env.NODE_ENV === "production";

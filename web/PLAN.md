@@ -22,6 +22,7 @@ The v1 product includes lifecycle management, connection details, live state, lo
     - /app/players — current online players plus persistent whitelist management.
     - /app/settings — address and curated Pumpkin settings with explicit dirty state, validation, sleeping-state restrictions, and clear “stop to edit” affordances.
     - /app/account — linked Google, Discord, Java, and Bedrock identities; explicit provider linking; browser-session listing/revocation; preserved-world/default-world selection; account state, service limits, and logout.
+- Support the in-game server-only entry point separately from account login. `/auth/server` reads the one-use token from the URL fragment, removes it from the address bar, and redeems it with a same-origin POST. `/manage/{serverId}` opens only the linked server panel with a distinct one-hour server session; this session does not sign into an account and cannot access account routes or another server.
 - Make every lifecycle state a first-class designed state: sleeping, queued, restoring, starting, online, stopping, snapshotting, failed, deleted. Show useful stage-specific language and actions rather than a generic spinner.
 - Failure states expose a stable user-facing error explanation, retry/recovery action where applicable, and expandable technical detail.
 - Preserve drafts across live server updates by keeping server state and form state separate.
@@ -73,10 +74,11 @@ Public contracts:
 - PUT /api/v1/account/worlds/{server_id}/default
 - DELETE /api/v1/account/sessions/{session_id}
 - POST /auth/minecraft/redeem (same-origin only; GET requests never mutate account state)
+- POST /auth/server/redeem (same-origin only; one-use token exchange for a one-hour session scoped to one server)
 
 Create explicit serializable DTOs for Session, Server, ServerSettings, LifecycleStatus, Operation, Snapshot, PlayerPresence, WhitelistEntry, LogEntry, and discriminated ServerEvent variants. Stop returning raw settings JSON and unstructured lifecycle errors.
 
-Every per-server route and event stream requires an active account session and checks that the account owns the path's server ID.
+Every per-server route and event stream checks that the caller may access the path's server ID. An account session must be active and own that server; a server-only session is limited to its one server and never authenticates account routes. Worker capabilities are service credentials, not browser sessions, and are valid only for the worker's current placement. API and PostgreSQL authorization both enforce the worker's assigned-server scope.
 
 Extend the server response with timestamps, current operation/stage, latest snapshot metadata, player count, storage limits/usage, and structured error information.
 
@@ -98,6 +100,8 @@ Emit or trigger PostgreSQL notifications for server state, logs, operations, sna
 - Expand Playwright into complete user journeys: public landing → OAuth → onboarding → start/queue/restore/online → live logs → players/whitelist → settings → backup → restore → restart/stop → deletion → logout.
 - Preserve browser security assertions for OAuth state binding, explicit provider linking, secure renewable cookies, session revocation, replay rejection, user isolation, and address conflicts.
 - Cover Java and Bedrock Minecraft login redemption for signed-in and signed-out users, token expiry/reuse, cross-origin POST rejection, and rejection of unauthenticated or forged game identities.
+- Cover server-only login redemption, fragment removal before the same-origin POST, one-use and 15-minute token expiry, the distinct one-hour cookie, account-route denial, cross-server denial, and deleted-server recovery states.
+- Verify worker identity comes from its unique credential, not request fields; test cross-worker capability denial, placement reassignment, database permission boundaries, credential provisioning/rotation, and denial of placement or generation writes from worker database roles.
 - Verify identity merges retain every server and its backup/history data, carry suspension forward, and preserve the browser account's default world or choose the oldest surviving world.
 - Verify account owners can switch the default among their preserved worlds and cannot select a world owned by another account.
 - Add Playwright checks at desktop, tablet, and 390px mobile widths; verify navigation, dialogs, console, long server/log content, empty/error states, and absence of horizontal overflow.
