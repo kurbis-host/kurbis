@@ -27,6 +27,7 @@ Docker Desktop is stopped as requested. Development and the runtime evidence in 
 - The pinned, patched Pumpkin host-control harness passed with real Java and Bedrock protocol clients. Offline clients exposed no verified identity; reconnects received new connection IDs; authenticated RPC, save, graceful shutdown, and socket cleanup passed.
 - The native gateway restart integration passed with real Java and Bedrock clients before and after control-plane/gateway restarts. Both editions joined waiting before backend transfer; valid unused hostnames reached waiting and were rejected; queued wake state and active placement survived restart. Evidence: `output/runtime/auth-gateway-restart-final-3/result.json`.
 - The Impeccable detector reported no findings for the changed account, login, and app-shell surfaces.
+- The native worker runtime's recovery, stale-PID fencing, and log-cursor unit tests passed **3/3**. The full native Java/Bedrock worker lifecycle passed **19 checks** against disposable local Postgres, including waiting admission, online/queued transfers, snapshot outage/retry, worker recovery/fencing, cross-worker restore, clean shutdown, Java/Bedrock wake, and automatic sleep after a verified **307-second idle interval following rejoin**. Full evidence: `output/runtime/native-plan-final-20261001/result.json`.
 
 ## Remaining release checks
 

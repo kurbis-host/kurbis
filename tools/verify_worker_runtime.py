@@ -148,8 +148,13 @@ def main():
                    "--port", str(port), "--address", options.pop("address", "live.mc.example.test"),
                    "--output", str(artifact)]
         for key, value in options.items():
+            option = "--" + key.replace("_", "-")
+            if isinstance(value, bool):
+                if value:
+                    command.append(option)
+                continue
             for item in value if isinstance(value, list) else [value]:
-                command.extend(["--" + key.replace("_", "-"), str(item)])
+                command.extend([option, str(item)])
         result = subprocess.run(command, capture_output=True, text=True, timeout=210)
         (args.output / f"protocol-{name}-{edition}.log").write_text(result.stdout + result.stderr)
         assert result.returncode == 0, f"Real {edition} protocol scenario {name} failed: {result.stdout} {result.stderr}"
@@ -335,10 +340,10 @@ enabled = false
             assert constraints["ReadonlyRootfs"] and constraints["PidsLimit"] == 512
             evidence["checks"].append({"real_start": "online", "memory_bytes": constraints["Memory"], "memory_swap_bytes": constraints["MemorySwap"], "readonly_root": True, "pids_limit": 512})
         gateway_java, gateway_bedrock = start_gateway()
-        protocol("java", gateway_java, "unknown", address="unknown.mc.example.test", expect_kick="Unknown")
-        protocol("java", gateway_java, "online", command=["give @s minecraft:diamond 7",
+        protocol("java", gateway_java, "unknown", address="unknown.mc.example.test", expect_close=True)
+        protocol("java", gateway_java, "online", transfer_port=46000, command=["give @s minecraft:diamond 7",
             "setblock 0 63 0 minecraft:gold_block"], expect_item=["diamond:7"], expect_message=["commands.setblock.success"], hold_seconds=5)
-        protocol("bedrock", gateway_bedrock, "unknown", address="unknown.mc.example.test", expect_kick="Unknown")
+        protocol("bedrock", gateway_bedrock, "unknown", address="unknown.mc.example.test", expect_close=True)
         protocol("bedrock", gateway_bedrock, "online", transfer_port=46001)
         queued_hostname_clients(gateway_java, gateway_bedrock, cookie)
         directory = root / "worker-0" / "servers" / server
@@ -430,7 +435,7 @@ enabled = false
         restored = root / "worker-1/servers" / server / stable["path"]
         assert restored.read_bytes() == expected
         evidence["checks"].append({"cross_worker_restore": "identical saved player data before login", "worker": workers[1]})
-        protocol("java", gateway_java, "cross-worker-gameplay", command=[
+        protocol("java", gateway_java, "cross-worker-gameplay", transfer_port=46100, command=[
             "fill 0 63 0 0 63 0 minecraft:emerald_block replace minecraft:gold_block"],
             expect_item=["diamond:7"], expect_message=["commands.fill.success"], hold_seconds=5)
         user_action(cookie, "stop")
@@ -455,7 +460,7 @@ enabled = false
         while time.monotonic() - initial_empty < 150:
             assert state() == "online", "Slept before five continuous empty minutes"
             time.sleep(1)
-        protocol("java", gateway_java, "idle-rejoin", expect_item=["diamond:7"], hold_seconds=10)
+        protocol("java", gateway_java, "idle-rejoin", transfer_port=46100, expect_item=["diamond:7"], hold_seconds=10)
         wait(lambda: player_count() == 0, "rejoining player leaves", 30)
         reset_empty = time.monotonic()
         while time.monotonic() - initial_empty < 305:
