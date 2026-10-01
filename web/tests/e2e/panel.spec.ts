@@ -18,6 +18,19 @@ async function captureResponsive(page: Page, route: string, name = route === '/'
   for (const width of [1440, 820, 390]) {
     await page.setViewportSize({ width, height: 1000 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${route} at ${width}px`).toBeTruthy();
+    const navigation = page.getByRole('navigation', { name: 'Server panel' });
+    if (await navigation.count()) {
+      const metrics = await navigation.evaluate(element => ({
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+        links: [...element.querySelectorAll('a')].map(link => {
+          const rect = link.getBoundingClientRect();
+          return rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight;
+        }),
+      }));
+      expect(metrics.scrollWidth, `${route} navigation at ${width}px`).toBeLessThanOrEqual(metrics.clientWidth);
+      expect(metrics.links.every(Boolean), `${route} links are visible at ${width}px`).toBeTruthy();
+    }
     await capture(page, `${name}-${width}.png`);
   }
 }
@@ -25,6 +38,14 @@ async function command(request: APIRequestContext, name: string, data?: unknown)
   const response = await request.post(`${fixture}/fixture/${name}`, { data });
   expect(response.ok(), await response.text()).toBeTruthy();
   return response;
+}
+async function issueMinecraftLink(request: APIRequestContext, identity: unknown) {
+  const response = await request.post(`${api}/internal/minecraft-login-links`, {
+    headers: { authorization: 'Bearer browser-internal-token' },
+    data: { identity, display_name: 'Minecraft Player' },
+  });
+  expect(response.status(), await response.text()).toBe(200);
+  return (await response.json()).url as string;
 }
 async function login(page: Page, name = 'Browser Player', provider = 'Google') {
   await page.goto('/login');
@@ -306,6 +327,59 @@ test('Google and Discord keep provider identities separate and both establish se
   expect((await browserApi(google, '/api/v1/session')).status).toBe(200);
   await google.close();
   await discord.close();
+});
+
+test('Minecraft fragment links redeem once through the same-origin browser page', async ({ page, browser, request }) => {
+  const identity = { kind: 'java', uuid: '97a3d856-32e1-4a67-a38a-754d7d39fc2f' };
+  const link = await issueMinecraftLink(request, identity);
+  const redemption = page.waitForRequest(request =>
+    new URL(request.url()).pathname === '/auth/minecraft/redeem' && request.method() === 'POST'
+  );
+  const appLoaded = page.waitForURL(/\/app\/setup$/, { waitUntil: 'load' });
+  await page.goto(link);
+  await redemption;
+  await appLoaded;
+  expect(new URL(page.url()).hash).toBe('');
+  expect((await browserApi(page, '/api/v1/session')).status).toBe(200);
+  await page.goto('/app/account');
+  await expect(page.getByText('Minecraft Java Edition', { exact: true })).toBeVisible();
+
+  const identityRow = await pool.query(
+    "SELECT user_id, provider FROM identities WHERE provider='minecraft_java' AND subject=$1",
+    [identity.uuid],
+  );
+  expect(identityRow.rows).toEqual([{ user_id: expect.any(String), provider: 'minecraft_java' }]);
+  const sessions = await pool.query(
+    'SELECT count(*) FROM sessions WHERE user_id=$1',
+    [identityRow.rows[0].user_id],
+  );
+  expect(sessions.rows[0].count).toBe('1');
+
+  const replay = await browser.newPage();
+  await replay.goto(link);
+  await expect(replay.getByText(/invalid, expired, or already used/i)).toBeVisible();
+  expect((await browserApi(replay, '/api/v1/session')).status).toBe(401);
+  await replay.close();
+});
+
+test('signed-in Minecraft redemption attaches to the browser account without replacing its world', async ({ page, request }) => {
+  await login(page);
+  await create(page, 'minecraft-owner-world');
+  const identity = { kind: 'bedrock', xuid: '2533274790395904' };
+  const link = await issueMinecraftLink(request, identity);
+  await page.goto(link);
+  await expect(page).toHaveURL(/\/app$/);
+  expect(new URL(page.url()).hash).toBe('');
+  expect((await current(page)).subdomain).toBe('minecraft-owner-world');
+
+  const owner = await pool.query(
+    "SELECT i.user_id, s.id AS server_id, s.is_default FROM identities i JOIN servers s ON s.owner_id=i.user_id WHERE i.provider='minecraft_bedrock' AND i.subject=$1",
+    [identity.xuid],
+  );
+  expect(owner.rows).toHaveLength(1);
+  expect(owner.rows[0]).toMatchObject({ server_id: expect.any(String), is_default: true });
+  await page.goto('/app/account');
+  await expect(page.getByText('Minecraft Bedrock Edition', { exact: true })).toBeVisible();
 });
 
 test('unverified provider email addresses are not saved on the account', async ({ page, request }) => {

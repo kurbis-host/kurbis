@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { Pool } from 'pg';
 
 const api = process.env.BROWSER_API_URL ?? 'http://127.0.0.1:18080';
 const fixture = process.env.BROWSER_FIXTURE_URL ?? 'http://127.0.0.1:18081';
 const panel = process.env.BROWSER_PANEL_URL ?? 'http://127.0.0.1:18082';
+const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
 
 async function mintLoginLink(
   request: APIRequestContext,
@@ -45,6 +47,7 @@ test.beforeEach(async ({ request }) => {
   const reset = await request.post(`${fixture}/fixture/reset`);
   expect(reset.ok(), await reset.text()).toBeTruthy();
 });
+test.afterAll(async () => { await pool.end(); });
 
 test('Minecraft browser links clear the fragment, redeem same-origin, and attach to signed-in accounts', async ({ page, request }) => {
   test.setTimeout(60000);
@@ -76,9 +79,24 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     const response = await fetch('/api/v1/session');
     return response.json();
   });
+  const bedrockXuid = '2533274790395904';
+  const sourceUser = randomUUID();
+  const sourceWorld = 'merged-bedrock-world';
+  await pool.query(
+    'INSERT INTO users(id, display_name, account_status) VALUES($1, $2, $3)',
+    [sourceUser, 'Bedrock Source Account', 'active'],
+  );
+  await pool.query(
+    "INSERT INTO identities(id, user_id, provider, subject, display_name)\n     VALUES($1, $2, 'minecraft_bedrock', $3, $4)",
+    [randomUUID(), sourceUser, bedrockXuid, 'Bedrock Browser Player'],
+  );
+  await pool.query(
+    'INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)',
+    [randomUUID(), sourceUser, sourceWorld],
+  );
   const bedrockLink = await mintLoginLink(
     request,
-    { kind: 'bedrock', xuid: '2533274790395904' },
+    { kind: 'bedrock', xuid: bedrockXuid },
     'Bedrock Browser Player',
   );
   await page.goto(`${bedrockLink.pathname}${bedrockLink.hash}`);
@@ -87,6 +105,16 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
   await expect(page.getByRole('heading', { name: 'Linked identities' })).toBeVisible();
   await expect(page.getByText('Minecraft Java Edition', { exact: true })).toBeVisible();
   await expect(page.getByText('Minecraft Bedrock Edition', { exact: true })).toBeVisible();
+  await expect(page.getByText(sourceWorld, { exact: true })).toBeVisible();
+  const makeDefault = page.getByRole('button', { name: 'Make default', exact: true });
+  await expect(makeDefault).toHaveCount(1);
+  await makeDefault.click();
+  await expect(page.getByRole('status')).toContainText(sourceWorld + ' is now the default world.');
+  const selectedWorld = await page.evaluate(async () => {
+    const response = await fetch('/api/v1/server');
+    return response.json();
+  });
+  expect(selectedWorld.subdomain).toBe(sourceWorld);
   const linkedSession = await page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
     return response.json();
@@ -95,4 +123,6 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
   expect(linkedSession.user.display_name).toBe('Java Browser Player');
   expect((await page.context().cookies()).find((item) => item.name === 'kurbis_session')?.value)
     .toBe(cookie?.value);
+  const sourceStillExists = await pool.query('SELECT 1 FROM users WHERE id = $1', [sourceUser]);
+  expect(sourceStillExists.rowCount).toBe(0);
 });

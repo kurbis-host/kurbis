@@ -67,8 +67,17 @@ mod tests {
     #[test]
     fn hosted_runtime_requires_online_java_and_full_bedrock_authentication() {
         let config = render_pumpkin_config(&Value::Null, 25565, 19132);
-        assert!(config.contains("[networking.java]\nonline_mode = true\nencryption = true"));
-        assert!(config.contains("[networking.bedrock]\nonline_mode = true\nencryption = true"));
+        assert!(
+            config.contains(
+                "[networking.java]\nenabled = true\nonline_mode = true\nencryption = true"
+            )
+        );
+        assert!(config.contains(
+            "[networking.bedrock]\nenabled = true\nonline_mode = true\nencryption = true"
+        ));
         assert!(config.contains("[networking.bedrock.authentication]\nenabled = true"));
+        assert!(config.contains(
+            "[networking.bedrock]\nenabled = true\nonline_mode = true\nencryption = true\naddress = \"0.0.0.0:19132\""
+        ));
     }
 }

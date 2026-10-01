@@ -280,18 +280,21 @@ async fn merge_accounts(
         .bind(account_ids.as_slice())
         .execute(&mut **tx)
         .await?;
+    sqlx::query("UPDATE servers SET owner_id = $1 WHERE owner_id = $2")
+        .bind(browser_id)
+        .bind(source_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE servers SET is_default = false WHERE owner_id = $1 AND is_default")
+        .bind(browser_id)
+        .execute(&mut **tx)
+        .await?;
     if let Some(server_id) = selected_default {
         sqlx::query("UPDATE servers SET is_default = true WHERE id = $1")
             .bind(server_id)
             .execute(&mut **tx)
             .await?;
     }
-
-    sqlx::query("UPDATE servers SET owner_id = $1 WHERE owner_id = $2")
-        .bind(browser_id)
-        .bind(source_id)
-        .execute(&mut **tx)
-        .await?;
     sqlx::query("UPDATE identities SET user_id = $1, updated_at = now() WHERE user_id = $2")
         .bind(browser_id)
         .bind(source_id)

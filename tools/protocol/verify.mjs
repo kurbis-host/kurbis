@@ -16,6 +16,7 @@ const { values } = parseArgs({ options: {
   username: { type: 'string', default: 'RuntimePlayer' },
   'transfer-port': { type: 'string' }, 'transfer-host': { type: 'string', default: '127.0.0.1' },
   'expect-kick': { type: 'string' }, 'hold-seconds': { type: 'string', default: '2' },
+  'expect-close': { type: 'boolean' },
   timeout: { type: 'string', default: '180' }, output: { type: 'string' },
   command: { type: 'string', multiple: true }, 'expect-item': { type: 'string', multiple: true },
   'expect-message': { type: 'string', multiple: true },
@@ -114,7 +115,7 @@ try {
         record(backend || direct ? 'backend_joined' : 'waiting_joined', { username: values.username });
       });
       client.once(values.edition === 'java' ? 'position' : 'spawn', () => {
-        if (!values['expect-kick'] && (backend || !values['transfer-port'])) {
+        if (!values['expect-kick'] && !values['expect-close'] && (backend || !values['transfer-port'])) {
           timer(() => {
             try {
               assertInventory();
@@ -127,12 +128,18 @@ try {
       client.on('error', fail);
       client.on(values.edition === 'java' ? 'end' : 'close', reason => {
         if (finished || !connected.has(client)) return;
+        if (values['expect-close'] && joined) {
+          record('connection_closed', { reason: String(reason) });
+          success();
+          return;
+        }
         fail(new Error(`Connection closed before completion: ${String(reason)}`));
       });
       const kicked = packet => {
         const text = JSON.stringify(packet);
         record('kicked', { packet });
         if (values['expect-kick'] && text.includes(values['expect-kick'])) success();
+        else if (values['expect-close'] && joined) success();
         else fail(new Error(`Unexpected kick: ${text}`));
       };
       client.on(values.edition === 'java' ? 'disconnect' : 'kick', kicked);

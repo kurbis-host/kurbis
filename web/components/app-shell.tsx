@@ -91,7 +91,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         ) : null}
 
         <nav
-          className="grid gap-[3px] max-[860px]:flex max-[860px]:gap-1 max-[860px]:overflow-x-auto max-[860px]:pb-2.5 max-[860px]:[scrollbar-width:none] max-[860px]:[&::-webkit-scrollbar]:hidden"
+          className="grid gap-[3px] max-[860px]:flex max-[860px]:gap-1 max-[860px]:overflow-x-auto max-[860px]:pb-2.5 max-[860px]:[scrollbar-width:none] max-[860px]:[&::-webkit-scrollbar]:hidden max-[640px]:grid max-[640px]:grid-cols-3 max-[640px]:overflow-visible max-[640px]:pb-3"
           aria-label="Server panel"
         >
           {nav.map(({ href, label, Icon }) => {
@@ -100,7 +100,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <Link
                 key={href}
                 href={href}
-                className={`flex min-h-11 items-center gap-[11px] rounded-sm px-[11px] text-sm font-[660] no-underline max-[860px]:min-h-10 max-[860px]:min-w-max max-[860px]:px-2.5 ${
+                className={`flex min-h-11 items-center gap-[11px] rounded-sm px-[11px] text-sm font-[660] no-underline max-[860px]:min-h-10 max-[860px]:min-w-max max-[860px]:px-2.5 max-[640px]:min-h-11 max-[640px]:min-w-0 max-[640px]:justify-center max-[640px]:gap-1.5 max-[640px]:px-1.5 max-[640px]:text-[13px] ${
                   active
                     ? "bg-canvas text-[#302b25] hover:bg-[#fff7e8]"
                     : "text-[#d8d0c0] hover:bg-white/7 hover:text-white"

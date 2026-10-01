@@ -68,7 +68,7 @@ Public contracts:
 - GET /api/v1/server/players
 - GET | POST | DELETE /api/v1/server/whitelist
 - GET /api/v1/account
-- POST /api/v1/account/default-world/{server_id}
+- PUT /api/v1/account/worlds/{server_id}/default
 - DELETE /api/v1/account/sessions/{session_id}
 - POST /auth/minecraft/redeem (same-origin only; GET requests never mutate account state)
 

@@ -222,13 +222,15 @@ class RestartVerification:
             "--username", f"Restart{edition.title()}",
             "--hold-seconds", "5", "--timeout", "90", "--output", str(artifact),
         ]
-        if expected_event == "direct_route" and edition == "bedrock":
-            command.extend(["--transfer-port", str(self.bedrock_backend)])
-        elif expected_event == "direct_route":
-            command.append("--direct")
-        destination = "backend" if expected_event == "direct_route" else "waiting"
+        waiting_transfer = expected_event == "waiting_to_backend"
+        if waiting_transfer:
+            backend_port = self.java_backend if edition == "java" else self.bedrock_backend
+            command.extend(["--transfer-port", str(backend_port)])
+        elif expected_event == "unknown_address_kick":
+            command.append("--expect-close")
+        destination = "backend" if waiting_transfer else "waiting"
         other = "waiting" if destination == "backend" else "backend"
-        waiting_is_transfer_hop = edition == "bedrock" and destination == "backend"
+        waiting_is_transfer_hop = waiting_transfer
         player_name = f"Restart{edition.title()}"
         with log_path.open("wb") as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
@@ -265,11 +267,19 @@ class RestartVerification:
         proof = json.loads(artifact.read_text())
         assert proof.get("passed") is True, proof
         events = [entry["event"] for entry in proof["events"]]
-        if expected_event == "direct_route":
-            if edition == "bedrock":
-                assert "native_transfer" in events and "backend_joined" in events, events
-            else:
-                assert "backend_joined" in events and "native_transfer" not in events, events
+        if waiting_transfer:
+            assert "waiting_joined" in events, events
+            assert "native_transfer" in events, events
+            assert "backend_joined" in events, events
+            assert (
+                events.index("waiting_joined")
+                < events.index("native_transfer")
+                < events.index("backend_joined")
+            ), events
+        elif expected_event == "unknown_address_kick":
+            assert "waiting_joined" in events, events
+            assert "kicked" in events or "connection_closed" in events, events
+            assert "auth/minecraft" not in json.dumps(proof["events"]), events
         else:
             assert expected_event in events, f"{expected_event} absent from {events}"
         return events
@@ -277,7 +287,12 @@ class RestartVerification:
     def verify_routes(self, stage):
         live = {}
         for edition in ("java", "bedrock"):
-            live[edition] = self.run_client(edition, self.live_subdomain, stage, "direct_route")
+            live[edition] = self.run_client(edition, self.live_subdomain, stage, "waiting_to_backend")
+        unknown_address = {}
+        for edition in ("java", "bedrock"):
+            unknown_address[edition] = self.run_client(
+                edition, f"unused-{self.suffix}", stage, "unknown_address_kick"
+            )
         queued = {}
         for edition in ("java", "bedrock"):
             queued[edition] = self.run_client(edition, self.queued_subdomain, stage, "waiting_joined")
@@ -309,6 +324,7 @@ class RestartVerification:
             "stage": stage,
             "live_placement": json.loads(placement),
             "live_real_clients": {"destination": "worker backend process", "events": live},
+            "valid_unused_address": {"destination": "waiting process", "events": unknown_address},
             "queued": {"state": state, "entry_count": queue_count, "requested_at": requested_at,
                        "destination": "waiting process", "real_clients": queued},
         })

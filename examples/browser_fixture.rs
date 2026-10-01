@@ -214,11 +214,24 @@ async fn email_verification(
     StatusCode::NO_CONTENT
 }
 async fn reset(State(f): State<Fixture>) -> Result<StatusCode, String> {
+    sqlx::query("DELETE FROM minecraft_login_tokens")
+        .execute(&f.pool)
+        .await
+        .map_err(err)?;
     sqlx::query(
         "DELETE FROM users WHERE id IN (
              SELECT user_id FROM identities
              WHERE provider IN ('google', 'discord')
                AND subject IN ('browser-user', 'browser-other-user')
+         )",
+    )
+    .execute(&f.pool)
+    .await
+    .map_err(err)?;
+    sqlx::query(
+        "DELETE FROM users WHERE id IN (
+             SELECT user_id FROM identities
+             WHERE provider IN ('minecraft_java', 'minecraft_bedrock')
          )",
     )
     .execute(&f.pool)
