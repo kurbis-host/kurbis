@@ -1,0 +1,126 @@
+name: kurbis-hoster
+
+x-control-plane-environment: &control-plane-environment
+  DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  CONTROL_PLANE_LISTEN: 0.0.0.0:8080
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+  ROOT_DOMAIN: ${ROOT_DOMAIN}
+  INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+  GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
+  GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
+  DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID}
+  DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET}
+
+services:
+  postgres:
+    image: postgres:18-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - 127.0.0.1:${DATABASE_PORT}:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [hoster]
+
+  control-plane:
+    image: melon-hoster:local
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    entrypoint: [/usr/local/bin/control-plane]
+    environment: *control-plane-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks: [hoster]
+
+  waiting-pumpkin:
+    image: melon-pumpkin:waiting
+    environment:
+      PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
+      PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
+    volumes:
+      - waiting-control:/run/kurbis-gateway
+    restart: unless-stopped
+    networks:
+      hoster:
+        ipv4_address: ${WAITING_IP}
+
+  gateway:
+    image: melon-hoster:local
+    entrypoint: [/usr/local/bin/gateway]
+    user: "2613:2613"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JAVA_LISTEN: 0.0.0.0:25565
+      BEDROCK_LISTEN: 0.0.0.0:19132
+      WAITING_JAVA_ADDRESS: ${WAITING_IP}:25566
+      WAITING_BEDROCK_ADDRESS: ${WAITING_IP}:19133
+      WAITING_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
+      PUMPKIN_GATEWAY_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
+      CONTROL_PLANE_URL: http://control-plane:8080
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      ROOT_DOMAIN: ${ROOT_DOMAIN}
+    ports:
+      - ${JAVA_PORT}:25565/tcp
+      - ${BEDROCK_PORT}:19132/udp
+    volumes:
+      - waiting-control:/run/kurbis-gateway:ro
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      waiting-pumpkin:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      hoster:
+        ipv4_address: ${GATEWAY_IP}
+
+  panel:
+    image: kurbis-panel:local
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        CONTROL_PLANE_INTERNAL_URL: http://control-plane:8080
+    ports:
+      - ${PANEL_PORT}:3000
+    environment:
+      CONTROL_PLANE_INTERNAL_URL: http://control-plane:8080
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    networks: [hoster]
+
+volumes:
+  postgres-data:
+  waiting-control:
+
+networks:
+  hoster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET}

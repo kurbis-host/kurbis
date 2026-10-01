@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -69,7 +70,7 @@ impl ServerRuntime for DockerRuntime {
             render_pumpkin_config(settings, 25565, 19132),
         )
         .await?;
-        ensure_pumpkin_ownership(server_dir).await?;
+        let (runtime_uid, runtime_gid) = ensure_pumpkin_ownership(server_dir).await?;
 
         let java = format!("{}:25565/tcp", placement.java_port);
         let bedrock_udp = format!("{}:19132/udp", placement.bedrock_port);
@@ -78,6 +79,7 @@ impl ServerRuntime for DockerRuntime {
         let lease_label = format!("kurbis.lease={}", placement.lease_token);
         let server_label = format!("kurbis.server_id={server_id}");
         let memory = SERVER_MEMORY_BYTES.to_string();
+        let runtime_user = format!("{runtime_uid}:{runtime_gid}");
         let status = Command::new("docker")
             .args([
                 "run",
@@ -94,6 +96,8 @@ impl ServerRuntime for DockerRuntime {
                 "1.0",
                 "--pids-limit",
                 "512",
+                "--user",
+                &runtime_user,
                 "--read-only",
                 "--security-opt",
                 "no-new-privileges:true",
@@ -236,9 +240,10 @@ fn container_name(server_id: Uuid) -> String {
     format!("kurbis-{server_id}")
 }
 
-async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
+async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<(u32, u32)> {
+    let metadata = tokio::fs::metadata(server_dir).await?;
+    let (uid, gid) = (metadata.uid(), metadata.gid());
+    if uid == 0 {
         let status = Command::new("chown")
             .arg("-R")
             .arg("2613:2613")
@@ -248,8 +253,13 @@ async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<()> {
         if !status.success() {
             bail!("failed to set Pumpkin volume ownership");
         }
+        return Ok(container_identity(uid, gid));
     }
-    Ok(())
+    Ok(container_identity(uid, gid))
+}
+
+fn container_identity(uid: u32, gid: u32) -> (u32, u32) {
+    if uid == 0 { (2613, 2613) } else { (uid, gid) }
 }
 
 #[cfg(test)]
@@ -267,5 +277,15 @@ mod tests {
         assert!(config.contains("max_players = 0"));
         assert!(config.contains("motd = \"hello \\\"kurbis\\\"\""));
         assert!(config.contains("view_distance = 8"));
+    }
+
+    #[test]
+    fn unprivileged_worker_keeps_server_files_owned_by_its_uid() {
+        assert_eq!(container_identity(501, 20), (501, 20));
+    }
+
+    #[test]
+    fn root_worker_uses_the_pumpkin_image_user() {
+        assert_eq!(container_identity(0, 0), (2613, 2613));
     }
 }

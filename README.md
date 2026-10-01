@@ -43,7 +43,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - Rust 1.98.1
 - PostgreSQL
 - Native host processes for local development (Docker is not needed)
-- Docker only for isolated production workers and Linux hard-quota verification
+- Docker Engine and Compose v2 for the container deployment and Docker workers
 - Node.js and npm (for the web panel)
 
 ## Development
@@ -98,6 +98,54 @@ http://localhost:3000/auth/discord/callback
 ```
 
 Put both client IDs and secrets in the ignored `web/.env.local` file. Remove the provider-specific `*_OAUTH_AUTHORIZE_URL`, `*_OAUTH_TOKEN_URL`, and `*_OAUTH_USERINFO_URL` overrides so the control plane uses Google's and Discord's production OAuth endpoints. For this mode, run the control plane and panel without `examples/browser_fixture.rs`.
+
+## Start a deployment
+
+The root launcher starts the full service set in a tmux dashboard. The first
+run creates a private `.env`; set the public panel URL, Minecraft root domain,
+worker's reachable IP, and Google/Discord OAuth credentials in that file.
+Register these callback URLs with both providers:
+
+```text
+https://<public-panel-origin>/auth/google/callback
+https://<public-panel-origin>/auth/discord/callback
+```
+
+Choose one deployment mode:
+
+```sh
+./start.sh native debug    # host processes, fast Rust and Next.js iteration
+./start.sh native release  # host processes, optimized Rust and production panel
+./start.sh docker          # Compose services plus the host Docker worker
+```
+
+Native mode needs Rust 1.98.1, Git, CMake, Node.js/npm, tmux, and an already
+running PostgreSQL database matching `DATABASE_URL_NATIVE`. It does not use
+Docker. Docker mode builds the pinned Pumpkin images and application images,
+starts PostgreSQL, control plane, gateway, waiting runtime, and panel in
+Compose, then runs the worker on the Linux host. The worker stays on the host
+because it controls the host Docker engine and worker storage mounts. Docker
+mode needs Linux, Docker Engine with Compose v2, Rust/Cargo, and tmux; use
+native mode on macOS. The first Pumpkin image build takes substantially longer
+than later starts.
+
+The Docker Compose deployment publishes the panel on `PANEL_PORT`, Java on
+`JAVA_PORT`, and Bedrock UDP on `BEDROCK_PORT`. Put an HTTPS reverse proxy in
+front of the panel port and point `PUBLIC_BASE_URL` at that HTTPS origin. Open
+the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
+`WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
+quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the
+permissions needed to mount ext4 loop devices; `directory` mode has no hard
+disk quota. The starter `.env` uses local snapshot storage under `data/objects`;
+for production durability, set `OBJECT_STORE_TYPE=s3` and configure the `S3_*`
+values. Set `DOCKER_SUBNET`, `WAITING_IP`, and `GATEWAY_IP` if the default
+Compose subnet conflicts with an existing network.
+
+Use `./start.sh attach` to reopen the dashboard and `./start.sh stop` to stop
+the dashboard and Compose services. In tmux, use the mouse or `Ctrl-b` followed
+by an arrow key to select a process pane; `Ctrl-b z` zooms the selected pane,
+and `Ctrl-b d` detaches. Persistent PostgreSQL data is kept when stopping
+Compose. Stop hosted worlds from the panel before shutting down their worker.
 
 ## Configuration
 

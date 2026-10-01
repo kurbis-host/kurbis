@@ -1,0 +1,25 @@
+accepts_transfers = true
+[networking.query]
+enabled = false
+[networking.rcon]
+enabled = false
+[networking.java]
+enabled = true
+online_mode = true
+encryption = true
+address = "0.0.0.0:25566"
+max_players = 0
+view_distance = 2
+simulation_distance = 2
+[networking.bedrock]
+enabled = true
+online_mode = true
+encryption = true
+address = "0.0.0.0:19133"
+max_players = 0
+view_distance = 2
+simulation_distance = 2
+[networking.bedrock.authentication]
+enabled = true
+[telemetry]
+enabled = false

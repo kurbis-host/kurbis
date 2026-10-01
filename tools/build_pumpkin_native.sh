@@ -2,6 +2,12 @@
 # Build the same pinned integration as the container, entirely on this host.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+profile=${1:-debug}
+case "$profile" in
+    debug) cargo_profile=dev ;;
+    release) cargo_profile=release ;;
+    *) echo "Usage: $0 [debug|release]" >&2; exit 2 ;;
+esac
 revision=$(cat "$root/runtime/pumpkin/REVISION")
 source_dir="$root/output/native-pumpkin/source"
 mkdir -p "$source_dir"
@@ -28,5 +34,9 @@ export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_DEV_CODEGEN_UNITS=16
 export CARGO_PROFILE_DEV_INCREMENTAL=false
 cd "$source_dir"
-cargo +1.98.1 build --locked --package pumpkin --bin pumpkin
-printf 'Native Pumpkin: %s\n' "$CARGO_TARGET_DIR/debug/pumpkin"
+set --
+if [ "$profile" = release ]; then
+    set -- --release
+fi
+cargo +1.98.1 build "$@" --locked --package pumpkin --bin pumpkin
+printf 'Native Pumpkin: %s/%s/pumpkin\n' "$CARGO_TARGET_DIR" "$cargo_profile"

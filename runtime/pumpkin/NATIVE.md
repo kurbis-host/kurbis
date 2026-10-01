@@ -5,10 +5,12 @@ or Linux, without Docker. macOS workers default to `WORKER_RUNTIME=native`;
 Linux workers can select it explicitly. PostgreSQL, lifecycle coordination, snapshot verification, idle policy,
 waiting clients and generation fencing are shared with Docker workers.
 
-Build locally with Rust 1.98.1, Git, CMake and a C/C++ compiler installed:
+Build locally with Rust 1.98.1, Git, CMake and a C/C++ compiler installed.
+The build script accepts `debug` or `release` (default `debug`):
 
 ```sh
-tools/build_pumpkin_native.sh
+tools/build_pumpkin_native.sh debug
+tools/build_pumpkin_native.sh release
 cargo build --bins
 export DATABASE_URL=postgres://localhost/melon_hoster
 . examples/config/native-worker.env.example
