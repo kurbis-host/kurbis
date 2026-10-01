@@ -49,12 +49,16 @@ The wrapper derives a disposable offline-authentication test image without
 changing production authentication. Java protocol checks cover unknown
 hostnames, online routing and sleeping wake/native transfer/backend login.
 Commands create inventory and changed world blocks, which are checked after
-cross-worker recovery and clean shutdown. Bedrock 1.26.51 login is blocked by
-the pinned upstream NetherNet TLS signaling issue documented in
-`../pumpkin/README.md`.
+cross-worker recovery and clean shutdown. Bedrock tests terminate TLS using a
+disposable trusted CA, route status and SDP through the waiting and assigned
+server endpoints, reject bad certificate names/hosts and malformed signaling,
+and verify RakNet/STUN/DTLS UDP relay isolation. A physical Bedrock client was
+intentionally not exercised at the user's direction; the automated tests make
+no claim of a real-client login.
 
 The harness includes Java capacity waiting on a second hostname and a real
 five-minute idle/rejoin interval. Read `PROGRESS.md` for executed evidence.
-Native mode runs these lifecycle scenarios without hard quota checks; see
-`../pumpkin/NATIVE.md`. Syntax validation alone is not evidence that mounts,
-quotas or gameplay passed.
+The wrapper builds hoster and Pumpkin images from this checkout before running;
+it does not reuse existing application images. Native mode runs lifecycle
+scenarios without hard quota checks; see `../pumpkin/NATIVE.md`. Syntax
+validation alone is not evidence that mounts, quotas or gameplay passed.

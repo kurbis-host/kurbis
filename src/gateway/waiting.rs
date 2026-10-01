@@ -379,14 +379,10 @@ async fn transfer(
     state: &mut WaitingState,
     target: &RouteTarget,
 ) -> Result<()> {
-    let host = target
-        .worker_address
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("online route has no worker address"))?;
-    let port = transfer_port(target, player.edition)
-        .ok_or_else(|| anyhow::anyhow!("online route has no port for player edition"))?;
+    let (host, port) = transfer_target(config, target, player.edition)
+        .ok_or_else(|| anyhow::anyhow!("online route has no address for player edition"))?;
     control
-        .transfer(&config.waiting_control_socket, player.id, host, port)
+        .transfer(&config.waiting_control_socket, player.id, &host, port)
         .await?;
     state.transfer_sent = true;
     tracing::info!(
@@ -412,10 +408,20 @@ fn notice_for(state: ObservedState) -> &'static str {
     }
 }
 
-fn transfer_port(target: &RouteTarget, edition: PlayerEdition) -> Option<u16> {
+fn transfer_target(
+    config: &GatewayConfig,
+    target: &RouteTarget,
+    edition: PlayerEdition,
+) -> Option<(String, u16)> {
     match edition {
-        PlayerEdition::Java => target.java_port,
-        PlayerEdition::Bedrock => target.bedrock_port,
+        PlayerEdition::Java => Some((
+            target.worker_address.as_deref()?.to_owned(),
+            target.java_port?,
+        )),
+        PlayerEdition::Bedrock => Some((
+            format!("s-{}.{}", target.server_id, config.root_domain),
+            config.bedrock_public_port,
+        )),
     }
 }
 
@@ -457,10 +463,35 @@ mod tests {
     }
 
     #[test]
-    fn transfer_uses_the_edition_specific_backend_port() {
+    fn bedrock_transfer_uses_gateway_alias_while_java_stays_direct_to_worker() {
+        let config = GatewayConfig {
+            common: crate::config::CommonConfig {
+                database_url: String::new(),
+            },
+            java_listen: "127.0.0.1:25565".parse().unwrap(),
+            bedrock_listen: "127.0.0.1:19132".parse().unwrap(),
+            bedrock_public_port: 19132,
+            bedrock_tls_certificate: "/unused/test-cert.pem".into(),
+            bedrock_tls_private_key: "/unused/test-key.pem".into(),
+            waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_control_socket: "/unused/control.sock".into(),
+            waiting_control_token: "test".into(),
+            control_plane_url: "http://127.0.0.1:8080".into(),
+            internal_token: "test".into(),
+            root_domain: "mc.example.test".into(),
+            wake_timeout: Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        };
         let target = online_target();
-        assert_eq!(transfer_port(&target, PlayerEdition::Java), Some(25570));
-        assert_eq!(transfer_port(&target, PlayerEdition::Bedrock), Some(19140));
+        assert_eq!(
+            transfer_target(&config, &target, PlayerEdition::Java),
+            Some(("203.0.113.10".into(), 25570))
+        );
+        assert_eq!(
+            transfer_target(&config, &target, PlayerEdition::Bedrock),
+            Some((format!("s-{}.mc.example.test", target.server_id), 19132))
+        );
     }
 
     #[test]

@@ -7,14 +7,19 @@ cross-worker gameplay and real idle behavior.
 """
 import argparse
 import hashlib
+import http.client
 import http.server
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import shutil
+import shlex
 import socket
+import ssl
+import stat
 import subprocess
 import tempfile
 import time
@@ -27,14 +32,84 @@ import uuid
 from verify_host_control import rpc
 
 
-def run(*args, check=True):
-    return subprocess.run(args, text=True, capture_output=True, check=check)
+LOGIN_LINK = re.compile(r"(https?://[^\s\"<>]+/auth/server#token=)[A-Za-z0-9_-]{43}")
+MAX_HTTP_RESPONSE_BYTES = 1 << 20
+
+
+def redact_login_links(value):
+    return LOGIN_LINK.sub(r"\1[redacted]", value)
+
+
+def run(*args, check=True, env=None):
+    return subprocess.run(args, text=True, capture_output=True, check=check, env=env)
 
 
 def free_port():
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
         return connection.getsockname()[1]
+
+
+def create_test_tls_certificate(directory):
+    certificate = directory / "bedrock-gateway-test.crt"
+    private_key = directory / "bedrock-gateway-test.key"
+    run(
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-days", "2", "-sha256", "-keyout", str(private_key),
+        "-out", str(certificate), "-subj", "/CN=*.mc.example.test",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,digitalSignature,keyCertSign,keyEncipherment",
+        "-addext", "extendedKeyUsage=serverAuth",
+        "-addext", "subjectAltName=DNS:mc.example.test,DNS:*.mc.example.test,IP:127.0.0.1",
+    )
+    os.chmod(private_key, 0o600)
+    return certificate, private_key
+
+
+def bedrock_https_request(
+    certificate,
+    port,
+    hostname,
+    method,
+    path,
+    body=b"",
+    content_type=None,
+    *,
+    server_name=None,
+    host_header=None,
+):
+    context = ssl.create_default_context(cafile=str(certificate))
+    context.set_alpn_protocols(["h2", "http/1.1"])
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    with context.wrap_socket(raw, server_hostname=server_name or hostname) as connection:
+        connection.settimeout(10)
+        assert connection.selected_alpn_protocol() == "http/1.1"
+        headers = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {host_header or f'{hostname}:{port}'}",
+            "Connection: close",
+            "Accept: application/json, application/sdp",
+            f"Content-Length: {len(body)}",
+        ]
+        if content_type:
+            headers.append(f"Content-Type: {content_type}")
+        connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + body)
+        response = http.client.HTTPResponse(connection)
+        response.begin()
+        payload = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        assert len(payload) <= MAX_HTTP_RESPONSE_BYTES, "Bedrock signaling response exceeded its cap"
+        return response.status, response.headers, payload
+
+
+def reject_bad_bedrock_tls_name(certificate, port):
+    context = ssl.create_default_context(cafile=str(certificate))
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="attacker.example.test"):
+                pass
+    except ssl.SSLCertVerificationError:
+        return
+    raise AssertionError("TLS accepted a hostname outside the Bedrock certificate")
 
 
 def wait(check, description, timeout=180):
@@ -54,17 +129,25 @@ def main():
     parser.add_argument("--pumpkin-image", default="melon-pumpkin:host-control")
     parser.add_argument("--output", type=Path, default=Path("/opt/melon-hoster-verification/results"))
     parser.add_argument("--native-binary", type=Path)
+    parser.add_argument("--plugin-wasm", type=Path)
     parser.add_argument("--database-url")
     parser.add_argument("--protocol-dir", type=Path, default=Path("/verification/protocol"))
     parser.add_argument("--worker-port-base", type=int, default=46000)
     parser.add_argument("--waiting-port-base", type=int, default=45000)
     parser.add_argument("--snapshot-interval-seconds", type=int, default=90)
+    parser.add_argument(
+        "--readiness-only",
+        action="store_true",
+        help="stop after one worker starts Pumpkin and host-control reports ready",
+    )
     args = parser.parse_args()
     native = args.native_binary is not None
     if native:
         args.native_binary = args.native_binary.resolve(strict=True)
         if not args.database_url:
             parser.error("--native-binary requires a disposable --database-url")
+        default_plugin = Path(__file__).resolve().parents[1] / "plugins/kurbis-control/target/wasm32-wasip2/debug/kurbis_control.wasm"
+        args.plugin_wasm = (args.plugin_wasm or default_plugin).resolve(strict=True)
     if not native and (os.geteuid() != 0 or os.uname().sysname != "Linux"):
         raise RuntimeError("Live quota verification requires a root Linux worker")
     args.bin_dir = args.bin_dir.resolve(strict=True)
@@ -90,10 +173,13 @@ def main():
     queued_backend = f"kurbis-{queued_server}"
     secret = secrets.token_hex(32)
     db_port, api_port, oauth_port = free_port(), free_port(), free_port()
+    plugin_api_base_url = f"http://{'127.0.0.1' if native else '172.18.0.1'}:{api_port}"
+    bedrock_certificate, bedrock_private_key = create_test_tls_certificate(root)
     waiting_container = f"melon-runtime-waiting-{identifier}"
     oauth_service = None
     processes = []
     logs = []
+    worker_bundles = {}
     evidence = {"root": str(root), "server": server, "workers": workers, "checks": []}
 
     def sql(query):
@@ -110,6 +196,86 @@ def main():
             sql(f"INSERT INTO identities(id,user_id,provider,subject,display_name,minecraft_player_id) "
                 f"VALUES(gen_random_uuid(),'{user_id}','minecraft_java','{player_id}','RuntimePlayer','{player_id}')")
 
+    def worker_bundle(index):
+        if index in worker_bundles:
+            return worker_bundles[index]
+        bundle_path = root / f"worker-{index}.env"
+        provisioning_environment = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "LANG", "LC_ALL", "RUST_LOG", "SSL_CERT_FILE", "SSL_CERT_DIR")
+            if key in os.environ
+        }
+        provisioning_environment.update({
+            "WORKER_PROVISIONING_DATABASE_URL": (
+                args.database_url if native else
+                f"postgres://postgres:{secret}@127.0.0.1:{db_port}/melon_runtime_test"
+            ),
+            "WORKER_ID": workers[index],
+            "WORKER_NAME": f"runtime-{identifier}-{index}",
+            "WORKER_ADDRESS": "127.0.0.1",
+            "WORKER_SIGNAL_ADDRESS": "127.0.0.1",
+            "WORKER_CONTROL_PLANE_URL": f"http://127.0.0.1:{api_port}",
+            "PUBLIC_BASE_URL": plugin_api_base_url,
+            "WORKER_RUNTIME": "native" if native else "docker",
+            "WORKER_STORAGE_MODE": "directory" if native else "loopback_ext4",
+            "WORKER_ROOT": str(root / f"worker-{index}"),
+            "WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP": "true",
+            "SNAPSHOT_INTERVAL_SECONDS": str(args.snapshot_interval_seconds),
+            "IDLE_TIMEOUT_SECONDS": "300",
+            "WORKER_MEMORY_GIB": "2",
+            "WORKER_DISK_GIB": "20",
+            "WORKER_CPU_MILLIS": "2000",
+            "WORKER_PORT_MIN": str(worker_ports[index]),
+            "WORKER_PORT_MAX": str(worker_ports[index] + 20),
+        })
+        if native:
+            provisioning_environment["PUMPKIN_BINARY"] = str(
+                Path(__file__).resolve().with_name("native_pumpkin_fixture.py")
+            )
+            provisioning_environment["KURBIS_CONTROL_PLUGIN_WASM"] = str(args.plugin_wasm)
+        else:
+            provisioning_environment["PUMPKIN_IMAGE"] = args.pumpkin_image
+        run(
+            str(args.bin_dir / "worker-bundle"), "--worker-id", workers[index],
+            "--output", str(bundle_path), env=provisioning_environment,
+        )
+        assert bundle_path.is_file(), f"worker-bundle did not create worker {index} credentials"
+        assert stat.S_IMODE(bundle_path.stat().st_mode) == 0o600
+        values = {}
+        for line in bundle_path.read_text().splitlines():
+            key, separator, raw = line.removeprefix("export ").partition("=")
+            allowed_bundle_key = key.startswith("WORKER_") or key in {
+                "CONTROL_PLANE_URL", "PUBLIC_BASE_URL", "PUMPKIN_HOST_CONTROL_TOKEN",
+                "PUMPKIN_BINARY", "PUMPKIN_IMAGE", "KURBIS_CONTROL_PLUGIN_WASM",
+                "SNAPSHOT_INTERVAL_SECONDS", "IDLE_TIMEOUT_SECONDS",
+            }
+            assert separator and allowed_bundle_key, (
+                f"unexpected worker bundle entry: {key}"
+            )
+            parsed = shlex.split(raw)
+            assert len(parsed) == 1
+            values[key] = parsed[0]
+        required = {
+            "WORKER_ID", "WORKER_NAME", "WORKER_ADDRESS", "WORKER_SIGNAL_ADDRESS",
+            "WORKER_DATABASE_URL", "WORKER_API_TOKEN", "PUMPKIN_HOST_CONTROL_TOKEN",
+            "CONTROL_PLANE_URL", "PUBLIC_BASE_URL", "WORKER_RUNTIME",
+            "WORKER_STORAGE_MODE", "WORKER_ROOT",
+        }
+        assert required <= values.keys(), f"worker {index} bundle misses {required - values.keys()}"
+        assert not ({"DATABASE_URL", "INTERNAL_TOKEN", "OBJECT_STORE_TYPE", "OBJECT_STORE_LOCAL_ROOT"} & values.keys())
+        role = urllib.parse.urlsplit(values["WORKER_DATABASE_URL"]).username
+        assert role and role != "postgres", "worker bundle reused the control-plane database role"
+        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", values["WORKER_API_TOKEN"])
+        worker_bundles[index] = values
+        evidence["checks"].append({
+            "worker_bundle": index,
+            "database_role_isolated": role,
+            "bundle_mode": "0600",
+            "api_token_length": len(values["WORKER_API_TOKEN"]),
+            "contains_no_control_plane_or_object_store_credentials": True,
+        })
+        return values
+
     def runtime_alive(index):
         record_path = root / f"worker-{index}/servers" / server / "run/native-process.json"
         if not record_path.exists():
@@ -123,7 +289,7 @@ def main():
         index = workers.index(placement_worker)
         path = (Path(f"/tmp/kurbis-native-{uuid.UUID(placement_worker).hex}") / f"{uuid.UUID(server).hex}.sock"
                 if native else root / f"worker-{index}/servers" / server / "run/host-control.sock")
-        return rpc(path, secret, "status")["players"]
+        return rpc(path, worker_bundle(index)["PUMPKIN_HOST_CONTROL_TOKEN"], "status")["players"]
 
     def state():
         return sql(f"SELECT observed_state FROM servers WHERE id = '{server}'")
@@ -137,24 +303,188 @@ def main():
     def launch(binary, environment, name):
         log = (args.output / f"{name}.log").open("wb")
         logs.append(log)
-        process = subprocess.Popen([str(args.bin_dir / binary)], env={**os.environ, **environment}, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        if binary == "worker":
+            allow = {
+                "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "RUST_LOG",
+                "SSL_CERT_FILE", "SSL_CERT_DIR", "DOCKER_HOST", "DOCKER_CONFIG",
+                "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+            }
+            process_environment = {key: value for key, value in os.environ.items() if key in allow}
+        else:
+            process_environment = os.environ.copy()
+        process_environment.update(environment)
+        if binary == "worker":
+            assert "DATABASE_URL" not in process_environment
+            assert "INTERNAL_TOKEN" not in process_environment
+            assert not any(key.startswith(("OBJECT_STORE_", "AWS_")) for key in process_environment)
+        process = subprocess.Popen([str(args.bin_dir / binary)], env=process_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         processes.append(process)
         return process
 
     def worker(index):
-        environment = {**common,
-            "WORKER_ID": workers[index], "WORKER_NAME": f"runtime-{identifier}-{index}", "WORKER_ADDRESS": "127.0.0.1",
-            "WORKER_ROOT": str(root / f"worker-{index}"), "WORKER_STORAGE_MODE": "directory" if native else "loopback_ext4",
-            "WORKER_RUNTIME": "native" if native else "docker",
-            "PUMPKIN_BINARY": str(Path(__file__).resolve().with_name("native_pumpkin_fixture.py")),
-            "NATIVE_FIXTURE_BINARY": str(args.native_binary or ""),
-            "WORKER_MEMORY_GIB": "2", "WORKER_DISK_GIB": "20", "WORKER_CPU_MILLIS": "2000",
-            "WORKER_PORT_MIN": str(worker_ports[index]), "WORKER_PORT_MAX": str(worker_ports[index] + 20),
-            "PUMPKIN_IMAGE": args.pumpkin_image, "PUMPKIN_HOST_CONTROL_TOKEN": secret,
-            "SNAPSHOT_INTERVAL_SECONDS": str(args.snapshot_interval_seconds), "IDLE_TIMEOUT_SECONDS": "300",
-            "OBJECT_STORE_TYPE": "local", "OBJECT_STORE_LOCAL_ROOT": str(root / "objects"),
+        environment = {
+            **worker_bundle(index),
         }
+        if native:
+            environment["NATIVE_FIXTURE_BINARY"] = str(args.native_binary)
         return launch("worker", environment, f"worker-{index}-{len(processes)}")
+
+    def worker_healthy(index):
+        role = urllib.parse.urlsplit(worker_bundle(index)["WORKER_DATABASE_URL"]).username
+        return sql(
+            f"SELECT (w.heartbeat_at > now() - interval '30 seconds')::text || ':' || "
+            f"EXISTS(SELECT 1 FROM pg_stat_activity WHERE usename = '{role}')::text "
+            f"FROM workers w WHERE w.id = '{workers[index]}'"
+        ) == "true:true"
+
+    def worker_role_permissions(index):
+        role = urllib.parse.urlsplit(worker_bundle(index)["WORKER_DATABASE_URL"]).username
+        return sql(
+            f"SELECT concat(rolcanlogin::text,':',rolsuper::text,':',rolcreatedb::text,':',rolcreaterole::text,':',rolbypassrls::text,':',"
+            f"pg_has_role(rolname,'worker_runtime','MEMBER')::text) FROM pg_roles WHERE rolname='{role}'"
+        )
+
+    def verify_worker_runtime_identity(index):
+        wait(lambda: worker_healthy(index), f"worker {index} heartbeat from its isolated database role")
+        permissions = worker_role_permissions(index)
+        assert permissions == "true:false:false:false:false:true", (
+            f"worker {index} database role has unexpected privileges: {permissions}"
+        )
+        evidence["checks"].append({
+            "worker_runtime_identity": index,
+            "active_database_session": True,
+            "worker_runtime_role_only": True,
+            "superuser_createdb_createrole_bypassrls": False,
+        })
+
+    def verify_plugin_staging(index=0):
+        server_dir = root / f"worker-{index}" / "servers" / server
+        plugin_path = server_dir / "plugins/kurbis-control.wasm"
+        config_path = server_dir / "plugins/data/kurbis-control/config.json"
+        capability_path = root / f"worker-{index}" / "capabilities" / f"{server}.token"
+        if native:
+            plugin_bytes = plugin_path.read_bytes()
+            plugin_hash = hashlib.sha256(plugin_bytes).hexdigest()
+            assert plugin_hash == hashlib.sha256(args.plugin_wasm.read_bytes()).hexdigest()
+        else:
+            plugin_probe = run(
+                "docker", "exec", backend, "sha256sum", "/pumpkin/plugins/kurbis-control.wasm",
+                check=False,
+            )
+            if plugin_probe.returncode != 0:
+                listing = run(
+                    "docker", "exec", backend, "find", "/pumpkin/plugins", "-maxdepth", "2",
+                    "-type", "f", check=False,
+                )
+                raise RuntimeError(
+                    "Docker Pumpkin plugin probe failed: "
+                    f"{plugin_probe.stderr.strip()}; files={listing.stdout.strip()}"
+                )
+            image_hash = plugin_probe.stdout.split()[0]
+            plugin_hash = image_hash
+            expected_hash = run(
+                "docker", "run", "--rm", "--entrypoint", "/usr/bin/sha256sum",
+                args.pumpkin_image, "/usr/local/share/kurbis-control.wasm",
+            ).stdout.split()[0]
+            assert plugin_hash == expected_hash
+        config = json.loads(config_path.read_text())
+        capability = config.get("capability", "")
+        assert config.get("server_id") == server
+        assert config.get("api_base_url") == plugin_api_base_url
+        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", capability)
+        assert capability_path.read_text().strip() == capability
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(capability_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(capability_path.parent.stat().st_mode) == 0o700
+        assert sql(
+            f"SELECT count(*) FROM server_instance_capabilities c JOIN placements p "
+            f"ON p.server_id=c.server_id AND p.worker_id=c.worker_id "
+            f"AND p.generation=c.placement_generation WHERE c.server_id='{server}' "
+            f"AND c.worker_id='{workers[index]}'"
+        ) == "1"
+        evidence["checks"].append({
+            "managed_plugin_staged": True,
+            "capability_outside_server_volume": True,
+            "capability_file_mode": "0600",
+            "plugin_sha256": plugin_hash,
+        })
+        return capability
+
+    def server_management_state():
+        return sql(
+            f"SELECT json_build_object("
+            f"'settings',(SELECT settings FROM servers WHERE id='{server}'),"
+            f"'whitelist',COALESCE((SELECT json_agg(jsonb_build_object("
+            f"'player_id',player_id,'name',name) ORDER BY player_id) "
+            f"FROM whitelist_entries WHERE server_id='{server}'),'[]'::json),"
+            f"'whitelist_revision',(SELECT jsonb_build_object("
+            f"'revision',revision,'applied_revision',applied_revision) "
+            f"FROM server_whitelist_state WHERE server_id='{server}'),"
+            f"'operations',COALESCE((SELECT json_agg(jsonb_build_object("
+            f"'id',id,'kind',kind,'status',status,'generation',generation,"
+            f"'attempt',attempt,'payload',payload,'last_error',last_error) ORDER BY id) "
+            f"FROM operations WHERE server_id='{server}'),'[]'::json),"
+            f"'start_request',(SELECT jsonb_build_object('reason',reason) "
+            f"FROM start_requests WHERE server_id='{server}')"
+            f")::text"
+        )
+
+    def verify_plugin_permissions(gateway_java):
+        operator_before = server_management_state()
+        protocol(
+            gateway_java,
+            "operator-kurbis-menu-start",
+            transfer_port=worker_ports[0],
+            command=["kurbis"],
+            click_slot=[39, 20, 22],
+            expect_gui_opens=3,
+            expect_message=["start requested; current state: online"],
+            forbid_message=["Kurbis: authentication required"],
+            hold_seconds=5,
+            timeout=60,
+        )
+        wait(lambda: state() == "online", "operator GUI action leaves the live server online", 10)
+        assert server_management_state() == operator_before, (
+            "operator's already-online start action changed settings, whitelist, or operation state"
+        )
+
+        non_operator_before = server_management_state()
+        forbidden_commands = [
+            "kurbis",
+            "kurbis status",
+            "kurbis login",
+            "kurbis start confirm",
+            "kurbis stop confirm",
+            "kurbis restart confirm",
+            "kurbis snapshot confirm",
+            "kurbis set motd unauthorized",
+            f"kurbis whitelist add {uuid.uuid4()} NoOpPlayer",
+        ]
+        protocol(
+            gateway_java,
+            "non-operator-kurbis-permissions",
+            transfer_port=worker_ports[0],
+            username="NoOpPlayer",
+            command=forbidden_commands,
+            expect_gui_opens=0,
+            forbid_message=[
+                "One-use server login link",
+                "requested; current state:",
+                "Updated motd",
+                "Added NoOpPlayer to the whitelist",
+                "Restoring snapshot",
+            ],
+            hold_seconds=5,
+            timeout=60,
+        )
+        assert server_management_state() == non_operator_before, (
+            "non-operator Kurbis commands changed settings, whitelist, or operation state"
+        )
+        evidence["checks"].append({
+            "kurbis_operator_menu": {"gui_opens": 3, "clicked_slots": [39, 20, 22], "action": "online start acknowledged"},
+            "kurbis_non_operator": {"commands_denied": len(forbidden_commands), "gui_opens": 0,
+                                    "settings_whitelist_operations_unchanged": True},
+        })
 
     def wake():
         request = urllib.request.Request(f"http://127.0.0.1:{api_port}/internal/wake/live.mc.example.test", method="POST", headers={"authorization": f"Bearer {secret}"})
@@ -164,9 +494,12 @@ def main():
     def protocol(port, name, **options):
         edition = "java"
         artifact = args.output / f"protocol-{name}-{edition}.json"
+        expect_server_login_link = options.pop("expect_server_login_link", False)
         command = ["node", str(args.protocol_dir / "verify.mjs"), "--edition", edition,
                    "--port", str(port), "--address", options.pop("address", "live.mc.example.test"),
                    "--output", str(artifact)]
+        if expect_server_login_link:
+            command.append("--capture-login-link")
         for key, value in options.items():
             option = "--" + key.replace("_", "-")
             if isinstance(value, bool):
@@ -176,8 +509,7 @@ def main():
             for item in value if isinstance(value, list) else [value]:
                 command.extend([option, str(item)])
         client_log = args.output / f"protocol-{name}-{edition}.log"
-        output = client_log.open("w")
-        client = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True)
+        client = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         waiting_socket = root / "waiting/run/host-control.sock"
         observed_players = []
         route_snapshots = []
@@ -226,15 +558,28 @@ def main():
                 except subprocess.TimeoutExpired:
                     client.kill()
                     client.wait()
-            output.close()
-        stdout = client_log.read_text()
+        stdout, _ = client.communicate()
+        client_log.write_text(redact_login_links(stdout))
         assert client.returncode == 0, (
-            f"Real {edition} protocol scenario {name} failed: {stdout}; "
+            f"Real {edition} protocol scenario {name} failed: {redact_login_links(stdout)}; "
             f"waiting players observed: {observed_players}; route snapshots: {route_snapshots}"
         )
         proof = json.loads(artifact.read_text())
         assert proof["passed"] is True
         evidence["checks"].append({"protocol": name, "edition": edition, "events": proof["events"]})
+        if expect_server_login_link:
+            marker = next(
+                (line.partition("=")[2] for line in stdout.splitlines()
+                 if line.startswith("KURBIS_LOGIN_LINK=")),
+                None,
+            )
+            assert marker is not None, "Kurbis plugin did not return a browser login link"
+            parsed = urllib.parse.urlsplit(marker)
+            token = urllib.parse.parse_qs(parsed.fragment).get("token", [None])[0]
+            assert parsed.path == "/auth/server" and re.fullmatch(r"[A-Za-z0-9_-]{43}", token or ""), (
+                "Kurbis login link has an unexpected URL shape"
+            )
+            return marker
 
     def queued_hostname_clients(java, cookie):
         seed_account(queued_owner, queued_owner, "Queue Test")
@@ -274,6 +619,7 @@ def main():
         wait(lambda: state() == "online", "original hostname resumes after queued capacity test")
 
     def start_gateway():
+        java, bedrock = free_port(), free_port()
         waiting_root = root / "waiting"
         waiting_root.mkdir()
         (waiting_root / "run").mkdir()
@@ -289,12 +635,15 @@ view_distance = 2
 simulation_distance = 2
 [networking.bedrock]
 enabled = true
+motd = "Kurbis waiting fixture"
 view_distance = 2
 simulation_distance = 2
 [networking.bedrock.nethernet]
 enabled = true
 address = "0.0.0.0:{waiting_bedrock_port}"
-external_ip = ""
+signal_address = "0.0.0.0:{waiting_bedrock_port}"
+external_ip = "127.0.0.1"
+external_port = {bedrock}
 identity_key = "nethernet-key.der"
 stun_servers = []
 [telemetry]
@@ -320,8 +669,10 @@ enabled = false
             except (OSError, ValueError):
                 return False
         wait(ready, "actual waiting Pumpkin host-control readiness")
-        java, bedrock = free_port(), free_port()
         launch("gateway", {**common, "JAVA_LISTEN": f"127.0.0.1:{java}", "BEDROCK_LISTEN": f"127.0.0.1:{bedrock}",
+            "BEDROCK_PUBLIC_PORT": str(bedrock),
+            "BEDROCK_TLS_CERT_FILE": str(bedrock_certificate),
+            "BEDROCK_TLS_KEY_FILE": str(bedrock_private_key),
             "WAITING_JAVA_ADDRESS": f"127.0.0.1:{waiting_java_port}", "WAITING_BEDROCK_ADDRESS": f"127.0.0.1:{waiting_bedrock_port}",
             "WAITING_CONTROL_SOCKET": str(waiting_root / "run/host-control.sock"), "PUMPKIN_GATEWAY_CONTROL_TOKEN": secret,
             "CONTROL_PLANE_URL": f"http://127.0.0.1:{api_port}", "INTERNAL_TOKEN": secret,
@@ -335,7 +686,90 @@ enabled = false
             except OSError:
                 return False
         wait(listening, "real gateway listener")
-        return java, bedrock
+        def bedrock_tls_ready():
+            try:
+                status, _, _ = bedrock_https_request(
+                    bedrock_certificate, bedrock, "live.mc.example.test", "GET", "/v1/join"
+                )
+                return status == 200
+            except (OSError, ssl.SSLError, AssertionError):
+                return False
+        wait(bedrock_tls_ready, "trusted Bedrock TLS signaling listener")
+        return java, bedrock, bedrock_certificate
+
+    def verify_bedrock_signal(port, certificate):
+        waiting_status, waiting_headers, waiting_body = bedrock_https_request(
+            certificate, port, "live.mc.example.test", "GET", "/v1/join"
+        )
+        waiting = json.loads(waiting_body)
+        assert waiting_status == 200 and waiting_headers.get_content_type() == "application/json"
+        assert waiting["name"] == "Kurbis waiting fixture"
+        assert isinstance(waiting.get("protocol"), int) and waiting["protocol"] > 0
+
+        alias = f"s-{server}.mc.example.test"
+        backend_status, backend_headers, backend_body = bedrock_https_request(
+            certificate, port, alias, "GET", "/v1/join"
+        )
+        backend = json.loads(backend_body)
+        assert backend_status == 200 and backend_headers.get_content_type() == "application/json"
+        assert isinstance(backend.get("name"), str) and backend.get("name")
+
+        bad_sdp, _, _ = bedrock_https_request(
+            certificate, port, alias, "POST", "/v1/join/runtime-invalid-sdp",
+            b"not an SDP offer", "application/sdp",
+        )
+        assert bad_sdp == 400, f"malformed SDP was not rejected: HTTP {bad_sdp}"
+        no_content_type, _, _ = bedrock_https_request(
+            certificate, port, alias, "POST", "/v1/join/runtime-invalid-content-type", b"offer"
+        )
+        empty_offer, _, _ = bedrock_https_request(
+            certificate, port, alias, "POST", "/v1/join/runtime-empty-offer", b"", "application/sdp"
+        )
+        oversized, _, _ = bedrock_https_request(
+            certificate, port, alias, "POST", "/v1/join/runtime-large-offer",
+            b"x" * (MAX_HTTP_RESPONSE_BYTES + 1), "application/sdp",
+        )
+        query, _, _ = bedrock_https_request(
+            certificate, port, "live.mc.example.test", "GET", "/v1/join?unexpected=1"
+        )
+        escaped_id, _, _ = bedrock_https_request(
+            certificate, port, alias, "POST", "/v1/join/runtime%2Fescape", b"offer", "application/sdp"
+        )
+        wrong_port, _, _ = bedrock_https_request(
+            certificate, port, "live.mc.example.test", "GET", "/v1/join",
+            host_header=f"live.mc.example.test:{port + 1}",
+        )
+        mismatched_sni, _, _ = bedrock_https_request(
+            certificate, port, "live.mc.example.test", "GET", "/v1/join",
+            server_name="live.mc.example.test", host_header=f"{alias}:{port}",
+        )
+        unsupported, _, _ = bedrock_https_request(
+            certificate, port, "live.mc.example.test", "DELETE", "/v1/join"
+        )
+        unknown_alias = f"s-{uuid.uuid4()}.mc.example.test"
+        unavailable, _, _ = bedrock_https_request(
+            certificate, port, unknown_alias, "GET", "/v1/join"
+        )
+        assert (no_content_type, empty_offer, oversized, query, escaped_id, wrong_port,
+                mismatched_sni, unsupported, unavailable) == (400, 400, 413, 400, 404, 400, 421, 405, 503)
+        reject_bad_bedrock_tls_name(certificate, port)
+        evidence["checks"].append({
+            "bedrock_tls": {
+                "valid_waiting_status": waiting_status,
+                "valid_assigned_server_status": backend_status,
+                "malformed_sdp_status": bad_sdp,
+                "invalid_content_type_status": no_content_type,
+                "empty_offer_status": empty_offer,
+                "oversized_offer_status": oversized,
+                "query_status": query,
+                "escaped_network_id_status": escaped_id,
+                "wrong_port_status": wrong_port,
+                "mismatched_sni_status": mismatched_sni,
+                "unsupported_method_status": unsupported,
+                "unassigned_alias_status": unavailable,
+                "untrusted_certificate_name_rejected": True,
+            }
+        })
 
     class Provider(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
@@ -391,6 +825,63 @@ enabled = false
             body = response.read()
             return json.loads(body) if body else None
 
+    def verify_server_login(link):
+        origin = f"http://127.0.0.1:{api_port}"
+        parsed = urllib.parse.urlsplit(link)
+        assert f"{parsed.scheme}://{parsed.netloc}" == origin
+        token = urllib.parse.parse_qs(parsed.fragment).get("token", [None])[0]
+        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", token or "")
+
+        def redeem(request_origin):
+            request = urllib.request.Request(
+                f"{origin}/auth/server/redeem",
+                data=json.dumps({"token": token}).encode(),
+                method="POST",
+                headers={"Origin": request_origin, "Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return response.status, json.load(response), response.headers.get("Set-Cookie", "")
+            except urllib.error.HTTPError as error:
+                return error.code, None, ""
+
+        cross_origin_status, _, _ = redeem("https://attacker.example")
+        assert cross_origin_status == 403
+        status, payload, set_cookie = redeem(origin)
+        assert status == 200 and payload.get("server_id") == server
+        cookie = set_cookie.split(";", 1)[0]
+        assert cookie.startswith("kurbis_server_session=")
+        assert "HttpOnly" in set_cookie and "Secure" in set_cookie and "SameSite=Lax" in set_cookie
+
+        def scoped_status(path):
+            request = urllib.request.Request(f"{origin}{path}", headers={"Cookie": cookie})
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return response.status
+            except urllib.error.HTTPError as error:
+                return error.code
+
+        assert scoped_status(f"/api/v1/servers/{server}/players") == 200
+        assert scoped_status(f"/api/v1/servers/{uuid.uuid4()}/players") == 401
+        assert scoped_status("/api/v1/account") == 401
+        replay_status, _, _ = redeem(origin)
+        assert replay_status == 401
+        sql(
+            f"UPDATE server_sessions SET expires_at=now()-interval '1 second' "
+            f"WHERE server_id='{server}'"
+        )
+        expired_status = scoped_status(f"/api/v1/servers/{server}/players")
+        assert expired_status == 401
+        evidence["checks"].append({
+            "kurbis_link_redemption": "one-use",
+            "cross_origin_status": cross_origin_status,
+            "server_api_status": 200,
+            "cross_server_status": 401,
+            "account_api_status": 401,
+            "replay_status": replay_status,
+            "expired_session_status": expired_status,
+        })
+
     try:
         if not native:
             run("docker", "run", "--detach", "--name", postgres, "--publish", f"127.0.0.1:{db_port}:5432",
@@ -403,7 +894,8 @@ enabled = false
             "OBJECT_STORE_TYPE": "local",
             "OBJECT_STORE_LOCAL_ROOT": str(root / "objects"),
         }
-        launch("control-plane", {**common, "CONTROL_PLANE_LISTEN": f"127.0.0.1:{api_port}",
+        listen_host = "127.0.0.1" if native else "0.0.0.0"
+        launch("control-plane", {**common, "CONTROL_PLANE_LISTEN": f"{listen_host}:{api_port}",
             "PUBLIC_BASE_URL": f"http://127.0.0.1:{api_port}", "PANEL_ORIGIN": "http://127.0.0.1:18082", "ROOT_DOMAIN": "mc.example.test",
             "INTERNAL_TOKEN": secret,
             "GOOGLE_OAUTH_CLIENT_ID": "runtime-google", "GOOGLE_OAUTH_CLIENT_SECRET": secret,
@@ -423,9 +915,15 @@ enabled = false
         sql(f"INSERT INTO servers(id,owner_id,subdomain) VALUES('{server}','{owner}','live'); UPDATE servers SET settings = '{{\"view_distance\":2,\"simulation_distance\":2}}' WHERE id = '{server}'")
         cookie = user_session()
         first_worker = worker(0)
-        wait(lambda: sql(f"SELECT count(*) FROM workers WHERE id = '{workers[0]}'") == "1", "worker heartbeat")
+        verify_worker_runtime_identity(0)
         wake()
         wait(lambda: state() == "online", "actual runtime/Pumpkin readiness")
+        if args.readiness_only:
+            evidence["checks"].append({"real_start": "online", "readiness_only": True})
+            evidence["passed"] = True
+            (args.output / "result.json").write_text(json.dumps(evidence, indent=2) + "\n")
+            print(json.dumps(evidence, indent=2))
+            return
         if native:
             evidence["checks"].append({"real_start": "online", "runtime": "native"})
         else:
@@ -434,24 +932,33 @@ enabled = false
             assert constraints["Memory"] == 2 * 1024 ** 3 and constraints["MemorySwap"] == 2 * 1024 ** 3
             assert constraints["ReadonlyRootfs"] and constraints["PidsLimit"] == 512
             evidence["checks"].append({"real_start": "online", "memory_bytes": constraints["Memory"], "memory_swap_bytes": constraints["MemorySwap"], "readonly_root": True, "pids_limit": 512})
-        gateway_java, gateway_bedrock = start_gateway()
+        gateway_java, gateway_bedrock, gateway_certificate = start_gateway()
+        verify_bedrock_signal(gateway_bedrock, gateway_certificate)
         protocol(gateway_java, "unknown", address="unknown.mc.example.test", expect_close=True)
         online_commands = [
             "give @s minecraft:diamond 7",
             "execute at @s run setblock ~ ~-1 ~ minecraft:gold_block",
+            "kurbis login",
         ]
-        online_messages = ["commands.setblock.success"]
-        protocol(
+        online_messages = [
+            "commands.setblock.success",
+            "One-use server login link (valid for 15 minutes):",
+        ]
+        initial_capability = verify_plugin_staging(0)
+        login_link = protocol(
             gateway_java,
             "online",
             transfer_port=worker_ports[0],
             command=online_commands,
             expect_item=["diamond:7"],
             expect_message=online_messages,
-            forbid_message=["Sign in to kurbis:", "One-use server login link"],
+            forbid_message=["Sign in to kurbis:"],
+            expect_server_login_link=True,
             hold_seconds=5,
             timeout=60,
         )
+        verify_server_login(login_link)
+        verify_plugin_permissions(gateway_java)
         queued_hostname_clients(gateway_java, cookie)
         directory = root / "worker-0" / "servers" / server
         if not native:
@@ -534,7 +1041,7 @@ enabled = false
         evidence["checks"].append({"latest_completed_recovery_generation": int(recovery_generation), "player_sha256": hashlib.sha256(expected).hexdigest()})
         sql(f"INSERT INTO snapshots(id,server_id,generation,manifest_key,size_bytes,checksum,reason,complete) SELECT '{uuid.uuid4()}','{server}',MAX(generation)+1,'partial',0,'partial','periodic',false FROM snapshots WHERE server_id = '{server}'")
         worker(1)
-        wait(lambda: sql(f"SELECT count(*) FROM workers WHERE id = '{workers[1]}'") == "1", "second worker heartbeat")
+        verify_worker_runtime_identity(1)
         sql(f"UPDATE workers SET heartbeat_at = now() - interval '1 minute' WHERE id = '{workers[0]}'")
         assert sql(f"SELECT active FROM placements WHERE server_id = '{server}'") == "t"
         assert runtime_alive(0) if native else run("docker", "inspect", "--format", "{{.State.Running}}", backend).stdout.strip() == "true"
@@ -561,6 +1068,10 @@ enabled = false
         assert sql(f"SELECT worker_id FROM placements WHERE server_id = '{server}'") == workers[1]
         restored = root / "worker-1/servers" / server / stable["path"]
         assert restored.read_bytes() == expected
+        relocated_capability = verify_plugin_staging(1)
+        assert relocated_capability != initial_capability, (
+            "placement reassignment reused a stale server capability"
+        )
         evidence["checks"].append({"cross_worker_restore": "identical saved player data before login", "worker": workers[1]})
         protocol(gateway_java, "cross-worker-gameplay", transfer_port=worker_ports[1], command=[
             "execute at @s if block ~ ~-1 ~ minecraft:gold_block run setblock ~ ~-1 ~ minecraft:emerald_block"],
@@ -570,7 +1081,13 @@ enabled = false
         final = json.loads(sql(f"SELECT json_build_object('generation',sn.generation,'reason',sn.reason,'complete',sn.complete,'reserved',w.reserved_memory_bytes) FROM servers s JOIN snapshots sn ON sn.server_id=s.id AND sn.generation=s.current_snapshot_generation JOIN placements p ON p.server_id=s.id JOIN workers w ON w.id=p.worker_id WHERE s.id='{server}'"))
         assert final["reason"] == "shutdown" and final["complete"] is True and final["reserved"] == 0
         evidence["checks"].append({"clean_shutdown_final_snapshot": final})
-        protocol(gateway_java, "sleeping-wake", transfer_port=worker_ports[1], command=["execute at @s if block ~ ~-1 ~ minecraft:emerald_block run setblock ~ ~-1 ~ minecraft:diamond_block"], expect_item=["diamond:7"], expect_message=["commands.setblock.success"], hold_seconds=5)
+        protocol(gateway_java, "sleeping-wake",
+            transfer_port_range=[
+                f"{worker_ports[0]}-{worker_ports[0] + 20}",
+                f"{worker_ports[1]}-{worker_ports[1] + 20}",
+            ],
+            command=["execute at @s if block ~ ~-1 ~ minecraft:emerald_block run setblock ~ ~-1 ~ minecraft:diamond_block"],
+            expect_item=["diamond:7"], expect_message=["commands.setblock.success"], hold_seconds=5)
         wait(lambda: state() == "online", "native Java wake and transfer")
         user_action(cookie, "stop")
         wait(lambda: state() == "sleeping", "shutdown before manual idle-test resume")
@@ -583,7 +1100,23 @@ enabled = false
         while time.monotonic() - initial_empty < 150:
             keep_online_through_snapshot()
             time.sleep(1)
-        protocol(gateway_java, "idle-rejoin", transfer_port=worker_ports[1], expect_item=["diamond:7"], hold_seconds=10)
+        wait(
+            lambda: state() == "snapshotting",
+            "periodic snapshot before idle rejoin",
+            max(60, args.snapshot_interval_seconds + 30),
+        )
+        wait(
+            lambda: state() == "online",
+            "periodic snapshot completes before idle rejoin",
+            30,
+        )
+        protocol(
+            gateway_java,
+            "idle-rejoin",
+            transfer_port=worker_ports[1],
+            expect_item=["diamond:7"],
+            hold_seconds=2,
+        )
         wait(lambda: state() == "online" and player_count() == 0, "rejoining player leaves", 30)
         reset_empty = time.monotonic()
         while time.monotonic() - initial_empty < 305:
@@ -612,8 +1145,13 @@ enabled = false
             assert after_pressure["oom_kill"] > before_pressure["oom_kill"], f"No kernel cgroup OOM kill: {before_pressure}, {after_pressure}"
             evidence["checks"].append({"memory_pressure_exit": pressure.returncode, "memory_limit_bytes": 2 * 1024 ** 3,
                                        "swap_limit_bytes": 0, "memory_events_before": before_pressure, "memory_events_after": after_pressure})
-        evidence["limitations"] = ["Native development processes have no hard memory cgroup or ext4 quota",
-            "Bedrock 1.26.51 login is blocked by the pinned upstream NetherNet TLS signaling issue"]
+        evidence["limitations"] = (
+            ["Native development processes have no hard memory cgroup or ext4 quota"]
+            if native else []
+        )
+        evidence["not_performed_by_user_instruction"] = [
+            "physical Bedrock client login/UI interaction"
+        ]
         evidence["passed"] = True
         (args.output / "result.json").write_text(json.dumps(evidence, indent=2) + "\n")
         print(json.dumps(evidence, indent=2))
@@ -642,10 +1180,14 @@ enabled = false
                             pass
                     log_path = record_path.with_name("native.log")
                     if log_path.exists():
-                        shutil.copyfile(log_path, args.output / f"backend-{index}-{identity}.log")
+                        (args.output / f"backend-{index}-{identity}.log").write_text(
+                            redact_login_links(log_path.read_text(errors="replace"))
+                        )
         else:
             backend_logs = run("docker", "logs", backend, check=False)
-            (args.output / "backend-at-exit.log").write_text(backend_logs.stdout + backend_logs.stderr)
+            (args.output / "backend-at-exit.log").write_text(
+                redact_login_links(backend_logs.stdout + backend_logs.stderr)
+            )
         for process in reversed(processes):
             if process.poll() is None:
                 process.send_signal(signal.SIGCONT)
@@ -667,11 +1209,50 @@ enabled = false
                 queued_mount = root / f"worker-{index}/servers" / queued_server
                 if queued_mount.exists():
                     run("umount", str(queued_mount), check=False)
+        for index in range(2):
+            capability_directory = root / f"worker-{index}/capabilities"
+            if capability_directory.exists():
+                shutil.rmtree(capability_directory)
+            for identity in (server, queued_server):
+                plugin_config = (
+                    root / f"worker-{index}/servers" / identity /
+                    "plugins/data/kurbis-control/config.json"
+                )
+                try:
+                    plugin_config.unlink()
+                except FileNotFoundError:
+                    pass
+        for bundle_path in root.glob("worker-*.env"):
+            try:
+                bundle_path.unlink()
+            except FileNotFoundError:
+                pass
         if oauth_service:
             oauth_service.shutdown()
             oauth_service.server_close()
         for log in logs:
             log.close()
+        for certificate_file in (bedrock_certificate, bedrock_private_key):
+            try:
+                certificate_file.unlink()
+            except FileNotFoundError:
+                pass
+        if native:
+            for index, bundle in worker_bundles.items():
+                role = urllib.parse.unquote(urllib.parse.urlsplit(bundle["WORKER_DATABASE_URL"]).username or "")
+                if not re.fullmatch(r"wkr_[a-f0-9]{32}_[a-f0-9]{8}", role):
+                    print(f"Retaining unexpected test worker database role name: {role!r}")
+                    continue
+                cleanup = run(
+                    "psql", args.database_url, "-qAt", "-c",
+                    f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    f"WHERE usename='{role}' AND pid<>pg_backend_pid(); "
+                    f"DELETE FROM worker_auth.credentials WHERE worker_id='{workers[index]}'; "
+                    f"REVOKE worker_runtime FROM {role}; DROP ROLE IF EXISTS {role}",
+                    check=False,
+                )
+                if cleanup.returncode != 0:
+                    print(f"Could not remove temporary database role for worker {index}: {cleanup.stderr.strip()}")
         # Refuse to remove a directory if any quota mount failed to unmount.
         mounts = "" if native else Path("/proc/mounts").read_text()
         if str(root) not in mounts:

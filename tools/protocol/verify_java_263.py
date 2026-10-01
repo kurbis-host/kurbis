@@ -2,6 +2,7 @@
 """Protocol 777 Java client for worker lifecycle verification."""
 import argparse
 import json
+import re
 import socket
 import struct
 import time
@@ -9,6 +10,17 @@ from pathlib import Path
 
 PROTOCOL = 777
 DIAMOND_ITEM_ID = 1012
+LOGIN_LINK = re.compile(r"(https?://[^\s\"<>]+/auth/server#token=)[A-Za-z0-9_-]{43}")
+
+
+def redact_login_links(value):
+    if isinstance(value, str):
+        return LOGIN_LINK.sub(r"\1[redacted]", value)
+    if isinstance(value, list):
+        return [redact_login_links(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_login_links(item) for key, item in value.items()}
+    return value
 
 
 def vi(value):
@@ -78,6 +90,83 @@ def send_packet(sock, packet, body=b"", compression=None):
     sock.sendall(vi(len(payload)) + payload)
 
 
+def container_click_payload(sync_id, revision, slot):
+    if not 0 <= slot < 54:
+        raise ValueError("GUI slot must be between 0 and 53")
+    return vi(sync_id) + vi(revision) + struct.pack(">hB", slot, 0) + vi(0) + vi(0) + b"\x00"
+
+
+def port_range(value):
+    try:
+        lower, upper = (int(part) for part in value.split("-", 1))
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("transfer range must be MIN-MAX")
+    if not 1 <= lower <= upper <= 65535:
+        raise argparse.ArgumentTypeError("transfer range must be within 1..65535")
+    return lower, upper
+
+
+def transfer_port_allowed(port, exact_port, ranges):
+    if exact_port is not None:
+        return port == exact_port
+    return any(lower <= port <= upper for lower, upper in ranges)
+
+
+def skip_item_component(data, offset, component_id):
+    # The managed Kurbis menu uses custom_name and lore components. Decode
+    # those network forms so GUI packets remain verifiable on modern clients;
+    # unknown component payloads are rejected rather than guessed.
+    if component_id in (6, 11):  # custom_name/lore are Java NBT payloads
+        return skip_nbt(data, offset)
+    if component_id in (1, 2, 3, 12) or 88 <= component_id <= 121:
+        # max-stack/damage/max-damage/rarity and registry-backed variants
+        # are encoded as VarInts.
+        _, offset = read_vi(data, offset)
+        return offset
+    raise ValueError(f"unsupported added item component id {component_id}")
+
+
+def skip_nbt(data, offset):
+    def payload(tag, cursor):
+        if tag == 1:
+            return cursor + 1
+        if tag == 2:
+            return cursor + 2
+        if tag in (3, 4, 5, 6):
+            return cursor + {3: 4, 4: 8, 5: 4, 6: 8}[tag]
+        if tag in (7, 11, 12):
+            count = int.from_bytes(data[cursor:cursor + 4], "big", signed=True)
+            cursor += 4
+            width = {7: 1, 11: 4, 12: 8}[tag]
+            return cursor + max(count, 0) * width
+        if tag == 8:
+            length = int.from_bytes(data[cursor:cursor + 2], "big")
+            return cursor + 2 + length
+        if tag == 9:
+            element = data[cursor]
+            count = int.from_bytes(data[cursor + 1:cursor + 5], "big", signed=True)
+            cursor += 5
+            for _ in range(max(count, 0)):
+                cursor = payload(element, cursor)
+            return cursor
+        if tag == 10:
+            while True:
+                child = data[cursor]
+                cursor += 1
+                if child == 0:
+                    return cursor
+                name_len = int.from_bytes(data[cursor:cursor + 2], "big")
+                cursor += 2 + name_len
+                cursor = payload(child, cursor)
+        raise ValueError(f"unsupported NBT tag {tag}")
+
+    tag = data[offset]
+    offset += 1
+    if tag == 0:
+        return offset
+    return payload(tag, offset)
+
+
 def unpack_item(body, offset):
     count, offset = read_vi(body, offset)
     if count == 0:
@@ -85,10 +174,11 @@ def unpack_item(body, offset):
     item_id, offset = read_vi(body, offset)
     additions, offset = read_vi(body, offset)
     removals, offset = read_vi(body, offset)
-    if additions or removals:
-        # Verification scenarios give plain items; keep the parsed item while
-        # making an unsupported component layout fail with useful evidence.
-        raise ValueError(f"unexpected item components (add={additions}, remove={removals})")
+    for _ in range(additions):
+        component_id, offset = read_vi(body, offset)
+        offset = skip_item_component(body, offset, component_id)
+    for _ in range(removals):
+        _, offset = read_vi(body, offset)
     return {"item_id": item_id, "count": count}, offset
 
 
@@ -101,9 +191,13 @@ class ProtocolClient:
         self.joined = False
         self.transfer_seen = False
         self.packet_counts = {}
+        self.gui_open_count = 0
+        self.pending_gui_sync_id = None
+        self.gui_click_index = 0
 
     def record(self, event, **data):
         item = {"event": event, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **data}
+        item = redact_login_links(item)
         self.evidence["events"].append(item)
         print(json.dumps(item), flush=True)
 
@@ -137,6 +231,7 @@ class ProtocolClient:
                 except EOFError as error:
                     if self.args.expect_close or self.args.expect_kick:
                         self.record("connection_closed", reason=str(error), joined=self.joined)
+                        self.assert_expectations()
                         return
                     raise
 
@@ -177,10 +272,19 @@ class ProtocolClient:
                     reason = body.decode("utf-8", "replace")
                     self.record("kicked", packet=reason)
                     if self.args.expect_kick and self.args.expect_kick in reason:
+                        self.assert_expectations()
                         return
                     if self.args.expect_close:
+                        self.assert_expectations()
                         return
                     raise AssertionError(f"Unexpected play disconnect: {reason}")
+
+                if packet == 60:  # Open screen
+                    sync_id, _ = read_vi(body)
+                    self.gui_open_count += 1
+                    self.pending_gui_sync_id = sync_id
+                    self.record("gui_opened", sync_id=sync_id)
+                    continue
 
                 if packet == 73:  # Player position / teleport
                     teleport, offset = read_vi(body)
@@ -207,13 +311,21 @@ class ProtocolClient:
                     continue
                 if packet == 18:  # Container content
                     window, offset = read_vi(body)
-                    _revision, offset = read_vi(body, offset)
+                    revision, offset = read_vi(body, offset)
                     count, offset = read_vi(body, offset)
                     for slot in range(count):
                         item, offset = unpack_item(body, offset)
                         self.inventory[slot] = item
                     if offset < len(body):
                         unpack_item(body, offset)  # Carried item
+                    if window == self.pending_gui_sync_id:
+                        self.pending_gui_sync_id = None
+                        if self.gui_click_index < len(self.args.click_slot):
+                            slot = self.args.click_slot[self.gui_click_index]
+                            click = container_click_payload(window, revision, slot)
+                            send_packet(sock, 18, click, compression)
+                            self.gui_click_index += 1
+                            self.record("gui_slot_clicked", slot=slot, sync_id=window)
                     continue
                 if packet == 20:  # Container slot
                     window, offset = read_vi(body)
@@ -227,6 +339,13 @@ class ProtocolClient:
                 if packet == 124:  # System chat
                     text = body.decode("utf-8", "replace")
                     self.messages.append(text)
+                    if self.args.capture_login_link:
+                        link = re.search(
+                            r"https?://[^\s\"<>]+/auth/server#token=[A-Za-z0-9_-]{43}",
+                            text,
+                        )
+                        if link:
+                            print(f"KURBIS_LOGIN_LINK={link.group(0)}", flush=True)
                     self.record("server_message", text=text)
                     continue
                 if packet == 132:  # Transfer
@@ -234,10 +353,12 @@ class ProtocolClient:
                     host = body[offset:offset + host_length].decode("utf-8")
                     offset += host_length
                     port, _ = read_vi(body, offset)
-                    if not self.args.transfer_port or backend or self.transfer_seen:
+                    if (self.args.transfer_port is None and not self.args.transfer_port_range) or backend or self.transfer_seen:
                         raise AssertionError("Unexpected or repeated native transfer")
-                    if port != self.args.transfer_port:
-                        raise AssertionError(f"Transfer port {port} != {self.args.transfer_port}")
+                    if not transfer_port_allowed(
+                        port, self.args.transfer_port, self.args.transfer_port_range
+                    ):
+                        raise AssertionError(f"Transfer port {port} is outside the provisioned ranges")
                     if host != self.args.transfer_host:
                         raise AssertionError(f"Transfer host {host} != {self.args.transfer_host}")
                     if not self.joined:
@@ -274,6 +395,16 @@ class ProtocolClient:
         for forbidden in self.args.forbid_message:
             if any(forbidden in message for message in self.messages):
                 raise AssertionError(f"Unexpected server message: {forbidden}")
+        if self.args.expect_gui_opens is not None:
+            if self.gui_open_count != self.args.expect_gui_opens:
+                raise AssertionError(
+                    f"GUI opened {self.gui_open_count} times, expected {self.args.expect_gui_opens}"
+                )
+            if self.gui_click_index != len(self.args.click_slot):
+                raise AssertionError(
+                    f"Sent {self.gui_click_index} GUI clicks, expected {len(self.args.click_slot)}"
+                )
+            self.record("gui_verified", open_count=self.gui_open_count, clicks=self.gui_click_index)
 
 
 def main():
@@ -285,6 +416,7 @@ def main():
     parser.add_argument("--address", required=True)
     parser.add_argument("--username", default="RuntimePlayer")
     parser.add_argument("--transfer-port", type=int)
+    parser.add_argument("--transfer-port-range", type=port_range, action="append", default=[])
     parser.add_argument("--transfer-host", default="127.0.0.1")
     parser.add_argument("--expect-kick")
     parser.add_argument("--hold-seconds", type=float, default=2)
@@ -292,14 +424,20 @@ def main():
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--command", action="append", default=[])
+    parser.add_argument("--capture-login-link", action="store_true")
     parser.add_argument("--expect-item", action="append", default=[])
     parser.add_argument("--expect-message", action="append", default=[])
     parser.add_argument("--forbid-message", action="append", default=[])
+    parser.add_argument("--click-slot", action="append", type=int, default=[])
+    parser.add_argument("--expect-gui-opens", type=int)
     parser.add_argument("--direct", action="store_true")
     args = parser.parse_args()
     evidence = {"edition": "java", "address": args.address, "protocol": args.protocol, "events": []}
     try:
-        ProtocolClient(args, evidence).connect(args.host, args.port, args.address, args.direct or not args.transfer_port)
+        ProtocolClient(args, evidence).connect(
+            args.host, args.port, args.address,
+            args.direct or (args.transfer_port is None and not args.transfer_port_range),
+        )
         evidence["passed"] = True
     except Exception as error:
         evidence["passed"] = False

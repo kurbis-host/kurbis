@@ -1,5 +1,9 @@
 #!/bin/sh
 set -eu
+# This fixture replaces the hosted entrypoint, so retain its managed plugin
+# installation boundary explicitly.
+mkdir -p /pumpkin/plugins
+install -m 0644 /usr/local/share/kurbis-control.wasm /pumpkin/plugins/kurbis-control.wasm
 # The disposable harness supplies config before start. Disable external identity
 # providers only in this derived test image, retaining real packet/crypto flows.
 awk '
