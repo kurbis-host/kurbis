@@ -117,12 +117,13 @@ async fn account_merge_preserves_suspension_default_world_and_world_history() {
     let game_world = add_world(&pool, game_user, "preserve-game").await;
     let java_uuid = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO identities(id, user_id, provider, subject, display_name)
-         VALUES($1, $2, 'minecraft_java', $3, 'Verified Java Player')",
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Verified Java Player', $4)",
     )
     .bind(Uuid::new_v4())
     .bind(game_user)
     .bind(java_uuid.to_string())
+    .bind(java_uuid)
     .execute(&pool)
     .await
     .unwrap();
@@ -135,6 +136,7 @@ async fn account_merge_preserves_suspension_default_world_and_world_history() {
         &pool,
         "minecraft_java",
         &java_uuid.to_string(),
+        java_uuid,
         "Verified Java Player",
         Some(browser_user),
     )

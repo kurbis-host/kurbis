@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use object_store::ObjectStore;
 use reqwest::Client;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -20,6 +21,7 @@ use super::{auth, lifecycle::Lifecycle};
 mod account;
 mod activity;
 mod events;
+mod exports;
 mod internal;
 mod logs;
 mod players;
@@ -51,6 +53,7 @@ pub struct AppState {
     pub lifecycle: Lifecycle,
     pub config: ControlPlaneConfig,
     pub http: Client,
+    pub object_store: Arc<dyn ObjectStore>,
 }
 
 #[derive(Debug)]
@@ -155,30 +158,62 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(account::revoke_session),
         )
         .route(
-            "/api/v1/server",
+            "/api/v1/servers",
+            get(server::list_servers).post(server::create_server),
+        )
+        .route(
+            "/api/v1/servers/{server_id}",
             get(server::get_server)
-                .post(server::create_server)
                 .patch(server::update_server)
                 .delete(server::delete_server),
         )
-        .route("/api/v1/server/actions", post(server::server_action))
-        .route("/api/v1/server/events", get(events::server_events))
-        .route("/api/v1/server/logs", get(logs::logs))
-        .route("/api/v1/server/activity", get(activity::activity))
-        .route("/api/v1/server/snapshots", get(snapshots::snapshots))
         .route(
-            "/api/v1/server/snapshots/{generation}/restore",
+            "/api/v1/servers/{server_id}/actions",
+            post(server::server_action),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/reset",
+            post(server::reset_server),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/events",
+            get(events::server_events),
+        )
+        .route("/api/v1/servers/{server_id}/logs", get(logs::logs))
+        .route(
+            "/api/v1/servers/{server_id}/activity",
+            get(activity::activity),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/snapshots",
+            get(snapshots::snapshots),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/snapshots/{generation}/restore",
             post(snapshots::restore_snapshot),
         )
-        .route("/api/v1/server/players", get(players::players))
         .route(
-            "/api/v1/server/whitelist",
+            "/api/v1/servers/{server_id}/exports",
+            get(exports::list_exports).post(exports::create_export),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/exports/{export_id}",
+            get(exports::get_export).delete(exports::cancel_export),
+        )
+        .route(
+            "/api/v1/servers/{server_id}/exports/{export_id}/download",
+            get(exports::download_export),
+        )
+        .route("/api/v1/servers/{server_id}/players", get(players::players))
+        .route(
+            "/api/v1/servers/{server_id}/whitelist",
             get(whitelist::whitelist)
                 .post(whitelist::add_whitelist_entry)
                 .delete(whitelist::remove_whitelist_entry),
         )
         .route("/internal/resolve/{hostname}", get(internal::resolve))
         .route("/internal/wake/{hostname}", post(internal::wake))
+        .route("/internal/admission", post(internal::admit))
         .route(
             "/internal/minecraft-login-links",
             post(internal::mint_minecraft_link),

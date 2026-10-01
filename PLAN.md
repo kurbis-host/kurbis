@@ -136,7 +136,7 @@ Minecraft login links are issued only for identities proven by successful online
 
 An account merge moves identities, sessions, and server ownership transactionally. Preserve snapshots, operations, logs, events, player history, whitelist data, and all other records attached to the existing server IDs. A suspended source or destination leaves the merged account suspended. Keep the browser account's selected default world; if it has none, choose the oldest surviving world. There remains one default world after each merge.
 
-Browser sessions use random opaque tokens stored as hashes in Postgres and Secure, HttpOnly, SameSite cookies. Renew cookie retention during visits; support listing and revoking individual sessions. Keep in-game management commands outside this scope.
+Browser sessions use random opaque tokens stored as hashes in Postgres and Secure, HttpOnly, SameSite cookies. Renew cookie retention during visits and support listing and revoking individual sessions.
 
 ## Test Plan
 
@@ -158,6 +158,7 @@ Test the complete lifecycle rather than isolated smoke tests:
 - Browser E2E tests cover OAuth, server creation, address selection, lifecycle controls, queue state, logs, and deletion.
 - Identity tests cover legacy-data migration, normalized verified-email linking under concurrency, suspended-account merges, preservation of all server-linked history, and default-world selection.
 - Browser security tests cover OAuth provider linking, signed-in and signed-out Minecraft redemption, one-use/15-minute tokens, cross-origin rejection, forged or offline identity rejection, persistent sessions, revocation, and logout.
+- Per-server API tests verify every server route checks active account ownership, including events, logs, exports, players, whitelist, snapshots, and lifecycle mutations.
 - Native end-to-end tests use real Java and Bedrock clients to cover authenticated waiting, wake, queueing, transfer, snapshots, recovery, and worker fencing. Use Linux containers separately for hard memory and disk quota tests.
 
 ## Assumptions

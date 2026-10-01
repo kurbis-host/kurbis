@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus};
@@ -9,9 +9,9 @@ mod operations;
 mod placement;
 
 pub use operations::{
-    claim_operation, complete_delete, complete_restore, complete_snapshot, complete_start,
-    complete_stop, fail_operation, recover_running_operations, retry_operation,
-    update_operation_payload, validate_delete,
+    begin_snapshot_retry, claim_operation, complete_delete, complete_reset, complete_restore,
+    complete_snapshot, complete_start, complete_stop, defer_snapshot_operation, fail_operation,
+    recover_running_operations, retry_operation, update_operation_payload, validate_delete,
 };
 use placement::{
     enqueue_delete, lock_placement, lock_server, lock_server_optional, place_and_enqueue_start,
@@ -58,6 +58,9 @@ impl Lifecycle {
             }
             None => bail!("server not found"),
         };
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
         if queued_only {
             let queued: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM start_requests WHERE server_id = $1)",
@@ -160,6 +163,12 @@ impl Lifecycle {
     pub async fn request_stop(&self, server_id: Uuid, reason: &str) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
+        if has_live_snapshot(&mut tx, server_id).await? {
+            bail!("server snapshot is in progress");
+        }
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
@@ -275,6 +284,12 @@ impl Lifecycle {
     pub async fn request_restart(&self, server_id: Uuid) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
+        if has_live_snapshot(&mut tx, server_id).await? {
+            bail!("server snapshot is in progress");
+        }
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
@@ -322,12 +337,27 @@ impl Lifecycle {
     }
 
     pub async fn request_snapshot(&self, server_id: Uuid) -> Result<ObservedState> {
+        self.request_snapshot_with_reason(server_id, crate::model::SnapshotReason::Manual)
+            .await
+    }
+
+    pub async fn request_snapshot_with_reason(
+        &self,
+        server_id: Uuid,
+        reason: crate::model::SnapshotReason,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
+        if has_live_snapshot(&mut tx, server_id).await? {
+            bail!("a server snapshot is already in progress");
+        }
         if server.observed_state != ObservedState::Online
             || server.desired_state != DesiredState::Running
         {
-            bail!("manual snapshots require an online running server");
+            bail!("snapshots require an online running server");
         }
         let placement = lock_placement(&mut tx, server_id)
             .await?
@@ -335,29 +365,115 @@ impl Lifecycle {
         if !placement.active || placement.generation != server.generation {
             bail!("online server placement is not active for the current generation");
         }
-        let live_snapshot: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                SELECT 1 FROM operations
-                WHERE server_id = $1 AND kind = 'snapshot' AND status IN ('pending','running')
-             )",
-        )
-        .bind(server_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if live_snapshot {
-            bail!("manual snapshot already in progress");
-        }
         enqueue_operation(
             &mut tx,
             server_id,
             Some(placement.worker_id),
             OperationKind::Snapshot,
             server.generation,
-            json!({"reason":"manual"}),
+            json!({"reason":reason}),
         )
         .await?;
+        sqlx::query(
+            "UPDATE servers SET observed_state = 'snapshotting', updated_at = now() WHERE id = $1",
+        )
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(ObservedState::Online)
+        Ok(ObservedState::Snapshotting)
+    }
+
+    pub async fn request_world_export(&self, server_id: Uuid, requested_by: Uuid) -> Result<Uuid> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
+            .bind(server_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let server = lock_server(&mut tx, server_id).await?;
+        if server.desired_state == DesiredState::Deleted
+            || server.observed_state == ObservedState::Deleted
+        {
+            bail!("server is deleted");
+        }
+        let has_live_operation: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE server_id = $1 AND status IN ('pending', 'running'))",
+        )
+        .bind(server_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_live_operation {
+            bail!("another server operation is in progress");
+        }
+
+        let export_id = Uuid::new_v4();
+        match server.observed_state {
+            ObservedState::Online if server.desired_state == DesiredState::Running => {
+                let placement = lock_placement(&mut tx, server_id)
+                    .await?
+                    .context("online server has no placement")?;
+                if !placement.active || placement.generation != server.generation {
+                    bail!("online server placement is not active for the current generation");
+                }
+                sqlx::query(
+                    "INSERT INTO world_exports(id, server_id, requested_by, status, stage, worker_id)
+                     VALUES($1, $2, $3, 'pending', 'waiting_snapshot', $4)",
+                )
+                .bind(export_id)
+                .bind(server_id)
+                .bind(requested_by)
+                .bind(placement.worker_id)
+                .execute(&mut *tx)
+                .await?;
+                enqueue_operation(
+                    &mut tx,
+                    server_id,
+                    Some(placement.worker_id),
+                    OperationKind::Snapshot,
+                    server.generation,
+                    json!({"reason":"export", "stage":"requested"}),
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE servers SET observed_state = 'snapshotting', updated_at = now()
+                     WHERE id = $1",
+                )
+                .bind(server_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            ObservedState::Sleeping if server.desired_state == DesiredState::Stopped => {
+                let generation = server
+                    .current_snapshot_generation
+                    .context("uninitialized worlds must be started before exporting")?;
+                let complete: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM snapshots
+                     WHERE server_id = $1 AND generation = $2 AND complete)",
+                )
+                .bind(server_id)
+                .bind(generation)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !complete {
+                    bail!("server has no authoritative completed snapshot to export");
+                }
+                sqlx::query(
+                    "INSERT INTO world_exports(
+                         id, server_id, requested_by, status, stage, source_generation
+                     ) VALUES($1, $2, $3, 'pending', 'ready', $4)",
+                )
+                .bind(export_id)
+                .bind(server_id)
+                .bind(requested_by)
+                .bind(generation)
+                .execute(&mut *tx)
+                .await?;
+            }
+            _ => bail!("world export requires an online or sleeping server"),
+        }
+        tx.commit().await?;
+        Ok(export_id)
     }
 
     pub async fn request_restore(
@@ -376,6 +492,9 @@ impl Lifecycle {
             .execute(&mut *tx)
             .await?;
         let server = lock_server(&mut tx, server_id).await?;
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
@@ -426,6 +545,12 @@ impl Lifecycle {
     pub async fn request_delete(&self, server_id: Uuid) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        if has_live_reset(&mut tx, server_id).await? {
+            bail!("server reset is in progress");
+        }
+        if has_live_snapshot(&mut tx, server_id).await? {
+            bail!("server snapshot is in progress");
+        }
         sqlx::query(
             "UPDATE servers SET desired_state = 'deleted', last_error = NULL, updated_at = now()
              WHERE id = $1",
@@ -533,4 +658,148 @@ impl Lifecycle {
         }
         Ok(started)
     }
+
+    pub async fn request_reset(
+        &self,
+        server_id: Uuid,
+        mode: &str,
+        full_reset_settings: serde_json::Value,
+    ) -> Result<ObservedState> {
+        if !matches!(mode, "world" | "full") {
+            bail!("unsupported reset mode");
+        }
+        let mut tx = self.pool.begin().await?;
+        let server = lock_server(&mut tx, server_id).await?;
+        if server.desired_state == DesiredState::Deleted
+            || server.observed_state == ObservedState::Deleted
+        {
+            bail!("server is deleted");
+        }
+        let live_operation: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE server_id = $1 AND status IN ('pending', 'running'))",
+        )
+        .bind(server_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if live_operation {
+            bail!("another server operation is in progress");
+        }
+        let was_running = server.observed_state == ObservedState::Online
+            && server.desired_state == DesiredState::Running;
+        if !was_running && server.observed_state != ObservedState::Sleeping {
+            bail!("reset requires an online or sleeping server");
+        }
+        let worker_id = if was_running {
+            let placement = lock_placement(&mut tx, server_id)
+                .await?
+                .context("online server has no worker placement")?;
+            if !placement.active || placement.generation != server.generation {
+                bail!("online server placement is not active for the current generation");
+            }
+            let healthy: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM workers WHERE id = $1 AND NOT draining
+                  AND heartbeat_at > now() - interval '30 seconds')",
+            )
+            .bind(placement.worker_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !healthy {
+                bail!(
+                    "assigned worker is unavailable; reset cannot safely stop the running server"
+                );
+            }
+            Some(placement.worker_id)
+        } else {
+            let healthy_worker: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM workers WHERE NOT draining
+                  AND heartbeat_at > now() - interval '30 seconds')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if !healthy_worker {
+                bail!("no worker is available to reset this server");
+            }
+            None
+        };
+
+        if mode == "full" {
+            sqlx::query("UPDATE servers SET settings = $2 WHERE id = $1")
+                .bind(server_id)
+                .bind(full_reset_settings)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM whitelist_entries WHERE server_id = $1")
+                .bind(server_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO server_whitelist_state(server_id, revision, applied_revision)
+                 VALUES($1, 1, 0) ON CONFLICT(server_id) DO UPDATE
+                   SET revision = server_whitelist_state.revision + 1, updated_at = now()",
+            )
+            .bind(server_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE servers SET generation = generation + 1, desired_state = $2,
+             observed_state = 'resetting', last_error = NULL, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(server_id)
+        .bind(if was_running {
+            DesiredState::Running
+        } else {
+            DesiredState::Stopped
+        })
+        .execute(&mut *tx)
+        .await?;
+        if was_running {
+            let placement_updated = sqlx::query(
+                "UPDATE placements SET generation = $2, updated_at = now()
+                 WHERE server_id = $1 AND worker_id = $3 AND generation = $4 AND active",
+            )
+            .bind(server_id)
+            .bind(server.generation + 1)
+            .bind(worker_id)
+            .bind(server.generation)
+            .execute(&mut *tx)
+            .await?;
+            if placement_updated.rows_affected() != 1 {
+                bail!("running reset lost its active placement while advancing generation");
+            }
+        }
+        enqueue_operation(
+            &mut tx,
+            server_id,
+            worker_id,
+            OperationKind::Reset,
+            server.generation + 1,
+            json!({"mode": mode, "was_running": was_running, "stage": "requested"}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ObservedState::Resetting)
+    }
+}
+
+async fn has_live_reset(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations
+         WHERE server_id = $1 AND kind = 'reset' AND status IN ('pending', 'running'))",
+    )
+    .bind(server_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+async fn has_live_snapshot(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations
+         WHERE server_id = $1 AND kind = 'snapshot' AND status IN ('pending', 'running'))",
+    )
+    .bind(server_id)
+    .fetch_one(&mut **tx)
+    .await?)
 }

@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 import { Pool } from 'pg';
 import AxeBuilder from '@axe-core/playwright';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
@@ -9,10 +10,31 @@ const api = process.env.BROWSER_API_URL ?? 'http://127.0.0.1:18080';
 const fixture = process.env.BROWSER_FIXTURE_URL ?? 'http://127.0.0.1:18081';
 const panel = process.env.BROWSER_PANEL_URL ?? 'http://127.0.0.1:18082';
 const artifactRoot = process.env.BROWSER_OUTPUT_DIR ?? path.resolve('../output/playwright');
+const fixtureDataRoot = process.env.BROWSER_FIXTURE_DATA_DIR;
+const objectStoreRoot = process.env.BROWSER_OBJECT_STORE_ROOT;
 async function capture(page: Page, name: string) {
   const screenshot = path.join(artifactRoot, 'screenshots', name);
   await mkdir(path.dirname(screenshot), { recursive: true });
   await page.screenshot({ path: screenshot, fullPage: true });
+}
+async function writeFixtureWorld(serverId: string, bytes: string) {
+  if (!fixtureDataRoot) throw new Error('BROWSER_FIXTURE_DATA_DIR is required');
+  const world = path.join(fixtureDataRoot, 'worlds', serverId, 'world');
+  await mkdir(world, { recursive: true });
+  await writeFile(path.join(world, 'level.dat'), bytes);
+}
+async function snapshotWorldFile(serverId: string, generation: number) {
+  if (!objectStoreRoot) throw new Error('BROWSER_OBJECT_STORE_ROOT is required');
+  const result = await pool.query(
+    'SELECT manifest_key FROM snapshots WHERE server_id = $1 AND generation = $2 AND complete',
+    [serverId, generation],
+  );
+  if (!result.rowCount) return null;
+  const manifest = JSON.parse(await readFile(path.join(objectStoreRoot, result.rows[0].manifest_key), 'utf8'));
+  const file = manifest.files.find((entry: { path: string }) => entry.path === 'world/level.dat');
+  return file
+    ? readFile(path.join(objectStoreRoot, 'chunks', file.blake3), 'utf8')
+    : null;
 }
 async function captureResponsive(page: Page, route: string, name = route === '/' ? 'landing' : route.replaceAll('/', '-')) {
   for (const width of [1440, 820, 390]) {
@@ -39,10 +61,18 @@ async function command(request: APIRequestContext, name: string, data?: unknown)
   expect(response.ok(), await response.text()).toBeTruthy();
   return response;
 }
-async function issueMinecraftLink(request: APIRequestContext, identity: unknown) {
+type MinecraftIdentity = { kind: 'java'; uuid: string } | { kind: 'bedrock'; xuid: string };
+function minecraftPlayerId(identity: MinecraftIdentity) {
+  if (identity.kind === 'java') return identity.uuid;
+  return BigInt(identity.xuid).toString(16).padStart(32, '0').replace(
+    /^(........)(....)(....)(....)(............)$/,
+    '$1-$2-$3-$4-$5',
+  );
+}
+async function issueMinecraftLink(request: APIRequestContext, identity: MinecraftIdentity) {
   const response = await request.post(`${api}/internal/minecraft-login-links`, {
     headers: { authorization: 'Bearer browser-internal-token' },
-    data: { identity, display_name: 'Minecraft Player' },
+    data: { identity, minecraft_player_id: minecraftPlayerId(identity), display_name: 'Minecraft Player' },
   });
   expect(response.status(), await response.text()).toBe(200);
   return (await response.json()).url as string;
@@ -72,6 +102,7 @@ async function create(page: Page, name: string) {
   await page.getByPlaceholder('friends-world').fill(name);
   await page.getByRole('button', { name: /Create sleeping world/ }).click();
   await state(page, 'Sleeping');
+  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
 }
 async function browserApi(page: Page, path: string, method = 'GET', data?: unknown) {
   const cookie = (await page.context().cookies()).map(({ name, value }) => `${name}=${value}`).join('; ');
@@ -83,9 +114,55 @@ async function browserApi(page: Page, path: string, method = 'GET', data?: unkno
   return { status: response.status(), text: await response.text() };
 }
 async function current(page: Page) {
-  const response = await browserApi(page, '/api/v1/server');
+  const response = await browserApi(page, '/api/v1/servers');
   expect(response.status).toBe(200);
-  return JSON.parse(response.text);
+  const servers = JSON.parse(response.text) as Array<{
+    id: string;
+    is_default: boolean;
+    subdomain: string;
+    settings: { motd: string; whitelist: boolean; difficulty: string; gamemode: string };
+  }>;
+  return servers.find((server) => server.is_default) ?? servers[0] ?? null;
+}
+async function serverId(page: Page) {
+  const server = await current(page);
+  expect(server).not.toBeNull();
+  return server!.id;
+}
+async function serverApiPath(page: Page, suffix = '') {
+  return `/api/v1/servers/${await serverId(page)}${suffix}`;
+}
+async function serverRoute(page: Page, suffix = '') {
+  return `/app/servers/${await serverId(page)}${suffix}`;
+}
+async function resetFromSettings(page: Page, request: APIRequestContext, id: string, mode: 'world' | 'full') {
+  await page.goto(`/app/servers/${id}/settings`);
+  const trigger = mode === 'world' ? 'World reset' : 'Full server reset';
+  const confirmation = mode === 'world' ? 'Reset world' : 'Reset full server';
+  await page.getByRole('button', { name: trigger, exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  const accepted = page.waitForResponse((response) =>
+    response.url().endsWith(`/api/v1/servers/${id}/reset`) && response.request().method() === 'POST',
+  );
+  await dialog.getByRole('button', { name: confirmation, exact: true }).click();
+  expect((await accepted).status()).toBe(202);
+  await expect.poll(async () => {
+    const result = await pool.query('SELECT observed_state FROM servers WHERE id = $1', [id]);
+    return result.rows[0]?.observed_state;
+  }).toBe('resetting');
+  const result = await command(request, 'tick');
+  expect((await result.json()).operation).toBe('reset');
+  await expect.poll(async () => {
+    const state = await pool.query('SELECT observed_state FROM servers WHERE id = $1', [id]);
+    const operation = await pool.query(
+      "SELECT status FROM operations WHERE server_id = $1 AND kind = 'reset' ORDER BY created_at DESC LIMIT 1",
+      [id],
+    );
+    return [state.rows[0]?.observed_state, operation.rows[0]?.status];
+  }).toEqual(['sleeping', 'succeeded']);
+  await page.goto(`/app/servers/${id}`);
+  await state(page, 'Sleeping');
 }
 
 test.beforeEach(async ({ request }) => { await command(request, 'reset'); });
@@ -112,7 +189,14 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   if (setupAudit.violations.length) axeResults['/app/setup'] = setupAudit.violations;
   await captureResponsive(page, '/app/setup');
   await create(page, 'accessible-world');
-  const routes = ['/app', '/app/console', '/app/backups', '/app/players', '/app/settings', '/app/account'];
+  const routes = [
+    await serverRoute(page),
+    await serverRoute(page, '/console'),
+    await serverRoute(page, '/backups'),
+    await serverRoute(page, '/players'),
+    await serverRoute(page, '/settings'),
+    '/app/account',
+  ];
   for (const route of routes) {
     await page.goto(route);
     await expect(page.getByRole('main')).toBeVisible();
@@ -122,8 +206,9 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
   await expect(page.getByText('Live updates connected')).toBeVisible();
-  const rawEvent = await page.evaluate(() => new Promise<string>((resolve, reject) => {
-    const source = new EventSource('/api/v1/server/events', { withCredentials: true });
+  const eventsPath = `/api/events?server_id=${encodeURIComponent(await serverId(page))}`;
+  const rawEvent = await page.evaluate((path) => new Promise<string>((resolve, reject) => {
+    const source = new EventSource(path, { withCredentials: true });
     const timeout = window.setTimeout(() => {
       source.close();
       reject(new Error('SSE did not replay a server event'));
@@ -133,9 +218,9 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
       source.close();
       resolve((event as MessageEvent<string>).data);
     });
-  }));
+  }), eventsPath);
   expect(JSON.parse(rawEvent)).toMatchObject({ type: 'server', data: { id: expect.any(String) } });
-  await page.goto('/app/settings');
+  await page.goto(await serverRoute(page, '/settings'));
   const trigger = page.getByRole('button', { name: 'Delete server', exact: true });
   await trigger.focus();
   await page.keyboard.press('Enter');
@@ -151,12 +236,12 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await expect(trigger).toBeFocused();
   expect(await page.evaluate(() => getComputedStyle(document.documentElement).scrollBehavior)).toBe('auto');
 
-  await page.goto('/app');
+  await page.goto(await serverRoute(page));
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await state(page, 'Queued');
   const queuedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (queuedAudit.violations.length) axeResults['/app?state=queued'] = queuedAudit.violations;
-  await captureResponsive(page, '/app/queued', 'states/queued');
+  await captureResponsive(page, await serverRoute(page), 'states/queued');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await state(page, 'Sleeping');
   await command(request, 'capacity', { available: true });
@@ -167,7 +252,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Online');
   const onlineAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (onlineAudit.violations.length) axeResults['/app?state=online'] = onlineAudit.violations;
-  await captureResponsive(page, '/app/online', 'states/online');
+  await captureResponsive(page, await serverRoute(page), 'states/online');
   await pool.query(
     "UPDATE servers SET observed_state = 'failed', last_error = $1 WHERE subdomain = $2",
     ['Fixture visual state: readiness timed out', 'accessible-world'],
@@ -175,12 +260,76 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Needs attention');
   const failedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (failedAudit.violations.length) axeResults['/app?state=failed'] = failedAudit.violations;
-  await captureResponsive(page, '/app/failed', 'states/failed');
+  await captureResponsive(page, await serverRoute(page), 'states/failed');
   await testInfo.attach('axe-route-results.json', {
     body: Buffer.from(JSON.stringify(axeResults, null, 2)),
     contentType: 'application/json',
   });
   expect(axeResults).toEqual({});
+});
+
+test('world and full reset preserve their distinct settings, whitelist, and recovery guarantees', async ({ page, request }) => {
+  await login(page);
+  await create(page, 'reset-world');
+  const id = await serverId(page);
+  await command(request, 'capacity', { available: true });
+  const settingsPath = await serverApiPath(page);
+  const updated = await browserApi(page, settingsPath, 'PATCH', {
+    settings: { motd: 'Keep this through a world reset', whitelist: true },
+  });
+  expect(updated.status).toBe(200);
+  const playerId = randomUUID();
+  const added = await browserApi(page, `${settingsPath}/whitelist`, 'POST', {
+    player_id: playerId,
+    name: 'PersistentPlayer',
+  });
+  expect(added.status).toBe(201);
+  await writeFixtureWorld(id, 'world data before world reset');
+
+  await resetFromSettings(page, request, id, 'world');
+  let server = await current(page);
+  expect(server?.subdomain).toBe('reset-world');
+  expect(server?.settings).toMatchObject({
+    motd: 'Keep this through a world reset',
+    whitelist: true,
+  });
+  let whitelist = await pool.query('SELECT player_id FROM whitelist_entries WHERE server_id = $1', [id]);
+  expect(whitelist.rows).toEqual([{ player_id: playerId }]);
+  let snapshots = await pool.query(
+    "SELECT generation FROM snapshots WHERE server_id = $1 AND complete AND reason = 'reset' ORDER BY generation",
+    [id],
+  );
+  expect(snapshots.rows).toHaveLength(2);
+  const worldBackup = Number(snapshots.rows[0].generation);
+  const worldReplacement = Number(snapshots.rows[1].generation);
+  expect(await snapshotWorldFile(id, worldBackup)).toBe('world data before world reset');
+  expect(await snapshotWorldFile(id, worldReplacement)).toBeNull();
+
+  const changedAgain = await browserApi(page, settingsPath, 'PATCH', {
+    settings: { motd: 'Full reset returns defaults' },
+  });
+  expect(changedAgain.status).toBe(200);
+  await writeFixtureWorld(id, 'world data before full reset');
+  await resetFromSettings(page, request, id, 'full');
+  server = await current(page);
+  expect(server?.subdomain).toBe('reset-world');
+  expect(server?.settings).toMatchObject({
+    motd: 'Hosted by Kurbis',
+    whitelist: false,
+    difficulty: 'Normal',
+    gamemode: 'Survival',
+  });
+  whitelist = await pool.query('SELECT player_id FROM whitelist_entries WHERE server_id = $1', [id]);
+  expect(whitelist.rows).toEqual([]);
+  snapshots = await pool.query(
+    "SELECT generation FROM snapshots WHERE server_id = $1 AND complete AND reason = 'reset' ORDER BY generation",
+    [id],
+  );
+  expect(snapshots.rows).toHaveLength(4);
+  const fullBackup = Number(snapshots.rows[2].generation);
+  const fullReplacement = Number(snapshots.rows[3].generation);
+  expect(await snapshotWorldFile(id, fullBackup)).toBe('world data before full reset');
+  expect(await snapshotWorldFile(id, fullReplacement)).toBeNull();
 });
 
 test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion and logout', async ({ page, request }) => {
@@ -189,7 +338,7 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await expect(page.getByText('browser-world.mc.example.test', { exact: true })).toHaveCount(3);
   await expect(page.getByText('2.00 GiB', { exact: true })).toBeVisible();
   await expect(page.getByText('5.00 GiB storage', { exact: true })).toBeVisible();
-  await page.goto('/app/settings');
+  await page.goto(await serverRoute(page, '/settings'));
   const session = (await page.context().cookies()).find(cookie => cookie.name === 'kurbis_session');
   expect(session).toMatchObject({ httpOnly: true, secure: true, sameSite: 'Lax' });
   const address = page.getByRole('textbox', { name: 'Address', exact: true });
@@ -207,7 +356,7 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await page.reload();
   await expect(motd).toHaveValue('Draft survives repeated polling');
   await expect(page.getByLabel('Difficulty', { exact: true })).toHaveValue('Hard');
-  await page.goto('/app');
+  await page.goto(await serverRoute(page));
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await state(page, 'Queued');
   await expect(page.getByRole('link', { name: 'Settings', exact: true })).toBeVisible();
@@ -218,15 +367,15 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await command(request, 'capacity', { available: true });
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await state(page, 'Restoring');
-  const blocked = await browserApi(page, '/api/v1/server', 'PATCH', { subdomain: 'forbidden-edit' });
+  const blocked = await browserApi(page, await serverApiPath(page), 'PATCH', { subdomain: 'forbidden-edit' });
   expect(blocked.status).toBe(409);
   await command(request, 'tick');
   await command(request, 'tick');
   await page.reload();
   await state(page, 'Online');
-  await page.goto('/app/console');
+  await page.goto(await serverRoute(page, '/console'));
   await expect(page.getByRole('log')).toContainText('Fixture runtime ready');
-  await page.goto('/app');
+  await page.goto(await serverRoute(page));
   await page.getByRole('button', { name: 'Restart', exact: true }).click();
   await state(page, 'Stopping');
   await command(request, 'tick');
@@ -248,10 +397,11 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await capture(page, 'panel-mobile.png');
   await page.setViewportSize({ width: 1440, height: 1000 });
   await capture(page, 'panel-desktop.png');
-  await page.goto('/app/settings');
+  await page.goto(await serverRoute(page, '/settings'));
   await page.getByRole('button', { name: 'Delete server', exact: true }).click();
+  const id = await serverId(page);
   const deleteResponse = page.waitForResponse(response =>
-    response.url().endsWith('/api/v1/server') && response.request().method() === 'DELETE'
+    response.url().endsWith(`/api/v1/servers/${id}`) && response.request().method() === 'DELETE'
   );
   await page.getByRole('dialog').getByRole('button', { name: 'Delete server', exact: true }).click();
   expect((await deleteResponse).status()).toBe(202);
@@ -292,15 +442,14 @@ test('OAuth browser binding, state replay, ownership and invalid configuration a
   await attacker.close();
   await login(page);
   await create(page, 'validation-world');
-  const duplicate = await browserApi(page, '/api/v1/server', 'POST', { subdomain: 'another-world' });
+  const duplicate = await browserApi(page, '/api/v1/servers', 'POST', { subdomain: 'another-world' });
   expect(duplicate.status).toBe(409);
   for (const input of [{ subdomain: '../bad' }, { settings: { difficulty: 'Impossible' } }, { settings: { view_distance: 33 } }, { settings: { plugins: ['unrestricted'] } }]) {
-    expect((await browserApi(page, '/api/v1/server', 'PATCH', input)).status).toBe(422);
+    expect((await browserApi(page, await serverApiPath(page), 'PATCH', input)).status).toBe(422);
   }
   expect((await current(page)).subdomain).toBe('validation-world');
   const anonymous = await browser.newContext();
-  expect((await anonymous.request.get(`${api}/api/v1/server`)).status()).toBe(401);
-  expect((await anonymous.request.post(`${api}/api/v1/server/actions`, { data: { action: 'start' } })).status()).toBe(401);
+  expect((await anonymous.request.get(`${api}/api/v1/servers`)).status()).toBe(401);
   await anonymous.close();
   const replay = await page.request.get(forged);
   expect(replay.status()).toBe(400);
@@ -343,7 +492,7 @@ test('Google and Discord keep provider identities separate and both establish se
 });
 
 test('Minecraft fragment links redeem once through the same-origin browser page', async ({ page, browser, request }) => {
-  const identity = { kind: 'java', uuid: '97a3d856-32e1-4a67-a38a-754d7d39fc2f' };
+  const identity = { kind: 'java' as const, uuid: randomUUID() };
   const link = await issueMinecraftLink(request, identity);
   const redemption = page.waitForRequest(request =>
     new URL(request.url()).pathname === '/auth/minecraft/redeem' && request.method() === 'POST'
@@ -378,10 +527,10 @@ test('Minecraft fragment links redeem once through the same-origin browser page'
 test('signed-in Minecraft redemption attaches to the browser account without replacing its world', async ({ page, request }) => {
   await login(page);
   await create(page, 'minecraft-owner-world');
-  const identity = { kind: 'bedrock', xuid: '2533274790395904' };
+  const identity = { kind: 'bedrock' as const, xuid: '2533274790395904' };
   const link = await issueMinecraftLink(request, identity);
   await page.goto(link);
-  await expect(page).toHaveURL(/\/app$/);
+  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
   expect(new URL(page.url()).hash).toBe('');
   expect((await current(page)).subdomain).toBe('minecraft-owner-world');
 
@@ -408,16 +557,17 @@ test('unverified provider email addresses are not saved on the account', async (
 test('separate OAuth accounts cannot read or mutate each other and address conflicts are explicit', async ({ page, browser, request }) => {
   await login(page);
   await create(page, 'owned-world');
+  const ownedServerId = await serverId(page);
   await command(request, 'identity', { subject: 'browser-other-user' });
   const other = await browser.newContext();
   const otherPage = await other.newPage();
   await login(otherPage, 'Other Player');
   expect(await current(otherPage)).toBeNull();
-  expect((await browserApi(otherPage, '/api/v1/server', 'PATCH', { subdomain: 'owned-world' })).status).toBe(404);
-  expect((await browserApi(otherPage, '/api/v1/server/actions', 'POST', { action: 'start' })).status).toBe(404);
-  expect((await browserApi(otherPage, '/api/v1/server', 'POST', { subdomain: 'owned-world' })).status).toBe(409);
+  expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}`, 'PATCH', { subdomain: 'owned-world' })).status).toBe(404);
+  expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}/actions`, 'POST', { action: 'start' })).status).toBe(404);
+  expect((await browserApi(otherPage, '/api/v1/servers', 'POST', { subdomain: 'owned-world' })).status).toBe(409);
   await create(otherPage, 'other-world');
-  expect((await browserApi(otherPage, '/api/v1/server', 'PATCH', { subdomain: 'owned-world' })).status).toBe(409);
+  expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}`, 'PATCH', { subdomain: 'owned-world' })).status).toBe(404);
   expect((await current(page)).subdomain).toBe('owned-world');
   expect((await current(otherPage)).subdomain).toBe('other-world');
   await other.close();

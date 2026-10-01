@@ -35,7 +35,7 @@ describe("overview lifecycle mutations", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { staleTime: Infinity, retry: false }, mutations: { retry: false } },
     });
-    client.setQueryData(queryKeys.server, server);
+    client.setQueryData(queryKeys.server(server.id), server);
     render(
       <Overview initialServer={server} initialActivity={[]} renderedAt={Date.now()} />,
       { wrapper: wrapper(client) },
@@ -43,7 +43,7 @@ describe("overview lifecycle mutations", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "Queued" })).toBeVisible());
-    expect(client.getQueryData<typeof server>(queryKeys.server)).toMatchObject({
+    expect(client.getQueryData<typeof server>(queryKeys.server(server.id))).toMatchObject({
       desired_state: "running",
       observed_state: "queued",
     });
@@ -51,7 +51,7 @@ describe("overview lifecycle mutations", () => {
     rejectRequest?.(new Error("control plane unavailable"));
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sleeping" })).toBeVisible());
     expect(screen.getByText("control plane unavailable")).toBeVisible();
-    expect(client.getQueryData(queryKeys.server)).toMatchObject({
+    expect(client.getQueryData(queryKeys.server(server.id))).toMatchObject({
       desired_state: "stopped",
       observed_state: "sleeping",
     });

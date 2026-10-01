@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod export;
 mod files;
 mod gc;
 mod manager;
@@ -12,6 +13,7 @@ mod manager;
 #[cfg(test)]
 mod tests;
 
+pub use export::WorldArchive;
 pub use gc::GarbageCollection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -27,12 +27,14 @@ case "$mode" in
     export WORKER_RUNTIME=native
     export WORKER_STORAGE_MODE=directory
     export WAITING_CONTROL_SOCKET="/tmp/kurbis-waiting-${WORKER_ID%%-*}.sock"
+    export CONTROL_PLANE_URL=http://127.0.0.1:8080
     ;;
   docker)
     binary_dir="$root/target/release"
     export DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${DATABASE_PORT}/${POSTGRES_DB}"
     export PUMPKIN_IMAGE=melon-pumpkin:host-control
     export WORKER_RUNTIME=docker
+    export CONTROL_PLANE_URL="http://127.0.0.1:${CONTROL_PLANE_PORT:-18080}"
     ;;
   *)
     echo "unknown deployment mode: $mode" >&2
@@ -71,9 +73,9 @@ case "$service" in
     export CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080
     cd "$root/web"
     if [[ $mode == native-debug ]]; then
-      exec npm run dev -- --hostname 0.0.0.0
+      exec pnpm run dev -- --hostname 0.0.0.0
     fi
-    exec npm run start -- --hostname 0.0.0.0
+    exec pnpm run start -- --hostname 0.0.0.0
     ;;
   postgres|control-plane-log|waiting-pumpkin-log|gateway-log|panel-log)
     compose_service=${service%-log}

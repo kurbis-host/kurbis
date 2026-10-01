@@ -13,7 +13,19 @@ impl WorkerRunner {
         .fetch_all(&self.pool)
         .await?;
 
-        self.idle_since.retain(|id, _| server_ids.contains(id));
+        let idle_server_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT s.id
+             FROM servers s
+             JOIN placements p ON p.server_id = s.id
+             WHERE p.worker_id = $1 AND p.generation = s.generation
+               AND s.desired_state = 'running'
+               AND s.observed_state IN ('online', 'snapshotting')",
+        )
+        .bind(self.config.id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        self.idle_since.retain(|id, _| idle_server_ids.contains(id));
         self.last_snapshot.retain(|id, _| server_ids.contains(id));
         for server_id in server_ids {
             let server_dir = self.server_dir(server_id);
@@ -59,6 +71,17 @@ impl WorkerRunner {
                     {
                         tracing::warn!(%server_id, ?error, "failed to synchronize whitelist state");
                     }
+                    if let Err(error) = sync_operators(
+                        &self.pool,
+                        self.runtime.as_ref(),
+                        server_id,
+                        &server_dir,
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%server_id, ?error, "failed to synchronize owner operators");
+                    }
                     let now = Instant::now();
                     let idle = self
                         .idle_since
@@ -83,7 +106,8 @@ impl WorkerRunner {
                 .or_insert_with(|| SnapshotSchedule::new(Instant::now()));
             if last.due(Instant::now(), self.config.snapshot_interval) {
                 let result = self
-                    .snapshot_running(server_id, SnapshotReason::Periodic)
+                    .lifecycle
+                    .request_snapshot_with_reason(server_id, SnapshotReason::Periodic)
                     .await;
                 let schedule = self
                     .last_snapshot
@@ -92,17 +116,6 @@ impl WorkerRunner {
                 match result {
                     Ok(_) => {
                         schedule.succeeded(Instant::now());
-                        sqlx::query(
-                            "UPDATE servers s SET last_error = NULL, updated_at = now()
-                            WHERE s.id = $1 AND s.observed_state = 'online'
-                              AND s.last_error LIKE 'Periodic snapshot failed:%'
-                              AND EXISTS(SELECT 1 FROM placements p WHERE p.server_id = s.id
-                                AND p.worker_id = $2 AND p.active AND p.generation = s.generation)",
-                        )
-                        .bind(server_id)
-                        .bind(self.config.id)
-                        .execute(&self.pool)
-                        .await?;
                     }
                     Err(error) => {
                         schedule.failed(Instant::now());
@@ -124,21 +137,6 @@ impl WorkerRunner {
             self.collect_logs(server_id).await?;
         }
         Ok(())
-    }
-
-    pub(super) async fn snapshot_running(
-        &self,
-        server_id: Uuid,
-        reason: SnapshotReason,
-    ) -> Result<i64> {
-        let server_dir = self.server_dir(server_id);
-        self.runtime.save(&server_dir).await?;
-        let snapshot = self
-            .snapshots
-            .create(server_id, &server_dir, reason)
-            .await?;
-        self.mark_cached(server_id, snapshot.generation).await?;
-        Ok(snapshot.generation)
     }
 
     pub(super) async fn collect_logs(&mut self, server_id: Uuid) -> Result<()> {

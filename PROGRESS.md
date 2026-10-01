@@ -2,35 +2,22 @@
 
 Last reviewed: 2026-10-01
 
-## Current status
+## Status
 
-The local control plane, PostgreSQL lifecycle model, workers, Java/Bedrock gateway and waiting flow, snapshot storage, native development runtime, Next.js product panel, and account identity/linking flows are implemented. No deployment has been performed.
+Plan 1 authentication and account linking and Plan 2 server management, durable resets, and world export are implemented in the Rust/Postgres control plane, gateway, worker, and Next.js panel. Per-server APIs and panel pages require an active owner session. In-game management commands remain deferred.
 
-Docker Desktop is stopped as requested. Development and the runtime evidence in this file use native macOS processes. The real-container memory-cgroup and 5 GiB filesystem-quota tests remain unrun because those require Docker/Linux; native directory checks are not a substitute for those hard limits.
+Minecraft admission now uses the authenticated waiting runtime for both editions. The runtime exposes authenticated Java UUIDs and validated Bedrock XUIDs; only verified identities receive one-use browser login links. Signed-out redemption creates a persistent session; signed-in redemption merges identities and account data. Account creation and Minecraft admission serialize on the account row, preserving the one-server capacity rule and a single default server.
 
-## Implemented
+World-only and full resets persist recoverable stages and generation fences. Export jobs pin immutable snapshots, stream ZIP64 world archives, validate source chunks and uploaded archive checksums, and expire after 24 hours.
 
-- Rust/Axum control plane with durable users and provider identities, sessions, servers, operations, placements, workers, capacity reservations, FIFO wake queue, player presence, whitelist revisions, activity, logs, snapshots, and event cursors.
-- Versioned owner-scoped API with lifecycle validation, typed DTOs, durable PostgreSQL-backed SSE, replay/catch-up, snapshot restore with monotonic generations, and account/session endpoints.
-- Native Rust gateway for Java TCP and Bedrock RakNet, hostname validation, waiting Pumpkin admission, wake/queue messages, and Minecraft-native backend transfer. Durable route resolution and invalidation remain in Postgres.
-- Rust worker with lease/fencing and recovery, Docker runtime support, and native host-process runtime for local development. Native mode does not impose cgroups or an ext4 quota.
-- Content-addressed incremental snapshots with checksum/manifest validation, complete-generation publication, restore pins, bounded retention, recovery retries, and garbage collection.
-- Next.js App Router public site and authenticated panel with setup, overview, console, backups, players, settings, account, same-origin API/OAuth proxying, typed schemas, TanStack Query, and SSE updates.
-- Original Kurbis voxel visual system, Tailwind CSS 4 utilities with a small global design-token stylesheet, responsive states, reduced-motion support, keyboard-accessible dialogs, and Axe coverage.
+## Verification
 
-## Verification evidence
+- `cargo test --all-targets -j 1 -- --test-threads=1` passed **106 tests** against PostgreSQL. Coverage includes identity migration and concurrent merges, suspension and world preservation, authenticated Java/Bedrock identity fixtures, account-serialized admission races, server-owner isolation, SSE, reset recovery, snapshots, worker leases, and ZIP64 archive contents/checksums.
+- `cargo fmt --all -- --check` passed.
+- Frontend unit tests passed **18/18**; TypeScript typecheck passed. The clean production build emitted only `/app/servers/{serverId}` panel routes and `/auth/minecraft`, with no deferred guest routes.
+- The fresh-database production Playwright run passed **12/12** journeys, including signed-in and signed-out Minecraft redemption, OAuth/session boundaries, both reset modes, owner isolation, responsive/accessibility checks, and security headers.
+- Native Pumpkin worker lifecycle verification is being repeated after removing an obsolete plugin-only worker environment dependency. Docker verification is unavailable because Docker Desktop is stopped and the local Docker socket is absent.
 
-- `TEST_DATABASE_URL=postgres://localhost/kurbis_auth_plan_20261001_4c91 cargo test --all-targets -- --test-threads=1` passed **93 tests**, including populated-data migration, verified-email linking, concurrent account merges, suspension preservation, session revocation, and multiple-world/default selection.
-- `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `git diff --check`, and Python fixture compilation passed.
-- `npm run typecheck` and `npm test` passed; the frontend suite has **14 tests across 9 files**.
-- The complete Playwright suite passed **10/10** in development mode and **10/10** against a production Next.js build. Coverage includes signed-out Minecraft login, signed-in merge, one-use token replay, OAuth identity/session behavior, Axe, keyboard use, reduced motion, and responsive layouts.
-- The pinned, patched Pumpkin host-control harness passed with real Java and Bedrock protocol clients. Offline clients exposed no verified identity; reconnects received new connection IDs; authenticated RPC, save, graceful shutdown, and socket cleanup passed.
-- The native gateway restart integration passed with real Java and Bedrock clients before and after control-plane/gateway restarts. Both editions joined waiting before backend transfer; valid unused hostnames reached waiting and were rejected; queued wake state and active placement survived restart. Evidence: `output/runtime/auth-gateway-restart-final-3/result.json`.
-- The Impeccable detector reported no findings for the changed account, login, and app-shell surfaces.
-- The native worker runtime's recovery, stale-PID fencing, and log-cursor unit tests passed **3/3**. The full native Java/Bedrock worker lifecycle passed **19 checks** against disposable local Postgres, including waiting admission, online/queued transfers, snapshot outage/retry, worker recovery/fencing, cross-worker restore, clean shutdown, Java/Bedrock wake, and automatic sleep after a verified **307-second idle interval following rejoin**. Full evidence: `output/runtime/native-plan-final-20261001/result.json`.
+## Release limits
 
-## Remaining release checks
-
-- Live Google/Discord sign-in and Microsoft/Xbox-backed Java/Bedrock identity validation require real provider accounts. Local OAuth, Minecraft redemption, and runtime identity tests use controlled fixtures.
-- Hard memory and disk quotas under Linux container load were not tested because Docker is unavailable in this environment.
-- Production deployment was not requested or performed.
+Real Microsoft/Xbox Bedrock login and handoff remain unverified: the pinned Pumpkin runtime has a documented NetherNet signaling TLS incompatibility. Controlled fixtures cover verified Bedrock XUID admission. Live Google/Discord accounts and Linux container memory/disk quota behavior also require external accounts or Docker/Linux. No production deployment was performed.

@@ -5,8 +5,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    DesiredState, ObservedState, OperationKind, OperationRecord as DbOperation, OperationStatus,
-    SnapshotReason, SnapshotRecord as DbSnapshot,
+    DEFAULT_SERVER_MOTD, DesiredState, ObservedState, OperationKind,
+    OperationRecord as DbOperation, OperationStatus, SnapshotReason, SnapshotRecord as DbSnapshot,
 };
 
 use super::ApiError;
@@ -42,7 +42,7 @@ pub struct ServerSettings {
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            motd: "Hosted by kurbis".to_owned(),
+            motd: DEFAULT_SERVER_MOTD.to_owned(),
             difficulty: Difficulty::Normal,
             gamemode: GameMode::Survival,
             view_distance: 12,
@@ -219,6 +219,7 @@ pub struct StorageUsage {
 pub struct Server {
     pub id: Uuid,
     pub subdomain: String,
+    pub is_default: bool,
     pub java_address: String,
     pub bedrock_address: String,
     pub settings: ServerSettings,

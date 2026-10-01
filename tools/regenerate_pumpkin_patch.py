@@ -16,9 +16,14 @@ root = Path(__file__).resolve().parent.parent
 patch = root / 'runtime/pumpkin/host-control.patch'
 revision = (patch.parent / 'REVISION').read_text().strip()
 files = [line.split(' b/', 1)[1].strip() for line in patch.read_text().splitlines() if line.startswith('diff --git')]
-files.extend(['crates/pumpkin/src/entity/player.rs', 'crates/pumpkin/src/net/bedrock/login.rs', 'crates/pumpkin-protocol/src/bedrock/client/crafting_data.rs', 'crates/pumpkin-protocol/src/bedrock/client/move_actor_delta.rs', 'crates/pumpkin/src/net/bedrock/mod.rs', 'crates/pumpkin-protocol/src/bedrock/client/transfer.rs', 'crates/pumpkin-protocol/src/bedrock/client/level_chunk.rs', 'crates/pumpkin-protocol/src/bedrock/client/set_actor_data.rs', 'crates/pumpkin-protocol/src/bedrock/server/resource_pack_response.rs', 'crates/pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs', 'crates/pumpkin-protocol/src/bedrock/client/creative_content.rs', 'crates/pumpkin-protocol/src/bedrock/network_item.rs', 'crates/pumpkin-protocol/src/bedrock/client/add_player.rs'])
 parts = []
 for name in dict.fromkeys(files):
+    tracked = subprocess.run(
+        ['git', '-C', str(args.reference), 'cat-file', '-e', f'{revision}:{name}'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if tracked.returncode:
+        continue
     original = subprocess.check_output(['git', '-C', str(args.reference), 'show', f'{revision}:{name}']).decode()
     edited = (args.edited / name).read_text()
     if original != edited:

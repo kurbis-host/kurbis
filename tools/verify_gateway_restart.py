@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Verify durable queued wakes and live routes across local service restarts.
+"""Verify durable queued wakes and live Java routes across local restarts.
 
 Uses an existing disposable PostgreSQL database, the local control-plane and
-gateway binaries, the native Pumpkin build, and real Java/Bedrock clients. It
+gateway binaries, the native Pumpkin build, and a real Java 26.3 client. It
 never starts Docker and refuses databases not explicitly named for this test.
 """
 import argparse
@@ -131,6 +131,8 @@ class RestartVerification:
     def start_control_plane(self):
         env = {
             "DATABASE_URL": self.args.database_url,
+            "OBJECT_STORE_TYPE": "local",
+            "OBJECT_STORE_LOCAL_ROOT": str(self.root / "objects"),
             "CONTROL_PLANE_LISTEN": f"127.0.0.1:{self.api_port}",
             "PUBLIC_BASE_URL": f"http://127.0.0.1:{self.api_port}",
             "ROOT_DOMAIN": "mc.example.test",
@@ -208,13 +210,11 @@ class RestartVerification:
         self.heartbeat_thread = threading.Thread(target=heartbeat, name="fixture-worker-heartbeat", daemon=True)
         self.heartbeat_thread.start()
 
-    def run_client(self, edition, subdomain, stage, expected_event):
-        if edition == "java":
-            port = self.java_gateway
-        else:
-            port = self.bedrock_gateway
+    def run_client(self, subdomain, stage, expected_event):
+        edition = "java"
         artifact = self.output / f"{stage}-{subdomain}-{edition}.json"
         log_path = self.output / f"{stage}-{subdomain}-{edition}.log"
+        port = self.java_gateway
         command = [
             "node", str(self.args.protocol_dir / "verify.mjs"),
             "--edition", edition, "--port", str(port),
@@ -224,8 +224,7 @@ class RestartVerification:
         ]
         waiting_transfer = expected_event == "waiting_to_backend"
         if waiting_transfer:
-            backend_port = self.java_backend if edition == "java" else self.bedrock_backend
-            command.extend(["--transfer-port", str(backend_port)])
+            command.extend(["--transfer-port", str(self.java_backend)])
         elif expected_event == "unknown_address_kick":
             command.append("--expect-close")
         destination = "backend" if waiting_transfer else "waiting"
@@ -285,17 +284,11 @@ class RestartVerification:
         return events
 
     def verify_routes(self, stage):
-        live = {}
-        for edition in ("java", "bedrock"):
-            live[edition] = self.run_client(edition, self.live_subdomain, stage, "waiting_to_backend")
-        unknown_address = {}
-        for edition in ("java", "bedrock"):
-            unknown_address[edition] = self.run_client(
-                edition, f"unused-{self.suffix}", stage, "unknown_address_kick"
-            )
-        queued = {}
-        for edition in ("java", "bedrock"):
-            queued[edition] = self.run_client(edition, self.queued_subdomain, stage, "waiting_joined")
+        live = self.run_client(self.live_subdomain, stage, "waiting_to_backend")
+        unknown_address = self.run_client(
+            f"unused-{self.suffix}", stage, "unknown_address_kick"
+        )
+        queued = self.run_client(self.queued_subdomain, stage, "waiting_joined")
         summary = self.sql(
             "SELECT json_build_array(s.observed_state::text,"
             "(SELECT count(*) FROM start_requests WHERE server_id=s.id)::int,"

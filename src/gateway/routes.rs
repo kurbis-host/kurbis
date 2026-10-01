@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     control_plane::api::resolve_subdomain,
-    model::{RouteTarget, validate_subdomain},
+    model::{RouteTarget, subdomain_from_hostname},
 };
 
 #[derive(Clone)]
@@ -106,30 +106,16 @@ impl RouteCache {
 }
 
 fn subdomain_for(hostname: &str, root_domain: &str) -> Option<String> {
-    let hostname = normalize_requested_hostname(hostname)?;
-    let suffix = format!(
-        ".{}",
-        root_domain.trim_end_matches('.').to_ascii_lowercase()
-    );
-    let subdomain = hostname.strip_suffix(&suffix)?;
-    if subdomain.contains('.') || !validate_subdomain(subdomain) {
-        return None;
-    }
-    Some(subdomain.to_owned())
+    subdomain_from_hostname(hostname, root_domain)
 }
 
 pub fn normalize_requested_hostname(value: &str) -> Option<String> {
     let value = value.split('\0').next()?.trim();
-    let without_port = if let Some((host, port)) = value.rsplit_once(':') {
-        if !host.contains(':') && port.parse::<u16>().is_ok() {
-            host
-        } else {
-            value
-        }
-    } else {
-        value
+    let hostname = match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
+        _ => value,
     };
-    let hostname = without_port.trim_end_matches('.').to_ascii_lowercase();
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
     (!hostname.is_empty()).then_some(hostname)
 }
 

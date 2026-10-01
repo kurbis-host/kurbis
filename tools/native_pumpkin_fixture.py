@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Disposable offline identity fixture; never used by production startup."""
-import json
 import os
 from pathlib import Path
 import sys
@@ -21,9 +20,5 @@ for line in config.read_text().splitlines():
     else:
         lines.append(line)
 config.write_text('\n'.join(lines) + '\n')
-Path('data').mkdir(exist_ok=True)
-ops = Path('data/ops.json')
-if not ops.exists():
-    ops.write_text(json.dumps([{'uuid': '63afe389-0d98-f833-4096-cc01dd62a9f0', 'name': 'RuntimePlayer', 'level': 4, 'bypasses_player_limit': True}]))
 binary = os.environ['NATIVE_FIXTURE_BINARY']
 os.execve(binary, [os.environ.get('PUMPKIN_PROCESS_MARKER', binary)], os.environ)

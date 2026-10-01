@@ -1,11 +1,21 @@
-import { controlPlaneOrigin } from "../../../../../lib/control-plane";
+import { controlPlaneOrigin } from "../../../lib/control-plane";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   const requestUrl = new URL(request.url);
-  const upstreamUrl = new URL("/api/v1/server/events", controlPlaneOrigin());
-  upstreamUrl.search = requestUrl.search;
+  const serverId = requestUrl.searchParams.get("server_id");
+  if (!serverId) {
+    return Response.json({ error: "server_id is required" }, { status: 400 });
+  }
+
+  const upstreamUrl = new URL(
+    `/api/v1/servers/${encodeURIComponent(serverId)}/events`,
+    controlPlaneOrigin(),
+  );
+  for (const [key, value] of requestUrl.searchParams) {
+    if (key !== "server_id") upstreamUrl.searchParams.append(key, value);
+  }
 
   const headers = new Headers({ accept: "text/event-stream" });
   const cookie = request.headers.get("cookie");

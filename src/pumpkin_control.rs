@@ -127,6 +127,15 @@ impl PumpkinControl {
         Ok(())
     }
 
+    pub async fn replace_operators(&self, socket: &Path, owners: &[WhitelistEntry]) -> Result<()> {
+        self.request(
+            socket,
+            json!({"action":"operators_replace", "operators":owners}),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn message(&self, socket: &Path, player_id: Uuid, message: &str) -> Result<()> {
         self.request(
             socket,

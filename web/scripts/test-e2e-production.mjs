@@ -17,14 +17,14 @@ const originalTypeFiles = new Map(
 );
 
 function run(args, extraEnv = {}) {
-  const result = spawnSync("npm", args, {
+  const result = spawnSync("pnpm", args, {
     cwd: process.cwd(),
     env: { ...env, ...extraEnv },
     stdio: "inherit",
   });
   if (result.error) throw result.error;
-  if (result.signal) throw new Error(`npm ${args.join(" ")} stopped by ${result.signal}`);
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (result.signal) throw new Error(`pnpm ${args.join(" ")} stopped by ${result.signal}`);
+  if (result.status !== 0) throw new Error(`pnpm ${args.join(" ")} exited with status ${result.status}`);
 }
 
 try {

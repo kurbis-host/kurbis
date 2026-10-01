@@ -58,6 +58,7 @@ struct OAuthState {
 #[serde(deny_unknown_fields)]
 pub struct MinecraftLinkRequest {
     identity: VerifiedMinecraftIdentity,
+    minecraft_player_id: Uuid,
     display_name: String,
 }
 
@@ -76,6 +77,7 @@ pub(super) struct MinecraftRedeemRequest {
 struct MinecraftLoginToken {
     provider: String,
     subject: String,
+    minecraft_player_id: Uuid,
     display_name: String,
 }
 
@@ -318,21 +320,16 @@ pub async fn create_minecraft_link(
     State(state): State<Arc<AppState>>,
     Json(request): Json<MinecraftLinkRequest>,
 ) -> Result<Json<MinecraftLinkResponse>, ApiError> {
-    let (provider, subject) = match request.identity {
-        VerifiedMinecraftIdentity::Java { uuid } => ("minecraft_java", uuid.to_string()),
-        VerifiedMinecraftIdentity::Bedrock { xuid } if valid_xuid(&xuid) => {
-            ("minecraft_bedrock", xuid)
-        }
-        VerifiedMinecraftIdentity::Bedrock { .. } => {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "verified Minecraft identity is invalid",
-            ));
-        }
-    };
-    if request.display_name.trim().is_empty()
-        || request.display_name.len() > 64
-        || request.display_name.chars().any(char::is_control)
+    let MinecraftLinkRequest {
+        identity,
+        minecraft_player_id,
+        display_name,
+    } = request;
+    let key = identity::minecraft_identity_key(&identity, minecraft_player_id)
+        .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
+    if display_name.trim().is_empty()
+        || display_name.len() > 64
+        || display_name.chars().any(char::is_control)
     {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -345,13 +342,14 @@ pub async fn create_minecraft_link(
         .execute(&state.pool)
         .await?;
     sqlx::query(
-        "INSERT INTO minecraft_login_tokens(token_hash, provider, subject, display_name, expires_at)
-         VALUES($1, $2, $3, $4, now() + make_interval(mins => $5))",
+        "INSERT INTO minecraft_login_tokens(token_hash, provider, subject, minecraft_player_id, display_name, expires_at)
+         VALUES($1, $2, $3, $4, $5, now() + make_interval(mins => $6))",
     )
     .bind(token_hash(&token))
-    .bind(provider)
-    .bind(subject)
-    .bind(request.display_name.trim())
+    .bind(key.provider)
+    .bind(key.subject)
+    .bind(minecraft_player_id)
+    .bind(display_name.trim())
     .bind(MINECRAFT_TOKEN_MINUTES as i32)
     .execute(&state.pool)
     .await?;
@@ -403,7 +401,7 @@ pub(super) async fn redeem_minecraft(
     let token: Option<MinecraftLoginToken> = sqlx::query_as(
         "DELETE FROM minecraft_login_tokens
          WHERE token_hash = $1 AND expires_at > now()
-         RETURNING provider, subject, display_name",
+         RETURNING provider, subject, minecraft_player_id, display_name",
     )
     .bind(token_hash(&request.token))
     .fetch_optional(&state.pool)
@@ -419,6 +417,7 @@ pub(super) async fn redeem_minecraft(
         &state.pool,
         &token.provider,
         &token.subject,
+        token.minecraft_player_id,
         &token.display_name,
         browser_user,
     )
@@ -576,7 +575,7 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
     cookie_value(headers, SESSION_COOKIE)
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+pub(super) fn cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|cookie| {
         let (name, value) = cookie.trim().split_once('=')?;
@@ -584,7 +583,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str
     })
 }
 
-fn same_origin(headers: &HeaderMap, public_base_url: &str) -> bool {
+pub(super) fn same_origin(headers: &HeaderMap, public_base_url: &str) -> bool {
     let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -598,13 +597,6 @@ fn same_origin(headers: &HeaderMap, public_base_url: &str) -> bool {
         return false;
     };
     actual.origin() == expected.origin() && actual.path() == "/" && actual.query().is_none()
-}
-
-fn valid_xuid(xuid: &str) -> bool {
-    !xuid.is_empty()
-        && xuid.len() <= 20
-        && xuid.bytes().all(|byte| byte.is_ascii_digit())
-        && xuid.bytes().any(|byte| byte != b'0')
 }
 
 fn map_identity_error(error: IdentityError) -> ApiError {
@@ -623,7 +615,7 @@ fn map_identity_error(error: IdentityError) -> ApiError {
     }
 }
 
-fn random_token() -> String {
+pub(super) fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
 }
 

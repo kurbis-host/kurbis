@@ -121,6 +121,7 @@ async fn handle_status(
                 ("starting", "Starting server".to_owned())
             }
             ObservedState::Failed => ("failed", "Server failed to start".to_owned()),
+            ObservedState::Resetting => ("starting", "Resetting server".to_owned()),
             state => ("sleeping", format!("{state:?}")),
         },
     };

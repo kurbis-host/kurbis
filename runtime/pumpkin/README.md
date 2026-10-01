@@ -1,19 +1,27 @@
 # Hosted Pumpkin runtime
 
-The upstream Pumpkin binary does not contain the host-control interface required by this worker. For local development, build the pinned source and checked-in integration natively with `tools/build_pumpkin_native.sh`; this is the recommended path on macOS and does not require Docker. The isolated Linux image can be built with:
+The hosted runtime builds Pumpkin directly on the local host with
+`tools/build_pumpkin_native.sh`; local development does not use Docker. The
+source pin is Pumpkin `0.2.0+26.3-26.51`, which speaks Java protocol 777 and
+Bedrock 1.26.51/protocol 2193.
+
+The checked-in integration adds the authenticated Unix host-control socket
+used by workers for player state, messages, transfers, saves, whitelist and
+operator updates, and shutdown. Snapshot saves flush watched chunk regions and
+return write failures so the worker can avoid marking an incomplete recovery
+point as complete. `tools/protocol/verify_java_263.py` exercises real protocol
+777 logins, transfers, commands, inventory, and reconnect persistence.
+
+Bedrock 1.26.51 uses NetherNet. The pinned upstream TCP signaling endpoint
+serves plain HTTP while current Bedrock clients initiate TLS, so Bedrock login
+requires a TLS termination path that this local runtime does not provide yet.
+See the [upstream Pumpkin issue](https://github.com/Pumpkin-MC/Pumpkin/issues/3738).
+Java 26.3 login and hosting behavior are verified independently.
+
+Build with Rust 1.98.1, Git, CMake, and a C/C++ compiler:
 
 ```sh
-docker build -f runtime/pumpkin/Dockerfile -t melon-pumpkin:host-control .
+tools/build_pumpkin_native.sh debug
 ```
 
-Set `PUMPKIN_IMAGE=melon-pumpkin:host-control` on every worker. The image runs as UID/GID 2613; the worker sets data-volume ownership accordingly. DockerRuntime supplies the Unix socket path and authentication token. Tokens must contain at least 32 bytes. The worker requires Linux for the quota filesystem.
-
-The interface provides readiness/player count, player hostname/edition, messages, native transfers, kicks, completed saves, and graceful shutdown. Pumpkin has no Postgres or scheduling dependency.
-
-The runtime pins `caf954d17043e1f618f4afe254cbcd479492d80b`, the final revision before the NetherNet transport change. It reports Java 26.2 and Bedrock 1.26.40/protocol 2168, with normal UDP/RakNet. The local native lifecycle suite exercises real Java and Bedrock client logins, waiting sessions, transfers, and world recovery; see `PROGRESS.md` for the current evidence and the scope of its disposable test identities.
-
-The integration patch also makes the save RPC await world/player/advancement/entity/block-entity/POI serialization and chunk/entity region writes. Watched regions are flushed rather than retained only in memory. Entity records are replaced for live chunks and deduplicated by UUID for dormant chunks, so repeated periodic saves do not append duplicate entities. Failed region writes restore dirty flags for retry. The native cross-worker recovery suite checks changed world blocks and player inventory after restart; its result is recorded in `PROGRESS.md`.
-
-Pumpkin and the integration source are distributed under GPL-3.0; the license is included. The exact base source is available from Pumpkin-MC/Pumpkin at the pinned revision; the complete integration modifications are checked in here. Image consumers must retain the corresponding source and license when distributing binaries.
-
-The container build fixes Rust to 1.98.1, uses one build job, disables upstream whole-program LTO, and uses sixteen code-generation units to bound compilation memory inside local Docker Desktop. BuildKit caches dependencies and artifacts. This changes build resource use, not the host-control protocol.
+The build script manages only ignored output/native-pumpkin/source, applies host-control.patch, copies host_control.rs, and writes the executable under output/native-pumpkin/target/debug/pumpkin. Keep the included GPL-3.0 license with distributed Pumpkin source or binaries.

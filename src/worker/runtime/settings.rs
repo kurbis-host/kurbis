@@ -1,7 +1,9 @@
 use serde_json::Value;
 
+use crate::model::DEFAULT_SERVER_MOTD;
+
 pub(crate) fn render_pumpkin_config(settings: &Value, java_port: u16, bedrock_port: u16) -> String {
-    let motd = setting_str(settings, "motd", "Hosted by kurbis");
+    let motd = setting_str(settings, "motd", DEFAULT_SERVER_MOTD);
     let difficulty = setting_str(settings, "difficulty", "Normal");
     let gamemode = setting_str(settings, "gamemode", "Survival");
     let view_distance = setting_u64(settings, "view_distance", 12).clamp(2, 32);
@@ -31,14 +33,18 @@ pub(crate) fn render_pumpkin_config(settings: &Value, java_port: u16, bedrock_po
          [networking.bedrock]\n\
          enabled = true\n\
          online_mode = true\n\
-         encryption = true\n\
-         address = \"0.0.0.0:{bedrock_port}\"\n\
          max_players = 0\n\
          motd = {motd}\n\
          view_distance = {view_distance}\n\
          simulation_distance = {simulation_distance}\n\
          [networking.bedrock.authentication]\n\
-         enabled = true\n",
+         enabled = true\n\
+         [networking.bedrock.nethernet]\n\
+         enabled = true\n\
+         address = \"0.0.0.0:{bedrock_port}\"\n\
+         external_ip = \"\"\n\
+         identity_key = \"nethernet-key.der\"\n\
+         stun_servers = []\n",
         difficulty = serde_json::to_string(difficulty).expect("string serialization cannot fail"),
         gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
         motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
@@ -72,12 +78,11 @@ mod tests {
                 "[networking.java]\nenabled = true\nonline_mode = true\nencryption = true"
             )
         );
-        assert!(config.contains(
-            "[networking.bedrock]\nenabled = true\nonline_mode = true\nencryption = true"
-        ));
+        assert!(config.contains("[networking.bedrock]\nenabled = true\nonline_mode = true"));
         assert!(config.contains("[networking.bedrock.authentication]\nenabled = true"));
         assert!(config.contains(
-            "[networking.bedrock]\nenabled = true\nonline_mode = true\nencryption = true\naddress = \"0.0.0.0:19132\""
+            "[networking.bedrock.nethernet]\nenabled = true\naddress = \"0.0.0.0:19132\"\nexternal_ip = \"\"\nidentity_key = \"nethernet-key.der\"\nstun_servers = []"
         ));
+        assert!(!config.contains("[networking.bedrock]\nencryption ="));
     }
 }

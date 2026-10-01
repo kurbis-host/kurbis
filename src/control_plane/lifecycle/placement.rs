@@ -23,7 +23,7 @@ pub(super) async fn lock_server_optional(
     server_id: Uuid,
 ) -> Result<Option<ServerRecord>> {
     Ok(sqlx::query_as::<_, ServerRecord>(
-        "SELECT id, owner_id, subdomain, desired_state, observed_state, settings, storage_bytes,
+        "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
                 generation, current_snapshot_generation, last_error, created_at, updated_at
          FROM servers WHERE id = $1 FOR UPDATE",
     )

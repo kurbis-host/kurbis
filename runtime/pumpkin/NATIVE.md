@@ -18,10 +18,7 @@ export DATABASE_URL=postgres://localhost/melon_hoster
 target/debug/worker
 ```
 
-The build script manages only `output/native-pumpkin/source`, initializes the
-pinned WIT submodule, applies the checked-in integration, and reuses native Cargo
-artifacts. `PUMPKIN_BUILD_JOBS` defaults to 4. `PUMPKIN_BINARY` must point to this
-host-control build; an ordinary upstream binary cannot satisfy readiness.
+The build script manages only the native Pumpkin source checkout under output/native-pumpkin/source. It applies the checked-in host-control integration and reuses native Cargo artifacts. PUMPKIN_BUILD_JOBS defaults to 4, and PUMPKIN_BINARY must point to this host-control build.
 
 Each worker needs a stable unique `WORKER_ID`, independent `WORKER_ROOT`, and
 nonoverlapping port range. If omitted, the native root is
@@ -48,18 +45,13 @@ For integrated real-client verification, create a fresh disposable PostgreSQL
 database and run:
 
 ```sh
-npm --prefix tools/protocol ci --ignore-scripts
 python3 tools/verify_worker_runtime.py --bin-dir target/debug \
   --native-binary output/native-pumpkin/target/debug/pumpkin \
   --database-url postgres://localhost/melon_native_runtime_test \
   --protocol-dir tools/protocol --output output/runtime/native-lifecycle
 ```
 
-This harness uses an explicit offline identity fixture only for its disposable
-servers. It does not change normal native or Docker authentication. Results are
-written to `result.json`; check `passed` and individual checks. Native success
-cannot establish Docker hard-quota enforcement. See PROGRESS.md for executed
-results and outstanding plan requirements.
+This harness uses an explicit offline identity fixture only for its disposable servers. It verifies that unverified players receive no account login link and does not change normal native or Docker authentication. Results are written to result.json; check passed and individual checks. Native success cannot establish Docker hard-quota enforcement. See PROGRESS.md for executed results and outstanding plan requirements.
 
 ## Run the gateway locally without Docker
 
@@ -80,10 +72,11 @@ tools/run_native_waiting.sh
 
 In another terminal with those same variables, run `cargo run --bin gateway`.
 Run the worker in a third terminal from the native worker example above.
-The default waiting ports are 25566/TCP and 19133/UDP; hosted backend ports
+The default waiting ports are 25566/TCP and 19133/TCP+UDP; hosted backend ports
 come from the worker’s distinct assigned range. Set wildcard DNS or local
-hostnames for your configured root domain to loopback. Bedrock clients must
-send that hostname in ServerAddress.
+hostnames for your configured root domain to loopback. Java 26.3 is supported.
+Bedrock 1.26.51 login is currently blocked by Pumpkin's NetherNet signaling
+TLS issue; see `runtime/pumpkin/README.md`.
 
 Stop hosted worlds through the panel before shutting down the worker. Native
 Pumpkin worlds intentionally survive worker exit for crash recovery. Stop the

@@ -13,8 +13,8 @@ function wrapper(client: QueryClient) {
 describe("backup restrictions", () => {
   it("allows restore while sleeping and manual snapshots only while online", () => {
     const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
-    client.setQueryData(queryKeys.server, server);
-    client.setQueryData(queryKeys.snapshots, [snapshot]);
+    client.setQueryData(queryKeys.server(server.id), server);
+    client.setQueryData(queryKeys.snapshots(server.id), [snapshot]);
     render(<Backups initialServer={server} initialSnapshots={[snapshot]} />, { wrapper: wrapper(client) });
     expect(screen.getByRole("button", { name: "Restore" })).toBeEnabled();
     expect(screen.getByRole("button", { name: /create manual backup/i })).toBeDisabled();

@@ -1,7 +1,7 @@
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
 };
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::model::{OperationRecord as DbOperation, SnapshotRecord as DbSnapshot};
 
 use super::activity::{EventRow, ServerEventKind};
-use super::internal::{owned_server, require_active_user, server_by_id};
+use super::internal::{require_server_owner, server_by_id};
 use super::logs::LogEntry;
 use super::players::player_list;
 use super::server::server_view;
@@ -130,7 +130,7 @@ pub(super) async fn server_event_payload(
 struct SseState {
     state: Arc<AppState>,
     listener: PgListener,
-    user_id: Uuid,
+    headers: HeaderMap,
     server_id: Uuid,
     cursor: i64,
 }
@@ -138,41 +138,17 @@ struct SseState {
 pub(super) async fn next_event_row(
     pool: &PgPool,
     server_id: Uuid,
-    user_id: Uuid,
     cursor: i64,
 ) -> Result<Option<EventRow>, sqlx::Error> {
     sqlx::query_as::<_, EventRow>(
         "SELECT e.id, e.event_type, e.created_at
          FROM server_events e
-         JOIN servers s ON s.id = e.server_id
-         JOIN users u ON u.id = s.owner_id
          WHERE e.server_id = $1 AND e.id > $2
-           AND s.owner_id = $3 AND u.account_status = 'active'
          ORDER BY e.id ASC LIMIT 1",
     )
     .bind(server_id)
     .bind(cursor)
-    .bind(user_id)
     .fetch_optional(pool)
-    .await
-}
-
-async fn sse_access_allowed(
-    pool: &PgPool,
-    server_id: Uuid,
-    user_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM servers s
-            JOIN users u ON u.id = s.owner_id
-            WHERE s.id = $1 AND s.owner_id = $2 AND u.account_status = 'active'
-         )",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_one(pool)
     .await
 }
 
@@ -205,16 +181,10 @@ pub(super) fn event_cursor(headers: &HeaderMap, query: &EventsQuery) -> Result<i
 pub(super) async fn server_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let user = require_active_user(&state, &headers).await?;
-    let server = owned_server(&state.pool, user.id).await?.ok_or_else(|| {
-        ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "server_not_found",
-            "server not found",
-        )
-    })?;
+    let server = require_server_owner(&state, &headers, server_id).await?;
     let cursor = event_cursor(&headers, &query)?;
 
     // LISTEN before the first durable read. A commit between these two steps is
@@ -226,16 +196,29 @@ pub(super) async fn server_events(
     let stream_state = SseState {
         state,
         listener,
-        user_id: user.id,
+        headers,
         server_id: server.id,
         cursor,
     };
     let output = stream::unfold(stream_state, |mut stream_state| async move {
         loop {
+            if let Err(error) = require_server_owner(
+                &stream_state.state,
+                &stream_state.headers,
+                stream_state.server_id,
+            )
+            .await
+            {
+                tracing::debug!(
+                    ?error,
+                    "closing server event stream after authorization failed"
+                );
+                return None;
+            }
+
             match next_event_row(
                 &stream_state.state.pool,
                 stream_state.server_id,
-                stream_state.user_id,
                 stream_state.cursor,
             )
             .await
@@ -278,21 +261,6 @@ pub(super) async fn server_events(
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(?error, "failed to read durable server events");
-                    return None;
-                }
-            }
-
-            match sse_access_allowed(
-                &stream_state.state.pool,
-                stream_state.server_id,
-                stream_state.user_id,
-            )
-            .await
-            {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(error) => {
-                    tracing::warn!(?error, "failed to revalidate SSE authorization");
                     return None;
                 }
             }

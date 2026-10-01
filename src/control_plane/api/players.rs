@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
 use chrono::{DateTime, Utc};
@@ -10,7 +10,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::internal::require_owned_server;
+use super::internal::require_server_owner;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -84,7 +84,8 @@ pub(super) async fn player_list(
 pub(super) async fn players(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<PlayerPresence>>, ApiError> {
-    let server = require_owned_server(&state, &headers).await?;
+    let server = require_server_owner(&state, &headers, server_id).await?;
     Ok(Json(player_list(&state.pool, server.id).await?))
 }

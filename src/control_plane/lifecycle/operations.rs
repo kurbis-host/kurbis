@@ -15,7 +15,7 @@ pub async fn claim_operation(pool: &PgPool, worker_id: Uuid) -> Result<Option<Op
                 last_error, created_at, updated_at
          FROM operations
          WHERE status = 'pending' AND next_attempt_at <= now()
-           AND (worker_id = $1 OR (worker_id IS NULL AND kind = 'delete'))
+           AND (worker_id = $1 OR (worker_id IS NULL AND kind IN ('delete', 'reset')))
          ORDER BY created_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
@@ -58,7 +58,18 @@ pub async fn recover_running_operations(pool: &PgPool, worker_id: Uuid) -> Resul
 
 pub async fn retry_operation(pool: &PgPool, op: &OperationRecord, error: &str) -> Result<bool> {
     const MAX_ATTEMPTS: i32 = 5;
-    if op.attempt >= MAX_ATTEMPTS {
+    let resumable_snapshot: bool = if op.kind == OperationKind::Snapshot {
+        sqlx::query_scalar(
+            "SELECT COALESCE(payload->>'stage' = 'deferred', false)
+             FROM operations WHERE id = $1",
+        )
+        .bind(op.id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        false
+    };
+    if op.attempt >= MAX_ATTEMPTS && !resumable_snapshot {
         fail_operation(pool, op, error).await?;
         return Ok(false);
     }
@@ -83,6 +94,113 @@ pub async fn retry_operation(pool: &PgPool, op: &OperationRecord, error: &str) -
         bail!("stale operation claim cannot schedule a retry");
     }
     Ok(true)
+}
+
+/// Reopen a snapshot attempt after a deferred upload, fencing new admissions
+/// until the worker has saved and stopped the runtime again.
+pub async fn begin_snapshot_retry(pool: &PgPool, op: &OperationRecord) -> Result<()> {
+    if op.kind != OperationKind::Snapshot {
+        bail!("snapshot retry requires a snapshot operation");
+    }
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if server.generation != op.generation
+        || server.desired_state != DesiredState::Running
+        || server.observed_state != ObservedState::Online
+    {
+        bail!("snapshot retry no longer matches the online server generation");
+    }
+    if !lock_claim(&mut tx, op, None).await? {
+        bail!("snapshot retry claim is no longer running");
+    }
+    let placement = lock_placement(&mut tx, op.server_id)
+        .await?
+        .context("snapshot retry lost placement")?;
+    validate_placement(op, &placement)?;
+    if !placement.active {
+        bail!("snapshot retry requires an active placement");
+    }
+    sqlx::query(
+        "UPDATE placements SET active = false, updated_at = now()
+         WHERE server_id = $1 AND generation = $2",
+    )
+    .bind(op.server_id)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'snapshotting', updated_at = now()
+         WHERE id = $1 AND generation = $2",
+    )
+    .bind(op.server_id)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE operations SET payload = payload || '{\"stage\":\"requested\"}'::jsonb,
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(op.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Keep the existing runtime routable when snapshot storage is temporarily
+/// unavailable, and persist a stage that can safely begin a fresh capture.
+pub async fn defer_snapshot_operation(
+    pool: &PgPool,
+    op: &OperationRecord,
+    error: &str,
+) -> Result<()> {
+    if op.kind != OperationKind::Snapshot {
+        bail!("only a snapshot operation can be deferred");
+    }
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if server.generation != op.generation
+        || server.desired_state != DesiredState::Running
+        || server.observed_state != ObservedState::Snapshotting
+    {
+        bail!("snapshot deferral no longer matches the current server generation");
+    }
+    if !lock_claim(&mut tx, op, None).await? {
+        bail!("snapshot deferral claim is no longer running");
+    }
+    let placement = lock_placement(&mut tx, op.server_id)
+        .await?
+        .context("snapshot deferral lost placement")?;
+    validate_placement(op, &placement)?;
+    if placement.active {
+        bail!("snapshot deferral requires the stopped placement fence");
+    }
+    sqlx::query(
+        "UPDATE operations SET payload = payload || '{\"stage\":\"deferred\"}'::jsonb,
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(op.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE placements SET active = true, updated_at = now()
+         WHERE server_id = $1 AND generation = $2",
+    )
+    .bind(op.server_id)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'online', last_error = $2, updated_at = now()
+         WHERE id = $1 AND generation = $3",
+    )
+    .bind(op.server_id)
+    .bind(error)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn fail_operation(pool: &PgPool, op: &OperationRecord, error: &str) -> Result<()> {
@@ -318,27 +436,67 @@ pub async fn complete_snapshot(pool: &PgPool, op: &OperationRecord, generation: 
         tx.commit().await?;
         return Ok(());
     }
+    if server.observed_state != ObservedState::Snapshotting
+        || server.desired_state != DesiredState::Running
+    {
+        bail!("snapshot completion requires a running server in the snapshotting state");
+    }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
         .context("snapshot lost placement")?;
     validate_placement(op, &placement)?;
+    let reason = op
+        .payload
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .context("snapshot operation is missing its reason")?;
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2
-         AND complete AND reason = 'manual' AND created_at >= $3
+         AND complete AND reason::text = $3 AND created_at >= $4
          AND manifest_key <> '' AND checksum <> '')",
     )
     .bind(op.server_id)
     .bind(generation)
+    .bind(reason)
     .bind(op.created_at)
     .fetch_one(&mut *tx)
     .await?;
-    if !placement.active || server.current_snapshot_generation != Some(generation) || !valid {
-        bail!("snapshot completion requires a published complete manual snapshot");
+    if placement.active || server.current_snapshot_generation != Some(generation) || !valid {
+        bail!("snapshot completion requires a published complete stopped-runtime snapshot");
     }
+    sqlx::query(
+        "UPDATE placements SET active = true, updated_at = now()
+         WHERE server_id = $1 AND generation = $2",
+    )
+    .bind(op.server_id)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = $1")
         .bind(op.id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'online', storage_bytes =
+             (SELECT size_bytes FROM snapshots WHERE server_id = $1 AND generation = $2),
+             last_error = NULL, updated_at = now()
+         WHERE id = $1 AND generation = $3",
+    )
+    .bind(op.server_id)
+    .bind(generation)
+    .bind(op.generation)
+    .execute(&mut *tx)
+    .await?;
+    if reason == "export" {
+        sqlx::query(
+            "UPDATE world_exports SET source_generation = $2, stage = 'ready', updated_at = now()
+             WHERE server_id = $1 AND status = 'pending' AND source_generation IS NULL",
+        )
+        .bind(op.server_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -444,6 +602,86 @@ pub async fn complete_restore(
         }
         DesiredState::Stopped => {}
     }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn complete_reset(
+    pool: &PgPool,
+    op: &OperationRecord,
+    snapshot_generation: i64,
+    storage_bytes: i64,
+    was_running: bool,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if op.kind != OperationKind::Reset || server.generation != op.generation {
+        bail!("reset completion requires the current reset operation");
+    }
+    if !lock_claim(&mut tx, op, Some(OperationStatus::Succeeded)).await? {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let valid_snapshot: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2
+         AND complete AND reason = 'reset' AND size_bytes = $3
+         AND manifest_key <> '' AND checksum <> '' AND created_at >= $4)",
+    )
+    .bind(op.server_id)
+    .bind(snapshot_generation)
+    .bind(storage_bytes)
+    .bind(op.created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    if server.current_snapshot_generation != Some(snapshot_generation) || !valid_snapshot {
+        bail!("reset completion requires the authoritative replacement snapshot");
+    }
+    let placement = lock_placement(&mut tx, op.server_id).await?;
+    if was_running {
+        let placement = placement.context("running reset lost its placement")?;
+        validate_placement(op, &placement)?;
+        sqlx::query("UPDATE placements SET active = true, updated_at = now() WHERE server_id = $1")
+            .bind(op.server_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if placement.is_some_and(|placement| placement.active) {
+        bail!("sleeping reset left an active placement");
+    }
+
+    sqlx::query("UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE servers SET observed_state = $2, storage_bytes = $3, last_error = NULL, updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(op.server_id)
+    .bind(if was_running {
+        ObservedState::Online
+    } else {
+        ObservedState::Sleeping
+    })
+    .bind(storage_bytes)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM worker_snapshot_cache WHERE server_id = $1")
+        .bind(op.server_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
+         VALUES($1, $2, $3) ON CONFLICT(worker_id, server_id) DO UPDATE
+           SET generation = EXCLUDED.generation, updated_at = now()",
+    )
+    .bind(
+        op.worker_id
+            .context("reset operation has no worker claim")?,
+    )
+    .bind(op.server_id)
+    .bind(snapshot_generation)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

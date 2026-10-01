@@ -8,28 +8,28 @@ import { server } from "./fixtures";
 describe("server event integration", () => {
   it("patches authoritative server state into the shared cache", () => {
     const client = new QueryClient();
-    client.setQueryData(queryKeys.server, server);
-    applyServerEvent(client, { id: 10, type: "server", data: { ...server, observed_state: "online", desired_state: "running", player_count: 2 } });
-    expect(client.getQueryData<typeof server>(queryKeys.server)).toMatchObject({ observed_state: "online", player_count: 2 });
+    client.setQueryData(queryKeys.server(server.id), server);
+    applyServerEvent(client, server.id, { id: 10, type: "server", data: { ...server, observed_state: "online", desired_state: "running", player_count: 2 } });
+    expect(client.getQueryData<typeof server>(queryKeys.server(server.id))).toMatchObject({ observed_state: "online", player_count: 2 });
   });
 
   it("prevents an older in-flight server read from overwriting a live event", async () => {
     const client = new QueryClient();
-    client.setQueryData(queryKeys.server, server);
+    client.setQueryData(queryKeys.server(server.id), server);
     let finishStaleRead!: (value: typeof server) => void;
     const staleRead = client.fetchQuery({
-      queryKey: queryKeys.server,
+      queryKey: queryKeys.server(server.id),
       queryFn: () => new Promise<typeof server>((resolve) => { finishStaleRead = resolve; }),
       staleTime: 0,
     });
     await Promise.resolve();
 
     const liveServer = { ...server, observed_state: "online" as const, player_count: 3 };
-    applyServerEvent(client, { id: 11, type: "server", data: liveServer });
+    applyServerEvent(client, server.id, { id: 11, type: "server", data: liveServer });
     finishStaleRead(server);
     await staleRead.catch(() => undefined);
 
-    expect(client.getQueryData<typeof server>(queryKeys.server)).toMatchObject({
+    expect(client.getQueryData<typeof server>(queryKeys.server(server.id))).toMatchObject({
       observed_state: "online",
       player_count: 3,
     });
@@ -37,11 +37,11 @@ describe("server event integration", () => {
 
   it("appends live log entries without duplicating event ids", () => {
     const client = new QueryClient();
-    client.setQueryData(queryKeys.logs, { items: [], next_after_id: null });
+    client.setQueryData(queryKeys.logs(server.id), { items: [], next_after_id: null });
     const event = { id: 12, type: "log" as const, data: { id: 12, created_at: "2026-09-30T18:20:00Z", line: "Server ready" } };
-    applyServerEvent(client, event);
-    applyServerEvent(client, event);
-    const page = client.getQueryData<{ items: { id: number }[] }>(queryKeys.logs);
+    applyServerEvent(client, server.id, event);
+    applyServerEvent(client, server.id, event);
+    const page = client.getQueryData<{ items: { id: number }[] }>(queryKeys.logs(server.id));
     expect(page?.items).toHaveLength(1);
   });
 
@@ -67,11 +67,11 @@ describe("server event integration", () => {
         updated_at: "2026-09-30T18:19:00Z",
       }],
     };
-    applyServerEvent(client, { id: 13, type: "players", data: players });
-    applyServerEvent(client, { id: 14, type: "whitelist", data: whitelist });
-    expect(client.getQueryData(queryKeys.players)).toEqual(players);
-    expect(client.getQueryData(queryKeys.whitelist)).toEqual(whitelist);
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.server });
+    applyServerEvent(client, server.id, { id: 13, type: "players", data: players });
+    applyServerEvent(client, server.id, { id: 14, type: "whitelist", data: whitelist });
+    expect(client.getQueryData(queryKeys.players(server.id))).toEqual(players);
+    expect(client.getQueryData(queryKeys.whitelist(server.id))).toEqual(whitelist);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.server(server.id) });
   });
 
   it("refreshes activity for every durable event type", () => {
@@ -88,8 +88,8 @@ describe("server event integration", () => {
 
     for (const event of events) {
       invalidate.mockClear();
-      applyServerEvent(client, event);
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.activity });
+      applyServerEvent(client, server.id, event);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.activity(server.id) });
     }
   });
 });

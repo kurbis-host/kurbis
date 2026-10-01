@@ -63,20 +63,23 @@ export function Overview({
   initialServer,
   initialActivity,
   renderedAt,
+  panelBasePath,
 }: {
   initialServer: Server;
   initialActivity: ActivityItem[];
   renderedAt: number;
+  panelBasePath?: string;
 }) {
   const queryClient = useQueryClient();
+  const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
-    queryKey: queryKeys.server,
-    queryFn: fetchServer,
+    queryKey: queryKeys.server(serverId),
+    queryFn: () => fetchServer(serverId),
     initialData: initialServer,
   });
   const { data: activity = initialActivity } = useQuery({
-    queryKey: queryKeys.activity,
-    queryFn: fetchActivity,
+    queryKey: queryKeys.activity(serverId),
+    queryFn: () => fetchActivity(serverId),
     initialData: initialActivity,
   });
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -88,15 +91,16 @@ export function Overview({
   }, []);
   const action = useMutation({
     mutationFn: async (name: "start" | "stop" | "restart") =>
-      apiVoid("/api/v1/server/actions", {
+      apiVoid(`/api/v1/servers/${serverId}/actions`, {
         method: "POST",
         body: jsonBody({ action: name }),
       }),
     onMutate: async (name) => {
       setRequestError(null);
-      await queryClient.cancelQueries({ queryKey: queryKeys.server });
-      const previous = queryClient.getQueryData<Server | null>(queryKeys.server);
-      queryClient.setQueryData<Server | null>(queryKeys.server, (current) => {
+      const serverKey = queryKeys.server(serverId);
+      await queryClient.cancelQueries({ queryKey: serverKey });
+      const previous = queryClient.getQueryData<Server | null>(serverKey);
+      queryClient.setQueryData<Server | null>(serverKey, (current) => {
         if (!current) return current;
         return name === "start"
           ? { ...current, desired_state: "running", observed_state: "queued" }
@@ -110,12 +114,12 @@ export function Overview({
     },
     onError: (error, _name, context) => {
       if (context?.previous !== undefined) {
-        queryClient.setQueryData(queryKeys.server, context.previous);
+        queryClient.setQueryData(queryKeys.server(serverId), context.previous);
       }
       setRequestError(errorMessage(error));
     },
     onSettled: () =>
-      void queryClient.invalidateQueries({ queryKey: queryKeys.server }),
+      void queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
   });
 
   if (!server) {
@@ -349,7 +353,7 @@ export function Overview({
           )}
           <Link
             className="mt-[22px] inline-flex items-center gap-[7px] text-[13px] font-[780] text-sky-deep no-underline"
-            href="/app/backups"
+            href={`${panelBasePath ?? `/app/servers/${serverId}`}/backups`}
           >
             Open backup history <ExternalLink size={14} />
           </Link>

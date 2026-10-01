@@ -9,7 +9,7 @@ The project is designed for a free single-region hosting service where servers c
 The system is split into three main parts:
 
 - **Control plane**: Rust/Axum service backed by PostgreSQL. It owns users, servers, placements, lifecycle operations, worker state, and routing information.
-- **Gateway**: Rust Java hostname proxy, Bedrock UDP/RakNet transport, and authenticated Pumpkin waiting-session orchestration. Local protocol coverage uses real Java and Bedrock clients with disposable test identities; account-login verification is tracked in PROGRESS.md.
+- **Gateway**: Rust Java hostname proxy, Bedrock transport, and authenticated Pumpkin waiting-session orchestration. Local protocol coverage uses a real Java 26.3 client with disposable test identities; Bedrock 1.26.51 login is blocked by the pinned NetherNet signaling issue.
 - **Workers**: Rust agents responsible for Docker containers or native host processes, local storage, snapshots, and Pumpkin lifecycle management.
 
 The web panel in `web/` provides the user interface for managing hosted servers.
@@ -17,7 +17,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 ## Features
 
 - One new hosted Minecraft server per account; account merges preserve all existing worlds.
-- Java and Bedrock hostname routing, sleeping-server wake, waiting sessions, and native backend transfer, exercised with real protocol clients.
+- Java 26.3 hostname routing, sleeping-server wake, waiting sessions, and native backend transfer, exercised with a real protocol client.
 - Wake-on-join for sleeping servers.
 - Automatic sleep after inactivity.
 - Worker scheduling with resource reservations.
@@ -44,7 +44,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - PostgreSQL
 - Native host processes for local development (Docker is not needed)
 - Docker Engine and Compose v2 for the container deployment and Docker workers
-- Node.js and npm (for the web panel)
+- Node.js and pnpm 11.2.2 (for the web panel)
 
 ## Development
 
@@ -84,8 +84,8 @@ Then run the panel:
 
 ```bash
 cd web
-npm install
-npm run dev
+pnpm install --frozen-lockfile
+pnpm run dev
 ```
 
 The fixture signs in as a local development identity (`Browser Player`); it does not contact a real OAuth provider. The control plane listens on `127.0.0.1:8080`, and the panel on `http://localhost:3000`.
@@ -119,7 +119,7 @@ Choose one deployment mode:
 ./start.sh docker          # Compose services plus the host Docker worker
 ```
 
-Native mode needs Rust 1.98.1, Git, CMake, Node.js/npm, tmux, and a local
+Native mode needs Rust 1.98.1, Git, CMake, Node.js/pnpm, tmux, and a local
 PostgreSQL server. If `DATABASE_URL_NATIVE` cannot connect, the launcher uses
 the current operating-system PostgreSQL role to create or update the configured
 database role and create the database. That local role must have PostgreSQL
@@ -214,6 +214,6 @@ Browser lifecycle and OAuth verification uses a disposable database and real pan
 
 Build local hoster binaries with `cargo build --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Its Linux image can be built with `docker build -f runtime/Dockerfile -t melon-hoster:local .`; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
 
-To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks save/shutdown. The native lifecycle harness additionally exercises real Java and Bedrock protocol clients, waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
+To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks Java 26.3 login, save/shutdown, and player activity. The native lifecycle harness also exercises Java waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
 
 For faster development on this Mac or Linux, use [native host execution](runtime/pumpkin/NATIVE.md). Build with `tools/build_pumpkin_native.sh` and select `WORKER_RUNTIME=native`; the shared lifecycle and snapshot system works without Docker. Native development mode has no hard memory or filesystem isolation.

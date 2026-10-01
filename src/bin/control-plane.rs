@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use kurbis_hoster::{
-    config::ControlPlaneConfig,
+    config::{ControlPlaneConfig, ObjectStoreConfig},
     control_plane::{
         api::{AppState, router, spawn_queue_drain},
         lifecycle::Lifecycle,
@@ -14,6 +14,7 @@ use kurbis_hoster::{
 async fn main() -> Result<()> {
     init_tracing("kurbis_hoster=info,tower_http=info");
     let config = ControlPlaneConfig::from_env()?;
+    let object_store = ObjectStoreConfig::from_env()?.build().await?;
     let pool = db::connect(&config.common.database_url).await?;
     db::migrate(&pool).await?;
     let lifecycle = Lifecycle::new(pool.clone());
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
         pool,
         lifecycle,
         config,
+        object_store,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()?,

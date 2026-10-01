@@ -8,6 +8,7 @@ export const observedStateSchema = z.enum([
   "online",
   "stopping",
   "snapshotting",
+  "resetting",
   "failed",
   "deleted",
 ]);
@@ -79,7 +80,7 @@ export type AccountData = z.infer<typeof accountSchema>;
 
 export const operationSchema = z.object({
   id: z.string(),
-  kind: z.enum(["start", "stop", "restart", "snapshot", "restore", "delete"]),
+  kind: z.enum(["start", "stop", "restart", "snapshot", "restore", "reset", "delete"]),
   status: z.enum(["pending", "running", "succeeded", "failed", "cancelled"]),
   stage: z.string().nullable(),
   message: z.string().nullable(),
@@ -90,7 +91,7 @@ export type Operation = z.infer<typeof operationSchema>;
 
 export const snapshotSchema = z.object({
   generation: z.number().int().nonnegative(),
-  reason: z.enum(["periodic", "shutdown", "manual", "restore"]),
+  reason: z.enum(["periodic", "shutdown", "manual", "restore", "reset", "export"]),
   size_bytes: z.number().nonnegative(),
   created_at: z.string(),
 });
@@ -107,6 +108,7 @@ export type ServerError = z.infer<typeof serverErrorSchema>;
 export const serverSchema = z.object({
   id: z.string(),
   subdomain: z.string(),
+  is_default: z.boolean(),
   java_address: z.string(),
   bedrock_address: z.string(),
   desired_state: z.enum(["running", "stopped", "deleted"]),
@@ -123,6 +125,7 @@ export const serverSchema = z.object({
   error: serverErrorSchema.nullable(),
 });
 export type Server = z.infer<typeof serverSchema>;
+export const serverListSchema = z.array(serverSchema);
 
 export const logEntrySchema = z.object({
   id: z.number().int().nonnegative(),
@@ -174,6 +177,22 @@ export const whitelistListSchema = z.object({
 });
 export type WhitelistState = z.infer<typeof whitelistListSchema>;
 export const snapshotListSchema = z.array(snapshotSchema);
+
+export const worldExportSchema = z.object({
+  id: z.string().uuid(),
+  server_id: z.string().uuid(),
+  status: z.enum(["pending", "running", "completed", "failed", "cancelled", "expired"]),
+  stage: z.string(),
+  source_generation: z.number().int().nullable(),
+  archive_size: z.number().int().nonnegative().nullable(),
+  archive_checksum: z.string().nullable(),
+  last_error: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  expires_at: z.string().nullable(),
+});
+export type WorldExport = z.infer<typeof worldExportSchema>;
+export const worldExportListSchema = z.array(worldExportSchema);
 
 export const serverEventSchema = z.discriminatedUnion("type", [
   z.object({ id: z.number().int().nonnegative(), type: z.literal("server"), data: serverSchema.optional() }),

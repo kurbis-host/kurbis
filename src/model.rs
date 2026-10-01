@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub const SERVER_MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 pub const SERVER_STORAGE_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 pub const SERVER_CPU_MILLIS: i64 = 1000;
+pub const DEFAULT_SERVER_MOTD: &str = "Hosted by Kurbis";
 pub const DEFAULT_IDLE_SECONDS: i64 = 5 * 60;
 pub const SNAPSHOT_RETENTION_GENERATIONS: i64 = 5;
 
@@ -29,6 +30,7 @@ pub enum ObservedState {
     Online,
     Stopping,
     Snapshotting,
+    Resetting,
     Failed,
     Deleted,
 }
@@ -42,6 +44,7 @@ pub enum OperationKind {
     Restart,
     Snapshot,
     Restore,
+    Reset,
     Delete,
 }
 
@@ -64,6 +67,8 @@ pub enum SnapshotReason {
     Shutdown,
     Manual,
     Restore,
+    Reset,
+    Export,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -71,6 +76,7 @@ pub struct ServerRecord {
     pub id: Uuid,
     pub owner_id: Uuid,
     pub subdomain: String,
+    pub is_default: bool,
     pub desired_state: DesiredState,
     pub observed_state: ObservedState,
     pub settings: serde_json::Value,
@@ -182,6 +188,27 @@ pub fn validate_subdomain(value: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
+pub fn subdomain_from_hostname(value: &str, root_domain: &str) -> Option<String> {
+    let value = value.split('\0').next()?.trim();
+    let host = match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
+        _ => value,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let root = root_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if root.is_empty() {
+        return None;
+    }
+    let subdomain = host.strip_suffix(&format!(".{root}"))?;
+    if subdomain.contains('.') || !validate_subdomain(subdomain) {
+        return None;
+    }
+    Some(subdomain.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +221,26 @@ mod tests {
         assert!(!validate_subdomain("-edge"));
         assert!(!validate_subdomain("edge-"));
         assert!(!validate_subdomain("edge.example"));
+    }
+
+    #[test]
+    fn hostname_validation_is_shared_and_normalizes_client_input() {
+        assert_eq!(
+            subdomain_from_hostname(" Maple.Play.Example.Com.:19132 ", "play.example.com"),
+            Some("maple".into())
+        );
+        assert_eq!(
+            subdomain_from_hostname("a.b.play.example.com", "play.example.com"),
+            None
+        );
+        assert_eq!(
+            subdomain_from_hostname("maple.other.example.com", "play.example.com"),
+            None
+        );
+        assert_eq!(
+            subdomain_from_hostname("maple.play.example.com:invalid", "play.example.com"),
+            None
+        );
     }
 
     #[test]

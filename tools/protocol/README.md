@@ -1,10 +1,23 @@
-# Real protocol verification clients
+# Java 26.3 protocol verifier
 
-This is a disposable integration client, not a production gateway dependency.
-Install with `npm ci --ignore-scripts` and run `node verify.mjs --edition java|bedrock --port PORT --address HOSTNAME --output RESULT.json`.
+`verify_java_263.py` is a standard-library client for Java protocol 777. It
+performs the real login, configuration and play handshakes used by local
+runtime verification, and can check waiting joins, transfers, commands,
+inventory, server messages and disconnects. It writes a JSON evidence file for
+each run.
 
-Java uses protocol 775 (26.1), supported by the pinned Pumpkin runtime reporting 26.2. Bedrock uses 1.26.40/protocol 2168 over the JavaScript RakNet backend. The tests complete actual login/configuration/spawn flows and decode native transfer packets; `--transfer-port` additionally requires the expected transfer and a second backend login. Offline identities avoid external Microsoft credentials only inside the disposable derived runtime image. Production authentication stays enabled.
+The host-control integration check also sends protocol 776 (Java 26.2) and
+confirms the server rejects it with the expected outdated-client reason.
 
-`--command` and `--expect-item NAME:COUNT` can be repeated for Java gameplay/persistence assertions. The client acknowledges teleports and observes inventory packets. Every run writes JSON events and a success/failure result; timeout and unexpected disconnect/transfer fail verification.
+Run it directly with Python 3, or through the Node wrapper used by lifecycle
+tools:
 
-The lockfile contains upstream native-build and authentication dependencies. The current npm audit reports nine findings: critical/high findings are in tar/axios/cmake-js paths used by native addon downloads/builds, which are disabled by `--ignore-scripts`; the selected direct Bedrock client uses only JS RakNet and does not import the convenience module that initializes a native backend. Moderate findings involve authentication and UUID buffer-writing paths; these tests use offline authentication and never supply caller-controlled UUID output buffers. This is an explicit reachability assessment, not a clean-audit claim. Do not enable package scripts or use this fixture for untrusted archive/authentication operations without addressing the affected dependencies.
+```sh
+python3 verify_java_263.py --edition java --port PORT --address HOSTNAME --output RESULT.json
+node verify.mjs --edition java --port PORT --address HOSTNAME --output RESULT.json
+```
+
+The client uses no npm dependencies. Bedrock 1.26.51 uses NetherNet; the pinned
+Pumpkin signaling endpoint currently returns plain HTTP to clients that begin
+with TLS, so Bedrock login is not covered by this verifier. See
+[Pumpkin issue #3738](https://github.com/Pumpkin-MC/Pumpkin/issues/3738).

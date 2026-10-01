@@ -1,7 +1,7 @@
 import { Account } from "../../../../components/account";
-import { getAccount, getServer, getSession } from "../../../../lib/api/server";
+import { getAccount, getServers, getSession } from "../../../../lib/api/server";
 
 export default async function AccountPage() {
-  const [session, server, account] = await Promise.all([getSession(), getServer(), getAccount()]);
-  return <Account initialSession={session} initialServer={server} initialAccount={account} />;
+  const [session, servers, account] = await Promise.all([getSession(), getServers(), getAccount()]);
+  return <Account initialSession={session} initialServers={servers} initialAccount={account} />;
 }

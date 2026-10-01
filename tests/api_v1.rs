@@ -6,8 +6,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
+use bytes::Bytes;
 use common::{create_user, test_pool};
 use futures::StreamExt;
+use futures::future::join_all;
 use kurbis_hoster::{
     config::{CommonConfig, ControlPlaneConfig, OAuthConfig, OAuthProviderConfig},
     control_plane::{
@@ -15,6 +17,7 @@ use kurbis_hoster::{
         lifecycle::{Lifecycle, healthy_worker_template, heartbeat_worker},
     },
 };
+use object_store::{ObjectStore, path::Path as ObjectPath};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -54,6 +57,7 @@ fn state(pool: PgPool) -> Arc<AppState> {
             },
         },
         http: reqwest::Client::new(),
+        object_store: Arc::new(object_store::memory::InMemory::new()),
     })
 }
 
@@ -90,6 +94,27 @@ fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) 
     }
     builder
         .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .unwrap()
+}
+
+fn internal_admission_request(
+    hostname: &str,
+    identity: Option<Value>,
+    minecraft_player_id: Option<Uuid>,
+) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/internal/admission")
+        .header(header::AUTHORIZATION, "Bearer api-v1-test-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "hostname": hostname,
+                "identity": identity,
+                "minecraft_player_id": minecraft_player_id,
+            })
+            .to_string(),
+        ))
         .unwrap()
 }
 
@@ -145,17 +170,17 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
 
     let empty = app
         .clone()
-        .oneshot(request(Method::GET, "/api/v1/server", Some(&token), None))
+        .oneshot(request(Method::GET, "/api/v1/servers", Some(&token), None))
         .await
         .unwrap();
-    assert_eq!(json_body(empty).await, Value::Null);
+    assert_eq!(json_body(empty).await, json!([]));
 
     let subdomain = format!("api-{}", &owner_id.simple().to_string()[..12]);
     let created = app
         .clone()
         .oneshot(request(
             Method::POST,
-            "/api/v1/server",
+            "/api/v1/servers",
             Some(&token),
             Some(json!({
                 "subdomain": subdomain,
@@ -176,6 +201,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
     let created = json_body(created).await;
     let server_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
     assert_eq!(created["observed_state"], "sleeping");
+    assert_eq!(created["is_default"], true);
     assert_eq!(
         created["java_address"],
         format!("{subdomain}.mc.example.test")
@@ -186,19 +212,19 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            "/api/v1/server",
+            &format!("/api/v1/servers/{server_id}"),
             Some(&other_token),
             None,
         ))
         .await
         .unwrap();
-    assert_eq!(json_body(isolated).await, Value::Null);
+    assert_eq!(isolated.status(), StatusCode::NOT_FOUND);
 
     let patched = app
         .clone()
         .oneshot(request(
             Method::PATCH,
-            "/api/v1/server",
+            &format!("/api/v1/servers/{server_id}"),
             Some(&token),
             Some(json!({"settings":{"motd":"Changed through v1"}})),
         ))
@@ -214,7 +240,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::POST,
-            "/api/v1/server/actions",
+            &format!("/api/v1/servers/{server_id}/actions"),
             Some(&token),
             Some(json!({"action":"snapshot"})),
         ))
@@ -238,7 +264,10 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            &format!("/api/v1/server/logs?after_id={}&limit=1", log_ids[0]),
+            &format!(
+                "/api/v1/servers/{server_id}/logs?after_id={}&limit=1",
+                log_ids[0]
+            ),
             Some(&token),
             None,
         ))
@@ -263,7 +292,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            "/api/v1/server/players",
+            &format!("/api/v1/servers/{server_id}/players"),
             Some(&token),
             None,
         ))
@@ -277,7 +306,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            "/api/v1/server/whitelist",
+            &format!("/api/v1/servers/{server_id}/whitelist"),
             Some(&token),
             None,
         ))
@@ -293,7 +322,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::POST,
-            "/api/v1/server/whitelist",
+            &format!("/api/v1/servers/{server_id}/whitelist"),
             Some(&token),
             Some(json!({"player_id":player_id,"name":"Alex"})),
         ))
@@ -310,7 +339,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            "/api/v1/server/activity?limit=8",
+            &format!("/api/v1/servers/{server_id}/activity?limit=8"),
             Some(&token),
             None,
         ))
@@ -334,7 +363,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::GET,
-            "/api/v1/server/snapshots",
+            &format!("/api/v1/servers/{server_id}/snapshots"),
             Some(&token),
             None,
         ))
@@ -348,7 +377,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::POST,
-            "/api/v1/server/snapshots/1/restore",
+            &format!("/api/v1/servers/{server_id}/snapshots/1/restore"),
             Some(&token),
             None,
         ))
@@ -361,7 +390,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .clone()
         .oneshot(request(
             Method::DELETE,
-            &format!("/api/v1/server/whitelist?player_id={player_id}"),
+            &format!("/api/v1/servers/{server_id}/whitelist?player_id={player_id}"),
             Some(&token),
             None,
         ))
@@ -422,6 +451,10 @@ async fn account_can_switch_default_between_merged_worlds_without_cross_owner_ac
         .unwrap();
     assert_eq!(account.status(), StatusCode::OK);
     let account = json_body(account).await;
+    assert!(
+        account["identities"][0]["id"].is_string(),
+        "account identities must include their IDs"
+    );
     let worlds = account["worlds"].as_array().unwrap();
     assert_eq!(worlds.len(), 2);
     assert_eq!(
@@ -459,15 +492,15 @@ async fn account_can_switch_default_between_merged_worlds_without_cross_owner_ac
         .unwrap();
     assert_eq!(switched.status(), StatusCode::NO_CONTENT);
 
-    let default_server = app
+    let default_servers = app
         .clone()
-        .oneshot(request(Method::GET, "/api/v1/server", Some(&token), None))
+        .oneshot(request(Method::GET, "/api/v1/servers", Some(&token), None))
         .await
         .unwrap();
-    assert_eq!(
-        json_body(default_server).await["id"],
-        merged_world.to_string()
-    );
+    let default_servers = json_body(default_servers).await;
+    assert!(default_servers.as_array().unwrap().iter().any(|server| {
+        server["id"] == merged_world.to_string() && server["is_default"] == true
+    }));
 
     let foreign_selection = app
         .clone()
@@ -490,6 +523,558 @@ async fn account_can_switch_default_between_merged_worlds_without_cross_owner_ac
 
     sqlx::query("DELETE FROM users WHERE id = ANY($1)")
         .bind([owner_id, other_owner_id].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn world_exports_require_a_retained_source_and_enforce_ownership_cancellation_and_expiry() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner_id, token) = user_session(&pool, "active").await;
+    let (_, other_token) = user_session(&pool, "active").await;
+    let server_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1,$2,$3)")
+        .bind(server_id)
+        .bind(owner_id)
+        .bind(format!("export-{}", &server_id.simple().to_string()[..12]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app_state = state(pool.clone());
+    let object_store = app_state.object_store.clone();
+    let app = router(app_state);
+    let endpoint = format!("/api/v1/servers/{server_id}/exports");
+
+    let uninitialized = app
+        .clone()
+        .oneshot(request(Method::POST, &endpoint, Some(&token), None))
+        .await
+        .unwrap();
+    assert_eq!(uninitialized.status(), StatusCode::CONFLICT);
+    let export_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM world_exports WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(export_count, 0);
+
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 1, 'export-test-manifest', 100, 'manifest-checksum', 'manual', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET current_snapshot_generation = 1 WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let created = app
+        .clone()
+        .oneshot(request(Method::POST, &endpoint, Some(&token), None))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created = json_body(created).await;
+    let export_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    assert_eq!(created["source_generation"], 1);
+    assert_eq!(created["status"], "pending");
+
+    let foreign = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("{endpoint}/{export_id}"),
+            Some(&other_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    let cancelled = app
+        .clone()
+        .oneshot(request(
+            Method::DELETE,
+            &format!("{endpoint}/{export_id}"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(cancelled).await["status"], "cancelled");
+
+    let completed_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO world_exports(
+            id, server_id, requested_by, status, stage, source_generation
+         ) VALUES($1, $2, $3, 'pending', 'ready', 1)",
+    )
+    .bind(completed_id)
+    .bind(server_id)
+    .bind(owner_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = format!("exports/{server_id}/{completed_id}/1.zip");
+    let archive = Bytes::from_static(b"zip64 archive test fixture");
+    object_store
+        .put(&ObjectPath::from(key.clone()), archive.clone().into())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE world_exports SET status = 'completed', stage = 'completed',
+             archive_key = $2, archive_size = $3, archive_checksum = $4,
+             expires_at = now() + interval '24 hours'
+         WHERE id = $1",
+    )
+    .bind(completed_id)
+    .bind(&key)
+    .bind(archive.len() as i64)
+    .bind(blake3::hash(&archive).to_hex().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let download = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("{endpoint}/{completed_id}/download"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(download.headers()[header::CONTENT_TYPE], "application/zip");
+    assert_eq!(to_bytes(download.into_body(), 1024).await.unwrap(), archive);
+
+    let foreign_download = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("{endpoint}/{completed_id}/download"),
+            Some(&other_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_download.status(), StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE world_exports SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(completed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let expired = app
+        .oneshot(request(
+            Method::GET,
+            &format!("{endpoint}/{completed_id}/download"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+
+    sqlx::query("DELETE FROM users WHERE id IN (SELECT user_id FROM identities WHERE subject LIKE 'api-v1-test-%')")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn every_server_route_requires_ownership_and_legacy_singular_routes_are_gone() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner_id, _) = user_session(&pool, "active").await;
+    let (foreign_owner_id, foreign_token) = user_session(&pool, "active").await;
+    let server_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1,$2,$3)")
+        .bind(server_id)
+        .bind(owner_id)
+        .bind(format!(
+            "isolation-{}",
+            &server_id.simple().to_string()[..12]
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let export_id = Uuid::new_v4();
+    let player_id = Uuid::new_v4();
+    let prefix = format!("/api/v1/servers/{server_id}");
+    let app = router(state(pool.clone()));
+    let protected_routes = [
+        (Method::GET, prefix.clone(), None),
+        (
+            Method::PATCH,
+            prefix.clone(),
+            Some(json!({"settings":{"motd":"foreign"}})),
+        ),
+        (Method::DELETE, prefix.clone(), None),
+        (
+            Method::POST,
+            format!("{prefix}/actions"),
+            Some(json!({"action":"start"})),
+        ),
+        (
+            Method::POST,
+            format!("{prefix}/reset"),
+            Some(json!({"mode":"world"})),
+        ),
+        (Method::GET, format!("{prefix}/events"), None),
+        (Method::GET, format!("{prefix}/logs"), None),
+        (Method::GET, format!("{prefix}/activity"), None),
+        (Method::GET, format!("{prefix}/snapshots"), None),
+        (Method::POST, format!("{prefix}/snapshots/1/restore"), None),
+        (Method::GET, format!("{prefix}/exports"), None),
+        (Method::POST, format!("{prefix}/exports"), None),
+        (Method::GET, format!("{prefix}/exports/{export_id}"), None),
+        (
+            Method::DELETE,
+            format!("{prefix}/exports/{export_id}"),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("{prefix}/exports/{export_id}/download"),
+            None,
+        ),
+        (Method::GET, format!("{prefix}/players"), None),
+        (Method::GET, format!("{prefix}/whitelist"), None),
+        (
+            Method::POST,
+            format!("{prefix}/whitelist"),
+            Some(json!({"player_id":player_id,"name":"Foreign"})),
+        ),
+        (
+            Method::DELETE,
+            format!("{prefix}/whitelist?player_id={player_id}"),
+            None,
+        ),
+    ];
+
+    for (method, uri, body) in protected_routes {
+        let response = app
+            .clone()
+            .oneshot(request(method, &uri, Some(&foreign_token), body))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "foreign account must not access {uri}"
+        );
+    }
+
+    for (method, uri) in [
+        (Method::GET, "/api/v1/server"),
+        (Method::POST, "/api/v1/server"),
+        (Method::GET, "/api/v1/server/actions"),
+        (Method::GET, "/api/v1/server/events"),
+        (Method::GET, "/api/v1/server/logs"),
+        (Method::GET, "/api/v1/server/activity"),
+        (Method::GET, "/api/v1/server/snapshots"),
+        (Method::POST, "/api/v1/server/snapshots/1/restore"),
+        (Method::GET, "/api/v1/server/players"),
+        (Method::GET, "/api/v1/server/whitelist"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(method, uri, Some(&foreign_token), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "legacy route {uri}"
+        );
+    }
+
+    let (desired_state, whitelist_count, export_count): (String, i64, i64) = sqlx::query_as(
+        "SELECT s.desired_state::text,
+                (SELECT count(*) FROM whitelist_entries WHERE server_id = s.id),
+                (SELECT count(*) FROM world_exports WHERE server_id = s.id)
+         FROM servers s WHERE s.id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(desired_state, "stopped");
+    assert_eq!(whitelist_count, 0);
+    assert_eq!(export_count, 0);
+
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind([owner_id, foreign_owner_id].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_admission_serializes_creation_redirects_and_keeps_existing_host_access() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let identity_id = Uuid::new_v4();
+    let (owner_id, _) = user_session(&pool, "active").await;
+    let java_uuid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Admission Java', $4)",
+    )
+    .bind(identity_id)
+    .bind(owner_id)
+    .bind(java_uuid.to_string())
+    .bind(java_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = router(state(pool.clone()));
+    let hosts = (0..8)
+        .map(|_| format!("race-{}", &Uuid::new_v4().simple().to_string()[..12]))
+        .collect::<Vec<_>>();
+    let identity = json!({"kind":"java", "uuid":java_uuid});
+    let responses = join_all(hosts.iter().map(|subdomain| {
+        let app = app.clone();
+        let identity = identity.clone();
+        let hostname = format!("{subdomain}.mc.example.test");
+        async move {
+            app.oneshot(internal_admission_request(
+                &hostname,
+                Some(identity),
+                Some(java_uuid),
+            ))
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+
+    let mut admitted_server = None;
+    let mut created_count = 0;
+    let mut redirect_count = 0;
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = json_body(response).await;
+        let server_id = Uuid::parse_str(result["target"]["server_id"].as_str().unwrap()).unwrap();
+        if let Some(expected) = admitted_server {
+            assert_eq!(server_id, expected);
+        } else {
+            admitted_server = Some(server_id);
+        }
+        if result["created"] == true {
+            created_count += 1;
+        }
+        if let Some(message) = result["private_message"].as_str() {
+            redirect_count += 1;
+            let address = result["target"]["subdomain"].as_str().unwrap();
+            assert_eq!(
+                message,
+                format!(
+                    "You already have a server at {address}.mc.example.test; connecting you there."
+                )
+            );
+        }
+    }
+    assert_eq!(created_count, 1);
+    assert_eq!(redirect_count, hosts.len() - 1);
+    let server_id = admitted_server.unwrap();
+    let (server_count, default_count): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE is_default)
+         FROM servers WHERE owner_id = $1",
+    )
+    .bind(owner_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((server_count, default_count), (1, 1));
+
+    let hostname: String = sqlx::query_scalar("SELECT subdomain FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let existing_guest = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!("{hostname}.mc.example.test"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(existing_guest.status(), StatusCode::OK);
+    let existing_guest = json_body(existing_guest).await;
+    assert_eq!(existing_guest["target"]["server_id"], server_id.to_string());
+    assert_eq!(existing_guest["created"], false);
+
+    let guest_unknown = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!(
+                "guest-{}.mc.example.test",
+                &Uuid::new_v4().simple().to_string()[..12]
+            ),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(guest_unknown.status(), StatusCode::NOT_FOUND);
+
+    let forged_profile = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!(
+                "forged-{}.mc.example.test",
+                &Uuid::new_v4().simple().to_string()[..12]
+            ),
+            Some(identity),
+            Some(Uuid::new_v4()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged_profile.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (bedrock_owner, _) = user_session(&pool, "active").await;
+    let xuid = format!("{}", Uuid::new_v4().as_u64_pair().0);
+    let bedrock_profile = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_bedrock', $3, 'Admission Bedrock', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(bedrock_owner)
+    .bind(&xuid)
+    .bind(bedrock_profile)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let bedrock = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!(
+                "bedrock-{}.mc.example.test",
+                &Uuid::new_v4().simple().to_string()[..12]
+            ),
+            Some(json!({"kind":"bedrock", "xuid":xuid})),
+            Some(bedrock_profile),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bedrock.status(), StatusCode::OK);
+
+    let (mixed_owner, mixed_token) = user_session(&pool, "active").await;
+    let mixed_java_uuid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Mixed Race Java', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(mixed_owner)
+    .bind(mixed_java_uuid.to_string())
+    .bind(mixed_java_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mixed_identity = json!({"kind":"java", "uuid":mixed_java_uuid});
+    let requests = (0..8).map(|index| {
+        let app = app.clone();
+        let token = mixed_token.clone();
+        let identity = mixed_identity.clone();
+        async move {
+            let subdomain = format!(
+                "mixed-{}-{}",
+                index,
+                &Uuid::new_v4().simple().to_string()[..8]
+            );
+            if index % 2 == 0 {
+                app.oneshot(request(
+                    Method::POST,
+                    "/api/v1/servers",
+                    Some(&token),
+                    Some(json!({"subdomain":subdomain})),
+                ))
+                .await
+                .unwrap()
+            } else {
+                app.oneshot(internal_admission_request(
+                    &format!("{subdomain}.mc.example.test"),
+                    Some(identity),
+                    Some(mixed_java_uuid),
+                ))
+                .await
+                .unwrap()
+            }
+        }
+    });
+    for response in join_all(requests).await {
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::CREATED | StatusCode::CONFLICT | StatusCode::OK
+            ),
+            "mixed web/admission request returned {}",
+            response.status()
+        );
+    }
+    let (mixed_server_count, mixed_default_count): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE is_default)
+         FROM servers WHERE owner_id = $1",
+    )
+    .bind(mixed_owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((mixed_server_count, mixed_default_count), (1, 1));
+
+    let (suspended_owner, _) = user_session(&pool, "suspended").await;
+    let suspended_uuid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Suspended Java', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(suspended_owner)
+    .bind(suspended_uuid.to_string())
+    .bind(suspended_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let suspended_admission = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!(
+                "suspended-{}.mc.example.test",
+                &Uuid::new_v4().simple().to_string()[..8]
+            ),
+            Some(json!({"kind":"java", "uuid":suspended_uuid})),
+            Some(suspended_uuid),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(suspended_admission.status(), StatusCode::FORBIDDEN);
+    let suspended_server_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM servers WHERE owner_id = $1")
+            .bind(suspended_owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(suspended_server_count, 0);
+
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind([owner_id, bedrock_owner, mixed_owner, suspended_owner].as_slice())
         .execute(&pool)
         .await
         .unwrap();
@@ -527,7 +1112,7 @@ async fn sse_replays_durable_events_after_last_event_id() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/server/events")
+                .uri(format!("/api/v1/servers/{server_id}/events"))
                 .header(header::COOKIE, format!("kurbis_session={token}"))
                 .header("last-event-id", baseline.to_string())
                 .body(Body::empty())

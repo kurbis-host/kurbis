@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Save, Square, Trash2 } from "lucide-react";
+import { RotateCcw, Save, Square, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
@@ -36,12 +36,13 @@ export function serverToSettingsValues(server: Server): SettingsFormValues {
   };
 }
 
-export function Settings({ initialServer }: { initialServer: Server }) {
+export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { initialServer: Server; afterDeleteHref?: string }) {
   const queryClient = useQueryClient();
   const router = useRouter();
+  const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
-    queryKey: queryKeys.server,
-    queryFn: fetchServer,
+    queryKey: queryKeys.server(serverId),
+    queryFn: () => fetchServer(serverId),
     initialData: initialServer,
   });
   if (!server) throw new Error("Server disappeared while settings were open.");
@@ -53,7 +54,7 @@ export function Settings({ initialServer }: { initialServer: Server }) {
   const {
     register,
     control,
-    reset,
+    reset: resetForm,
     handleSubmit,
     formState: { errors, isDirty, isSubmitting },
   } = form;
@@ -68,18 +69,31 @@ export function Settings({ initialServer }: { initialServer: Server }) {
     const nextKey = JSON.stringify(nextValues);
     if (nextKey !== previousServerKey.current && !isDirty) {
       previousServerKey.current = nextKey;
-      reset(nextValues);
+      resetForm(nextValues);
     }
-  }, [server, isDirty, reset]);
+  }, [server, isDirty, resetForm]);
 
   const stop = useMutation({
     mutationFn: () =>
-      apiVoid("/api/v1/server/actions", {
+      apiVoid(`/api/v1/servers/${serverId}/actions`, {
         method: "POST",
         body: jsonBody({ action: "stop" }),
       }),
     onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: queryKeys.server }),
+      void queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
+    onError: (error) => setRequestError(errorMessage(error)),
+  });
+  const reset = useMutation({
+    mutationFn: (mode: "world" | "full") => apiVoid(`/api/v1/servers/${serverId}/reset`, {
+      method: "POST",
+      body: jsonBody({ mode }),
+    }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.snapshots(serverId) }),
+      ]);
+    },
     onError: (error) => setRequestError(errorMessage(error)),
   });
 
@@ -87,15 +101,15 @@ export function Settings({ initialServer }: { initialServer: Server }) {
     setRequestError(null);
     try {
       const { subdomain, ...settings } = values;
-      const updated = await apiRequest("/api/v1/server", serverSchema, {
+      const updated = await apiRequest(`/api/v1/servers/${serverId}`, serverSchema, {
         method: "PATCH",
         body: jsonBody({ subdomain, settings }),
       });
-      queryClient.setQueryData(queryKeys.server, updated);
+      queryClient.setQueryData(queryKeys.server(serverId), updated);
       previousServerKey.current = JSON.stringify(
         serverToSettingsValues(updated),
       );
-      reset(serverToSettingsValues(updated));
+      resetForm(serverToSettingsValues(updated));
     } catch (error) {
       setRequestError(errorMessage(error));
     }
@@ -104,9 +118,9 @@ export function Settings({ initialServer }: { initialServer: Server }) {
   const remove = async () => {
     setRequestError(null);
     try {
-      await apiVoid("/api/v1/server", { method: "DELETE" });
-      queryClient.setQueryData(queryKeys.server, null);
-      router.replace("/app/setup");
+      await apiVoid(`/api/v1/servers/${serverId}`, { method: "DELETE" });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.servers });
+      router.replace(afterDeleteHref);
     } catch (error) {
       setRequestError(errorMessage(error));
     }
@@ -291,6 +305,32 @@ export function Settings({ initialServer }: { initialServer: Server }) {
         </Surface>
 
         <aside className="sticky top-[30px] grid gap-[18px] max-[900px]:static max-[900px]:grid-cols-2 max-[620px]:grid-cols-1">
+          <Surface className="p-[22px]">
+            <h2 className="m-0 font-display text-xl leading-[1.2] font-[800]">Reset world</h2>
+            <p className="mt-2 mb-0 text-[13px] leading-normal text-ink-soft">
+              Both options keep the server address and ownership. Players are warned before an online reset; a pre-reset backup is retained.
+            </p>
+            <div className="mt-[17px] grid gap-2.5 [&_button]:w-full">
+              <ConfirmDialog
+                disabled={!allowed.canReset || reset.isPending}
+                title="Reset world progress?"
+                description="This clears every dimension, inventory, advancement, and player progress while preserving server settings, whitelist, bans, and operator access. A pre-reset backup is created first."
+                confirmLabel="Reset world"
+                onConfirm={() => reset.mutate("world")}
+                trigger={<Button variant="secondary" disabled={!allowed.canReset || reset.isPending}><RotateCcw size={15} />World reset</Button>}
+              />
+              <ConfirmDialog
+                danger
+                disabled={!allowed.canReset || reset.isPending}
+                title="Reset the full server?"
+                description="This also restores settings to defaults and clears added whitelist, ban, and operator access. Ownership, address, and derived owner privileges remain. A pre-reset backup is created first."
+                confirmLabel="Reset full server"
+                onConfirm={() => reset.mutate("full")}
+                trigger={<Button variant="danger" disabled={!allowed.canReset || reset.isPending}><RotateCcw size={15} />Full server reset</Button>}
+              />
+            </div>
+            {reset.isPending ? <p className="mb-0 text-xs text-ink-soft">Reset queued. This page will show its current stage.</p> : null}
+          </Surface>
           <Surface className="p-[22px]">
             <h2 className="m-0 font-display text-xl leading-[1.2] font-[800]">
               Sleeping-state edits

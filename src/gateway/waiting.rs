@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
@@ -18,6 +18,9 @@ struct WaitingState {
     last_wake: Option<Instant>,
     transfer_sent: bool,
     login_link_sent: bool,
+    admission_target: Option<RouteTarget>,
+    admission_hostname: Option<String>,
+    admission_complete: bool,
 }
 
 impl WaitingState {
@@ -28,6 +31,9 @@ impl WaitingState {
             last_wake: None,
             transfer_sent: false,
             login_link_sent: false,
+            admission_target: None,
+            admission_hostname: None,
+            admission_complete: false,
         }
     }
 
@@ -125,7 +131,64 @@ async fn handle_player(
         return Ok(());
     }
 
-    let target = routes.resolve(&player.server_address).await?;
+    if !state.login_link_sent
+        && let Some(identity) = player.verified_identity.as_ref()
+    {
+        let url =
+            create_minecraft_login_link(config, http, identity, player.id, &player.name).await?;
+        control
+            .message(
+                &config.waiting_control_socket,
+                player.id,
+                &format!("Sign in to kurbis: {url}"),
+            )
+            .await?;
+        state.login_link_sent = true;
+    }
+
+    if !state.admission_complete {
+        match request_admission(config, http, player).await {
+            Ok(admission) => {
+                if let Some(message) = admission.private_message.as_deref()
+                    && let Err(error) = control
+                        .message(&config.waiting_control_socket, player.id, message)
+                        .await
+                {
+                    tracing::warn!(player_id = %player.id, ?error, "failed to deliver private server redirect notice");
+                }
+                state.admission_hostname = Some(format!(
+                    "{}.{}",
+                    admission.target.subdomain, config.root_domain
+                ));
+                state.admission_target = Some(admission.target);
+                state.admission_complete = true;
+            }
+            Err(error) => {
+                if let Some(status) = error.status()
+                    && status.is_client_error()
+                {
+                    control
+                        .kick(
+                            &config.waiting_control_socket,
+                            player.id,
+                            admission_error_message(status),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+        }
+    }
+
+    let admitted_hostname = state
+        .admission_hostname
+        .as_deref()
+        .context("admission did not set a server address")?;
+    let target = routes
+        .resolve(admitted_hostname)
+        .await?
+        .or_else(|| state.admission_target.clone());
 
     if target
         .as_ref()
@@ -139,20 +202,6 @@ async fn handle_player(
             )
             .await?;
         return Ok(());
-    }
-
-    if !state.login_link_sent
-        && let Some(identity) = player.verified_identity.as_ref()
-    {
-        let url = create_minecraft_login_link(config, http, identity, &player.name).await?;
-        control
-            .message(
-                &config.waiting_control_socket,
-                player.id,
-                &format!("Sign in to kurbis: {url}"),
-            )
-            .await?;
-        state.login_link_sent = true;
     }
 
     let Some(target) = target else {
@@ -185,6 +234,7 @@ async fn handle_player(
                 | ObservedState::Starting
                 | ObservedState::Stopping
                 | ObservedState::Snapshotting
+                | ObservedState::Resetting
         )
     {
         control
@@ -211,7 +261,7 @@ async fn handle_player(
         .last_wake
         .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
     {
-        request_wake(config, &player.server_address).await?;
+        request_wake(config, admitted_hostname).await?;
         state.last_wake = Some(Instant::now());
     }
 
@@ -238,7 +288,57 @@ async fn handle_player(
 #[derive(Serialize)]
 struct MinecraftLinkRequest<'a> {
     identity: &'a VerifiedMinecraftIdentity,
+    minecraft_player_id: Uuid,
     display_name: &'a str,
+}
+
+#[derive(Serialize)]
+struct AdmissionRequest<'a> {
+    hostname: &'a str,
+    identity: Option<&'a VerifiedMinecraftIdentity>,
+    minecraft_player_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct AdmissionResponse {
+    target: RouteTarget,
+    private_message: Option<String>,
+    #[allow(dead_code)]
+    created: bool,
+}
+
+async fn request_admission(
+    config: &GatewayConfig,
+    http: &reqwest::Client,
+    player: &WaitingPlayer,
+) -> Result<AdmissionResponse, reqwest::Error> {
+    http.post(format!(
+        "{}/internal/admission",
+        config.control_plane_url.trim_end_matches('/')
+    ))
+    .bearer_auth(&config.internal_token)
+    .json(&AdmissionRequest {
+        hostname: &player.server_address,
+        identity: player.verified_identity.as_ref(),
+        minecraft_player_id: player.verified_identity.as_ref().map(|_| player.id),
+    })
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await
+}
+
+fn admission_error_message(status: reqwest::StatusCode) -> &'static str {
+    match status {
+        reqwest::StatusCode::FORBIDDEN => "This account is suspended or cannot create a server.",
+        reqwest::StatusCode::NOT_FOUND => {
+            "Unknown server address. Link this Minecraft account before creating a server."
+        }
+        reqwest::StatusCode::CONFLICT => "Server admission is changing. Please reconnect shortly.",
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY => "Minecraft identity could not be verified.",
+        _ => "Server admission was rejected. Please reconnect shortly.",
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,6 +350,7 @@ async fn create_minecraft_login_link(
     config: &GatewayConfig,
     http: &reqwest::Client,
     identity: &VerifiedMinecraftIdentity,
+    minecraft_player_id: Uuid,
     display_name: &str,
 ) -> Result<String> {
     let response = http
@@ -260,6 +361,7 @@ async fn create_minecraft_login_link(
         .bearer_auth(&config.internal_token)
         .json(&MinecraftLinkRequest {
             identity,
+            minecraft_player_id,
             display_name,
         })
         .send()
@@ -304,6 +406,7 @@ fn notice_for(state: ObservedState) -> &'static str {
         ObservedState::Restoring => "Restoring your world…",
         ObservedState::Starting => "Starting your server…",
         ObservedState::Stopping | ObservedState::Snapshotting => "Saving before restart…",
+        ObservedState::Resetting => "Resetting your server…",
         ObservedState::Sleeping => "Waking your server…",
         _ => "Preparing your server…",
     }

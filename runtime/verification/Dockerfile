@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim AS protocol
 WORKDIR /verification/protocol
 COPY tools/protocol/package.json tools/protocol/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
-COPY tools/protocol/verify.mjs tools/protocol/raknet11.cjs ./
+COPY tools/protocol/verify.mjs tools/protocol/verify_java_263.py ./
 
 FROM melon-hoster:local AS hoster
 FROM docker:28-dind AS docker

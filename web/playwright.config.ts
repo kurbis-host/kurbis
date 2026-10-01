@@ -12,19 +12,25 @@ const apiUrl = `http://127.0.0.1:${portBase}`;
 const fixtureUrl = `http://127.0.0.1:${portBase + 1}`;
 const panelUrl = `http://127.0.0.1:${portBase + 2}`;
 const artifactRoot = path.join(root, `output/playwright/run-${portBase}`);
+const fixtureDataRoot = path.join(root, `output/playwright/fixture-${portBase}`);
+const objectStoreRoot = path.join(root, `output/playwright/object-store-${portBase}`);
 const panelCommand = process.env.E2E_NEXT_MODE === 'production'
-  ? `npm run start -- --hostname 127.0.0.1 --port ${portBase + 2}`
-  : `npm run dev -- --hostname 127.0.0.1 --port ${portBase + 2}`;
+  ? `pnpm run start --hostname 127.0.0.1 --port ${portBase + 2}`
+  : `pnpm run dev --hostname 127.0.0.1 --port ${portBase + 2}`;
 process.env.BROWSER_FIXTURE_URL = fixtureUrl;
 process.env.BROWSER_PANEL_URL = panelUrl;
 process.env.BROWSER_API_URL = apiUrl;
 process.env.BROWSER_OUTPUT_DIR = artifactRoot;
+process.env.BROWSER_FIXTURE_DATA_DIR = fixtureDataRoot;
+process.env.BROWSER_OBJECT_STORE_ROOT = objectStoreRoot;
 const env = {
   ...process.env,
   NEXT_DIST_DIR: `.next-e2e-${portBase}`,
   TEST_DATABASE_URL: database,
   DATABASE_URL: database,
-  TEST_ARTIFACT_ROOT: path.join(root, `output/playwright/fixture-${portBase}`),
+  TEST_ARTIFACT_ROOT: fixtureDataRoot,
+  OBJECT_STORE_TYPE: 'local',
+  OBJECT_STORE_LOCAL_ROOT: objectStoreRoot,
   BROWSER_OUTPUT_DIR: artifactRoot,
   CONTROL_PLANE_LISTEN: `127.0.0.1:${portBase}`,
   BROWSER_FIXTURE_LISTEN: `127.0.0.1:${portBase + 1}`,

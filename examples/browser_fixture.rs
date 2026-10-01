@@ -11,8 +11,9 @@ use axum::{
 use kurbis_hoster::{
     config::ObjectStoreConfig,
     control_plane::lifecycle::{
-        Lifecycle, claim_operation, complete_delete, complete_restore, complete_snapshot,
-        complete_start, complete_stop, healthy_worker_template, heartbeat_worker, validate_delete,
+        Lifecycle, claim_operation, complete_delete, complete_reset, complete_restore,
+        complete_snapshot, complete_start, complete_stop, healthy_worker_template,
+        heartbeat_worker, validate_delete,
     },
     db,
     model::{OperationKind, SnapshotReason},
@@ -272,9 +273,10 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
     let root = f.root.join(op.server_id.to_string());
     match op.kind {
         OperationKind::Start => {
-            tokio::fs::create_dir_all(&root).await.map_err(err)?;
-            if !root.join("level.dat").exists() {
-                tokio::fs::write(root.join("level.dat"), b"browser-fixture-world")
+            let world = root.join("world");
+            tokio::fs::create_dir_all(&world).await.map_err(err)?;
+            if !world.join("level.dat").exists() {
+                tokio::fs::write(world.join("level.dat"), b"browser-fixture-world")
                     .await
                     .map_err(err)?;
             }
@@ -346,6 +348,51 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
             .await
             .map_err(err)?;
         }
+        OperationKind::Reset => {
+            let was_running = op
+                .payload
+                .get("was_running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mode = op
+                .payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("world");
+            tokio::fs::create_dir_all(&root).await.map_err(err)?;
+            f.snapshots
+                .create(op.server_id, &root, SnapshotReason::Reset)
+                .await
+                .map_err(err)?;
+            if mode == "full" {
+                match tokio::fs::remove_dir_all(&root).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(err(error)),
+                }
+            } else {
+                match tokio::fs::remove_dir_all(root.join("world")).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(err(error)),
+                }
+            }
+            tokio::fs::create_dir_all(&root).await.map_err(err)?;
+            let snapshot = f
+                .snapshots
+                .create(op.server_id, &root, SnapshotReason::Reset)
+                .await
+                .map_err(err)?;
+            complete_reset(
+                &f.pool,
+                &op,
+                snapshot.generation,
+                snapshot.size_bytes,
+                was_running,
+            )
+            .await
+            .map_err(err)?;
+        }
     }
     f.lifecycle.drain_queue_once().await.map_err(err)?;
     Ok(Json(json!({"operation":op.kind})))
@@ -365,13 +412,7 @@ async fn main() -> Result<()> {
     let panel_origin =
         std::env::var("PANEL_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:18082".to_owned());
     let root = std::path::PathBuf::from(std::env::var("TEST_ARTIFACT_ROOT")?);
-    let snapshots = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: root.join("objects"),
-        },
-    )
-    .await?;
+    let snapshots = SnapshotManager::new(pool.clone(), &ObjectStoreConfig::from_env()?).await?;
     let fixture = Fixture {
         lifecycle: Lifecycle::new(pool.clone()),
         pool,

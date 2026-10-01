@@ -1,6 +1,7 @@
 .git
 .env*
 target
+**/target
 **/node_modules
 web/.next
 output

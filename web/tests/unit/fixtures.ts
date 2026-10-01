@@ -10,6 +10,7 @@ export const snapshot: Snapshot = {
 export const server: Server = {
   id: "server-1",
   subdomain: "melon-world",
+  is_default: true,
   java_address: "melon-world.mc.example.test",
   bedrock_address: "melon-world.mc.example.test",
   desired_state: "stopped",

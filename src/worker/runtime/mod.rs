@@ -55,6 +55,12 @@ pub trait ServerRuntime: Send + Sync {
             .await
     }
 
+    async fn replace_operators(&self, server_dir: &Path, owners: &[WhitelistEntry]) -> Result<()> {
+        self.control()
+            .replace_operators(&self.socket_path(server_dir)?, owners)
+            .await
+    }
+
     async fn save(&self, server_dir: &Path) -> Result<()> {
         self.control().save(&self.socket_path(server_dir)?).await
     }

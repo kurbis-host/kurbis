@@ -1,8 +1,8 @@
-use std::{path::Path as FsPath, sync::Arc};
+use std::path::Path as FsPath;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path};
+use object_store::{ObjectStore, path::Path};
 use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
 use uuid::Uuid;
 
@@ -27,31 +27,7 @@ impl SnapshotManager {
         Ok(connection)
     }
     pub async fn new(pool: PgPool, config: &ObjectStoreConfig) -> Result<Self> {
-        let store: Arc<dyn ObjectStore> = match config {
-            ObjectStoreConfig::Local { root } => {
-                tokio::fs::create_dir_all(root).await?;
-                Arc::new(LocalFileSystem::new_with_prefix(root)?)
-            }
-            ObjectStoreConfig::S3 {
-                bucket,
-                region,
-                endpoint,
-                access_key,
-                secret_key,
-                allow_http,
-            } => {
-                let mut builder = AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .with_region(region)
-                    .with_access_key_id(access_key)
-                    .with_secret_access_key(secret_key)
-                    .with_allow_http(*allow_http);
-                if let Some(endpoint) = endpoint {
-                    builder = builder.with_endpoint(endpoint);
-                }
-                Arc::new(builder.build()?)
-            }
-        };
+        let store = config.build().await?;
         Ok(Self { pool, store })
     }
 
@@ -386,6 +362,12 @@ impl SnapshotManager {
                  WHERE o.server_id = snapshots.server_id AND o.kind = 'restore'
                    AND o.status IN ('pending', 'running')
                    AND o.payload->>'target_generation' = snapshots.generation::text
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM world_exports e
+                 WHERE e.server_id = snapshots.server_id
+                   AND e.source_generation = snapshots.generation
+                   AND e.status IN ('pending', 'running')
                )
              ORDER BY generation ASC",
         )

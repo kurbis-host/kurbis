@@ -11,23 +11,22 @@ import {
   WandSparkles,
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
-import { fetchServer, fetchSession } from "../lib/api/queries";
+import { fetchServer, fetchServers, fetchSession } from "../lib/api/queries";
 import { lifecycle } from "../lib/lifecycle";
-import { queryKeys } from "../lib/query";
+import { queryKeys, selectedServerId } from "../lib/query";
 
-const fullNav = [
-  { href: "/app", label: "Overview", Icon: Gauge },
-  { href: "/app/console", label: "Console", Icon: ScrollText },
-  { href: "/app/backups", label: "Backups", Icon: ArchiveRestore },
-  { href: "/app/players", label: "Players", Icon: UserRoundCheck },
-  { href: "/app/settings", label: "Settings", Icon: Settings2 },
-  { href: "/app/account", label: "Account", Icon: CircleUserRound },
+const serverNav = [
+  { suffix: "", label: "Overview", Icon: Gauge },
+  { suffix: "/console", label: "Console", Icon: ScrollText },
+  { suffix: "/backups", label: "Backups", Icon: ArchiveRestore },
+  { suffix: "/players", label: "Players", Icon: UserRoundCheck },
+  { suffix: "/settings", label: "Settings", Icon: Settings2 },
 ];
 
 function isActive(pathname: string, href: string) {
-  return href === "/app" ? pathname === href : pathname.startsWith(href);
+  return pathname === href || (href === "/app/account" && pathname.startsWith(`${href}/`));
 }
 
 function stateTone(state: string | undefined) {
@@ -39,23 +38,33 @@ function stateTone(state: string | undefined) {
   return "bg-[#df9d58]";
 }
 
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({ servers: initialServers, children }: { servers: import("../lib/contracts").Server[]; children: ReactNode }) {
   const pathname = usePathname();
+  const router = useRouter();
+  const routeServerId = selectedServerId(pathname);
+  const { data: servers = initialServers } = useQuery({ queryKey: queryKeys.servers, queryFn: fetchServers, initialData: initialServers });
+  const defaultServer = servers.find((item) => item.is_default) ?? servers[0];
+  const activeServerId = routeServerId ?? defaultServer?.id;
+  const { data: server } = useQuery({
+    queryKey: activeServerId ? queryKeys.server(activeServerId) : ["servers", "none"],
+    queryFn: () => fetchServer(activeServerId!),
+    enabled: Boolean(activeServerId),
+    initialData: activeServerId ? servers.find((item) => item.id === activeServerId) : undefined,
+  });
   const { data: session } = useQuery({
     queryKey: queryKeys.session,
     queryFn: fetchSession,
   });
-  const { data: server } = useQuery({
-    queryKey: queryKeys.server,
-    queryFn: fetchServer,
-  });
   const { data: eventStatus = "idle" } = useQuery<string>({
-    queryKey: queryKeys.eventStatus,
+    queryKey: server ? queryKeys.eventStatus(server.id) : ["servers", "none", "event-status"],
     queryFn: async () => "idle",
     enabled: false,
   });
   const nav = server
-    ? fullNav
+    ? [
+        ...serverNav.map(({ suffix, label, Icon }) => ({ href: `/app/servers/${server.id}${suffix}`, label, Icon })),
+        { href: "/app/account", label: "Account", Icon: CircleUserRound },
+      ]
     : [
         { href: "/app/setup", label: "Setup", Icon: WandSparkles },
         { href: "/app/account", label: "Account", Icon: CircleUserRound },
@@ -88,6 +97,23 @@ export function AppShell({ children }: { children: ReactNode }) {
               {server.java_address}
             </span>
           </div>
+        ) : null}
+
+        {servers.length > 1 ? (
+          <label className="mx-2 mb-3 grid gap-1.5 text-[11px] font-[760] text-[#c9c1b1]">
+            <span>SERVER</span>
+            <select
+              aria-label="Select server"
+              className="min-h-10 min-w-0 rounded-sm border border-white/15 bg-[#403a32] px-2.5 text-[13px] text-[#f8f1df]"
+              value={server?.id ?? ""}
+              onChange={(event) => {
+                const suffix = routeServerId ? pathname.replace(`/app/servers/${routeServerId}`, "") : "";
+                router.push(`/app/servers/${event.target.value}${suffix}`);
+              }}
+            >
+              {servers.map((item) => <option key={item.id} value={item.id}>{item.subdomain}{item.is_default ? " · default" : ""}</option>)}
+            </select>
+          </label>
         ) : null}
 
         <nav

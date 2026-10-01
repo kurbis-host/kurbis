@@ -5,10 +5,11 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
+use uuid::Uuid;
 
 use crate::model::{ObservedState, SnapshotRecord as DbSnapshot};
 
-use super::internal::require_owned_server;
+use super::internal::require_server_owner;
 use super::server::ServerActionResponse;
 use super::types::Snapshot;
 use super::{ApiError, AppState, lifecycle_error};
@@ -16,8 +17,9 @@ use super::{ApiError, AppState, lifecycle_error};
 pub(super) async fn snapshots(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<Snapshot>>, ApiError> {
-    let server = require_owned_server(&state, &headers).await?;
+    let server = require_server_owner(&state, &headers, server_id).await?;
     let snapshots = sqlx::query_as::<_, DbSnapshot>(
         "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete,
                 created_at
@@ -37,9 +39,9 @@ pub(super) async fn snapshots(
 pub(super) async fn restore_snapshot(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(generation): Path<i64>,
+    Path((server_id, generation)): Path<(Uuid, i64)>,
 ) -> Result<Json<ServerActionResponse>, ApiError> {
-    let server = require_owned_server(&state, &headers).await?;
+    let server = require_server_owner(&state, &headers, server_id).await?;
     if server.observed_state != ObservedState::Sleeping {
         return Err(ApiError::with_code(
             StatusCode::CONFLICT,

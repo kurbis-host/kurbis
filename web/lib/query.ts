@@ -1,11 +1,18 @@
 export const queryKeys = {
   session: ["session"] as const,
   account: ["account"] as const,
-  server: ["server"] as const,
-  activity: ["server", "activity"] as const,
-  logs: ["server", "logs"] as const,
-  snapshots: ["server", "snapshots"] as const,
-  players: ["server", "players"] as const,
-  whitelist: ["server", "whitelist"] as const,
-  eventStatus: ["server", "event-status"] as const,
+  servers: ["servers"] as const,
+  server: (serverId: string) => ["servers", serverId] as const,
+  activity: (serverId: string) => ["servers", serverId, "activity"] as const,
+  logs: (serverId: string) => ["servers", serverId, "logs"] as const,
+  snapshots: (serverId: string) => ["servers", serverId, "snapshots"] as const,
+  players: (serverId: string) => ["servers", serverId, "players"] as const,
+  whitelist: (serverId: string) => ["servers", serverId, "whitelist"] as const,
+  exports: (serverId: string) => ["servers", serverId, "exports"] as const,
+  eventStatus: (serverId: string) => ["servers", serverId, "event-status"] as const,
 };
+
+export function selectedServerId(pathname: string) {
+  const match = pathname.match(/^\/app\/servers\/([^/]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}

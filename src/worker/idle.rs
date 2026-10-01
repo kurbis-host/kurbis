@@ -18,14 +18,29 @@ impl IdleTimer {
     }
 
     pub fn expired(&mut self, status: &PlayerStatus, now: Instant, timeout: Duration) -> bool {
-        if status.players > 0 || status.activity_revision != self.revision {
-            self.revision = status.activity_revision;
-            self.empty_since = (status.players == 0).then_some(now);
-        }
+        self.observe(status, now);
         if status.players == 0 {
             now.duration_since(*self.empty_since.get_or_insert(now)) >= timeout
         } else {
             false
+        }
+    }
+
+    pub fn observe(&mut self, status: &PlayerStatus, now: Instant) {
+        if status.players > 0 || status.activity_revision != self.revision {
+            self.revision = status.activity_revision;
+            self.empty_since = (status.players == 0).then_some(now);
+        }
+    }
+
+    /// A snapshot restarts Pumpkin, which resets its process-local activity
+    /// counter. Rebase that counter without resetting continuous emptiness.
+    pub fn after_snapshot_restart(&mut self, status: &PlayerStatus, now: Instant) {
+        self.revision = status.activity_revision;
+        if status.players > 0 {
+            self.empty_since = None;
+        } else {
+            self.empty_since.get_or_insert(now);
         }
     }
 }
@@ -70,5 +85,41 @@ mod tests {
         status.activity_revision = 0;
         assert!(!timer.expired(&status, now + timeout * 3, timeout));
         assert!(timer.expired(&status, now + timeout * 4, timeout));
+    }
+
+    #[test]
+    fn snapshot_restart_preserves_continuous_emptiness_and_rebases_activity() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(300);
+        let mut status = PlayerStatus {
+            players: 0,
+            activity_revision: 10,
+        };
+        let mut timer = IdleTimer::new(&status, now);
+        let resumed = PlayerStatus {
+            players: 0,
+            activity_revision: 0,
+        };
+        timer.after_snapshot_restart(&resumed, now + Duration::from_secs(120));
+        assert!(!timer.expired(&resumed, now + timeout - Duration::from_secs(1), timeout));
+        assert!(timer.expired(&resumed, now + timeout, timeout));
+
+        status.players = 1;
+        status.activity_revision = 1;
+        assert!(!timer.expired(&status, now + timeout, timeout));
+        status.players = 0;
+        status.activity_revision = 2;
+        assert!(!timer.expired(&status, now + timeout * 2, timeout));
+        let resumed = PlayerStatus {
+            players: 0,
+            activity_revision: 0,
+        };
+        timer.after_snapshot_restart(&resumed, now + timeout * 2 + Duration::from_secs(120));
+        assert!(!timer.expired(
+            &resumed,
+            now + timeout * 3 - Duration::from_secs(1),
+            timeout
+        ));
+        assert!(timer.expired(&resumed, now + timeout * 3, timeout));
     }
 }

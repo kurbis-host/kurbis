@@ -12,9 +12,15 @@ async function mintLoginLink(
   identity: { kind: 'java'; uuid: string } | { kind: 'bedrock'; xuid: string },
   displayName: string,
 ) {
+  const minecraftPlayerId = identity.kind === 'java'
+    ? identity.uuid
+    : BigInt(identity.xuid).toString(16).padStart(32, '0').replace(
+      /^(........)(....)(....)(....)(............)$/,
+      '$1-$2-$3-$4-$5',
+    );
   const response = await request.post(`${api}/internal/minecraft-login-links`, {
     headers: { authorization: 'Bearer browser-internal-token' },
-    data: { identity, display_name: displayName },
+    data: { identity, minecraft_player_id: minecraftPlayerId, display_name: displayName },
   });
   expect(response.status(), await response.text()).toBe(200);
   const { url } = await response.json() as { url: string };
@@ -73,13 +79,17 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
 
   await page.getByPlaceholder('friends-world').fill('minecraft-auth-world');
   await page.getByRole('button', { name: /Create sleeping world/ }).click();
-  await expect(page).toHaveURL(/\/app$/);
+  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
 
   const originalSession = await page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
     return response.json();
   });
   const bedrockXuid = '2533274790395904';
+  const bedrockProfile = BigInt(bedrockXuid).toString(16).padStart(32, '0').replace(
+    /^(........)(....)(....)(....)(............)$/,
+    '$1-$2-$3-$4-$5',
+  );
   const sourceUser = randomUUID();
   const sourceWorld = 'merged-bedrock-world';
   await pool.query(
@@ -87,8 +97,8 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     [sourceUser, 'Bedrock Source Account', 'active'],
   );
   await pool.query(
-    "INSERT INTO identities(id, user_id, provider, subject, display_name)\n     VALUES($1, $2, 'minecraft_bedrock', $3, $4)",
-    [randomUUID(), sourceUser, bedrockXuid, 'Bedrock Browser Player'],
+    "INSERT INTO identities(id, user_id, provider, subject, minecraft_player_id, display_name)\n     VALUES($1, $2, 'minecraft_bedrock', $3, $4, $5)",
+    [randomUUID(), sourceUser, bedrockXuid, bedrockProfile, 'Bedrock Browser Player'],
   );
   await pool.query(
     'INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)',
@@ -100,19 +110,20 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     'Bedrock Browser Player',
   );
   await page.goto(`${bedrockLink.pathname}${bedrockLink.hash}`);
-  await expect(page).toHaveURL(/\/app$/);
+  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
   await page.goto('/app/account');
   await expect(page.getByRole('heading', { name: 'Linked identities' })).toBeVisible();
   await expect(page.getByText('Minecraft Java Edition', { exact: true })).toBeVisible();
   await expect(page.getByText('Minecraft Bedrock Edition', { exact: true })).toBeVisible();
-  await expect(page.getByText(sourceWorld, { exact: true })).toBeVisible();
+  await expect(page.getByRole('main').getByText(sourceWorld, { exact: true })).toBeVisible();
   const makeDefault = page.getByRole('button', { name: 'Make default', exact: true });
   await expect(makeDefault).toHaveCount(1);
   await makeDefault.click();
   await expect(page.getByRole('status')).toContainText(sourceWorld + ' is now the default world.');
   const selectedWorld = await page.evaluate(async () => {
-    const response = await fetch('/api/v1/server');
-    return response.json();
+    const response = await fetch('/api/v1/servers');
+    const servers = await response.json();
+    return servers.find((server: { is_default: boolean }) => server.is_default);
   });
   expect(selectedWorld.subdomain).toBe(sourceWorld);
   const linkedSession = await page.evaluate(async () => {

@@ -17,10 +17,10 @@ function toText(items: LogEntry[]) {
     .join("\n");
 }
 
-export function Console({ initialLogs }: { initialLogs: LogPage }) {
+export function Console({ serverId, initialLogs }: { serverId: string; initialLogs: LogPage }) {
   const { data = initialLogs } = useQuery({
-    queryKey: queryKeys.logs,
-    queryFn: fetchLogs,
+    queryKey: queryKeys.logs(serverId),
+    queryFn: () => fetchLogs(serverId),
     initialData: initialLogs,
   });
   const [paused, setPaused] = useState(false);

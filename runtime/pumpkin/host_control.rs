@@ -6,11 +6,13 @@ use std::{
 };
 
 use pumpkin_config::whitelist::WhitelistEntry;
+use pumpkin_config::op::Op;
 use pumpkin_protocol::{
     bedrock::client::transfer::CTransfer as BedrockTransfer, codec::var_int::VarInt,
     java::client::play::CTransfer as JavaTransfer,
 };
 use pumpkin_util::text::TextComponent;
+use pumpkin_util::PermissionLvl;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
@@ -42,6 +44,7 @@ struct Request {
     message: Option<String>,
     enabled: Option<bool>,
     whitelist_entries: Option<Vec<WhitelistEntry>>,
+    operators: Option<Vec<WhitelistEntry>>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +58,7 @@ enum Action {
     Save,
     Shutdown,
     WhitelistReplace,
+    OperatorsReplace,
 }
 
 pub fn spawn(server: &Arc<Server>) {
@@ -169,7 +173,6 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                         "java": server.advanced_config.networking.java.online_mode
                             && server.advanced_config.networking.java.encryption,
                         "bedrock": server.advanced_config.networking.bedrock.online_mode
-                            && server.advanced_config.networking.bedrock.encryption
                             && server.advanced_config.networking.bedrock.authentication.enabled,
                     }}),
             )
@@ -218,8 +221,7 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                         "edition": edition,
                         "server_address": server_address,
                         "verified_identity": verified_identity,
-                        "ready_for_transfer": matches!(player.client.as_ref(), ClientPlatform::Java(_))
-                            || player.client_loaded.load(std::sync::atomic::Ordering::Acquire),
+                        "ready_for_transfer": player.has_client_loaded(),
                     }))
                 })
                 .collect::<Vec<_>>();
@@ -244,7 +246,7 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                 )
                 .await;
             };
-            player.send_system_message_raw(&TextComponent::text(message), true).await;
+            player.send_system_message_raw(&TextComponent::text(message), true);
             write_response(&mut write_half, json!({"ok": true})).await
         }
         Action::Transfer => {
@@ -315,17 +317,29 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                 .await;
             };
             {
-                let mut whitelist = server.data.whitelist_config.write().await;
+                let mut whitelist = server
+                    .data
+                    .whitelist_config
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 whitelist.whitelist = entries;
                 whitelist.save();
             }
             server.white_list.store(enabled, Ordering::Release);
             if enabled && server.basic_config.enforce_whitelist {
-                let whitelist = server.data.whitelist_config.read().await;
-                for player in server.get_all_players() {
-                    if whitelist.is_whitelisted(&player.gameprofile) {
-                        continue;
-                    }
+                let to_kick = {
+                    let whitelist = server
+                        .data
+                        .whitelist_config
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    server
+                        .get_all_players()
+                        .into_iter()
+                        .filter(|player| !whitelist.is_whitelisted(&player.gameprofile))
+                        .collect::<Vec<_>>()
+                };
+                for player in to_kick {
                     player
                         .client
                         .kick(
@@ -334,6 +348,45 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                         )
                         .await;
                 }
+            }
+            write_response(&mut write_half, json!({"ok": true})).await
+        }
+        Action::OperatorsReplace => {
+            let Some(owners) = request.operators else {
+                return write_response(
+                    &mut write_half,
+                    json!({"ok": false, "error": "missing_operators"}),
+                )
+                .await;
+            };
+            {
+                let mut config = server
+                    .data
+                    .operator_config
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for owner in owners {
+                    if let Some(existing) = config.ops.iter_mut().find(|op| op.uuid == owner.uuid) {
+                        existing.name = owner.name.clone();
+                        existing.level = PermissionLvl::Four;
+                        existing.bypasses_player_limit = true;
+                    } else {
+                        config.ops.push(Op::new(
+                            owner.uuid,
+                            owner.name.clone(),
+                            PermissionLvl::Four,
+                            true,
+                        ));
+                    }
+                    if let Some(player) = server.get_player_by_uuid(owner.uuid) {
+                        player.set_permission_lvl(
+                            server,
+                            PermissionLvl::Four,
+                            &server.command_dispatcher.load(),
+                        );
+                    }
+                }
+                config.save();
             }
             write_response(&mut write_half, json!({"ok": true})).await
         }

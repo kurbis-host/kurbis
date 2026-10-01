@@ -57,15 +57,38 @@ pub async fn prepare_server_data(
 
 /// Files managed by orchestration rather than persistent Minecraft world data.
 pub(crate) fn is_runtime_file(relative: &Path) -> bool {
-    let name = relative
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default();
     matches!(
-        name,
-        "pumpkin.toml" | "advanced_config.toml" | "nethernet-key.der" | "whitelist.json"
+        relative.to_str(),
+        Some("pumpkin.toml" | "advanced_config.toml" | "nethernet-key.der" | "whitelist.json")
     ) || relative
         .components()
         .next()
         .is_some_and(|v| matches!(v.as_os_str().to_str(), Some("logs" | "run")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_configuration_and_logs_are_not_persisted_with_world_data() {
+        for path in [
+            "pumpkin.toml",
+            "advanced_config.toml",
+            "nethernet-key.der",
+            "whitelist.json",
+            "logs/latest.log",
+            "run/host-control.sock",
+        ] {
+            assert!(is_runtime_file(Path::new(path)));
+        }
+        for path in [
+            "plugins/other-plugin/plugin.wasm",
+            "plugins/data/other-plugin/config.json",
+            "plugins/data/other-plugin/whitelist.json",
+        ] {
+            assert!(!is_runtime_file(Path::new(path)));
+        }
+        assert!(!is_runtime_file(Path::new("world/level.dat")));
+    }
 }

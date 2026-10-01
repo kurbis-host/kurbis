@@ -44,19 +44,20 @@ export function Players({
   initialWhitelist: WhitelistState;
 }) {
   const queryClient = useQueryClient();
+  const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
-    queryKey: queryKeys.server,
-    queryFn: fetchServer,
+    queryKey: queryKeys.server(serverId),
+    queryFn: () => fetchServer(serverId),
     initialData: initialServer,
   });
   const { data: players = initialPlayers } = useQuery({
-    queryKey: queryKeys.players,
-    queryFn: fetchPlayers,
+    queryKey: queryKeys.players(serverId),
+    queryFn: () => fetchPlayers(serverId),
     initialData: initialPlayers,
   });
   const { data: whitelist = initialWhitelist } = useQuery({
-    queryKey: queryKeys.whitelist,
-    queryFn: fetchWhitelist,
+    queryKey: queryKeys.whitelist(serverId),
+    queryFn: () => fetchWhitelist(serverId),
     initialData: initialWhitelist,
   });
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -69,25 +70,25 @@ export function Players({
 
   const add = useMutation({
     mutationFn: ({ player_id, name }: WhitelistFormValues) =>
-      apiVoid("/api/v1/server/whitelist", {
+      apiVoid(`/api/v1/servers/${serverId}/whitelist`, {
         method: "POST",
         body: jsonBody({ player_id, name }),
       }),
     onMutate: () => setRequestError(null),
     onSuccess: () => {
       form.reset();
-      void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist(serverId) });
     },
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const remove = useMutation({
     mutationFn: (entry: WhitelistEntry) =>
-      apiVoid(`/api/v1/server/whitelist?player_id=${entry.player_id}`, {
+      apiVoid(`/api/v1/servers/${serverId}/whitelist?player_id=${entry.player_id}`, {
         method: "DELETE",
       }),
     onMutate: () => setRequestError(null),
     onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist }),
+      void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist(serverId) }),
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const whitelistedIds = new Set(whitelist.entries.map((entry) => entry.player_id));

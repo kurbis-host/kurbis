@@ -2,7 +2,62 @@ use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::pumpkin_control::VerifiedMinecraftIdentity;
+
 const IDENTITY_WRITE_LOCK: i64 = 0x4b55_5242_4953;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinecraftIdentityKey {
+    pub provider: &'static str,
+    pub subject: String,
+}
+
+pub fn minecraft_identity_key(
+    identity: &VerifiedMinecraftIdentity,
+    minecraft_player_id: Uuid,
+) -> Result<MinecraftIdentityKey, &'static str> {
+    if minecraft_player_id.is_nil() {
+        return Err("verified Minecraft profile is invalid");
+    }
+    let (provider, subject) = match identity {
+        VerifiedMinecraftIdentity::Java { uuid } if *uuid == minecraft_player_id => {
+            ("minecraft_java", uuid.to_string())
+        }
+        VerifiedMinecraftIdentity::Java { .. } => {
+            return Err("verified Java profile does not match its identity");
+        }
+        VerifiedMinecraftIdentity::Bedrock { xuid } if valid_xuid(xuid) => {
+            ("minecraft_bedrock", xuid.clone())
+        }
+        VerifiedMinecraftIdentity::Bedrock { .. } => {
+            return Err("verified Minecraft identity is invalid");
+        }
+    };
+    Ok(MinecraftIdentityKey { provider, subject })
+}
+
+pub async fn resolve_minecraft_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &MinecraftIdentityKey,
+    minecraft_player_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT user_id FROM identities
+         WHERE provider = $1 AND subject = $2 AND minecraft_player_id = $3",
+    )
+    .bind(key.provider)
+    .bind(&key.subject)
+    .bind(minecraft_player_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+fn valid_xuid(xuid: &str) -> bool {
+    !xuid.is_empty()
+        && xuid.len() <= 20
+        && xuid.bytes().all(|byte| byte.is_ascii_digit())
+        && xuid.bytes().any(|byte| byte != b'0')
+}
 
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -172,6 +227,7 @@ pub async fn attach_minecraft_identity(
     pool: &PgPool,
     provider: &str,
     subject: &str,
+    minecraft_player_id: Uuid,
     display_name: &str,
     browser_account: Option<Uuid>,
 ) -> Result<Uuid, IdentityError> {
@@ -216,24 +272,26 @@ pub async fn attach_minecraft_identity(
 
     if existing.is_none() {
         sqlx::query(
-            "INSERT INTO identities(id, user_id, provider, subject, display_name)
-             VALUES($1, $2, $3, $4, $5)",
+            "INSERT INTO identities(id, user_id, provider, subject, minecraft_player_id, display_name)
+             VALUES($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::new_v4())
         .bind(account_id)
         .bind(provider)
         .bind(subject)
+        .bind(minecraft_player_id)
         .bind(display_name)
         .execute(&mut *tx)
         .await?;
     } else {
         sqlx::query(
-            "UPDATE identities SET display_name = $3, updated_at = now()
-             WHERE provider = $1 AND subject = $2 AND user_id = $4",
+            "UPDATE identities SET display_name = $3, minecraft_player_id = $4, updated_at = now()
+             WHERE provider = $1 AND subject = $2 AND user_id = $5",
         )
         .bind(provider)
         .bind(subject)
         .bind(display_name)
+        .bind(minecraft_player_id)
         .bind(account_id)
         .execute(&mut *tx)
         .await?;

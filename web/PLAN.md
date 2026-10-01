@@ -8,7 +8,7 @@ The new visual direction is an **original voxel-world interface**: unmistakably 
 
 The target audience is mixed: effortless for casual friend groups, with progressively disclosed controls for experienced server owners.
 
-The v1 product includes lifecycle management, connection details, live state, logs, configuration, player/whitelist management, backup history/manual backups/restore, operational activity, resource usage, account UX, onboarding, and failure recovery. Keep payments, plugins/mod uploads, unrestricted file management, arbitrary binaries, and admin tooling out of scope.
+The v1 product includes lifecycle management, connection details, live state, logs, configuration, player/whitelist management, backup history/manual backups/restore, operational activity, resource usage, account UX, onboarding, and failure recovery. Keep payments, plugin/mod uploads, unrestricted file management, arbitrary binaries, and admin tooling out of scope.
 
 ## Product, UX, and Design
 
@@ -58,21 +58,25 @@ Replace the current ad-hoc panel endpoints with a versioned typed API and delete
 Public contracts:
 
 - GET /api/v1/session
-- GET | POST | PATCH | DELETE /api/v1/server
-- POST /api/v1/server/actions with start | stop | restart | snapshot
-- GET /api/v1/server/events for SSE
-- GET /api/v1/server/logs?after_id=&limit=
-- GET /api/v1/server/activity
-- GET /api/v1/server/snapshots
-- POST /api/v1/server/snapshots/{generation}/restore
-- GET /api/v1/server/players
-- GET | POST | DELETE /api/v1/server/whitelist
+- GET /api/v1/servers; GET | PATCH | DELETE /api/v1/servers/{server_id}
+- POST /api/v1/servers/{server_id}/actions with start | stop | restart | snapshot
+- POST /api/v1/servers/{server_id}/reset
+- GET /api/v1/servers/{server_id}/events for SSE
+- GET /api/v1/servers/{server_id}/logs?after_id=&limit=
+- GET /api/v1/servers/{server_id}/activity
+- GET /api/v1/servers/{server_id}/snapshots
+- POST /api/v1/servers/{server_id}/snapshots/{generation}/restore
+- GET /api/v1/servers/{server_id}/players
+- GET | POST | DELETE /api/v1/servers/{server_id}/whitelist
+- GET | POST /api/v1/servers/{server_id}/exports; GET /api/v1/servers/{server_id}/exports/{export_id}/download; DELETE /api/v1/servers/{server_id}/exports/{export_id}
 - GET /api/v1/account
 - PUT /api/v1/account/worlds/{server_id}/default
 - DELETE /api/v1/account/sessions/{session_id}
 - POST /auth/minecraft/redeem (same-origin only; GET requests never mutate account state)
 
 Create explicit serializable DTOs for Session, Server, ServerSettings, LifecycleStatus, Operation, Snapshot, PlayerPresence, WhitelistEntry, LogEntry, and discriminated ServerEvent variants. Stop returning raw settings JSON and unstructured lifecycle errors.
+
+Every per-server route and event stream requires an active account session and checks that the account owns the path's server ID.
 
 Extend the server response with timestamps, current operation/stage, latest snapshot metadata, player count, storage limits/usage, and structured error information.
 
@@ -89,6 +93,7 @@ Emit or trigger PostgreSQL notifications for server state, logs, operations, sna
 ## Test Plan and Acceptance Criteria
 
 - Add Rust/Postgres integration coverage for every new API, ownership isolation, suspended accounts, lifecycle action validation, manual snapshots, snapshot-history visibility, monotonic rollback restore, whitelist persistence/runtime synchronization, player presence, pagination, and SSE authorization/reconnect/catch-up behavior.
+- Verify per-server ownership isolation for every resource, action, export, and event stream.
 - Add frontend component tests for lifecycle rendering, optimistic mutations, settings draft isolation, validation, reconnect handling, destructive confirmations, backup restrictions, whitelist interactions, and error states.
 - Expand Playwright into complete user journeys: public landing → OAuth → onboarding → start/queue/restore/online → live logs → players/whitelist → settings → backup → restore → restart/stop → deletion → logout.
 - Preserve browser security assertions for OAuth state binding, explicit provider linking, secure renewable cookies, session revocation, replay rejection, user isolation, and address conflicts.

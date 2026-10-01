@@ -109,7 +109,7 @@ impl ControlPlaneConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     pub common: CommonConfig,
     pub id: uuid::Uuid,
@@ -285,6 +285,37 @@ pub enum ObjectStoreConfig {
 }
 
 impl ObjectStoreConfig {
+    pub async fn build(&self) -> Result<std::sync::Arc<dyn object_store::ObjectStore>> {
+        use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem};
+
+        let store: std::sync::Arc<dyn ObjectStore> = match self {
+            Self::Local { root } => {
+                tokio::fs::create_dir_all(root).await?;
+                std::sync::Arc::new(LocalFileSystem::new_with_prefix(root)?)
+            }
+            Self::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key,
+                secret_key,
+                allow_http,
+            } => {
+                let mut builder = AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_region(region)
+                    .with_access_key_id(access_key)
+                    .with_secret_access_key(secret_key)
+                    .with_allow_http(*allow_http);
+                if let Some(endpoint) = endpoint {
+                    builder = builder.with_endpoint(endpoint);
+                }
+                std::sync::Arc::new(builder.build()?)
+            }
+        };
+        Ok(store)
+    }
+
     pub fn from_env() -> Result<Self> {
         match value("OBJECT_STORE_TYPE", "s3").as_str() {
             "local" => Ok(Self::Local {

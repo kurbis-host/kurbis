@@ -17,6 +17,8 @@ impl WorkerRunner {
                 }
             }
             self.maintain_online_servers().await?;
+            self.expire_stale_exports_if_due().await?;
+            self.spawn_world_export_if_idle().await?;
             if self.last_local_gc.elapsed() >= Duration::from_secs(60) {
                 self.gc_stale_local_storage().await?;
                 self.last_local_gc = Instant::now();
@@ -61,6 +63,47 @@ impl WorkerRunner {
                     "failed-start cleanup failed; preserving placement fence and retrying"),
             }
         }
+        let snapshot_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT s.id FROM servers s JOIN placements p ON p.server_id = s.id
+             WHERE p.worker_id = $1 AND s.observed_state = 'failed'
+               AND EXISTS(SELECT 1 FROM operations o WHERE o.server_id = s.id
+                 AND o.generation = p.generation AND o.kind = 'snapshot' AND o.status = 'failed')",
+        )
+        .bind(self.config.id)
+        .fetch_all(&self.pool)
+        .await?;
+        for server_id in snapshot_ids {
+            let server_dir = self.server_dir(server_id);
+            match self.runtime.server_is_running(server_id).await {
+                Ok(true) => match self.runtime.graceful_stop(server_id, &server_dir).await {
+                    Ok(()) => {
+                        sqlx::query(
+                            "UPDATE placements SET active = false, updated_at = now()
+                             WHERE server_id = $1 AND worker_id = $2",
+                        )
+                        .bind(server_id)
+                        .bind(self.config.id)
+                        .execute(&self.pool)
+                        .await?;
+                        clear_players(&self.pool, server_id).await?;
+                    }
+                    Err(error) => tracing::error!(%server_id, ?error,
+                        "failed snapshot runtime cleanup failed; preserving placement fence"),
+                },
+                Ok(false) => {
+                    sqlx::query(
+                        "UPDATE placements SET active = false, updated_at = now()
+                         WHERE server_id = $1 AND worker_id = $2",
+                    )
+                    .bind(server_id)
+                    .bind(self.config.id)
+                    .execute(&self.pool)
+                    .await?;
+                }
+                Err(error) => tracing::error!(%server_id, ?error,
+                    "could not verify failed snapshot runtime cleanup"),
+            }
+        }
         Ok(())
     }
 
@@ -72,16 +115,208 @@ impl WorkerRunner {
         match op.kind {
             OperationKind::Start => self.start(op).await,
             OperationKind::Stop | OperationKind::Restart => self.stop(op).await,
-            OperationKind::Snapshot => {
-                let snapshot = self
-                    .snapshot_running(op.server_id, SnapshotReason::Manual)
-                    .await?;
-                complete_snapshot(&self.pool, op, snapshot).await?;
-                Ok(())
-            }
+            OperationKind::Snapshot => self.snapshot(op).await,
             OperationKind::Restore => self.restore(op).await,
+            OperationKind::Reset => self.reset(op).await,
             OperationKind::Delete => self.delete(op).await,
         }
+    }
+
+    async fn snapshot(&mut self, op: &OperationRecord) -> Result<()> {
+        let reason = serde_json::from_value::<SnapshotReason>(
+            op.payload
+                .get("reason")
+                .cloned()
+                .context("snapshot operation is missing its reason")?,
+        )?;
+        let placement = self.placement(op.server_id).await?;
+        if placement.worker_id != self.config.id || placement.generation != op.generation {
+            bail!("snapshot operation placement does not match worker or generation");
+        }
+        let server_dir = self.storage.ensure(op.server_id).await?;
+        let mut stage = op
+            .payload
+            .get("stage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("requested")
+            .to_owned();
+
+        if stage == "deferred" {
+            begin_snapshot_retry(&self.pool, op).await?;
+            stage = "requested".into();
+        }
+
+        if stage == "requested" {
+            if self.runtime.server_is_running(op.server_id).await? {
+                if let Some(idle) = self.idle_since.get_mut(&op.server_id) {
+                    let status = self.runtime.player_status(&server_dir).await?;
+                    idle.observe(&status, Instant::now());
+                }
+                let socket = self.runtime.socket_path(&server_dir)?;
+                for player in self.runtime.players(&server_dir).await? {
+                    let _ = self
+                        .runtime
+                        .control()
+                        .message(
+                            &socket,
+                            player.id,
+                            "The server is saving a world snapshot. You will be disconnected briefly.",
+                        )
+                        .await;
+                }
+                self.runtime.save(&server_dir).await?;
+            }
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"saved"})).await?;
+            stage = "saved".into();
+        }
+
+        if stage == "saved" {
+            if self.runtime.server_is_running(op.server_id).await? {
+                self.runtime
+                    .graceful_stop(op.server_id, &server_dir)
+                    .await?;
+            }
+            sqlx::query(
+                "UPDATE placements SET active = false, updated_at = now()
+                 WHERE server_id = $1 AND generation = $2 AND worker_id = $3",
+            )
+            .bind(op.server_id)
+            .bind(op.generation)
+            .bind(self.config.id)
+            .execute(&self.pool)
+            .await?;
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"stopped"}))
+                .await?;
+            stage = "stopped".into();
+        }
+
+        let (snapshot_generation, snapshot_size) = if stage == "stopped" {
+            if self.runtime.server_is_running(op.server_id).await? {
+                bail!("refusing to snapshot while the runtime is active");
+            }
+            let snapshot = match self
+                .snapshots
+                .create(op.server_id, &server_dir, reason)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.resume_snapshot_runtime(op.server_id, &placement, &server_dir)
+                        .await
+                        .context("could not resume runtime after snapshot storage failure")?;
+                    defer_snapshot_operation(
+                        &self.pool,
+                        op,
+                        &format!("Snapshot upload failed: {error:#}"),
+                    )
+                    .await?;
+                    return Err(error).context("snapshot upload failed; runtime resumed for retry");
+                }
+            };
+            self.mark_cached(op.server_id, snapshot.generation).await?;
+            update_operation_payload(
+                &self.pool,
+                op,
+                serde_json::json!({
+                    "stage":"snapshotted",
+                    "snapshot_generation":snapshot.generation,
+                    "snapshot_size":snapshot.size_bytes,
+                }),
+            )
+            .await?;
+            stage = "snapshotted".into();
+            (snapshot.generation, snapshot.size_bytes)
+        } else if matches!(stage.as_str(), "snapshotted" | "restarted") {
+            (
+                op.payload
+                    .get("snapshot_generation")
+                    .and_then(serde_json::Value::as_i64)
+                    .context("snapshot stage is missing its generation")?,
+                op.payload
+                    .get("snapshot_size")
+                    .and_then(serde_json::Value::as_i64)
+                    .context("snapshot stage is missing its size")?,
+            )
+        } else {
+            bail!("unknown snapshot operation stage {stage:?}");
+        };
+
+        if stage == "snapshotted" {
+            self.resume_snapshot_runtime(op.server_id, &placement, &server_dir)
+                .await?;
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"restarted"}))
+                .await?;
+            stage = "restarted".into();
+        }
+
+        if stage != "restarted" {
+            bail!("snapshot operation did not reach its restart stage");
+        }
+        ensure_storage_limit(snapshot_size)?;
+        complete_snapshot(&self.pool, op, snapshot_generation).await?;
+        Ok(())
+    }
+
+    async fn resume_snapshot_runtime(
+        &mut self,
+        server_id: Uuid,
+        placement: &PlacementRecord,
+        server_dir: &std::path::Path,
+    ) -> Result<()> {
+        if placement.worker_id != self.config.id {
+            bail!("snapshot runtime restart belongs to another worker");
+        }
+        let settings: serde_json::Value =
+            sqlx::query_scalar("SELECT settings FROM servers WHERE id = $1 AND generation = $2")
+                .bind(server_id)
+                .bind(placement.generation)
+                .fetch_one(&self.pool)
+                .await?;
+        if !self.runtime.server_is_running(server_id).await? {
+            write_whitelist_file(&self.pool, server_id, server_dir).await?;
+            write_operator_file(&self.pool, server_id, server_dir).await?;
+        }
+        self.ensure_runtime_ready(server_id, placement, server_dir, &settings)
+            .await?;
+        sync_whitelist(
+            &self.pool,
+            self.runtime.as_ref(),
+            server_id,
+            server_dir,
+            true,
+        )
+        .await?;
+        sync_operators(
+            &self.pool,
+            self.runtime.as_ref(),
+            server_id,
+            server_dir,
+            true,
+        )
+        .await?;
+        let status = self.runtime.player_status(server_dir).await?;
+        if let Some(idle) = self.idle_since.get_mut(&server_id) {
+            idle.after_snapshot_restart(&status, Instant::now());
+        }
+        Ok(())
+    }
+
+    async fn ensure_runtime_ready(
+        &self,
+        server_id: Uuid,
+        placement: &PlacementRecord,
+        server_dir: &std::path::Path,
+        settings: &serde_json::Value,
+    ) -> Result<()> {
+        if !self.runtime.server_is_running(server_id).await? {
+            self.runtime
+                .start(server_id, placement, server_dir, settings)
+                .await?;
+        }
+        self.runtime
+            .wait_ready(server_id, server_dir, Duration::from_secs(120))
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn restore(&mut self, op: &OperationRecord) -> Result<()> {
@@ -110,6 +345,8 @@ impl WorkerRunner {
             self.snapshots
                 .restore_generation(op.server_id, target_generation, &server_dir)
                 .await?;
+            write_whitelist_file(&self.pool, op.server_id, &server_dir).await?;
+            write_operator_file(&self.pool, op.server_id, &server_dir).await?;
             update_operation_payload(&self.pool, op, serde_json::json!({"stage":"restored"}))
                 .await?;
             stage = "restored".into();
@@ -157,6 +394,249 @@ impl WorkerRunner {
         )
         .await?;
         clear_players(&self.pool, op.server_id).await?;
+        self.idle_since.remove(&op.server_id);
+        self.last_snapshot.remove(&op.server_id);
+        Ok(())
+    }
+
+    pub(super) async fn reset(&mut self, op: &OperationRecord) -> Result<()> {
+        let mode = op
+            .payload
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .context("reset operation is missing mode")?;
+        if !matches!(mode, "world" | "full") {
+            bail!("reset operation has an invalid mode");
+        }
+        let was_running = op
+            .payload
+            .get("was_running")
+            .and_then(serde_json::Value::as_bool)
+            .context("reset operation is missing prior server state")?;
+        let mut stage = op
+            .payload
+            .get("stage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("requested")
+            .to_owned();
+        let (generation, current_snapshot): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT generation, current_snapshot_generation FROM servers WHERE id = $1",
+        )
+        .bind(op.server_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("reset server disappeared")?;
+        if generation != op.generation {
+            bail!("reset operation generation is stale");
+        }
+        let server_dir = self.storage.ensure(op.server_id).await?;
+
+        if !was_running {
+            crate::worker::persistence::prepare_server_data(
+                &self.pool,
+                self.config.id,
+                op.server_id,
+                current_snapshot,
+                &self.storage,
+                &self.snapshots,
+            )
+            .await?;
+        } else {
+            let placement = self.placement(op.server_id).await?;
+            if placement.worker_id != self.config.id || placement.generation != op.generation {
+                bail!("running reset does not match the current worker placement");
+            }
+        }
+
+        if stage == "requested" {
+            if was_running && self.runtime.server_is_running(op.server_id).await? {
+                let socket = self.runtime.socket_path(&server_dir)?;
+                for player in self.runtime.players(&server_dir).await? {
+                    let _ = self
+                        .runtime
+                        .control()
+                        .message(
+                            &socket,
+                            player.id,
+                            "This server is resetting now. You will be disconnected briefly.",
+                        )
+                        .await;
+                }
+                self.runtime.save(&server_dir).await?;
+            }
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"saved"})).await?;
+            stage = "saved".into();
+        }
+
+        if stage == "saved" {
+            if was_running && self.runtime.server_is_running(op.server_id).await? {
+                self.runtime
+                    .graceful_stop(op.server_id, &server_dir)
+                    .await?;
+            }
+            if was_running {
+                sqlx::query(
+                    "UPDATE placements SET active = false, updated_at = now()
+                             WHERE server_id = $1 AND generation = $2 AND worker_id = $3",
+                )
+                .bind(op.server_id)
+                .bind(op.generation)
+                .bind(self.config.id)
+                .execute(&self.pool)
+                .await?;
+            }
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"stopped"}))
+                .await?;
+            stage = "stopped".into();
+        }
+
+        if stage == "stopped" {
+            if self.runtime.server_is_running(op.server_id).await? {
+                bail!("refusing to snapshot reset data while the runtime is active");
+            }
+            let backup = self
+                .snapshots
+                .create(op.server_id, &server_dir, SnapshotReason::Reset)
+                .await?;
+            update_operation_payload(
+                &self.pool,
+                op,
+                serde_json::json!({
+                    "stage":"backed_up", "pre_reset_generation":backup.generation
+                }),
+            )
+            .await?;
+            stage = "backed_up".into();
+        }
+
+        if stage == "backed_up" {
+            if mode == "full" {
+                self.storage.reset(op.server_id).await?;
+            } else {
+                remove_reset_world(&server_dir.join("world")).await?;
+            }
+            clear_players(&self.pool, op.server_id).await?;
+            write_whitelist_file(&self.pool, op.server_id, &server_dir).await?;
+            write_operator_file(&self.pool, op.server_id, &server_dir).await?;
+            sqlx::query("DELETE FROM worker_snapshot_cache WHERE server_id = $1")
+                .bind(op.server_id)
+                .execute(&self.pool)
+                .await?;
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"cleared"}))
+                .await?;
+            stage = "cleared".into();
+        }
+
+        if stage == "cleared" {
+            if was_running {
+                let settings: serde_json::Value =
+                    sqlx::query_scalar("SELECT settings FROM servers WHERE id = $1")
+                        .bind(op.server_id)
+                        .fetch_one(&self.pool)
+                        .await?;
+                let placement = self.placement(op.server_id).await?;
+                if placement.worker_id != self.config.id || placement.generation != op.generation {
+                    bail!("reset restart does not match the worker placement");
+                }
+                write_whitelist_file(&self.pool, op.server_id, &server_dir).await?;
+                write_operator_file(&self.pool, op.server_id, &server_dir).await?;
+                self.ensure_runtime_ready(op.server_id, &placement, &server_dir, &settings)
+                    .await?;
+                sync_whitelist(
+                    &self.pool,
+                    self.runtime.as_ref(),
+                    op.server_id,
+                    &server_dir,
+                    true,
+                )
+                .await?;
+                sync_operators(
+                    &self.pool,
+                    self.runtime.as_ref(),
+                    op.server_id,
+                    &server_dir,
+                    true,
+                )
+                .await?;
+                self.runtime.save(&server_dir).await?;
+                self.runtime
+                    .graceful_stop(op.server_id, &server_dir)
+                    .await?;
+            }
+            update_operation_payload(&self.pool, op, serde_json::json!({"stage":"initialized"}))
+                .await?;
+            stage = "initialized".into();
+        }
+
+        let (snapshot_generation, snapshot_size) = if stage == "initialized" {
+            let snapshot = self
+                .snapshots
+                .create(op.server_id, &server_dir, SnapshotReason::Reset)
+                .await?;
+            update_operation_payload(
+                &self.pool,
+                op,
+                serde_json::json!({
+                    "stage":"snapshotted", "snapshot_generation":snapshot.generation,
+                    "snapshot_size":snapshot.size_bytes,
+                }),
+            )
+            .await?;
+            (snapshot.generation, snapshot.size_bytes)
+        } else if stage == "snapshotted" {
+            (
+                op.payload
+                    .get("snapshot_generation")
+                    .and_then(serde_json::Value::as_i64)
+                    .context("reset snapshot stage is missing its generation")?,
+                op.payload
+                    .get("snapshot_size")
+                    .and_then(serde_json::Value::as_i64)
+                    .context("reset snapshot stage is missing its size")?,
+            )
+        } else {
+            bail!("unknown reset operation stage {stage:?}");
+        };
+
+        if was_running {
+            let settings: serde_json::Value =
+                sqlx::query_scalar("SELECT settings FROM servers WHERE id = $1")
+                    .bind(op.server_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+            let placement = self.placement(op.server_id).await?;
+            if !self.runtime.server_is_running(op.server_id).await? {
+                write_whitelist_file(&self.pool, op.server_id, &server_dir).await?;
+                write_operator_file(&self.pool, op.server_id, &server_dir).await?;
+            }
+            self.ensure_runtime_ready(op.server_id, &placement, &server_dir, &settings)
+                .await?;
+            sync_whitelist(
+                &self.pool,
+                self.runtime.as_ref(),
+                op.server_id,
+                &server_dir,
+                true,
+            )
+            .await?;
+            sync_operators(
+                &self.pool,
+                self.runtime.as_ref(),
+                op.server_id,
+                &server_dir,
+                true,
+            )
+            .await?;
+        }
+        ensure_storage_limit(snapshot_size)?;
+        complete_reset(
+            &self.pool,
+            op,
+            snapshot_generation,
+            snapshot_size,
+            was_running,
+        )
+        .await?;
         self.idle_since.remove(&op.server_id);
         self.last_snapshot.remove(&op.server_id);
         Ok(())
@@ -210,6 +690,7 @@ impl WorkerRunner {
         let storage_bytes = persistent_size(&server_dir)?;
         ensure_storage_limit(storage_bytes)?;
         write_whitelist_file(&self.pool, op.server_id, &server_dir).await?;
+        write_operator_file(&self.pool, op.server_id, &server_dir).await?;
 
         sqlx::query(
             "UPDATE servers SET observed_state = 'starting', updated_at = now()
@@ -223,6 +704,14 @@ impl WorkerRunner {
             .start(op.server_id, &placement, &server_dir, &settings)
             .await?;
         sync_whitelist(
+            &self.pool,
+            self.runtime.as_ref(),
+            op.server_id,
+            &server_dir,
+            true,
+        )
+        .await?;
+        sync_operators(
             &self.pool,
             self.runtime.as_ref(),
             op.server_id,
@@ -328,4 +817,16 @@ impl WorkerRunner {
         self.last_snapshot.remove(&op.server_id);
         Ok(())
     }
+}
+
+async fn remove_reset_world(path: &std::path::Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            tokio::fs::remove_file(path).await?;
+        }
+        Ok(_) => tokio::fs::remove_dir_all(path).await?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }

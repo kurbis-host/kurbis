@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 profile=${1:-debug}
 case "$profile" in
-    debug) cargo_profile=dev ;;
+    debug) cargo_profile=debug ;;
     release) cargo_profile=release ;;
     *) echo "Usage: $0 [debug|release]" >&2; exit 2 ;;
 esac

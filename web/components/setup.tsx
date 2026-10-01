@@ -62,12 +62,13 @@ export function Setup() {
         hardcore: values.hardcore,
         whitelist: values.whitelist,
       };
-      const server = await apiRequest("/api/v1/server", serverSchema, {
+      const server = await apiRequest("/api/v1/servers", serverSchema, {
         method: "POST",
         body: jsonBody({ subdomain: values.subdomain, settings }),
       });
-      queryClient.setQueryData(queryKeys.server, server);
-      router.replace("/app");
+      queryClient.setQueryData(queryKeys.server(server.id), server);
+      queryClient.setQueryData(queryKeys.servers, [server]);
+      router.replace(`/app/servers/${server.id}`);
     } catch (error) {
       form.setError("root", { message: errorMessage(error) });
     }

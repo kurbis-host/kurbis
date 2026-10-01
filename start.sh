@@ -102,11 +102,11 @@ check_native_dependencies() {
   require_command git
   require_command cmake
   require_command node
-  require_command npm
+  require_command pnpm
   require_command python3
   require_command psql
   require_command curl
-  [[ -f $ROOT/web/package-lock.json ]] || die "web/package-lock.json is missing"
+  [[ -f $ROOT/web/pnpm-lock.yaml ]] || die "web/pnpm-lock.yaml is missing"
 }
 
 check_native_database() {
@@ -236,12 +236,12 @@ start_native() {
   "$ROOT/tools/build_pumpkin_native.sh" "$profile"
   if [[ ! -d $ROOT/web/node_modules ]]; then
     printf 'Installing panel dependencies...\n'
-    npm --prefix "$ROOT/web" ci
+    pnpm --dir "$ROOT/web" install --frozen-lockfile --ignore-scripts
   fi
   if [[ $profile == release ]]; then
     cargo_args+=(--release)
     printf 'Building the production panel...\n'
-    (cd "$ROOT/web" && CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080 npm run build)
+    (cd "$ROOT/web" && CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080 pnpm run build)
   fi
   (cd "$ROOT" && cargo "${cargo_args[@]}")
 

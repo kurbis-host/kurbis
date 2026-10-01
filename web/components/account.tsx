@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gamepad2, Link2, LogOut, MonitorSmartphone, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { apiVoid, errorMessage } from "../lib/api/client";
-import { fetchAccount, fetchServer, fetchSession } from "../lib/api/queries";
+import { fetchAccount, fetchServers, fetchSession } from "../lib/api/queries";
 import type { AccountData, Server, Session } from "../lib/contracts";
 import { formatBytes } from "../lib/format";
 import { queryKeys } from "../lib/query";
@@ -16,11 +16,11 @@ const secondaryLink =
 
 export function Account({
   initialSession,
-  initialServer,
+  initialServers,
   initialAccount,
 }: {
   initialSession: Session;
-  initialServer: Server | null;
+  initialServers: Server[];
   initialAccount: AccountData;
 }) {
   const queryClient = useQueryClient();
@@ -31,10 +31,10 @@ export function Account({
     queryFn: fetchSession,
     initialData: initialSession,
   });
-  const { data: server = initialServer } = useQuery({
-    queryKey: queryKeys.server,
-    queryFn: fetchServer,
-    initialData: initialServer,
+  const { data: servers = initialServers } = useQuery({
+    queryKey: queryKeys.servers,
+    queryFn: fetchServers,
+    initialData: initialServers,
   });
   const { data: account = initialAccount } = useQuery({
     queryKey: queryKeys.account,
@@ -60,11 +60,12 @@ export function Account({
       setWorldNotice(selected ? `${selected.subdomain} is now the default world.` : "Default world updated.");
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.account }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.server }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.servers }),
       ]);
     },
     onError: (error) => setActionError(errorMessage(error)),
   });
+  const server = servers.find((item) => item.is_default) ?? servers[0] ?? null;
 
   async function logout() {
     setActionError(null);

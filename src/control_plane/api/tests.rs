@@ -1,9 +1,9 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use super::events::{EventsQuery, event_cursor, next_event_row};
-use super::internal::subdomain_from_hostname;
 use super::types::{ServerSettings, ServerSettingsPatch};
 use super::{AppState, router};
+use crate::model::subdomain_from_hostname;
 use axum::{
     body::{Body, to_bytes},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
@@ -65,6 +65,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
             },
         },
         http: reqwest::Client::new(),
+        object_store: Arc::new(object_store::memory::InMemory::new()),
     })
 }
 
@@ -139,6 +140,7 @@ fn json_request(
 }
 
 async fn mint_minecraft_link(app: &axum::Router, identity: Value) -> Value {
+    let minecraft_player_id = test_profile_id(&identity);
     let response = app
         .clone()
         .oneshot(
@@ -146,7 +148,7 @@ async fn mint_minecraft_link(app: &axum::Router, identity: Value) -> Value {
                 .header(header::AUTHORIZATION, "Bearer test-internal-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({"identity":identity,"display_name":"Minecraft Player"})
+                    serde_json::json!({"identity":identity,"minecraft_player_id":minecraft_player_id,"display_name":"Minecraft Player"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -155,6 +157,18 @@ async fn mint_minecraft_link(app: &axum::Router, identity: Value) -> Value {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap()
+}
+
+fn test_profile_id(identity: &Value) -> Uuid {
+    if let Some(value) = identity.get("uuid").and_then(Value::as_str) {
+        return value.parse().unwrap();
+    }
+    let numeric = identity
+        .get("xuid")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or(1);
+    Uuid::from_u128(numeric.max(1))
 }
 
 fn minecraft_token(link: &Value) -> String {
@@ -171,7 +185,7 @@ fn minecraft_token(link: &Value) -> String {
 fn extracts_only_one_valid_label() {
     assert_eq!(
         subdomain_from_hostname("abc.play.example.com", "play.example.com"),
-        Some("abc")
+        Some("abc".into())
     );
     assert_eq!(
         subdomain_from_hostname("abc.def.play.example.com", "play.example.com"),
@@ -183,7 +197,7 @@ fn extracts_only_one_valid_label() {
     );
     assert_eq!(
         subdomain_from_hostname("AbC.PLAY.EXAMPLE.COM", "play.example.com"),
-        Some("AbC")
+        Some("abc".into())
     );
 }
 
@@ -250,7 +264,7 @@ async fn suspended_session_is_visible_but_control_plane_access_is_forbidden() {
 
     let server_response = app
         .clone()
-        .oneshot(authenticated_request("/api/v1/server", &token))
+        .oneshot(authenticated_request("/api/v1/servers", &token))
         .await
         .unwrap();
     assert_eq!(server_response.status(), StatusCode::FORBIDDEN);
@@ -274,16 +288,17 @@ async fn server_read_is_scoped_to_the_authenticated_owner() {
     let pool = test_pool().await;
     let (owner_a, token_a) = create_user_session(&pool, "active").await;
     let (owner_b, _) = create_user_session(&pool, "active").await;
-    create_server(&pool, owner_b).await;
+    let server_id = create_server(&pool, owner_b).await;
     let app = router(test_state(pool.clone()));
 
     let response = app
-        .oneshot(authenticated_request("/api/v1/server", &token_a))
+        .oneshot(authenticated_request(
+            &format!("/api/v1/servers/{server_id}"),
+            &token_a,
+        ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), 1024).await.unwrap();
-    assert_eq!(&body[..], b"null");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     sqlx::query("DELETE FROM users WHERE id = ANY($1)")
         .bind(vec![owner_a, owner_b])
@@ -293,7 +308,7 @@ async fn server_read_is_scoped_to_the_authenticated_owner() {
 }
 
 #[tokio::test]
-async fn durable_event_catch_up_enforces_cursor_owner_and_suspension() {
+async fn durable_event_catch_up_preserves_cursor_and_server_scope() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let (owner, _) = create_user_session(&pool, "active").await;
@@ -322,30 +337,18 @@ async fn durable_event_catch_up_enforces_cursor_owner_and_suspension() {
     .await
     .unwrap();
 
-    let row = next_event_row(&pool, server_id, owner, baseline)
+    let row = next_event_row(&pool, server_id, baseline)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.id, first);
-    let row = next_event_row(&pool, server_id, owner, first)
+    let row = next_event_row(&pool, server_id, first)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.id, second);
     assert!(
-        next_event_row(&pool, server_id, other_owner, baseline)
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    sqlx::query("UPDATE users SET account_status = 'suspended' WHERE id = $1")
-        .bind(owner)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(
-        next_event_row(&pool, server_id, owner, baseline)
+        next_event_row(&pool, Uuid::new_v4(), baseline)
             .await
             .unwrap()
             .is_none()
@@ -368,6 +371,7 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
     let link = mint_minecraft_link(&app, serde_json::json!({"kind":"java","uuid":java_uuid})).await;
     let token = minecraft_token(&link);
     let token_hash = blake3::hash(token.as_bytes()).as_bytes().to_vec();
+    let forged_uuid = Uuid::new_v4();
 
     let forged = app
         .clone()
@@ -378,7 +382,8 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "identity":{"kind":"java","uuid":Uuid::new_v4()},
+                        "identity":{"kind":"java","uuid":forged_uuid},
+                        "minecraft_player_id":forged_uuid,
                         "display_name":"Forged Player"
                     })
                     .to_string(),
@@ -524,12 +529,14 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
         .await
         .unwrap();
     assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
-    let bedrock_identity_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM identities WHERE provider='minecraft_bedrock'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bedrock_identity_count, 0);
+    let expired_identity_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identities
+         WHERE provider = 'minecraft_bedrock' AND subject = '2533274790395904'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(expired_identity_count, 0);
 
     sqlx::query("DELETE FROM users WHERE id=$1")
         .bind(user_id)
@@ -552,6 +559,7 @@ async fn signed_in_minecraft_redemption_merges_the_browser_account_and_all_world
         &pool,
         "minecraft_bedrock",
         bedrock_xuid,
+        test_profile_id(&serde_json::json!({"xuid":bedrock_xuid})),
         "Bedrock Player",
         None,
     )

@@ -1,11 +1,13 @@
 use super::publish_final_snapshot;
 use super::{
     DB_TEST_LOCK, Lifecycle, ObservedState, claim_operation, clean_test_rows,
-    cleanup_test_entities, complete_start, complete_stop, create_test_server, create_test_worker,
-    recover_running_operations, retry_operation, test_pool,
+    cleanup_test_entities, complete_reset, complete_start, complete_stop, create_test_server,
+    create_test_worker, recover_running_operations, retry_operation, test_pool,
+    update_operation_payload,
 };
 use kurbis_hoster::control_plane::lifecycle::fail_operation;
-use kurbis_hoster::model::{OperationStatus, SERVER_MEMORY_BYTES};
+use kurbis_hoster::model::{DesiredState, OperationStatus, SERVER_MEMORY_BYTES};
+use serde_json::json;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -359,10 +361,15 @@ async fn manual_snapshot_completion_requires_current_claim_and_published_manual_
         Some(worker),
         OperationKind::Snapshot,
         start.generation,
-        serde_json::json!({}),
+        serde_json::json!({"reason":"manual", "stage":"requested"}),
     )
     .await
     .unwrap();
+    sqlx::query("UPDATE servers SET observed_state = 'snapshotting' WHERE id = $1")
+        .bind(server)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let old = claim_operation(&pool, worker).await.unwrap().unwrap();
     recover_running_operations(&pool, worker).await.unwrap();
@@ -371,6 +378,11 @@ async fn manual_snapshot_completion_requires_current_claim_and_published_manual_
     publish_final_snapshot(&pool, &current, 1, 12).await;
     assert!(complete_snapshot(&pool, &current, 1).await.is_err());
     sqlx::query("UPDATE snapshots SET reason = 'manual' WHERE server_id = $1")
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE placements SET active = false WHERE server_id = $1")
         .bind(server)
         .execute(&pool)
         .await
@@ -401,14 +413,31 @@ async fn duplicate_manual_snapshot_requests_share_one_live_operation() {
 
     assert_eq!(
         lifecycle.request_snapshot(server).await.unwrap(),
-        ObservedState::Online
+        ObservedState::Snapshotting
     );
     let duplicate = lifecycle.request_snapshot(server).await.unwrap_err();
     assert!(
         duplicate
             .to_string()
-            .contains("manual snapshot already in progress")
+            .contains("a server snapshot is already in progress")
     );
+    assert!(lifecycle.request_stop(server, "conflict").await.is_err());
+    assert!(lifecycle.request_restart(server).await.is_err());
+    assert!(lifecycle.request_delete(server).await.is_err());
+    assert_eq!(
+        lifecycle
+            .request_start(server, "gateway_wake")
+            .await
+            .unwrap(),
+        ObservedState::Snapshotting
+    );
+    let current_state: ObservedState =
+        sqlx::query_scalar("SELECT observed_state FROM servers WHERE id = $1")
+            .bind(server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current_state, ObservedState::Snapshotting);
     let live_snapshots: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM operations
          WHERE server_id = $1 AND kind = 'snapshot' AND status IN ('pending','running')",
@@ -418,6 +447,105 @@ async fn duplicate_manual_snapshot_requests_share_one_live_operation() {
     .await
     .unwrap();
     assert_eq!(live_snapshots, 1);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn deferred_snapshot_retries_keep_the_runtime_online_without_losing_the_fence() {
+    use kurbis_hoster::control_plane::lifecycle::{begin_snapshot_retry, defer_snapshot_operation};
+
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-snapshot-deferred", 32100).await;
+    let (owner, server) = create_test_server(&pool, "snapshot-deferred").await;
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle.request_start(server, "test").await.unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 0).await.unwrap();
+
+    lifecycle.request_snapshot(server).await.unwrap();
+    let first = claim_operation(&pool, worker).await.unwrap().unwrap();
+    sqlx::query("UPDATE placements SET active = false WHERE server_id = $1")
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+    defer_snapshot_operation(&pool, &first, "object store is unavailable")
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_as::<_, (ObservedState, bool, String)>(
+            "SELECT s.observed_state, p.active, o.payload->>'stage'
+             FROM servers s JOIN placements p ON p.server_id = s.id
+             JOIN operations o ON o.server_id = s.id AND o.kind = 'snapshot'
+             WHERE s.id = $1",
+        )
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (ObservedState::Online, true, "deferred".into())
+    );
+    assert!(lifecycle.request_stop(server, "conflict").await.is_err());
+    assert!(
+        retry_operation(&pool, &first, "object store is unavailable")
+            .await
+            .unwrap()
+    );
+
+    sqlx::query(
+        "UPDATE operations SET attempt = 4, next_attempt_at = now()
+         WHERE server_id = $1 AND kind = 'snapshot'",
+    )
+    .bind(server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let fifth_attempt = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(fifth_attempt.attempt, 5);
+    begin_snapshot_retry(&pool, &fifth_attempt).await.unwrap();
+    let retry_state: (ObservedState, bool, String) = sqlx::query_as(
+        "SELECT s.observed_state, p.active, o.payload->>'stage'
+         FROM servers s JOIN placements p ON p.server_id = s.id
+         JOIN operations o ON o.server_id = s.id AND o.kind = 'snapshot'
+         WHERE s.id = $1",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retry_state,
+        (ObservedState::Snapshotting, false, "requested".into())
+    );
+
+    defer_snapshot_operation(&pool, &fifth_attempt, "object store is still unavailable")
+        .await
+        .unwrap();
+    assert!(
+        retry_operation(&pool, &fifth_attempt, "object store is still unavailable")
+            .await
+            .unwrap()
+    );
+    let status: OperationStatus = sqlx::query_scalar(
+        "SELECT status FROM operations WHERE server_id = $1 AND kind = 'snapshot'",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, OperationStatus::Pending);
+    let available: (ObservedState, bool) = sqlx::query_as(
+        "SELECT s.observed_state, p.active FROM servers s
+         JOIN placements p ON p.server_id = s.id WHERE s.id = $1",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(available, (ObservedState::Online, true));
+
     cleanup_test_entities(&pool, owner, &[worker]).await;
 }
 
@@ -569,4 +697,325 @@ async fn restore_admission_waits_for_snapshot_publication_before_pinning_source(
         .unwrap();
     assert_eq!(operations, 0);
     cleanup_test_entities(&pool, owner, &[worker]).await;
+}
+
+#[tokio::test]
+async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_invariants() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-reset-fencing", 31800).await;
+
+    let (online_owner, online_server) = create_test_server(&pool, "reset-world-online").await;
+    let online_subdomain: String =
+        sqlx::query_scalar("SELECT subdomain FROM servers WHERE id = $1")
+            .bind(online_server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let custom_settings = json!({
+        "motd":"Keep my world settings",
+        "difficulty":"Hard",
+        "gamemode":"Adventure",
+        "view_distance":10,
+        "simulation_distance":6,
+        "hardcore":true,
+        "whitelist":true
+    });
+    sqlx::query("UPDATE servers SET settings = $2 WHERE id = $1")
+        .bind(online_server)
+        .bind(&custom_settings)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let whitelist_player = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO whitelist_entries(server_id, player_id, name) VALUES($1, $2, 'KeepAccess')",
+    )
+    .bind(online_server)
+    .bind(whitelist_player)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 1, 'old-world-snapshot', 12, 'old-checksum', 'shutdown', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(online_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 1, storage_bytes = 12 WHERE id = $1",
+    )
+    .bind(online_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lifecycle = Lifecycle::new(pool.clone());
+    lifecycle
+        .request_start(online_server, "reset test")
+        .await
+        .unwrap();
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 12).await.unwrap();
+    let initial_generation = start.generation;
+    assert_eq!(
+        lifecycle
+            .request_reset(online_server, "world", json!({"unused":true}))
+            .await
+            .unwrap(),
+        ObservedState::Resetting
+    );
+    let reset = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(reset.generation, initial_generation + 1);
+    assert_eq!(reset.payload["mode"], "world");
+    assert_eq!(reset.payload["was_running"], true);
+
+    let (state, desired, generation, placement_generation, active, default_server): (
+        ObservedState,
+        DesiredState,
+        i64,
+        i64,
+        bool,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT s.observed_state, s.desired_state, s.generation, p.generation, p.active, s.is_default
+         FROM servers s JOIN placements p ON p.server_id = s.id WHERE s.id = $1",
+    )
+    .bind(online_server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            state,
+            desired,
+            generation,
+            placement_generation,
+            active,
+            default_server
+        ),
+        (
+            ObservedState::Resetting,
+            DesiredState::Running,
+            reset.generation,
+            reset.generation,
+            true,
+            true
+        )
+    );
+    assert!(
+        lifecycle
+            .request_start(online_server, "racing wake")
+            .await
+            .is_err()
+    );
+    assert!(
+        lifecycle
+            .request_stop(online_server, "racing stop")
+            .await
+            .is_err()
+    );
+    assert!(
+        lifecycle
+            .request_reset(online_server, "world", json!({}))
+            .await
+            .is_err()
+    );
+
+    update_operation_payload(&pool, &reset, json!({"stage":"backed_up"}))
+        .await
+        .unwrap();
+    recover_running_operations(&pool, worker).await.unwrap();
+    let recovered = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(recovered.id, reset.id);
+    assert_eq!(recovered.attempt, reset.attempt + 1);
+    assert_eq!(recovered.payload["stage"], "backed_up");
+    assert!(complete_reset(&pool, &reset, 2, 32, true).await.is_err());
+
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 2, 'post-world-reset', 32, 'new-checksum', 'reset', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(online_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 2, storage_bytes = 32 WHERE id = $1",
+    )
+    .bind(online_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    complete_reset(&pool, &recovered, 2, 32, true)
+        .await
+        .unwrap();
+    let (state, generation, snapshot, active, subdomain, settings): (
+        ObservedState,
+        i64,
+        i64,
+        bool,
+        String,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT s.observed_state, s.generation, s.current_snapshot_generation, p.active, s.subdomain, s.settings
+         FROM servers s JOIN placements p ON p.server_id = s.id WHERE s.id = $1",
+    )
+    .bind(online_server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (state, generation, snapshot, active, subdomain),
+        (
+            ObservedState::Online,
+            reset.generation,
+            2,
+            true,
+            online_subdomain
+        )
+    );
+    assert_eq!(settings, custom_settings);
+    let (whitelist_count, snapshot_count): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM whitelist_entries WHERE server_id = $1),
+                (SELECT count(*) FROM snapshots WHERE server_id = $1)",
+    )
+    .bind(online_server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((whitelist_count, snapshot_count), (1, 2));
+
+    let (sleeping_owner, sleeping_server) = create_test_server(&pool, "reset-full-sleeping").await;
+    let sleeping_subdomain: String =
+        sqlx::query_scalar("SELECT subdomain FROM servers WHERE id = $1")
+            .bind(sleeping_server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE servers SET settings = $2 WHERE id = $1")
+        .bind(sleeping_server)
+        .bind(&custom_settings)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO whitelist_entries(server_id, player_id, name) VALUES($1, $2, 'RemoveAccess')",
+    )
+    .bind(sleeping_server)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 1, 'sleeping-old-snapshot', 8, 'old', 'shutdown', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(sleeping_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 1, storage_bytes = 8 WHERE id = $1",
+    )
+    .bind(sleeping_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let default_settings = json!({
+        "motd":"A Pumpkin Server",
+        "difficulty":"Normal",
+        "gamemode":"Survival",
+        "view_distance":12,
+        "simulation_distance":8,
+        "hardcore":false,
+        "whitelist":false
+    });
+    lifecycle
+        .request_reset(sleeping_server, "full", default_settings.clone())
+        .await
+        .unwrap();
+    let sleeping_reset = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(sleeping_reset.payload["was_running"], false);
+    assert_eq!(sleeping_reset.generation, 1);
+    let (state, desired, settings, whitelist_count, default_server): (
+        ObservedState,
+        DesiredState,
+        serde_json::Value,
+        i64,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT s.observed_state, s.desired_state, s.settings,
+                (SELECT count(*) FROM whitelist_entries WHERE server_id = s.id), s.is_default
+         FROM servers s WHERE s.id = $1",
+    )
+    .bind(sleeping_server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, ObservedState::Resetting);
+    assert_eq!(desired, DesiredState::Stopped);
+    assert_eq!(settings, default_settings);
+    assert_eq!(whitelist_count, 0);
+    assert!(default_server);
+
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 2, 'post-full-reset', 4, 'new', 'reset', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(sleeping_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = 2, storage_bytes = 4 WHERE id = $1",
+    )
+    .bind(sleeping_server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    complete_reset(&pool, &sleeping_reset, 2, 4, false)
+        .await
+        .unwrap();
+    let (state, desired, current, active, subdomain): (
+        ObservedState,
+        DesiredState,
+        i64,
+        Option<bool>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT s.observed_state, s.desired_state, s.current_snapshot_generation, p.active, s.subdomain
+         FROM servers s LEFT JOIN placements p ON p.server_id = s.id WHERE s.id = $1",
+    )
+    .bind(sleeping_server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (state, desired, current, active, subdomain),
+        (
+            ObservedState::Sleeping,
+            DesiredState::Stopped,
+            2,
+            None,
+            sleeping_subdomain
+        )
+    );
+    let retained_backups: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE server_id = $1")
+            .bind(sleeping_server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_backups, 2);
+
+    cleanup_test_entities(&pool, online_owner, &[worker]).await;
+    cleanup_test_entities(&pool, sleeping_owner, &[]).await;
 }

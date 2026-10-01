@@ -40,17 +40,17 @@ describe("whitelist interactions", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
       const method = init?.method ?? "GET";
-      if (path === "/api/v1/server/whitelist" && method === "POST") {
+      if (path === `/api/v1/servers/${server.id}/whitelist` && method === "POST") {
         expect(JSON.parse(String(init?.body))).toEqual({ player_id: player.player_id, name: "Alex" });
         present = true;
         return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
       }
-      if (path.startsWith("/api/v1/server/whitelist?player_id=") && method === "DELETE") {
+      if (path.startsWith(`/api/v1/servers/${server.id}/whitelist?player_id=`) && method === "DELETE") {
         expect(path).toContain(player.player_id);
         present = false;
         return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
       }
-      if (path === "/api/v1/server/whitelist") {
+      if (path === `/api/v1/servers/${server.id}/whitelist`) {
         const data: WhitelistState = present
           ? {
               enabled: true,
@@ -79,9 +79,9 @@ describe("whitelist interactions", () => {
       desired_state: "running" as const,
       settings: { ...server.settings, whitelist: true },
     };
-    client.setQueryData(queryKeys.server, online);
-    client.setQueryData(queryKeys.players, [player]);
-    client.setQueryData(queryKeys.whitelist, emptyWhitelist);
+    client.setQueryData(queryKeys.server(server.id), online);
+    client.setQueryData(queryKeys.players(server.id), [player]);
+    client.setQueryData(queryKeys.whitelist(server.id), emptyWhitelist);
     render(
       <Players initialServer={online} initialPlayers={[player]} initialWhitelist={emptyWhitelist} />,
       { wrapper: wrapper(client) },
@@ -105,9 +105,9 @@ describe("whitelist interactions", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { staleTime: Infinity, retry: false }, mutations: { retry: false } },
     });
-    client.setQueryData(queryKeys.server, server);
-    client.setQueryData(queryKeys.players, [player]);
-    client.setQueryData(queryKeys.whitelist, emptyWhitelist);
+    client.setQueryData(queryKeys.server(server.id), server);
+    client.setQueryData(queryKeys.players(server.id), [player]);
+    client.setQueryData(queryKeys.whitelist(server.id), emptyWhitelist);
     render(
       <Players initialServer={server} initialPlayers={[player]} initialWhitelist={emptyWhitelist} />,
       { wrapper: wrapper(client) },

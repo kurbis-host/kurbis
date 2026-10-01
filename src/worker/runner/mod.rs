@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
+mod exports;
 mod heartbeat;
 mod maintenance;
 mod operations;
@@ -20,9 +21,10 @@ use storage::{ensure_storage_limit, persistent_size};
 use crate::{
     config::{RuntimeConfig, WorkerConfig},
     control_plane::lifecycle::{
-        Lifecycle, claim_operation, complete_delete, complete_restore, complete_snapshot,
-        complete_start, complete_stop, mark_runtime_lost, recover_running_operations,
-        retry_operation, update_operation_payload, validate_delete,
+        Lifecycle, begin_snapshot_retry, claim_operation, complete_delete, complete_reset,
+        complete_restore, complete_snapshot, complete_start, complete_stop,
+        defer_snapshot_operation, mark_runtime_lost, recover_running_operations, retry_operation,
+        update_operation_payload, validate_delete,
     },
     model::{
         OperationKind, OperationRecord, PlacementRecord, SERVER_STORAGE_BYTES, SnapshotReason,
@@ -31,7 +33,10 @@ use crate::{
         docker::DockerRuntime,
         idle::IdleTimer,
         lease::WorkerLease,
-        panel_state::{clear_players, sync_players, sync_whitelist, write_whitelist_file},
+        panel_state::{
+            clear_players, sync_operators, sync_players, sync_whitelist, write_operator_file,
+            write_whitelist_file,
+        },
         runtime::{ServerRuntime, native::NativeRuntime},
         snapshot::SnapshotManager,
         snapshot_retry::SnapshotSchedule,
@@ -52,6 +57,8 @@ pub struct WorkerRunner {
     last_log_read: HashMap<Uuid, DateTime<Utc>>,
     last_local_gc: Instant,
     last_object_gc: Instant,
+    last_export_cleanup: Instant,
+    world_export_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WorkerRunner {
@@ -60,6 +67,10 @@ impl WorkerRunner {
         let recovered = recover_running_operations(&pool, config.id).await?;
         if recovered > 0 {
             tracing::warn!(worker_id = %config.id, recovered, "recovered interrupted worker operations");
+        }
+        let recovered_exports = exports::recover_running_exports(&pool, config.id).await?;
+        if recovered_exports > 0 {
+            tracing::warn!(worker_id = %config.id, recovered = recovered_exports, "recovered interrupted world exports");
         }
         tokio::fs::create_dir_all(config.root.join("servers")).await?;
         let snapshots = SnapshotManager::new(pool.clone(), &config.object_store).await?;
@@ -92,6 +103,8 @@ impl WorkerRunner {
             last_log_read: HashMap::new(),
             last_local_gc: Instant::now(),
             last_object_gc: Instant::now(),
+            last_export_cleanup: Instant::now(),
+            world_export_task: None,
         })
     }
 

@@ -15,6 +15,7 @@ export const lifecycle: Record<ObservedState, LifecyclePresentation> = {
   online: { label: "Online", short: "Ready for players.", detail: "The gateway is routing connections to the live runtime. The idle timer starts when the last player leaves.", tone: "good" },
   stopping: { label: "Stopping", short: "Closing the runtime cleanly.", detail: "New work is blocked while Kurbis prepares a final consistent world snapshot.", tone: "warning" },
   snapshotting: { label: "Snapshotting", short: "Saving the authoritative world state.", detail: "The worker stays reserved until the snapshot is complete and safe to restore.", tone: "progress" },
+  resetting: { label: "Resetting", short: "Preparing a fresh world generation.", detail: "The runtime is fenced while Kurbis backs up, resets, and validates the replacement world.", tone: "warning" },
   failed: { label: "Needs attention", short: "The last lifecycle operation failed.", detail: "Review the issue below. Retry is available when the failure is recoverable.", tone: "danger" },
   deleted: { label: "Deleted", short: "This hosted world has been removed.", detail: "Its address and runtime allocation are no longer active.", tone: "quiet" },
 };
@@ -29,5 +30,6 @@ export function lifecycleActions(server: Server) {
     canSnapshot: state === "online",
     canRestore: state === "sleeping",
     canDelete: state === "sleeping",
+    canReset: state === "sleeping" || state === "online",
   };
 }

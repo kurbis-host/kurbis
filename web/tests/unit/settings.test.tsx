@@ -18,14 +18,14 @@ function wrapper(client: QueryClient) {
 describe("settings draft isolation", () => {
   it("does not overwrite a dirty draft when live server state changes", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
-    client.setQueryData(queryKeys.server, server);
+    client.setQueryData(queryKeys.server(server.id), server);
     render(<Settings initialServer={server} />, { wrapper: wrapper(client) });
     const user = userEvent.setup();
     const motd = screen.getByRole("textbox", { name: "MOTD" });
     await user.clear(motd);
     await user.type(motd, "Draft survives SSE");
     await act(async () => {
-      client.setQueryData(queryKeys.server, { ...server, observed_state: "queued", desired_state: "running", updated_at: "2026-09-30T18:30:00Z" });
+      client.setQueryData(queryKeys.server(server.id), { ...server, observed_state: "queued", desired_state: "running", updated_at: "2026-09-30T18:30:00Z" });
     });
     await waitFor(() => expect(screen.getByText(/configuration is locked while the world is queued/i)).toBeVisible());
     expect(motd).toHaveValue("Draft survives SSE");

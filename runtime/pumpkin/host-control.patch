@@ -1,93 +1,73 @@
-diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
---- a/crates/pumpkin/src/lib.rs
-+++ b/crates/pumpkin/src/lib.rs
-@@ -8,6 +8,8 @@
- use crate::data::VanillaData;
- use crate::logging::{GzipRollingLogger, PumpkinCommandCompleter, ReadlineLogWrapper};
- use crate::net::bedrock::BedrockClient;
-+#[cfg(unix)]
-+use crate::net::host_control;
- use crate::net::java::JavaClient;
- use crate::net::java::pending::PendingConnection;
- use crate::net::{ClientPlatform, DisconnectReason, PacketHandlerResult};
-@@ -355,6 +357,9 @@
-             .fire(&self.server, &mut ServerLoadEvent::new(LoadType::Startup))
-             .await;
- 
-+        #[cfg(unix)]
-+        host_control::spawn(&self.server);
+diff --git a/crates/pumpkin-world/src/chunk/io/file_manager.rs b/crates/pumpkin-world/src/chunk/io/file_manager.rs
+--- a/crates/pumpkin-world/src/chunk/io/file_manager.rs
++++ b/crates/pumpkin-world/src/chunk/io/file_manager.rs
+@@ -10,7 +10,7 @@
+     join,
+     sync::{OnceCell, RwLock, mpsc},
+ };
+-use tracing::{debug, error, trace};
++use tracing::{error, trace};
+
+ use crate::{
+     chunk::{ChunkReadingError, ChunkWritingError, io::Dirtiable},
+@@ -365,10 +365,15 @@
+                         let was_dirty = chunk.is_dirty();
+                         chunk.mark_dirty(false);
+
+-                        if was_dirty {
+-                            writer
++                        if was_dirty
++                            && let Err(error) = writer
+                                 .update_chunk(chunk.clone(), &self.chunk_config)
+-                                .await?;
++                                .await
++                        {
++                            for retry in &chunk_locks {
++                                retry.mark_dirty(true);
++                            }
++                            return Err(error);
+                         }
+                     }
+                     // Write-lock released here — flush can proceed under a read-lock.
+@@ -383,19 +388,19 @@
+                     watchers.get(&path).is_some_and(|&c| c > 0)
+                 };
+
++                // A completed host snapshot must reach disk even while players
++                // watch this region. Failed writes remain eligible for retry.
++                {
++                    let serializer = chunk_serializer.read().await;
++                    if let Err(error) = serializer.write(&path).await {
++                        for retry in &chunk_locks {
++                            retry.mark_dirty(true);
++                        }
++                        return Err(ChunkWritingError::IoError(error));
++                    }
++                }
 +
-         while !SHOULD_STOP.load(Ordering::Relaxed) {
-             if !self
-                 .unified_listener_task(&mut master_client_id, &tasks, &bedrock_clients)
-diff --git a/crates/pumpkin/src/net/mod.rs b/crates/pumpkin/src/net/mod.rs
---- a/crates/pumpkin/src/net/mod.rs
-+++ b/crates/pumpkin/src/net/mod.rs
-@@ -28,6 +28,8 @@
- use uuid::Uuid;
- pub mod authentication;
- pub mod bedrock;
-+#[cfg(unix)]
-+pub mod host_control;
- pub mod java;
- pub mod lan_broadcast;
- mod proxy;
-diff --git a/crates/pumpkin-world/src/chunk/mod.rs b/crates/pumpkin-world/src/chunk/mod.rs
---- a/crates/pumpkin-world/src/chunk/mod.rs
-+++ b/crates/pumpkin-world/src/chunk/mod.rs
-@@ -90,6 +90,8 @@
-     /// Chunk Z
-     pub z: i32,
-     pub data: Mutex<Vec<NbtCompound>>,
-+    /// Whether serialized entity data was consumed into live world entities.
-+    pub live: AtomicBool,
- 
-     pub dirty: AtomicBool,
- }
-diff --git a/crates/pumpkin-world/src/chunk/format/mod.rs b/crates/pumpkin-world/src/chunk/format/mod.rs
---- a/crates/pumpkin-world/src/chunk/format/mod.rs
-+++ b/crates/pumpkin-world/src/chunk/format/mod.rs
-@@ -639,6 +639,7 @@
-             x: position.x,
-             z: position.y,
-             data: Mutex::new(entities),
-+            live: AtomicBool::new(false),
-             dirty: AtomicBool::new(false),
-         })
-     }
+                 if !is_watched {
+-                    // A read-lock suffices for `write()` since we have already
+-                    // applied all mutations above.
+-                    {
+-                        let serializer = chunk_serializer.read().await;
+-                        debug!("Flushing {} to disk", path.display());
+-                        serializer
+-                            .write(&path)
+-                            .await
+-                            .map_err(ChunkWritingError::IoError)?;
+-                        // Read-lock released here.
+-                    };
+-
+                     // Drop our handle so `can_remove` may succeed.
+                     drop(chunk_serializer);
+
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
-@@ -306,6 +306,7 @@
-                     x: pos.x,
-                     z: pos.y,
-                     data: tokio::sync::Mutex::new(Vec::new()),
-+                    live: AtomicBool::new(false),
-                     dirty: AtomicBool::new(false),
-                 });
- 
-@@ -327,6 +328,7 @@
-                         x: pos.x,
-                         z: pos.y,
-                         data: tokio::sync::Mutex::new(Vec::new()),
-+                        live: AtomicBool::new(false),
-                         dirty: AtomicBool::new(false),
-                     });
- 
-@@ -353,6 +355,37 @@
-         F::Output: Send + 'static,
-     {
+@@ -353,6 +353,30 @@
          self.tasks.spawn(task)
-+    }
-+
-+    pub fn live_entity_chunk_positions(&self) -> Vec<Vector2<i32>> {
-+        self.loaded_entity_chunks
-+            .iter()
-+            .filter(|entry| entry.value().live.load(Ordering::Relaxed))
-+            .map(|entry| *entry.key())
-+            .collect()
-+    }
-+
+     }
+
 +    /// Await serialization and disk writes, including regions kept hot by watchers.
 +    pub async fn save_for_snapshot(&self) -> Result<(), String> {
 +        let chunks = self
@@ -99,6 +79,7 @@ diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.
 +            .save_chunks(&self.level_folder, chunks)
 +            .await
 +            .map_err(|error| format!("Chunk save failed: {error}"))?;
++
 +        let entities = self
 +            .loaded_entity_chunks
 +            .iter()
@@ -109,383 +90,78 @@ diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.
 +            .await
 +            .map_err(|error| format!("Entity save failed: {error}"))?;
 +        Ok(())
-     }
- 
-     pub async fn shutdown(&self) {
-diff --git a/crates/pumpkin-world/src/chunk/io/file_manager.rs b/crates/pumpkin-world/src/chunk/io/file_manager.rs
---- a/crates/pumpkin-world/src/chunk/io/file_manager.rs
-+++ b/crates/pumpkin-world/src/chunk/io/file_manager.rs
-@@ -10,7 +10,7 @@
-     join,
-     sync::{OnceCell, RwLock, mpsc},
- };
--use tracing::{debug, error, trace};
-+use tracing::{error, trace};
- 
- use crate::{
-     chunk::{
-@@ -31,8 +31,8 @@
- ///   All readers/writers for the same region file share this lock, so there
- ///   are never two concurrent writers for the same file.
- /// * `watchers` — a ref-count per path.  While a path has active watchers the
--///   serializer is **not** evicted from the cache and the file is **not**
--///   flushed to disk (the caller owns the flush lifecycle).
-+///   serializer is retained in the cache. Saves still flush to disk so a
-+///   completed save is a valid recovery boundary while players remain online.
- ///
- /// ### Lock ordering (must never be violated to avoid deadlocks)
- ///
-@@ -357,7 +357,14 @@
-                             chunk.mark_dirty(false);
- 
-                             if was_dirty {
--                                writer.update_chunk(&**chunk, &self.chunk_config).await?;
-+                                if let Err(error) =
-+                                    writer.update_chunk(&**chunk, &self.chunk_config).await
-+                                {
-+                                    for retry in &chunk_locks {
-+                                        retry.mark_dirty(true);
-+                                    }
-+                                    return Err(error);
-+                                }
-                             }
-                         }
-                         // Write-lock released here — flush can proceed under a read-lock.
-@@ -372,23 +379,20 @@
-                         watchers.get(&path).is_some_and(|&c| c > 0)
-                     };
- 
-+                    // A save must reach disk even while players watch this region.
-+                    // Keep a read-lock through the write so the serialized data cannot
-+                    // change during persistence. Failed writes remain eligible for retry.
-+                    {
-+                        let serializer = chunk_serializer.read().await;
-+                        if let Err(error) = serializer.write(&path).await {
-+                            for retry in &chunk_locks {
-+                                retry.mark_dirty(true);
-+                            }
-+                            return Err(ChunkWritingError::IoError(error));
-+                        }
-+                    }
-+                    drop(chunk_serializer);
-                     if !is_watched {
--                        // A read-lock suffices for `write()` since we have already
--                        // applied all mutations above.
--                        {
--                            let serializer = chunk_serializer.read().await;
--                            debug!("Flushing {} to disk", path.display());
--                            serializer
--                                .write(&path)
--                                .await
--                                .map_err(ChunkWritingError::IoError)?;
--                            // Read-lock released here.
--                        };
--
--                        // Drop our handle so `can_remove` may succeed.
--                        drop(chunk_serializer);
--
--                        // Evict the cache entry when no longer needed.
-                         self.maybe_evict(&path).await;
-                     }
- 
-diff --git a/crates/pumpkin/src/world/mod.rs b/crates/pumpkin/src/world/mod.rs
---- a/crates/pumpkin/src/world/mod.rs
-+++ b/crates/pumpkin/src/world/mod.rs
-@@ -372,9 +372,10 @@
-     }
- 
-     pub async fn shutdown(&self) {
--        for entity in self.entities.load().iter() {
--            self.save_entity(entity).await;
--        }
-+        let entities = self.entities.load_full();
-+        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-+            .await;
-+        self.save_block_entities().await;
- 
-         // Save portal POI to disk
-         let save_result = self.portal_poi.lock().await.save_all();
-@@ -385,18 +386,72 @@
-         self.level.shutdown().await;
-     }
- 
--    /// Serializes a live entity into its current chunk's entity data. The live
--    /// entity list is the source of truth while a chunk is loaded (its saved NBT
--    /// is consumed on load), so this simply appends the entity to the chunk it is
--    /// currently in; the chunk is rewritten from scratch every unload cycle, so
--    /// there is nothing stale to deduplicate.
--    async fn save_entity(&self, entity: &Arc<dyn EntityBase>) {
--        let current_chunk = entity.get_entity().block_pos.load().chunk_position();
--        let mut nbt = NbtCompound::new();
--        entity.write_nbt(&mut nbt).await;
--        let chunk = self.level.get_entity_chunk(current_chunk).await;
--        chunk.data.lock().await.push(nbt);
--        chunk.mark_dirty(true);
-+    async fn save_entities_by_chunk(
-+        &self,
-+        entities: &[Arc<dyn EntityBase>],
-+        snapshot_chunks: impl IntoIterator<Item = Vector2<i32>>,
-+    ) {
-+        let mut groups: HashMap<Vector2<i32>, Vec<NbtCompound>> = HashMap::new();
-+        for entity in entities {
-+            let mut nbt = NbtCompound::new();
-+            entity.write_nbt(&mut nbt).await;
-+            groups
-+                .entry(entity.get_entity().chunk_pos.load())
-+                .or_default()
-+                .push(nbt);
-+        }
-+        for pos in snapshot_chunks {
-+            groups.entry(pos).or_default();
-+        }
-+        for (pos, fresh) in groups {
-+            let chunk = if fresh.is_empty() {
-+                let Some(chunk) = self.level.get_entity_chunk_sync(&pos) else {
-+                    continue;
-+                };
-+                chunk
-+            } else {
-+                self.level.get_entity_chunk(pos).await
-+            };
-+            let mut data = chunk.data.lock().await;
-+            if chunk.live.load(Relaxed) {
-+                *data = fresh;
-+            } else {
-+                for record in fresh {
-+                    if let Some(uuid) = record.get_uuid("UUID") {
-+                        data.retain(|existing| existing.get_uuid("UUID") != Some(uuid));
-+                    }
-+                    data.push(record);
-+                }
-+            }
-+            drop(data);
-+            chunk.mark_dirty(true);
-+        }
 +    }
 +
-+    async fn save_block_entities(&self) {
-+        let entities: Vec<_> = self
-+            .block_entities
-+            .iter()
-+            .flat_map(|entry| entry.value().values().cloned().collect::<Vec<_>>())
-+            .collect();
-+        for entity in entities {
-+            let mut nbt = NbtCompound::new();
-+            entity.write_internal(&mut nbt).await;
-+            self.add_block_entity_nbt(entity.get_position(), &nbt);
-+        }
-+    }
-+
-+    pub async fn save_for_snapshot(&self) -> Result<(), String> {
-+        let entities = self.entities.load_full();
-+        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-+            .await;
-+        self.save_block_entities().await;
-+        self.portal_poi
-+            .lock()
-+            .await
-+            .save_all()
-+            .map_err(|error| format!("POI save failed: {error}"))?;
-+        self.level.save_for_snapshot().await
-     }
- 
-     /// Sends an entity status update to all players tracking the specified entity.
-@@ -3741,6 +3796,7 @@
-                     // a duplicate copy that would be re-appended on the next unload
-                     // and doubled on every reload.
-                     let entity_nbts = std::mem::take(&mut *chunk.data.lock().await);
-+                    chunk.live.store(true, Relaxed);
-                     let mut entities_to_add: Vec<Arc<dyn EntityBase>> =
-                         Vec::with_capacity(entity_nbts.len());
-                     for entity_nbt in &entity_nbts {
-@@ -4319,12 +4375,17 @@
-             new_entities
-         });
- 
-+        self.save_entities_by_chunk(&entities_to_remove, chunks_set.iter().copied())
-+            .await;
-+        self.save_block_entities().await;
-         for entity in entities_to_remove {
--            self.save_entity(&entity).await;
-             self.spawn_state.load().remove_entity(self, entity.as_ref());
-         }
- 
-         for chunk_pos in &chunks_set {
-+            if let Some(chunk) = self.level.get_entity_chunk_sync(chunk_pos) {
-+                chunk.live.store(false, Relaxed);
-+            }
-             self.block_entities.remove(chunk_pos);
-         }
-     }
-diff --git a/crates/pumpkin/src/server/mod.rs b/crates/pumpkin/src/server/mod.rs
---- a/crates/pumpkin/src/server/mod.rs
-+++ b/crates/pumpkin/src/server/mod.rs
-@@ -45,7 +45,7 @@
- use std::fs;
- use std::net::IpAddr;
- use std::sync::Arc;
--use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
-+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64};
- use std::{future::Future, sync::atomic::Ordering, time::Duration};
- use tokio::sync::{Mutex, OnceCell, RwLock};
- use tokio::task::{JoinHandle, JoinSet};
-@@ -104,6 +104,8 @@
-     pub dimensions: Vec<Dimension>,
-     /// Assigns unique IDs to containers.
-     container_id: AtomicU32,
-+    /// Changes for every successful player join and leave, including brief sessions.
-+    pub player_activity_revision: AtomicU64,
-     pub recipe_manager: Arc<recipe::RecipeManager>,
-     /// Assigns unique IDs to maps.
-     map_id: AtomicI32,
-@@ -264,6 +266,7 @@
-             ))),
-             permission_registry,
-             container_id: 0.into(),
-+            player_activity_revision: AtomicU64::new(0),
-             recipe_manager: Arc::new(recipe::RecipeManager::new()),
-             map_id: level_info.load().map_id.into(),
-             worlds: ArcSwap::from_pointee(vec![]),
-@@ -561,6 +564,7 @@
-                 if world
-                     .add_player(&player)
-                     .is_ok() {
-+                    self.player_activity_revision.fetch_add(1, Ordering::Release);
-                     let mut user_cache = self.data.user_cache.write().await;
-                     user_cache.upsert(player.gameprofile.id, player.gameprofile.name.clone());
- 
-@@ -586,6 +590,8 @@
-     }
- 
-     pub async fn remove_player(&self, player: &Player) {
-+        self.player_activity_revision
-+            .fetch_add(1, Ordering::Release);
-         player
-             .increment_stat(
-                 pumpkin_data::statistic::StatisticCategory::Custom,
-@@ -595,6 +601,26 @@
-             .await;
-         // TODO: Config if we want decrease online
-         self.listing.lock().await.remove_player(player);
-+    }
-+
-+    /// Save the full hosting recovery boundary before acknowledging host control.
-+    pub async fn save_all(&self) -> Result<(), String> {
-+        self.world_info_writer
-+            .write_world_info(&self.level_info.load(), &self.basic_config.get_world_path())
-+            .map_err(|error| format!("World info save failed: {error}"))?;
-+        self.player_data_storage
-+            .save_all_players(self)
-+            .await
-+            .map_err(|error| format!("Player save failed: {error}"))?;
-+        self.advancement_manager
-+            .save_all_players(&self.get_all_players())
-+            .await
-+            .map_err(|error| format!("Advancement save failed: {error}"))?;
-+        let worlds = self.worlds.load_full();
-+        for world in worlds.iter() {
-+            world.save_for_snapshot().await?;
-+        }
-+        Ok(())
-     }
- 
      pub async fn shutdown(&self) {
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/move_actor_delta.rs b/crates/pumpkin-protocol/src/bedrock/client/move_actor_delta.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/move_actor_delta.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/move_actor_delta.rs
-@@ -53,26 +53,29 @@
- impl PacketWrite for CMoveActorDelta {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
-         self.entity_runtime_id.write(writer)?;
--        self.flags.write(writer)?;
--
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_X != 0 {
--            self.x.write(writer)?;
--        }
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_Y != 0 {
--            self.y.write(writer)?;
--        }
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_Z != 0 {
--            self.z.write(writer)?;
--        }
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_PITCH != 0 {
--            self.pitch.write(writer)?;
--        }
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_YAW != 0 {
--            self.yaw.write(writer)?;
--        }
--        if self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_HEAD_YAW != 0 {
--            self.head_yaw.write(writer)?;
--        }
-+        // Protocol 2168 uses independent optionals, not a packed flag word.
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_X != 0)
-+            .then_some(self.x)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_Y != 0)
-+            .then_some(self.y)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_Z != 0)
-+            .then_some(self.z)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_PITCH != 0)
-+            .then_some(self.pitch)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_YAW != 0)
-+            .then_some(self.yaw)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_HAS_HEAD_YAW != 0)
-+            .then_some(self.head_yaw)
-+            .write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_ON_GROUND != 0).write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_TELEPORT != 0).write(writer)?;
-+        (self.flags & MOVE_ACTOR_DELTA_FLAG_FORCE_MOVE != 0).write(writer)?;
-+        false.write(writer)?; // Force completion.
-         Ok(())
-     }
+         let world_id = self.level_folder.root_folder.display();
+         info!("Saving level ({})...", world_id);
+diff --git a/crates/pumpkin/src/entity/player.rs b/crates/pumpkin/src/entity/player.rs
+--- a/crates/pumpkin/src/entity/player.rs
++++ b/crates/pumpkin/src/entity/player.rs
+@@ -396,6 +396,8 @@
  }
+
+ pub struct Player {
++    /// Unique for this authenticated client connection, including reconnects.
++    pub connection_id: uuid::Uuid,
+     /// The underlying living entity object that represents the player.
+     pub living_entity: LivingEntity,
+     /// The player's game profile information, including their username and UUID.
+@@ -718,6 +720,7 @@
+         let initially_loaded = !supports_player_loaded;
+
+         Self {
++            connection_id: uuid::Uuid::new_v4(),
+             living_entity,
+             config: ArcSwap::new(Arc::new(config)),
+             advancements: Arc::new(Mutex::new(
+diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
+--- a/crates/pumpkin/src/lib.rs
++++ b/crates/pumpkin/src/lib.rs
+@@ -474,6 +474,9 @@
+             .fire(&self.server, &mut ServerLoadEvent::new(LoadType::Startup))
+             .await;
+
++        #[cfg(unix)]
++        crate::net::host_control::spawn(&self.server);
++
+         self.server.start_telemetry();
+
+         while !SHOULD_STOP.load(Ordering::Relaxed) {
+diff --git a/crates/pumpkin/src/net/bedrock/login/login.rs b/crates/pumpkin/src/net/bedrock/login/login.rs
+--- a/crates/pumpkin/src/net/bedrock/login/login.rs
++++ b/crates/pumpkin/src/net/bedrock/login/login.rs
+@@ -60,6 +60,26 @@
+         } else {
+             pumpkin_auth::jwt::extract_oidc_token_player_claims(&auth_payload.token)?
+         };
++
++        let verified_xuid = if server.advanced_config.networking.bedrock.online_mode
++            && server
++                .advanced_config
++                .networking
++                .bedrock
++                .authentication
++                .enabled
++            && matches!(auth_payload.authentication_type, AuthenticationType::Full)
++        {
++            player_data
++                .xuid
++                .parse::<u64>()
++                .ok()
++                .filter(|xuid| *xuid > 0)
++                .map(|xuid| xuid.to_string())
++        } else {
++            None
++        };
++        self.verified_xuid.store(std::sync::Arc::new(verified_xuid));
+
+         let raw_token_str = std::str::from_utf8(&packet.raw_token).map_err(|_| {
+             LoginError::InvalidTokenFormat(serde_json::Error::custom(
 diff --git a/crates/pumpkin/src/net/bedrock/mod.rs b/crates/pumpkin/src/net/bedrock/mod.rs
 --- a/crates/pumpkin/src/net/bedrock/mod.rs
 +++ b/crates/pumpkin/src/net/bedrock/mod.rs
-@@ -352,8 +352,28 @@
-     }
- 
-     pub async fn kick(&self, reason: DisconnectReason, message: String) {
-+        let first = self.output_sequence_number.load(Ordering::Relaxed);
-         self.send_game_packet(&CDisconnectPlayer::new(reason as i32, message))
-             .await;
-+        let end = self.output_sequence_number.load(Ordering::Relaxed);
-+        // The unreliable RakNet close must not overtake the reliable Minecraft
-+        // disconnect. Keep retransmission/ACK handling alive until delivery or
-+        // a bounded timeout; enqueue completion alone only confirms UDP send.
-+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-+            loop {
-+                let pending = self
-+                    .unacked_outgoing_frames
-+                    .lock()
-+                    .await
-+                    .keys()
-+                    .any(|seq| seq.wrapping_sub(first) < end.wrapping_sub(first));
-+                if !pending || self.is_closed() {
-+                    break;
-+                }
-+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-+            }
-+        })
-+        .await;
-         self.close().await;
-     }
- 
-@@ -1298,7 +1318,8 @@
-                     .as_ref()
-                     .map_or(0, |p| p.online) as u32
-             };
--            if player_count >= server.advanced_config.networking.bedrock.max_players {
-+            let max_players = server.advanced_config.networking.bedrock.max_players;
-+            if max_players > 0 && player_count >= max_players {
-                 Self::send_offline_packet(
-                     &CNoFreeIncomingConnections::new(server.server_guid),
-                     addr,
-@@ -123,6 +123,7 @@
+@@ -100,6 +100,7 @@
      pub player: ArcSwap<Option<Arc<Player>>>,
      pub version: AtomicCell<BedrockMinecraftVersion>,
      pub client_data: ArcSwap<Option<Arc<ClientData>>>,
@@ -493,673 +169,106 @@ diff --git a/crates/pumpkin/src/net/bedrock/mod.rs b/crates/pumpkin/src/net/bedr
      /// All Bedrock clients
      /// This list is used to remove the client if the connection gets closed
      pub be_clients: Arc<Mutex<HashMap<SocketAddr, Arc<Self>>>>,
-@@ -184,6 +185,7 @@
+@@ -155,6 +156,7 @@
              address,
              version: AtomicCell::new(BedrockMinecraftVersion::Unknown),
              client_data: ArcSwap::new(Arc::new(None)),
 +            verified_xuid: ArcSwap::new(Arc::new(None)),
              be_clients,
-             network_writer: Arc::new(RwLock::new(UDPNetworkEncoder::new())),
-             network_reader: Mutex::new(UDPNetworkDecoder::new()),
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/transfer.rs b/crates/pumpkin-protocol/src/bedrock/client/transfer.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/transfer.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/transfer.rs
-@@ -2,7 +2,6 @@
- 
- use crate::serial::PacketWrite;
- 
--#[derive(PacketWrite)]
- #[packet(85)]
- pub struct CTransfer {
-     pub address: String,
-@@ -20,3 +19,13 @@
+             network_writer: Arc::new(RwLock::new(BedrockBatchEncoder::new())),
+             network_reader: Mutex::new(BedrockBatchDecoder::new()),
+diff --git a/crates/pumpkin/src/net/mod.rs b/crates/pumpkin/src/net/mod.rs
+--- a/crates/pumpkin/src/net/mod.rs
++++ b/crates/pumpkin/src/net/mod.rs
+@@ -31,6 +31,8 @@
+ use uuid::Uuid;
+ pub mod authentication;
+ pub mod bedrock;
++#[cfg(unix)]
++pub mod host_control;
+ pub mod chat;
+ pub mod chunk_sender;
+ pub use chunk_sender::ChunkSender;
+diff --git a/crates/pumpkin/src/server/mod.rs b/crates/pumpkin/src/server/mod.rs
+--- a/crates/pumpkin/src/server/mod.rs
++++ b/crates/pumpkin/src/server/mod.rs
+@@ -44,7 +44,7 @@
+ use std::fs;
+ use std::net::IpAddr;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64};
+ use std::{future::Future, sync::atomic::Ordering, time::Duration};
+ use tokio::sync::OnceCell;
+ use tokio::task::JoinHandle;
+@@ -101,6 +101,8 @@
+     pub dimensions: Vec<Dimension>,
+     /// Assigns unique IDs to containers.
+     container_id: AtomicU32,
++    /// Changes for every successful player join and leave, including brief sessions.
++    pub player_activity_revision: AtomicU64,
+     pub recipe_manager: Arc<recipe::RecipeManager>,
+     pub datapack_manager: Arc<crate::data::datapack::DatapackManager>,
+     pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
+@@ -284,6 +286,7 @@
+             plugin_manager: Arc::new(PluginManager::new(verify_plugin_signatures)),
+             permission_manager,
+             container_id: 0.into(),
++            player_activity_revision: AtomicU64::new(0),
+             recipe_manager: Arc::new(recipe::RecipeManager::new()),
+             datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
+             enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
+@@ -603,7 +606,10 @@
          }
-     }
- }
-+
-+impl PacketWrite for CTransfer {
-+    fn write<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
-+        self.address.write(writer)?;
-+        self.port.write(writer)?;
-+        self.reload_world.write(writer)?;
-+        // Protocol 2168 adds optional GatheringJoinInfo after reload_world.
-+        false.write(writer)
-+    }
-+}
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/level_chunk.rs b/crates/pumpkin-protocol/src/bedrock/client/level_chunk.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/level_chunk.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/level_chunk.rs
-@@ -27,9 +27,10 @@
- 
-         VarInt(self.dimension).write(writer)?;
-         let sub_chunk_count = self.chunk.section.count as u32;
--        debug_assert_eq!(sub_chunk_count, 24);
-         VarUInt(sub_chunk_count).write(writer)?;
-+        false.write(writer)?; // No limited sub-chunk request mode.
-         self.cache_enabled.write(writer)?;
-+        VarUInt(0).write(writer)?; // Blob hashes are always present in protocol 2168.
- 
-         let mut chunk_data = Vec::new();
-         let data_write = &mut chunk_data;
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/set_actor_data.rs b/crates/pumpkin-protocol/src/bedrock/client/set_actor_data.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/set_actor_data.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/set_actor_data.rs
-@@ -79,6 +79,7 @@
-         for (key, value) in &self.0 {
-             VarUInt(*key).write(writer)?;
-             VarUInt(value.type_id()).write(writer)?;
-+            (value.type_id() as u8).write(writer)?; // Protocol 2168 redundant legacy type.
-             value.write(writer)?;
+
+         for world in self.worlds.load().iter() {
+-            world.save().await;
++            world
++                .save_for_snapshot()
++                .await
++                .map_err(|error| format!("World snapshot save failed: {error}"))?;
          }
+
          Ok(())
-diff --git a/crates/pumpkin-protocol/src/bedrock/server/resource_pack_response.rs b/crates/pumpkin-protocol/src/bedrock/server/resource_pack_response.rs
---- a/crates/pumpkin-protocol/src/bedrock/server/resource_pack_response.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/server/resource_pack_response.rs
-@@ -1,16 +1,37 @@
--use crate::serial::PacketRead;
-+use crate::{codec::var_uint::VarUInt, serial::PacketRead};
- use pumpkin_macros::packet;
-+use std::io::{Error, ErrorKind, Read};
- 
--#[derive(PacketRead)]
- #[packet(8)]
- pub struct SResourcePackResponse {
--    pub response: u8,
--    pub download_size: u16,
-+    pub response: u32,
- }
- 
- impl SResourcePackResponse {
--    pub const STATUS_REFUSED: u8 = 1;
--    pub const STATUS_SEND_PACKS: u8 = 2;
--    pub const STATUS_HAVE_ALL_PACKS: u8 = 3;
--    pub const STATUS_COMPLETED: u8 = 4;
-+    pub const STATUS_REFUSED: u32 = 0;
-+    pub const STATUS_SEND_PACKS: u32 = 1;
-+    pub const STATUS_HAVE_ALL_PACKS: u32 = 2;
-+    pub const STATUS_COMPLETED: u32 = 3;
- }
-+
-+impl PacketRead for SResourcePackResponse {
-+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
-+        let response = VarUInt::read(reader)?.0;
-+        // Protocol 2168 repeats the status as a string. Pack IDs are present
-+        // only for SendPacks; the old byte/status + short/count layout is gone.
-+        let _ = String::read(reader)?;
-+        if response == Self::STATUS_SEND_PACKS {
-+            let count = VarUInt::read(reader)?.0;
-+            if count > 1024 {
-+                return Err(Error::new(
-+                    ErrorKind::InvalidData,
-+                    "too many resource pack IDs",
-+                ));
-+            }
-+            for _ in 0..count {
-+                let _ = String::read(reader)?;
-+            }
-+        }
-+        Ok(Self { response })
-+    }
-+}
-diff --git a/crates/pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs b/crates/pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs
---- a/crates/pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs
-+++ b/crates/pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs
-@@ -2497,14 +2497,6 @@
-                 protocol_version: p.protocol_version.try_into().unwrap(),
-             }))
-         }
--        id if id == <pumpkin_protocol::bedrock::server::SResourcePackResponse as pumpkin_protocol::Packet>::PACKET_ID as i32 => {
--            use pumpkin_protocol::BServerPacket;
--            let p = <pumpkin_protocol::bedrock::server::SResourcePackResponse as pumpkin_protocol::BServerPacket>::read(&mut Cursor::new(payload)).ok()?;
--            Some(BServerboundPacket::SResourcePackResponse(crate::plugin::loader::wasm::wasm_host::wit::v0_1::pumpkin::plugin::bedrock_packets::SResourcePackResponse {
--                response: p.response.try_into().unwrap(),
--                download_size: p.download_size.try_into().unwrap(),
--            }))
--        }
-         id if id == <pumpkin_protocol::bedrock::server::SSetLocalPlayerAsInitialized as pumpkin_protocol::Packet>::PACKET_ID as i32 => {
-             use pumpkin_protocol::BServerPacket;
-             let p = <pumpkin_protocol::bedrock::server::SSetLocalPlayerAsInitialized as pumpkin_protocol::BServerPacket>::read(&mut Cursor::new(payload)).ok()?;
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/creative_content.rs b/crates/pumpkin-protocol/src/bedrock/client/creative_content.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/creative_content.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/creative_content.rs
-@@ -41,7 +41,7 @@
- 
- impl PacketWrite for CreativeCategory {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
--        (*self as i32).write(writer)?;
-+        (*self as u8).write(writer)?;
-         Ok(())
+@@ -700,6 +706,8 @@
+             'after: {
+                 player.screen_handler_sync_handler.store_player(player.clone());
+                 world.add_player(&player).is_ok().then(|| {
++                    self.player_activity_revision
++                        .fetch_add(1, Ordering::Release);
+                     {
+                         let mut user_cache = self
+                             .data
+@@ -732,6 +740,8 @@
      }
- }
-diff --git a/crates/pumpkin-protocol/src/bedrock/network_item.rs b/crates/pumpkin-protocol/src/bedrock/network_item.rs
---- a/crates/pumpkin-protocol/src/bedrock/network_item.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/network_item.rs
-@@ -33,22 +33,36 @@
-     }
- }
- 
-+impl NetworkItemDescriptor {
-+    /// Writes the ItemV4 wire format used by AddPlayer in Bedrock 1.26.40.
-+    pub fn write_v4<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
-+        i16::try_from(self.id.0)
-+            .map_err(|error| Error::new(std::io::ErrorKind::InvalidInput, error))?
-+            .write(writer)?;
-+        self.stack_size.write(writer)?;
-+        self.aux_value.write(writer)?;
-+        false.write(writer)?;
-+        self.block_runtime_id.write(writer)?;
-+
-+        let mut extra = Vec::new();
-+        self.write_extra_data(&mut extra)?;
-+        VarUInt(extra.len() as u32).write(writer)?;
-+        writer.write_all(&extra)
-+    }
-+}
-+
- impl PacketRead for NetworkItemDescriptor {
-     fn read<R: Read>(buf: &mut R) -> Result<Self, Error> {
--        let id = VarInt::read(buf)?;
--        if id.0 == 0 {
--            return Ok(Self::default());
--        }
-+        let id = VarInt(i32::from(i16::read(buf)?));
-         let stack_size = u16::read(buf)?;
-         let aux_value = VarUInt::read(buf)?;
- 
-         let has_net_id = bool::read(buf)?;
-         if has_net_id {
--            let _variant = VarUInt::read(buf)?;
-             let _net_id = VarInt::read(buf)?;
+
+     pub fn remove_player(&self, player: &Player) {
++        self.player_activity_revision
++            .fetch_add(1, Ordering::Release);
+         player.increment_stat(
+             pumpkin_data::statistic::StatisticCategory::Custom,
+             pumpkin_data::statistic::CustomStatistic::LeaveGame as i32,
+diff --git a/crates/pumpkin/src/world/mod.rs b/crates/pumpkin/src/world/mod.rs
+--- a/crates/pumpkin/src/world/mod.rs
++++ b/crates/pumpkin/src/world/mod.rs
+@@ -7108,6 +7108,20 @@
          }
- 
--        let block_runtime_id = VarInt::read(buf)?;
-+        let block_runtime_id = VarInt(VarUInt::read(buf)?.0 as i32);
- 
-         let user_data_len = VarUInt::read(buf)?.0;
-         let mut user_data = vec![0u8; user_data_len as usize];
-@@ -69,15 +83,8 @@
-                     .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
-             }
- 
--            let place_on_len = VarUInt::read(&mut cursor)?.0;
--            for _ in 0..place_on_len {
--                place_on_blocks.push(String::read(&mut cursor)?);
--            }
--
--            let destroy_len = VarUInt::read(&mut cursor)?.0;
--            for _ in 0..destroy_len {
--                destroy_blocks.push(String::read(&mut cursor)?);
--            }
-+            place_on_blocks = read_block_list(&mut cursor)?;
-+            destroy_blocks = read_block_list(&mut cursor)?;
- 
-             if id.0 == (BedrockItem::SHIELD.id as i32) {
-                 shield_blocking_tick = i64::read(&mut cursor)?;
-@@ -105,7 +112,7 @@
-         net_id: Option<Option<VarInt>>,
-     ) -> Result<(), Error> {
-         self.id.write(writer)?;
--        if self.id.0 != 0 {
-+        {
-             self.stack_size.write(writer)?;
-             self.aux_value.write(writer)?;
- 
-@@ -116,30 +123,47 @@
-             self.block_runtime_id.write(writer)?;
- 
-             let mut buf = Vec::new();
--
--            if self.nbt_data.is_empty() {
--                (0i16).write(&mut buf)?;
--            } else {
--                (-1i16).write(&mut buf)?;
--                (1i8).write(&mut buf)?;
--
--                self.nbt_data.clone().write_to_writer_bedrock(&mut buf)?;
--            }
--
--            (self.place_on_blocks.len() as u32).write(&mut buf)?;
--            self.place_on_blocks.write(&mut buf)?;
--
--            (self.destroy_blocks.len() as u32).write(&mut buf)?;
--            self.destroy_blocks.write(&mut buf)?;
--
--            if self.id.0 == (BedrockItem::SHIELD.id as i32) {
--                self.shield_blocking_tick.write(&mut buf)?;
--            }
--
-+            self.write_extra_data(&mut buf)?;
-             VarUInt(buf.len() as u32).write(writer)?;
-             writer.write_all(&buf)?;
-         }
-         Ok(())
-+    }
-+
-+    fn write_extra_data<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
-+        if self.nbt_data.is_empty() {
-+            (0i16).write(writer)?;
-+        } else {
-+            (-1i16).write(writer)?;
-+            (1i8).write(writer)?;
-+            self.nbt_data
-+                .clone()
-+                .write_to_writer_bedrock(&mut *writer)?;
-+        }
-+
-+        write_block_list(writer, &self.place_on_blocks)?;
-+        write_block_list(writer, &self.destroy_blocks)?;
-+        if self.id.0 == BedrockItem::SHIELD.id as i32 {
-+            self.shield_blocking_tick.write(writer)?;
-+        }
-+        Ok(())
-+    }
-+}
-+
-+#[cfg(test)]
-+mod item_v4_tests {
-+    use super::NetworkItemDescriptor;
-+
-+    #[test]
-+    fn empty_item_uses_bedrock_12640_add_player_layout() {
-+        let mut encoded = Vec::new();
-+        NetworkItemDescriptor::default()
-+            .write_v4(&mut encoded)
-+            .unwrap();
-+
-+        assert_eq!(encoded.len(), 18);
-+        assert_eq!(&encoded[..8], &[0, 0, 0, 0, 0, 0, 0, 10]);
-+        assert_eq!(&encoded[8..], &[0; 10]);
      }
- }
- 
-@@ -180,49 +204,38 @@
- 
- impl PacketWrite for ItemStackWrapper {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
--        VarInt(self.id as i32).write(writer)?;
--
--        if self.id != 0 {
--            self.stack_size.write(writer)?;
--
--            self.aux_value.write(writer)?;
--
--            self.net_id.is_some().write(writer)?;
--
--            if let Some(id) = self.net_id {
--                VarInt(id.get()).write(writer)?;
--            }
--
--            self.block_runtime_id.write(writer)?;
--
--            let mut buf = Vec::new();
--
--            if self.nbt_data.is_empty() {
--                (0i16).write(&mut buf)?;
--            } else {
--                (-1i16).write(&mut buf)?;
--                (1i8).write(&mut buf)?;
--
--                self.nbt_data.clone().write_to_writer_bedrock(&mut buf)?;
--            }
--
--            (self.place_on_blocks.len() as u32).write(&mut buf)?;
--            for block in &self.place_on_blocks {
--                block.write(&mut buf)?;
--            }
--
--            (self.destroy_blocks.len() as u32).write(&mut buf)?;
--            for block in &self.destroy_blocks {
--                block.write(&mut buf)?;
--            }
--
--            if self.id == BedrockItem::SHIELD.id {
--                self.shield_blocking_tick.write(&mut buf)?;
--            }
--
--            VarUInt(buf.len() as u32).write(writer)?;
--            writer.write_all(&buf)?;
--        }
-+        self.id.write(writer)?;
-+        self.stack_size.write(writer)?;
-+        self.aux_value.write(writer)?;
+
++    /// Complete a durable recovery boundary for host-managed snapshots.
++    pub async fn save_for_snapshot(&self) -> Result<(), String> {
++        self.save().await;
 +
-+        self.net_id.is_some().write(writer)?;
-+
-+        if let Some(id) = self.net_id {
-+            VarInt(id.get()).write(writer)?;
-+        }
-+
-+        self.block_runtime_id.write(writer)?;
-+
-+        let mut buf = Vec::new();
-+
-+        if self.nbt_data.is_empty() {
-+            (0i16).write(&mut buf)?;
-+        } else {
-+            (-1i16).write(&mut buf)?;
-+            (1i8).write(&mut buf)?;
-+
-+            self.nbt_data.clone().write_to_writer_bedrock(&mut buf)?;
-+        }
-+
-+        write_block_list(&mut buf, &self.place_on_blocks)?;
-+        write_block_list(&mut buf, &self.destroy_blocks)?;
-+
-+        if self.id == BedrockItem::SHIELD.id {
-+            self.shield_blocking_tick.write(&mut buf)?;
-+        }
-+
-+        VarUInt(buf.len() as u32).write(writer)?;
-+        writer.write_all(&buf)?;
-         Ok(())
-     }
- }
-@@ -230,9 +243,6 @@
- impl PacketRead for ItemStackWrapper {
-     fn read<R: Read>(buf: &mut R) -> Result<Self, Error> {
-         let id = i16::read(buf)?;
--        if id == 0 {
--            return Ok(Self::default());
--        }
-         let stack_size = u16::read(buf)?;
-         let aux_value = VarUInt::read(buf)?;
- 
-@@ -265,15 +275,8 @@
-                     .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
-             }
- 
--            let place_on_len = VarUInt::read(&mut cursor)?.0;
--            for _ in 0..place_on_len {
--                place_on_blocks.push(String::read(&mut cursor)?);
--            }
--
--            let destroy_len = VarUInt::read(&mut cursor)?.0;
--            for _ in 0..destroy_len {
--                destroy_blocks.push(String::read(&mut cursor)?);
--            }
-+            place_on_blocks = read_block_list(&mut cursor)?;
-+            destroy_blocks = read_block_list(&mut cursor)?;
- 
-             if id == (BedrockItem::SHIELD.id) {
-                 shield_blocking_tick = i64::read(&mut cursor)?;
-@@ -324,7 +327,6 @@
-     pub aux_value: VarUInt,
-     pub block_runtime_id: VarUInt,
-     pub extra_data: Vec<u8>,
--    pub net_id_variant: Option<VarUInt>,
-     pub net_id: Option<NonZeroI32>,
- }
- 
-@@ -337,8 +339,6 @@
- 
-         self.net_id.is_some().write(writer)?;
-         if let Some(id) = self.net_id {
--            let variant = self.net_id_variant.unwrap_or(VarUInt(0));
--            variant.write(writer)?;
-             VarInt(id.get()).write(writer)?;
-         }
- 
-@@ -359,12 +359,10 @@
-         let aux_value = VarUInt::read(buf)?;
- 
-         let has_net_id = bool::read(buf)?;
--        let (net_id_variant, net_id) = if has_net_id {
--            let variant = VarUInt::read(buf)?;
--            let stack_id = VarInt::read(buf)?;
--            (Some(variant), NonZeroI32::new(stack_id.0))
-+        let net_id = if has_net_id {
-+            NonZeroI32::new(VarInt::read(buf)?.0)
-         } else {
--            (None, None)
-+            None
-         };
- 
-         let block_runtime_id = VarUInt::read(buf)?;
-@@ -379,7 +377,6 @@
-             aux_value,
-             block_runtime_id,
-             extra_data,
--            net_id_variant,
-             net_id,
-         })
-     }
-@@ -393,7 +390,7 @@
-             JavaToBedrockItemMapping::from_java_item_id(stack.get_item().id).map_or(
-                 Self::default(),
-                 |mapping| {
--                    let extra_data = vec![0u8, 0u8];
-+                    let extra_data = vec![0u8; 10];
- 
-                     Self {
-                         id: mapping.bedrock_item.id,
-@@ -401,7 +398,6 @@
-                         aux_value: VarUInt(mapping.bedrock_data),
-                         block_runtime_id: VarUInt(mapping.bedrock_block_state as u32),
-                         extra_data,
--                        net_id_variant: Some(VarUInt(0)),
-                         net_id: Some(stack.uid),
-                     }
-                 },
-@@ -620,3 +616,28 @@
-         })
-     }
- }
-+
-+fn write_block_list<W: Write>(writer: &mut W, blocks: &[String]) -> Result<(), Error> {
-+    (blocks.len() as u32).write(writer)?;
-+    for block in blocks {
-+        let length = u16::try_from(block.len()).map_err(|_| Error::other("block name too long"))?;
-+        length.write(writer)?;
-+        writer.write_all(block.as_bytes())?;
-+    }
-+    Ok(())
-+}
-+
-+fn read_block_list<R: Read>(reader: &mut R) -> Result<Vec<String>, Error> {
-+    let count = u32::read(reader)?;
-+    if count > 1024 {
-+        return Err(Error::other("too many block names"));
-+    }
-+    let mut blocks = Vec::with_capacity(count as usize);
-+    for _ in 0..count {
-+        let length = u16::read(reader)?;
-+        let mut bytes = vec![0; usize::from(length)];
-+        reader.read_exact(&mut bytes)?;
-+        blocks.push(String::from_utf8(bytes).map_err(Error::other)?);
-+    }
-+    Ok(blocks)
-+}
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/crafting_data.rs b/crates/pumpkin-protocol/src/bedrock/client/crafting_data.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/crafting_data.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/crafting_data.rs
-@@ -3,6 +3,7 @@
-     codec::{var_int::VarInt, var_uint::VarUInt},
-     serial::PacketWrite,
- };
-+use pumpkin_data::item::JavaToBedrockItemMapping;
- use pumpkin_macros::packet;
- use std::io::{Error, Write};
- 
-@@ -16,13 +17,22 @@
- impl PacketWrite for ItemDescriptorCount {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
-         if self.network_id == 0 {
--            // Invalid item descriptor (type 0)
--            0u8.write(writer)?;
-+            VarUInt(0).write(writer)?;
-+            VarInt(32767).write(writer)?;
-         } else {
--            // Default item descriptor (type 1)
--            1u8.write(writer)?;
--            self.network_id.write(writer)?;
--            self.metadata_value.write(writer)?;
-+            let mapping =
-+                JavaToBedrockItemMapping::from_bedrock(self.network_id, self.metadata_value as u32)
-+                    .ok_or_else(|| {
-+                        Error::new(std::io::ErrorKind::InvalidData, "unknown recipe ingredient")
-+                    })?;
-+            VarUInt(1).write(writer)?;
-+            "name".to_string().write(writer)?;
-+            mapping
-+                .bedrock_item
-+                .registry_key
-+                .to_string()
-+                .write(writer)?;
-+            VarInt(i32::from(self.metadata_value)).write(writer)?;
-         }
-         VarInt(self.count).write(writer)?;
-         Ok(())
-@@ -36,7 +46,10 @@
- 
- impl PacketWrite for RecipeUnlockRequirement {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
--        self.context.write(writer)?;
-+        VarInt(i32::from(self.context)).write(writer)?;
-+        if self.context != 0 {
-+            VarUInt(0).write(writer)?;
-+        }
-         Ok(())
-     }
- }
-@@ -109,7 +122,8 @@
-         self.width.write(writer)?;
-         self.height.write(writer)?;
- 
--        // input slice: width * height elements sequentially (no count prefix)
-+        // Protocol 2168 prefixes the flat shaped input array.
-+        VarUInt(self.input.len() as u32).write(writer)?;
-         for item in &self.input {
-             item.write(writer)?;
-         }
-@@ -148,22 +162,6 @@
-     Shaped(BedrockShapedRecipe),
- }
- 
--impl PacketWrite for BedrockRecipe {
--    fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
--        match self {
--            Self::Shapeless(recipe) => {
--                VarInt(0).write(writer)?; // type 0: Shapeless
--                recipe.write(writer)?;
--            }
--            Self::Shaped(recipe) => {
--                VarInt(1).write(writer)?; // type 1: Shaped
--                recipe.write(writer)?;
--            }
--        }
--        Ok(())
--    }
--}
--
- #[packet(52)]
- pub struct CCraftingData {
-     pub recipes: Vec<BedrockRecipe>,
-@@ -172,18 +170,16 @@
- 
- impl PacketWrite for CCraftingData {
-     fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
--        // recipes slice with VarUInt prefix
--        VarUInt(self.recipes.len() as u32).write(writer)?;
--        for recipe in &self.recipes {
--            recipe.write(writer)?;
-+        // The pinned runtime's recipe model is older than protocol 2168's
-+        // split recipe schema. Send an explicit empty registry until the
-+        // model is migrated; emitting the old tagged records corrupts the
-+        // following ItemRegistry packet and prevents clients from joining.
-+        for _ in 0..14 {
-+            VarUInt(0).write(writer)?;
-         }
--
--        // potion recipes count prefix (0)
--        VarUInt(0).write(writer)?;
--        // potion container change recipes count prefix (0)
--        VarUInt(0).write(writer)?;
--        // material reducers count prefix (0)
--        VarUInt(0).write(writer)?;
-+        for _ in 0..9 {
-+            VarUInt(0).write(writer)?;
-+        }
- 
-         // clean_recipes
-         self.clean_recipes.write(writer)?;
-diff --git a/crates/pumpkin/src/net/bedrock/login.rs b/crates/pumpkin/src/net/bedrock/login.rs
---- a/crates/pumpkin/src/net/bedrock/login.rs
-+++ b/crates/pumpkin/src/net/bedrock/login.rs
-@@ -51,4 +51,4 @@
--#[derive(Deserialize_repr)]
-+#[derive(Deserialize_repr, Clone, Copy)]
- #[repr(u8)]
- enum AuthenticationType {
-     Full,
-@@ -111,6 +111,12 @@
-             .compression
-             .info
-             .clone();
-+        // Decode the first compressed login even if it arrives before the
-+        // settings send future resumes. The settings packet itself stays plain.
-+        self.network_reader
++        let poi_save = self
++            .portal_poi
 +            .lock()
-+            .await
-+            .set_compression(compression.threshold as usize);
-         self.send_game_packet(&CNetworkSettings::new(
-             compression.threshold as u16,
-             0,
-@@ -164,3 +170,13 @@
-         };
- 
-+        let verified_xuid = if server.advanced_config.networking.bedrock.online_mode
-+            && server.advanced_config.networking.bedrock.encryption
-+            && matches!(auth_payload.authentication_type, AuthenticationType::Full)
-+        {
-+            player_data.xuid.parse::<u64>().ok().filter(|xuid| *xuid > 0)
-+                .map(|xuid| xuid.to_string())
-+        } else {
-+            None
-+        };
-+        self.verified_xuid.store(Arc::new(verified_xuid));
-         let raw_token_str = std::str::from_utf8(&packet.raw_token).map_err(|_| {
-@@ -224,7 +240,6 @@
-                 pumpkin_util::jwt::generate_handshake_jwt(&server_private_key, &salt)
-                     .map_err(LoginError::ChainValidationFailed)?;
-             let handshake_packet = CHandshake::new(handshake_jwt);
--            self.send_game_packet(&handshake_packet).await;
- 
-             let shared_secret =
-                 pumpkin_util::jwt::compute_shared_secret(&server_private_key, &client_public_key);
-@@ -242,6 +257,10 @@
-                         "encryption enable error".into(),
-                     ))
-                 })?;
-+            // The peer may reply as soon as the handshake reaches its socket.
-+            // Install inbound decryption before exposing the handshake; outbound
-+            // encryption starts only after this plaintext packet is flushed.
-+            self.send_game_packet(&handshake_packet).await;
-             self.network_writer
-                 .write()
-                 .await
-diff --git a/crates/pumpkin/src/entity/player.rs b/crates/pumpkin/src/entity/player.rs
---- a/crates/pumpkin/src/entity/player.rs
-+++ b/crates/pumpkin/src/entity/player.rs
-@@ -402,3 +402,5 @@
- pub struct Player {
-+    /// Unique for this authenticated client connection, including reconnects.
-+    pub connection_id: Uuid,
-     /// The underlying living entity object that represents the player.
-     pub living_entity: LivingEntity,
-@@ -670,3 +672,4 @@
-         Self {
-+            connection_id: Uuid::new_v4(),
-             living_entity,
-             config: ArcSwap::new(Arc::new(config)),
-diff --git a/crates/pumpkin-protocol/src/bedrock/client/add_player.rs b/crates/pumpkin-protocol/src/bedrock/client/add_player.rs
---- a/crates/pumpkin-protocol/src/bedrock/client/add_player.rs
-+++ b/crates/pumpkin-protocol/src/bedrock/client/add_player.rs
-@@ -45,7 +45,7 @@
-         self.pitch.write(writer)?;
-         self.yaw.write(writer)?;
-         self.head_yaw.write(writer)?;
--        self.held_item.write(writer)?;
-+        self.held_item.write_v4(writer)?;
-         self.game_mode.write(writer)?;
-         self.metadata.write(writer)?;
-         self.properties.write(writer)?;
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .save_all();
++        poi_save.map_err(|error| format!("POI save failed: {error}"))?;
++
++        self.level.save_for_snapshot().await
++    }
++
+     pub fn set_custom_data(&self, namespace: &str, key: &str, value: pumpkin_nbt::tag::NbtTag) {
+         let mut custom_data = self
+             .custom_data

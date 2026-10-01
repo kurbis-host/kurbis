@@ -1,16 +1,8 @@
 import { redirect } from "next/navigation";
-import { Overview } from "../../../components/overview";
-import { getActivity, getServer } from "../../../lib/api/server";
+import { getServers } from "../../../lib/api/server";
 
-export default async function OverviewPage() {
-  const server = await getServer();
-  if (!server) redirect("/app/setup");
-  const activity = await getActivity();
-  return (
-    <Overview
-      initialServer={server}
-      initialActivity={activity}
-      renderedAt={Date.now()}
-    />
-  );
+export default async function AppIndexPage() {
+  const servers = await getServers();
+  const selected = servers.find((server) => server.is_default) ?? servers[0];
+  redirect(selected ? `/app/servers/${selected.id}` : "/app/setup");
 }

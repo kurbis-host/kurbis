@@ -160,12 +160,13 @@ async fn linking_a_verified_game_identity_merges_accounts_without_losing_worlds_
     }
     let java_uuid = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO identities(id, user_id, provider, subject, display_name)
-         VALUES($1, $2, 'minecraft_java', $3, 'Java Player')",
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Java Player', $4)",
     )
     .bind(Uuid::new_v4())
     .bind(game_user)
     .bind(java_uuid.to_string())
+    .bind(java_uuid)
     .execute(&pool)
     .await
     .unwrap();
@@ -184,6 +185,7 @@ async fn linking_a_verified_game_identity_merges_accounts_without_losing_worlds_
         &pool,
         "minecraft_java",
         &java_uuid.to_string(),
+        java_uuid,
         "Java Player",
         Some(browser_user),
     )
@@ -271,15 +273,22 @@ async fn concurrent_identity_merges_preserve_all_sources_and_the_browser_default
     )
     .await;
     let java_subject = Uuid::new_v4().to_string();
-    let java_user =
-        attach_minecraft_identity(&pool, "minecraft_java", &java_subject, "Java Player", None)
-            .await
-            .unwrap();
+    let java_user = attach_minecraft_identity(
+        &pool,
+        "minecraft_java",
+        &java_subject,
+        java_subject.parse().unwrap(),
+        "Java Player",
+        None,
+    )
+    .await
+    .unwrap();
     let bedrock_subject = Uuid::new_v4().as_u128().to_string();
     let bedrock_user = attach_minecraft_identity(
         &pool,
         "minecraft_bedrock",
         &bedrock_subject,
+        Uuid::from_u128(bedrock_subject.parse().unwrap()),
         "Bedrock Player",
         None,
     )
@@ -328,6 +337,7 @@ async fn concurrent_identity_merges_preserve_all_sources_and_the_browser_default
         &pool,
         "minecraft_java",
         &java_subject,
+        java_subject.parse().unwrap(),
         "Java Player",
         Some(browser_user),
     );
@@ -335,6 +345,7 @@ async fn concurrent_identity_merges_preserve_all_sources_and_the_browser_default
         &pool,
         "minecraft_bedrock",
         &bedrock_subject,
+        Uuid::from_u128(bedrock_subject.parse().unwrap()),
         "Bedrock Player",
         Some(browser_user),
     );
@@ -501,6 +512,7 @@ async fn oldest_world_becomes_default_when_the_browser_account_has_none() {
         &pool,
         "minecraft_java",
         &identity_subject,
+        identity_subject.parse().unwrap(),
         "Java Player",
         None,
     )
@@ -528,6 +540,7 @@ async fn oldest_world_becomes_default_when_the_browser_account_has_none() {
         &pool,
         "minecraft_java",
         &identity_subject,
+        identity_subject.parse().unwrap(),
         "Java Player",
         Some(browser_user),
     )
