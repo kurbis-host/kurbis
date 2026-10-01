@@ -26,7 +26,6 @@ def main() -> int:
         "POSTGRES_PASSWORD": password,
         "INTERNAL_TOKEN": secrets.token_hex(32),
         "PUMPKIN_GATEWAY_CONTROL_TOKEN": secrets.token_hex(32),
-        "PUMPKIN_HOST_CONTROL_TOKEN": secrets.token_hex(32),
         "WORKER_ID": str(uuid.uuid4()),
     }
 

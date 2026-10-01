@@ -10,6 +10,14 @@ x-control-plane-environment: &control-plane-environment
   GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
   DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID}
   DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET}
+  OBJECT_STORE_TYPE: ${OBJECT_STORE_TYPE:-s3}
+  OBJECT_STORE_LOCAL_ROOT: /var/lib/kurbis/object-store
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+  S3_ALLOW_HTTP: ${S3_ALLOW_HTTP:-false}
 
 services:
   postgres:
@@ -37,6 +45,8 @@ services:
       dockerfile: runtime/Dockerfile
     entrypoint: [/usr/local/bin/control-plane]
     environment: *control-plane-environment
+    volumes:
+      - object-store:/var/lib/kurbis/object-store
     ports:
       - 127.0.0.1:${CONTROL_PLANE_PORT:-18080}:8080
     depends_on:
@@ -118,6 +128,7 @@ services:
 
 volumes:
   postgres-data:
+  object-store:
   waiting-control:
 
 networks:

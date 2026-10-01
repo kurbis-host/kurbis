@@ -14,6 +14,8 @@ Usage:
   ./start.sh attach                  Reattach to the process dashboard.
   ./start.sh stop                    Stop the dashboard and Compose services.
   ./start.sh setup                   Create .env with fresh secrets.
+  ./start.sh worker-bundle [id] [--rotate]
+                                      Provision private API and database credentials.
 
 Native mode defaults to release. On first use, setup creates .env; edit its
 URLs, worker address, and OAuth credentials before starting either mode.
@@ -65,10 +67,81 @@ check_deployment_values() {
   [[ $PUBLIC_BASE_URL != *example.com* ]] || die "replace the example PUBLIC_BASE_URL"
   [[ $ROOT_DOMAIN != *example.com* ]] || die "replace the example ROOT_DOMAIN"
   [[ $WORKER_ADDRESS != 203.0.113.10 ]] || die "set WORKER_ADDRESS to this worker's reachable address"
-  for name in INTERNAL_TOKEN PUMPKIN_GATEWAY_CONTROL_TOKEN PUMPKIN_HOST_CONTROL_TOKEN WORKER_ID; do
+  for name in INTERNAL_TOKEN PUMPKIN_GATEWAY_CONTROL_TOKEN WORKER_ID WORKER_SIGNAL_ADDRESS; do
     value=${!name:-}
     [[ -n $value && $value != GENERATE_ON_FIRST_START ]] || die "$name was not initialized; run ./start.sh setup"
   done
+}
+
+worker_bundle_path() {
+  printf '%s/data/worker-bundles/%s.env' "$ROOT" "$1"
+}
+
+provision_worker_bundle() {
+  local mode=$1 worker_id=${2:-$WORKER_ID} rotate=${3:-false} profile=${4:-release}
+  local database_url bundle_path control_plane_url runtime storage_mode pumpkin_binary
+  local pumpkin_image plugin_wasm
+  case "${WORKER_PROVISIONING_DATABASE_URL:-}" in
+    ?*) database_url=$WORKER_PROVISIONING_DATABASE_URL ;;
+    *)
+      case "$mode" in
+        native) database_url=$DATABASE_URL_NATIVE ;;
+        docker)
+          database_url="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${DATABASE_PORT}/${POSTGRES_DB}"
+          ;;
+        *) die "unsupported worker provisioning mode: $mode" ;;
+      esac
+      ;;
+  esac
+  case "$mode" in
+    native)
+      control_plane_url=${WORKER_CONTROL_PLANE_URL:-http://127.0.0.1:8080}
+      runtime=native
+      storage_mode=${WORKER_STORAGE_MODE:-directory}
+      pumpkin_binary=${PUMPKIN_BINARY:-"$ROOT/output/native-pumpkin/target/$profile/pumpkin"}
+      pumpkin_image=
+      plugin_wasm=${KURBIS_CONTROL_PLUGIN_WASM:-"$ROOT/plugins/kurbis-control/target/wasm32-wasip2/$profile/kurbis_control.wasm"}
+      ;;
+    docker)
+      control_plane_url=${WORKER_CONTROL_PLANE_URL:-"http://127.0.0.1:${CONTROL_PLANE_PORT:-18080}"}
+      runtime=docker
+      storage_mode=${WORKER_STORAGE_MODE:-directory}
+      pumpkin_binary=
+      pumpkin_image=${PUMPKIN_IMAGE:-melon-pumpkin:host-control}
+      plugin_wasm=
+      ;;
+    *) die "unsupported worker bundle mode: $mode" ;;
+  esac
+  bundle_path=$(worker_bundle_path "$worker_id")
+  mkdir -p "$(dirname "$bundle_path")"
+  local -a args=(--worker-id "$worker_id")
+  local -a provision_env=(
+    "WORKER_PROVISIONING_DATABASE_URL=$database_url"
+    "WORKER_CONTROL_PLANE_URL=$control_plane_url"
+    "PUBLIC_BASE_URL=$PUBLIC_BASE_URL"
+    "WORKER_RUNTIME=$runtime"
+    "WORKER_STORAGE_MODE=$storage_mode"
+    "WORKER_ROOT=${WORKER_ROOT:-./data/worker}"
+    "WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP=${WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP:-false}"
+    "SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-300}"
+    "IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-300}"
+  )
+  [[ -n $pumpkin_binary ]] && provision_env+=("PUMPKIN_BINARY=$pumpkin_binary")
+  [[ -n $pumpkin_image ]] && provision_env+=("PUMPKIN_IMAGE=$pumpkin_image")
+  [[ -n $plugin_wasm ]] && provision_env+=("KURBIS_CONTROL_PLUGIN_WASM=$plugin_wasm")
+  if [[ $rotate == true ]]; then
+    args+=(--rotate)
+  fi
+  env "${provision_env[@]}" cargo run --quiet --bin worker-bundle -- \
+    "${args[@]}" --output "$bundle_path"
+}
+
+ensure_worker_bundle() {
+  local mode=$1 profile=${2:-release} path
+  path=$(worker_bundle_path "$WORKER_ID")
+  if [[ ! -f $path ]]; then
+    provision_worker_bundle "$mode" "$WORKER_ID" false "$profile"
+  fi
 }
 
 require_command() {
@@ -210,9 +283,14 @@ create_dashboard() {
 
 start_dashboard_service() {
   local mode=$1 service=$2 pane pane_title pane_command
+  local -a service_args
+  service_args=("$ROOT/scripts/run-service.sh" "$ENV_FILE" "$ROOT" "$mode" "$service")
+  if [[ $service == worker ]]; then
+    service_args+=("$(worker_bundle_path "$WORKER_ID")")
+  fi
   while read -r pane pane_title; do
     if [[ $pane_title == "$service" ]]; then
-      printf -v pane_command '%q ' "$ROOT/scripts/run-service.sh" "$ENV_FILE" "$ROOT" "$mode" "$service"
+      printf -v pane_command '%q ' "${service_args[@]}"
       tmux send-keys -t "$pane" "$pane_command" C-m
       return 0
     fi
@@ -250,6 +328,7 @@ start_native() {
   create_dashboard control-plane waiting-pumpkin gateway worker panel
   start_dashboard_service "$mode" control-plane
   wait_for_http http://127.0.0.1:8080/healthz 'the control plane'
+  ensure_worker_bundle native "$profile"
   start_dashboard_service "$mode" waiting-pumpkin
   wait_for_native_waiting
   start_dashboard_service "$mode" gateway
@@ -265,6 +344,9 @@ start_docker() {
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
   docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to this user"
   check_docker_storage
+  case "$WORKER_SIGNAL_ADDRESS" in
+    127.*|::1) die "WORKER_SIGNAL_ADDRESS must be a host-private address reachable by the gateway container" ;;
+  esac
 
   printf 'Building the Docker Pumpkin runtime...\n'
   docker build -f "$ROOT/runtime/pumpkin/Dockerfile" -t melon-pumpkin:host-control "$ROOT"
@@ -281,6 +363,8 @@ start_docker() {
     docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yaml" logs --tail=100 || true
     die "Compose services did not become healthy"
   fi
+
+  ensure_worker_bundle docker
 
   create_dashboard postgres control-plane-log waiting-pumpkin-log gateway-log panel-log worker
   for service in postgres control-plane-log waiting-pumpkin-log gateway-log panel-log worker; do
@@ -315,6 +399,28 @@ case "$command_name" in
     ;;
   setup)
     setup_env
+    ;;
+  worker-bundle)
+    setup_env
+    load_env
+    [[ $# -le 3 ]] || die "worker-bundle accepts an optional worker ID and --rotate"
+    bundle_worker_id=$WORKER_ID
+    bundle_rotate=false
+    for argument in "${@:2}"; do
+      case "$argument" in
+        --rotate) bundle_rotate=true ;;
+        *)
+          [[ $bundle_worker_id == "$WORKER_ID" ]] || die "worker-bundle accepts only one worker ID"
+          bundle_worker_id=$argument
+          ;;
+      esac
+    done
+    [[ $bundle_worker_id != GENERATE_ON_FIRST_START ]] || die "run ./start.sh setup first"
+    bundle_mode=native
+    if [[ -f $MODE_FILE ]]; then
+      bundle_mode=$(<"$MODE_FILE")
+    fi
+    provision_worker_bundle "$bundle_mode" "$bundle_worker_id" "$bundle_rotate"
     ;;
   attach)
     require_command tmux

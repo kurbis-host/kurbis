@@ -58,6 +58,8 @@ Public API/panel supports:
 - Create/delete one server for a new account; preserve all worlds when identities merge.
 - Select/change an available subdomain while stopped.
 - Start/stop/restart.
+- Built-in OP-only Pumpkin management menu and commands for server status, players, logs, activity, settings, whitelist, snapshots, and lifecycle controls.
+- One-use server-only login link from the in-game plugin into the existing panel. It creates a server-scoped browser session and does not sign in to a Kurbis account.
 - Current state: sleeping, queued, restoring, starting, online, stopping, snapshotting, failed.
 - Basic console/log viewing.
 - Curated Pumpkin settings only.
@@ -124,6 +126,14 @@ Use Pumpkin's existing:
 
 Add only a small stable host-control interface where polling or external control is insufficient, preferably authenticated loopback/Unix-socket RPC exposed to the worker agent. It should provide readiness, player count, save completion, and graceful shutdown.
 
+### Kurbis server plugins
+
+Kurbis should ship first-party Pumpkin plugins that bring hosting controls into Minecraft while reusing the existing HTTP API. V1 starts with the built-in management plugin and its one-use server login link; this is the foundation for future Kurbis-owned server plugins, not a third-party plugin marketplace or arbitrary upload feature.
+
+The worker keeps each server capability outside its container and stages only that server's credential for the managed plugin. The API derives server scope from the capability; a plugin cannot select another server ID. Placement changes rotate the capability. Hosted runtime configuration grants the managed plugin only its declared permissions and keeps unsigned third-party plugins disabled.
+
+Workers are isolated from one another at the HTTP API, PostgreSQL, and object-store boundaries. The deployment CLI provisions a distinct worker ID, API credential, and restricted database credential for each worker; the control plane stores only a hash of each API credential. The control plane derives worker identity from the authenticated credential, never from a request field. A worker may obtain a server capability and access server-scoped data only while that server's current placement belongs to it. Shared internal credentials cannot issue server capabilities. Worker database roles cannot read or modify capability or worker-credential records, change placements or lifecycle generations, or access server-scoped rows outside their current assignments. Workers do not receive fleet-wide object-store credentials; snapshot and export object transfers go through control-plane endpoints that authorize the worker, server, assignment kind, and generation for every request and reauthorize streamed reads. Placement ownership, lease generations, server ownership, and desired state remain control-plane managed. Missing, duplicated, stale, or revoked worker credentials fail closed.
+
 The worker owns Docker/container state. Pumpkin must not communicate directly with Postgres or schedule itself.
 
 The native development runtime shares worker leases, lifecycle operations, storage manifests, snapshots, recovery, and gateway transfers with Docker workers. It is intended for trusted local development and does not provide hard memory or filesystem isolation. Linux container tests remain required to verify production quota enforcement.
@@ -159,7 +169,11 @@ Test the complete lifecycle rather than isolated smoke tests:
 - Identity tests cover legacy-data migration, normalized verified-email linking under concurrency, suspended-account merges, preservation of all server-linked history, and default-world selection.
 - Browser security tests cover OAuth provider linking, signed-in and signed-out Minecraft redemption, one-use/15-minute tokens, cross-origin rejection, forged or offline identity rejection, persistent sessions, revocation, and logout.
 - Per-server API tests verify every server route checks active account ownership, including events, logs, exports, players, whitelist, snapshots, and lifecycle mutations.
-- Native end-to-end tests use real Java and Bedrock clients to cover authenticated waiting, wake, queueing, transfer, snapshots, recovery, and worker fencing. Use Linux containers separately for hard memory and disk quota tests.
+- Server-access tests cover current-placement capability rotation, malformed and stale credentials, one-use 15-minute login links, one-hour server-only sessions, OP-only plugin commands, and denial of cross-server and account-wide APIs.
+- Worker-isolation tests cover unique credential provisioning, rejection of the shared internal token and forged worker IDs, capability issuance only for the authenticated worker's current placement, stale credentials after reassignment, and rotation/revocation behavior.
+- PostgreSQL permission tests prove a worker role cannot read or change capability or credential records, cannot modify placements or lifecycle generations, and can read or write server-scoped operational data only for its current assignments. Cross-worker attempts are tested before and after placement changes.
+- Object-store isolation tests prove a worker cannot read, write, head, or delete another server's objects, cannot reuse an old assignment or generation, and loses access during streamed transfers after revocation or reassignment.
+- Native end-to-end tests use real Java clients and available automated Bedrock protocol fixtures to cover authenticated waiting, wake, queueing, transfer, snapshots, recovery, and worker fencing. Live Bedrock phone testing is out of scope. Use Linux containers separately for hard memory and disk quota tests; if local Docker is unavailable, record that limitation and do not treat native verification as quota evidence.
 
 ## Assumptions
 
