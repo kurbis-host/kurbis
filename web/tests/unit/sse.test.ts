@@ -1,5 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
+import type { ServerEvent } from "../../lib/contracts";
 import { applyServerEvent } from "../../lib/sse";
 import { queryKeys } from "../../lib/query";
 import { server } from "./fixtures";
@@ -10,6 +11,28 @@ describe("server event integration", () => {
     client.setQueryData(queryKeys.server, server);
     applyServerEvent(client, { id: 10, type: "server", data: { ...server, observed_state: "online", desired_state: "running", player_count: 2 } });
     expect(client.getQueryData<typeof server>(queryKeys.server)).toMatchObject({ observed_state: "online", player_count: 2 });
+  });
+
+  it("prevents an older in-flight server read from overwriting a live event", async () => {
+    const client = new QueryClient();
+    client.setQueryData(queryKeys.server, server);
+    let finishStaleRead!: (value: typeof server) => void;
+    const staleRead = client.fetchQuery({
+      queryKey: queryKeys.server,
+      queryFn: () => new Promise<typeof server>((resolve) => { finishStaleRead = resolve; }),
+      staleTime: 0,
+    });
+    await Promise.resolve();
+
+    const liveServer = { ...server, observed_state: "online" as const, player_count: 3 };
+    applyServerEvent(client, { id: 11, type: "server", data: liveServer });
+    finishStaleRead(server);
+    await staleRead.catch(() => undefined);
+
+    expect(client.getQueryData<typeof server>(queryKeys.server)).toMatchObject({
+      observed_state: "online",
+      player_count: 3,
+    });
   });
 
   it("appends live log entries without duplicating event ids", () => {
@@ -49,5 +72,24 @@ describe("server event integration", () => {
     expect(client.getQueryData(queryKeys.players)).toEqual(players);
     expect(client.getQueryData(queryKeys.whitelist)).toEqual(whitelist);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.server });
+  });
+
+  it("refreshes activity for every durable event type", () => {
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const events: ServerEvent[] = [
+      { id: 1, type: "server" },
+      { id: 2, type: "operation" },
+      { id: 3, type: "snapshot" },
+      { id: 4, type: "players" },
+      { id: 5, type: "whitelist" },
+      { id: 6, type: "log" },
+    ];
+
+    for (const event of events) {
+      invalidate.mockClear();
+      applyServerEvent(client, event);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.activity });
+    }
   });
 });

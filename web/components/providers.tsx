@@ -16,22 +16,19 @@ function EventsBridge() {
     if (!server) return;
     queryClient.setQueryData(queryKeys.eventStatus, "connecting");
     const source = new EventSource("/api/v1/server/events", { withCredentials: true });
-    const consume = (event: MessageEvent<string>, type?: string) => {
-      try {
-        const raw = type
-          ? JSON.stringify({ id: Number(event.lastEventId || 0), type, data: JSON.parse(event.data) })
-          : event.data;
-        const parsed = parseServerEvent(raw);
-        if (parsed.success) applyServerEvent(queryClient, parsed.data);
-      } catch {
+    const consume = (event: MessageEvent<string>) => {
+      const parsed = parseServerEvent(event.data);
+      if (parsed.success) {
+        applyServerEvent(queryClient, parsed.data);
+      } else {
+        // Recover all visible server data if an event cannot be decoded.
         void queryClient.invalidateQueries({ queryKey: queryKeys.server });
       }
     };
     source.onopen = () => queryClient.setQueryData(queryKeys.eventStatus, "live");
     source.onerror = () => queryClient.setQueryData(queryKeys.eventStatus, "reconnecting");
-    source.onmessage = (event) => consume(event);
     for (const name of ["server", "operation", "snapshot", "players", "whitelist", "log"] as const) {
-      source.addEventListener(name, (event) => consume(event as MessageEvent<string>, name));
+      source.addEventListener(name, (event) => consume(event as MessageEvent<string>));
     }
     return () => source.close();
   }, [queryClient, server?.id]);

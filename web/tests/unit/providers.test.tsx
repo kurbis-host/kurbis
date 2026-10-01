@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppProviders } from "../../components/providers";
+import type { Server } from "../../lib/contracts";
 import { queryKeys } from "../../lib/query";
 import { server, session } from "./fixtures";
 
@@ -9,9 +10,19 @@ class EventSourceStub {
   static instance: EventSourceStub | null = null;
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
-  onmessage: ((event: MessageEvent<string>) => void) | null = null;
   readonly close = vi.fn();
-  readonly addEventListener = vi.fn();
+  private readonly listeners = new Map<string, EventListener>();
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const callback = typeof listener === "function"
+      ? listener
+      : listener.handleEvent.bind(listener);
+    this.listeners.set(type, callback);
+  }
+
+  emit(type: string, event: MessageEvent<string>) {
+    this.listeners.get(type)?.(event);
+  }
 
   constructor() {
     EventSourceStub.instance = this;
@@ -25,6 +36,14 @@ function EventStatus() {
     staleTime: Infinity,
   });
   return <span>{String(data)}</span>;
+}
+
+function ServerState() {
+  const { data } = useQuery<Server | null>({
+    queryKey: queryKeys.server,
+    queryFn: async () => server,
+  });
+  return <span>{data?.observed_state}</span>;
 }
 
 afterEach(() => {
@@ -47,5 +66,31 @@ describe("event reconnect state", () => {
     await waitFor(() => expect(screen.getByText("live")).toBeVisible());
     act(() => EventSourceStub.instance?.onerror?.(new Event("error")));
     await waitFor(() => expect(screen.getByText("reconnecting")).toBeVisible());
+  });
+
+  it("applies a named server event's complete envelope to the shared cache", async () => {
+    vi.stubGlobal("EventSource", EventSourceStub);
+    render(
+      <AppProviders session={session} server={server}>
+        <ServerState />
+      </AppProviders>,
+    );
+    await waitFor(() => expect(screen.getByText("sleeping")).toBeVisible());
+
+    const updatedServer = {
+      ...server,
+      desired_state: "running" as const,
+      observed_state: "online" as const,
+      player_count: 1,
+    };
+    act(() => EventSourceStub.instance?.emit(
+      "server",
+      new MessageEvent("server", {
+        data: JSON.stringify({ id: 21, type: "server", data: updatedServer }),
+        lastEventId: "21",
+      }),
+    ));
+
+    await waitFor(() => expect(screen.getByText("online")).toBeVisible());
   });
 });

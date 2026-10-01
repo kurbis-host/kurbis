@@ -120,6 +120,21 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
     if (audit.violations.length) axeResults[route] = audit.violations;
     await captureResponsive(page, route, `routes/${route.replaceAll('/', '-')}`);
   }
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await expect(page.getByText('Live updates connected')).toBeVisible();
+  const rawEvent = await page.evaluate(() => new Promise<string>((resolve, reject) => {
+    const source = new EventSource('/api/v1/server/events', { withCredentials: true });
+    const timeout = window.setTimeout(() => {
+      source.close();
+      reject(new Error('SSE did not replay a server event'));
+    }, 3000);
+    source.addEventListener('server', event => {
+      window.clearTimeout(timeout);
+      source.close();
+      resolve((event as MessageEvent<string>).data);
+    });
+  }));
+  expect(JSON.parse(rawEvent)).toMatchObject({ type: 'server', data: { id: expect.any(String) } });
   await page.goto('/app/settings');
   const trigger = page.getByRole('button', { name: 'Delete server', exact: true });
   await trigger.focus();
@@ -149,7 +164,6 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await state(page, 'Restoring');
   await command(request, 'tick');
   await command(request, 'tick');
-  await page.reload();
   await state(page, 'Online');
   const onlineAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (onlineAudit.violations.length) axeResults['/app?state=online'] = onlineAudit.violations;
@@ -158,7 +172,6 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
     "UPDATE servers SET observed_state = 'failed', last_error = $1 WHERE subdomain = $2",
     ['Fixture visual state: readiness timed out', 'accessible-world'],
   );
-  await page.reload();
   await state(page, 'Needs attention');
   const failedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (failedAudit.violations.length) axeResults['/app?state=failed'] = failedAudit.violations;
