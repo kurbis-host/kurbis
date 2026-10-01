@@ -119,15 +119,19 @@ Choose one deployment mode:
 ./start.sh docker          # Compose services plus the host Docker worker
 ```
 
-Native mode needs Rust 1.98.1, Git, CMake, Node.js/npm, tmux, and an already
-running PostgreSQL database matching `DATABASE_URL_NATIVE`. It does not use
-Docker. Docker mode builds the pinned Pumpkin images and application images,
-starts PostgreSQL, control plane, gateway, waiting runtime, and panel in
-Compose, then runs the worker on the Linux host. The worker stays on the host
-because it controls the host Docker engine and worker storage mounts. Docker
-mode needs Linux, Docker Engine with Compose v2, Rust/Cargo, and tmux; use
-native mode on macOS. The first Pumpkin image build takes substantially longer
-than later starts.
+Native mode needs Rust 1.98.1, Git, CMake, Node.js/npm, tmux, and a local
+PostgreSQL server. If `DATABASE_URL_NATIVE` cannot connect, the launcher uses
+the current operating-system PostgreSQL role to create or update the configured
+database role and create the database. That local role must have PostgreSQL
+administrator permissions; remote PostgreSQL databases must be provisioned
+separately. Native debug accepts an HTTP loopback `PUBLIC_BASE_URL`; native
+release and Docker require HTTPS. Native mode does not use Docker. Docker mode
+builds the pinned Pumpkin images and application images, starts PostgreSQL,
+control plane, gateway, waiting runtime, and panel in Compose, then runs the
+worker on the Linux host. The worker stays on the host because it controls the
+host Docker engine and worker storage mounts. Docker mode needs Linux, Docker
+Engine with Compose v2, Rust/Cargo, and tmux; use native mode on macOS. The
+first Pumpkin image build takes substantially longer than later starts.
 
 The Docker Compose deployment publishes the panel on `PANEL_PORT`, Java on
 `JAVA_PORT`, and Bedrock UDP on `BEDROCK_PORT`. Put an HTTPS reverse proxy in

@@ -38,7 +38,7 @@ load_env() {
 }
 
 check_deployment_values() {
-  local name value
+  local name value deployment=${1:-} profile=${2:-} local_origin
   for name in PUBLIC_BASE_URL ROOT_DOMAIN WORKER_ADDRESS \
     GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET \
     DISCORD_OAUTH_CLIENT_ID DISCORD_OAUTH_CLIENT_SECRET; do
@@ -46,7 +46,22 @@ check_deployment_values() {
     [[ -n $value ]] || die "$name is empty in .env"
     [[ $value != *replace-me* && $value != *REPLACE-ME* ]] || die "set $name in .env before starting"
   done
-  [[ $PUBLIC_BASE_URL == https://* ]] || die "PUBLIC_BASE_URL must use https://"
+  case "$PUBLIC_BASE_URL" in
+    https://*) ;;
+    http://*)
+      [[ $deployment == native && $profile == debug ]] \
+        || die "PUBLIC_BASE_URL must use https:// outside native debug mode"
+      local_origin=${PUBLIC_BASE_URL#http://}
+      local_origin=${local_origin%%/*}
+      local_origin=${local_origin%%\?*}
+      local_origin=${local_origin%%\#*}
+      case "$local_origin" in
+        localhost|localhost:*|127.0.0.1|127.0.0.1:*|'[::1]'|'[::1]':*) ;;
+        *) die "native debug allows http:// only for a loopback PUBLIC_BASE_URL" ;;
+      esac
+      ;;
+    *) die "PUBLIC_BASE_URL must use https://" ;;
+  esac
   [[ $PUBLIC_BASE_URL != *example.com* ]] || die "replace the example PUBLIC_BASE_URL"
   [[ $ROOT_DOMAIN != *example.com* ]] || die "replace the example ROOT_DOMAIN"
   [[ $WORKER_ADDRESS != 203.0.113.10 ]] || die "set WORKER_ADDRESS to this worker's reachable address"
@@ -95,8 +110,15 @@ check_native_dependencies() {
 }
 
 check_native_database() {
+  if psql "$DATABASE_URL_NATIVE" -X -qAt -c 'SELECT 1' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf 'Native PostgreSQL is not ready; trying to provision its local role and database...\n'
+  python3 "$ROOT/scripts/provision_native_database.py" \
+    || die "could not provision the local PostgreSQL role/database; see the setup error above"
   psql "$DATABASE_URL_NATIVE" -X -qAt -c 'SELECT 1' >/dev/null \
-    || die "cannot connect to DATABASE_URL_NATIVE; create the PostgreSQL role/database and start PostgreSQL first"
+    || die "local PostgreSQL setup completed, but DATABASE_URL_NATIVE still cannot connect"
 }
 
 check_docker_storage() {
@@ -307,7 +329,7 @@ case "$command_name" in
     [[ $profile == debug || $profile == release ]] || die "native profile must be debug or release"
     setup_env
     load_env
-    check_deployment_values
+    check_deployment_values native "$profile"
     check_mode_switch native
     check_tmux
     start_native "$profile"
@@ -316,7 +338,7 @@ case "$command_name" in
     [[ $# == 1 ]] || die "docker takes no extra arguments"
     setup_env
     load_env
-    check_deployment_values
+    check_deployment_values docker
     check_mode_switch docker
     check_tmux
     start_docker
