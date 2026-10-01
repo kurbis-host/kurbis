@@ -3,15 +3,16 @@ use serde_json::json;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus};
+use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus, ServerRecord};
 
 mod operations;
 mod placement;
 
 pub use operations::{
     begin_snapshot_retry, claim_operation, complete_delete, complete_reset, complete_restore,
-    complete_snapshot, complete_start, complete_stop, defer_snapshot_operation, fail_operation,
-    recover_running_operations, retry_operation, update_operation_payload, validate_delete,
+    complete_snapshot, complete_start, complete_stop, deactivate_placement_after_stop,
+    defer_snapshot_operation, fail_operation, recover_running_operations, retry_operation,
+    update_operation_payload, validate_delete,
 };
 use placement::{
     enqueue_delete, lock_placement, lock_server, lock_server_optional, place_and_enqueue_start,
@@ -25,6 +26,15 @@ pub use placement::{
 #[derive(Clone)]
 pub struct Lifecycle {
     pool: PgPool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LifecycleActor {
+    Owner,
+    AssignedWorker {
+        worker_id: Uuid,
+        expected_generation: i64,
+    },
 }
 
 impl Lifecycle {
@@ -161,124 +171,58 @@ impl Lifecycle {
     }
 
     pub async fn request_stop(&self, server_id: Uuid, reason: &str) -> Result<ObservedState> {
+        self.request_stop_for_actor(LifecycleActor::Owner, server_id, reason)
+            .await
+    }
+
+    pub async fn request_stop_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+        reason: &str,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
-        if has_live_reset(&mut tx, server_id).await? {
-            bail!("server reset is in progress");
-        }
-        if has_live_snapshot(&mut tx, server_id).await? {
-            bail!("server snapshot is in progress");
-        }
-        if server.desired_state == DesiredState::Deleted
-            || server.observed_state == ObservedState::Deleted
-        {
-            tx.commit().await?;
-            return Ok(ObservedState::Deleted);
-        }
-        sqlx::query(
-            "UPDATE servers SET desired_state = 'stopped', updated_at = now() WHERE id = $1",
+        authorize_actor(&mut tx, &server, actor, true).await?;
+        let state = request_stop_in_transaction(&mut tx, &server, reason).await?;
+        tx.commit().await?;
+        Ok(state)
+    }
+
+    pub async fn request_worker_stop(
+        &self,
+        worker_id: Uuid,
+        server_id: Uuid,
+        expected_generation: i64,
+        reason: &str,
+    ) -> Result<ObservedState> {
+        self.request_stop_for_actor(
+            LifecycleActor::AssignedWorker {
+                worker_id,
+                expected_generation,
+            },
+            server_id,
+            reason,
         )
-        .bind(server_id)
-        .execute(&mut *tx)
-        .await?;
+        .await
+    }
 
-        if server.observed_state == ObservedState::Restoring {
-            let restoring_snapshot: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM operations
-                    WHERE server_id = $1 AND kind = 'restore' AND status IN ('pending','running')
-                 )",
-            )
-            .bind(server_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if restoring_snapshot {
-                tx.commit().await?;
-                return Ok(ObservedState::Restoring);
-            }
-        }
-
-        match server.observed_state {
-            ObservedState::Sleeping | ObservedState::Deleted => {
-                tx.commit().await?;
-                Ok(server.observed_state)
-            }
-            ObservedState::Queued => {
-                sqlx::query("DELETE FROM start_requests WHERE server_id = $1")
-                    .bind(server_id)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query(
-                    "UPDATE operations SET status = 'cancelled', updated_at = now()
-                     WHERE server_id = $1 AND status = 'pending'",
-                )
-                .bind(server_id)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "UPDATE servers SET observed_state = 'sleeping', updated_at = now() WHERE id = $1",
-                )
-                .bind(server_id)
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                Ok(ObservedState::Sleeping)
-            }
-            ObservedState::Stopping | ObservedState::Snapshotting => {
-                tx.commit().await?;
-                Ok(server.observed_state)
-            }
-            _ => {
-                let placement = lock_placement(&mut tx, server_id)
-                    .await?
-                    .context("server has no placement to stop")?;
-
-                let live_start: Option<(Uuid, OperationStatus)> = sqlx::query_as(
-                    "SELECT id, status FROM operations
-                     WHERE server_id = $1 AND kind IN ('start','restart') AND status IN ('pending','running')
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(server_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some((id, OperationStatus::Pending)) = live_start {
-                    sqlx::query("UPDATE operations SET status = 'cancelled', updated_at = now() WHERE id = $1")
-                        .bind(id)
-                        .execute(&mut *tx)
-                        .await?;
-                    release_placement_resources(&mut tx, &placement).await?;
-                    sqlx::query(
-                        "UPDATE servers SET observed_state = 'sleeping', updated_at = now() WHERE id = $1",
-                    )
-                    .bind(server_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    return Ok(ObservedState::Sleeping);
-                }
-
-                if live_start.is_none() {
-                    enqueue_operation(
-                        &mut tx,
-                        server_id,
-                        Some(placement.worker_id),
-                        OperationKind::Stop,
-                        server.generation,
-                        json!({ "reason": reason }),
-                    )
-                    .await?;
-                    sqlx::query(
-                        "UPDATE servers SET observed_state = 'stopping', updated_at = now() WHERE id = $1",
-                    )
-                    .bind(server_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                tx.commit().await?;
-                Ok(ObservedState::Stopping)
-            }
-        }
+    pub async fn request_worker_snapshot(
+        &self,
+        worker_id: Uuid,
+        server_id: Uuid,
+        expected_generation: i64,
+        reason: crate::model::SnapshotReason,
+    ) -> Result<ObservedState> {
+        self.request_snapshot_for_actor(
+            LifecycleActor::AssignedWorker {
+                worker_id,
+                expected_generation,
+            },
+            server_id,
+            reason,
+        )
+        .await
     }
 
     pub async fn request_restart(&self, server_id: Uuid) -> Result<ObservedState> {
@@ -346,42 +290,22 @@ impl Lifecycle {
         server_id: Uuid,
         reason: crate::model::SnapshotReason,
     ) -> Result<ObservedState> {
+        self.request_snapshot_for_actor(LifecycleActor::Owner, server_id, reason)
+            .await
+    }
+
+    pub async fn request_snapshot_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+        reason: crate::model::SnapshotReason,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
-        if has_live_reset(&mut tx, server_id).await? {
-            bail!("server reset is in progress");
-        }
-        if has_live_snapshot(&mut tx, server_id).await? {
-            bail!("a server snapshot is already in progress");
-        }
-        if server.observed_state != ObservedState::Online
-            || server.desired_state != DesiredState::Running
-        {
-            bail!("snapshots require an online running server");
-        }
-        let placement = lock_placement(&mut tx, server_id)
-            .await?
-            .context("online server has no placement")?;
-        if !placement.active || placement.generation != server.generation {
-            bail!("online server placement is not active for the current generation");
-        }
-        enqueue_operation(
-            &mut tx,
-            server_id,
-            Some(placement.worker_id),
-            OperationKind::Snapshot,
-            server.generation,
-            json!({"reason":reason}),
-        )
-        .await?;
-        sqlx::query(
-            "UPDATE servers SET observed_state = 'snapshotting', updated_at = now() WHERE id = $1",
-        )
-        .bind(server_id)
-        .execute(&mut *tx)
-        .await?;
+        authorize_actor(&mut tx, &server, actor, true).await?;
+        let state = request_snapshot_in_transaction(&mut tx, &server, reason).await?;
         tx.commit().await?;
-        Ok(ObservedState::Snapshotting)
+        Ok(state)
     }
 
     pub async fn request_world_export(&self, server_id: Uuid, requested_by: Uuid) -> Result<Uuid> {
@@ -711,16 +635,14 @@ impl Lifecycle {
             }
             Some(placement.worker_id)
         } else {
-            let healthy_worker: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM workers WHERE NOT draining
-                  AND heartbeat_at > now() - interval '30 seconds')",
+            let healthy_worker: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM workers WHERE NOT draining
+                  AND heartbeat_at > now() - interval '30 seconds'
+                 ORDER BY id LIMIT 1",
             )
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-            if !healthy_worker {
-                bail!("no worker is available to reset this server");
-            }
-            None
+            Some(healthy_worker.context("no worker is available to reset this server")?)
         };
 
         if mode == "full" {
@@ -784,6 +706,36 @@ impl Lifecycle {
     }
 }
 
+async fn authorize_actor(
+    tx: &mut Transaction<'_, Postgres>,
+    server: &ServerRecord,
+    actor: LifecycleActor,
+    require_active: bool,
+) -> Result<()> {
+    let LifecycleActor::AssignedWorker {
+        worker_id,
+        expected_generation,
+    } = actor
+    else {
+        return Ok(());
+    };
+    let placement: Option<(Uuid, i64, bool)> =
+        sqlx::query_as("SELECT worker_id, generation, active FROM placements WHERE server_id = $1")
+            .bind(server.id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let (placement_worker_id, placement_generation, placement_active) =
+        placement.context("server has no worker placement for lifecycle command")?;
+    if server.generation != expected_generation
+        || placement_generation != expected_generation
+        || placement_worker_id != worker_id
+        || (require_active && !placement_active)
+    {
+        bail!("lifecycle command no longer matches the assigned worker generation");
+    }
+    Ok(())
+}
+
 async fn has_live_reset(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM operations
@@ -792,6 +744,160 @@ async fn has_live_reset(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> 
     .bind(server_id)
     .fetch_one(&mut **tx)
     .await?)
+}
+
+async fn request_stop_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    server: &ServerRecord,
+    reason: &str,
+) -> Result<ObservedState> {
+    let server_id = server.id;
+    if has_live_reset(tx, server_id).await? {
+        bail!("server reset is in progress");
+    }
+    if has_live_snapshot(tx, server_id).await? {
+        bail!("server snapshot is in progress");
+    }
+    if server.desired_state == DesiredState::Deleted
+        || server.observed_state == ObservedState::Deleted
+    {
+        return Ok(ObservedState::Deleted);
+    }
+    sqlx::query("UPDATE servers SET desired_state = 'stopped', updated_at = now() WHERE id = $1")
+        .bind(server_id)
+        .execute(&mut **tx)
+        .await?;
+
+    if server.observed_state == ObservedState::Restoring {
+        let restoring_snapshot: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM operations
+                WHERE server_id = $1 AND kind = 'restore' AND status IN ('pending','running')
+             )",
+        )
+        .bind(server_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if restoring_snapshot {
+            return Ok(ObservedState::Restoring);
+        }
+    }
+
+    match server.observed_state {
+        ObservedState::Sleeping | ObservedState::Deleted => Ok(server.observed_state),
+        ObservedState::Queued => {
+            sqlx::query("DELETE FROM start_requests WHERE server_id = $1")
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(
+                "UPDATE operations SET status = 'cancelled', updated_at = now()
+                 WHERE server_id = $1 AND status = 'pending'",
+            )
+            .bind(server_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "UPDATE servers SET observed_state = 'sleeping', updated_at = now() WHERE id = $1",
+            )
+            .bind(server_id)
+            .execute(&mut **tx)
+            .await?;
+            Ok(ObservedState::Sleeping)
+        }
+        ObservedState::Stopping | ObservedState::Snapshotting => Ok(server.observed_state),
+        _ => {
+            let live_start: Option<(Uuid, OperationStatus)> = sqlx::query_as(
+                "SELECT id, status FROM operations
+                 WHERE server_id = $1 AND kind IN ('start','restart')
+                   AND status IN ('pending','running')
+                 ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+            )
+            .bind(server_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let placement = lock_placement(tx, server_id)
+                .await?
+                .context("server has no placement to stop")?;
+
+            if let Some((id, OperationStatus::Pending)) = live_start {
+                sqlx::query(
+                    "UPDATE operations SET status = 'cancelled', updated_at = now() WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+                release_placement_resources(tx, &placement).await?;
+                sqlx::query(
+                    "UPDATE servers SET observed_state = 'sleeping', updated_at = now() WHERE id = $1",
+                )
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
+                return Ok(ObservedState::Sleeping);
+            }
+
+            if live_start.is_none() {
+                enqueue_operation(
+                    tx,
+                    server_id,
+                    Some(placement.worker_id),
+                    OperationKind::Stop,
+                    server.generation,
+                    json!({"reason": reason}),
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE servers SET observed_state = 'stopping', updated_at = now() WHERE id = $1",
+                )
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            Ok(ObservedState::Stopping)
+        }
+    }
+}
+
+async fn request_snapshot_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    server: &ServerRecord,
+    reason: crate::model::SnapshotReason,
+) -> Result<ObservedState> {
+    let server_id = server.id;
+    if has_live_reset(tx, server_id).await? {
+        bail!("server reset is in progress");
+    }
+    if has_live_snapshot(tx, server_id).await? {
+        bail!("a server snapshot is already in progress");
+    }
+    if server.observed_state != ObservedState::Online
+        || server.desired_state != DesiredState::Running
+    {
+        bail!("snapshots require an online running server");
+    }
+    let placement = lock_placement(tx, server_id)
+        .await?
+        .context("online server has no placement")?;
+    if !placement.active || placement.generation != server.generation {
+        bail!("online server placement is not active for the current generation");
+    }
+    enqueue_operation(
+        tx,
+        server_id,
+        Some(placement.worker_id),
+        OperationKind::Snapshot,
+        server.generation,
+        json!({"reason":reason}),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'snapshotting', updated_at = now() WHERE id = $1",
+    )
+    .bind(server_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(ObservedState::Snapshotting)
 }
 
 async fn has_live_snapshot(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {

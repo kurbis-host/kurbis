@@ -37,7 +37,7 @@ pub(super) async fn lock_placement(
     server_id: Uuid,
 ) -> Result<Option<PlacementRecord>> {
     Ok(sqlx::query_as::<_, PlacementRecord>(
-        "SELECT server_id, worker_id, generation, lease_token, java_port, bedrock_port,
+        "SELECT server_id, worker_id, generation, lease_token, java_port, bedrock_port, signal_port,
                 active, updated_at
          FROM placements WHERE server_id = $1 FOR UPDATE",
     )
@@ -51,7 +51,7 @@ pub(super) async fn select_worker(
     server: &ServerRecord,
 ) -> Result<Option<WorkerRecord>> {
     Ok(sqlx::query_as::<_, WorkerRecord>(
-        "SELECT w.id, w.name, w.address, w.total_memory_bytes, w.total_disk_bytes,
+        "SELECT w.id, w.name, w.address, w.signal_address, w.total_memory_bytes, w.total_disk_bytes,
                 w.total_cpu_millis, w.reserved_memory_bytes, w.reserved_disk_bytes,
                 w.reserved_cpu_millis, w.heartbeat_at, w.draining,
                 w.port_min, w.port_max
@@ -64,12 +64,14 @@ pub(super) async fn select_worker(
            AND w.total_disk_bytes - w.reserved_disk_bytes >= $4
            AND w.total_cpu_millis - w.reserved_cpu_millis >= $5
            AND EXISTS (
-               SELECT 1 FROM generate_series(w.port_min, w.port_max - 1) AS candidate(port)
+               SELECT 1 FROM generate_series(w.port_min, w.port_max - 2) AS candidate(port)
                WHERE NOT EXISTS (
                    SELECT 1 FROM port_leases l
-                   WHERE l.worker_id = w.id AND l.port IN (candidate.port, candidate.port + 1)
+                   WHERE l.worker_id = w.id
+                     AND l.port IN (candidate.port, candidate.port + 1, candidate.port + 2)
                )
            )
+           AND w.signal_address <> ''
          ORDER BY (c.worker_id IS NOT NULL) DESC,
                   (w.total_memory_bytes - w.reserved_memory_bytes - $3) ASC,
                   (w.total_disk_bytes - w.reserved_disk_bytes - $4) ASC,
@@ -120,10 +122,10 @@ pub(super) async fn place_and_enqueue_worker_operation(
 ) -> Result<()> {
     let base_port: Option<i32> = sqlx::query_scalar(
         "SELECT p
-         FROM generate_series($2, $3 - 1) AS p
+         FROM generate_series($2, $3 - 2) AS p
          WHERE NOT EXISTS (
              SELECT 1 FROM port_leases l
-             WHERE l.worker_id = $1 AND l.port IN (p, p + 1)
+             WHERE l.worker_id = $1 AND l.port IN (p, p + 1, p + 2)
          )
          ORDER BY p
          LIMIT 1",
@@ -133,7 +135,7 @@ pub(super) async fn place_and_enqueue_worker_operation(
     .bind(worker.port_max)
     .fetch_optional(&mut **tx)
     .await?;
-    let base_port = base_port.context("selected worker lost its free port pair")?;
+    let base_port = base_port.context("selected worker lost its free port triple")?;
 
     if let Some(old) = lock_placement(tx, server.id).await? {
         sqlx::query("DELETE FROM port_leases WHERE server_id = $1")
@@ -148,14 +150,15 @@ pub(super) async fn place_and_enqueue_worker_operation(
     let generation = server.generation + 1;
     let lease_token = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO placements(server_id, worker_id, generation, lease_token, java_port, bedrock_port, active)
-         VALUES($1, $2, $3, $4, $5, $6, false)
+        "INSERT INTO placements(server_id, worker_id, generation, lease_token, java_port, bedrock_port, signal_port, active)
+         VALUES($1, $2, $3, $4, $5, $6, $7, false)
          ON CONFLICT(server_id) DO UPDATE SET
            worker_id = EXCLUDED.worker_id,
            generation = EXCLUDED.generation,
            lease_token = EXCLUDED.lease_token,
            java_port = EXCLUDED.java_port,
            bedrock_port = EXCLUDED.bedrock_port,
+           signal_port = EXCLUDED.signal_port,
            active = false,
            updated_at = now()",
     )
@@ -165,10 +168,15 @@ pub(super) async fn place_and_enqueue_worker_operation(
     .bind(lease_token)
     .bind(base_port)
     .bind(base_port + 1)
+    .bind(base_port + 2)
     .execute(&mut **tx)
     .await?;
 
-    for (port, purpose) in [(base_port, "java"), (base_port + 1, "bedrock")] {
+    for (port, purpose) in [
+        (base_port, "java"),
+        (base_port + 1, "bedrock"),
+        (base_port + 2, "signal"),
+    ] {
         sqlx::query(
             "INSERT INTO port_leases(worker_id, port, server_id, purpose) VALUES($1,$2,$3,$4)",
         )
@@ -242,10 +250,29 @@ pub(super) async fn enqueue_delete(
     server_id: Uuid,
     generation: i64,
 ) -> Result<Uuid> {
+    // Cleanup is always assigned by the control plane. An inactive placement
+    // still identifies the worker that owns the server's local data; when no
+    // placement remains, choose a healthy registered worker so workers never
+    // claim an anonymous delete row.
+    let previous_worker: Option<Uuid> =
+        sqlx::query_scalar("SELECT worker_id FROM placements WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let worker_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM workers
+         WHERE NOT draining AND heartbeat_at > now() - interval '30 seconds'
+           AND ($1 IS NULL OR id <> $1)
+         ORDER BY id LIMIT 1",
+    )
+    .bind(previous_worker)
+    .fetch_optional(&mut **tx)
+    .await?
+    .or(previous_worker);
     enqueue_operation(
         tx,
         server_id,
-        None,
+        worker_id,
         OperationKind::Delete,
         generation,
         json!({"reason":"delete"}),
@@ -285,6 +312,7 @@ pub async fn mark_runtime_lost(
     pool: &PgPool,
     worker_id: Uuid,
     server_id: Uuid,
+    expected_generation: i64,
     error: &str,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -293,7 +321,11 @@ pub async fn mark_runtime_lost(
         tx.commit().await?;
         return Ok(());
     };
-    if placement.worker_id != worker_id || !placement.active {
+    if server.generation != expected_generation
+        || placement.worker_id != worker_id
+        || placement.generation != expected_generation
+        || !placement.active
+    {
         tx.commit().await?;
         return Ok(());
     }
@@ -337,10 +369,11 @@ pub async fn mark_runtime_lost(
 
 pub async fn heartbeat_worker(pool: &PgPool, worker: &WorkerRecord) -> Result<()> {
     sqlx::query(
-        "INSERT INTO workers(id,name,address,total_memory_bytes,total_disk_bytes,total_cpu_millis,heartbeat_at,draining,port_min,port_max)
-         VALUES($1,$2,$3,$4,$5,$6,now(),$7,$8,$9)
+        "INSERT INTO workers(id,name,address,signal_address,total_memory_bytes,total_disk_bytes,total_cpu_millis,heartbeat_at,draining,port_min,port_max)
+         VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10)
          ON CONFLICT(id) DO UPDATE SET
            name=EXCLUDED.name, address=EXCLUDED.address,
+           signal_address=EXCLUDED.signal_address,
            total_memory_bytes=EXCLUDED.total_memory_bytes, total_disk_bytes=EXCLUDED.total_disk_bytes,
            total_cpu_millis=EXCLUDED.total_cpu_millis,
            heartbeat_at=now(), draining=EXCLUDED.draining,
@@ -349,6 +382,7 @@ pub async fn heartbeat_worker(pool: &PgPool, worker: &WorkerRecord) -> Result<()
     .bind(worker.id)
     .bind(&worker.name)
     .bind(&worker.address)
+    .bind(&worker.signal_address)
     .bind(worker.total_memory_bytes)
     .bind(worker.total_disk_bytes)
     .bind(worker.total_cpu_millis)
@@ -378,6 +412,7 @@ pub fn healthy_worker_template(
         id,
         name,
         address,
+        signal_address: "127.0.0.1".to_owned(),
         total_memory_bytes,
         total_disk_bytes,
         total_cpu_millis,

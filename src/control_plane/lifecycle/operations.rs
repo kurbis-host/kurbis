@@ -10,12 +10,17 @@ use crate::model::{DesiredState, ObservedState, OperationKind, OperationRecord, 
 
 pub async fn claim_operation(pool: &PgPool, worker_id: Uuid) -> Result<Option<OperationRecord>> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM workers WHERE id = $1 FOR UPDATE")
+        .bind(worker_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("worker is not registered")?;
     let op = sqlx::query_as::<_, OperationRecord>(
-        "SELECT id, server_id, worker_id, kind, status, generation, attempt, payload,
-                last_error, created_at, updated_at
-         FROM operations
-         WHERE status = 'pending' AND next_attempt_at <= now()
-           AND (worker_id = $1 OR (worker_id IS NULL AND kind IN ('delete', 'reset')))
+        "SELECT o.id, o.server_id, o.worker_id, o.kind, o.status, o.generation, o.attempt,
+                o.payload, o.last_error, o.created_at, o.updated_at
+         FROM operations o JOIN servers s ON s.id = o.server_id
+         WHERE o.status = 'pending' AND o.next_attempt_at <= now()
+           AND o.worker_id = $1 AND o.generation = s.generation
          ORDER BY created_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
@@ -29,26 +34,67 @@ pub async fn claim_operation(pool: &PgPool, worker_id: Uuid) -> Result<Option<Op
     };
     sqlx::query(
         "UPDATE operations
-         SET worker_id = COALESCE(worker_id, $2), status = 'running', attempt = attempt + 1,
+         SET status = 'running', attempt = attempt + 1,
              claimed_at = now(), updated_at = now()
-         WHERE id = $1",
+         WHERE id = $1 AND worker_id = $2 AND status = 'pending'",
     )
     .bind(op.id)
     .bind(worker_id)
     .execute(&mut *tx)
     .await?;
-    op.worker_id = Some(worker_id);
     op.status = OperationStatus::Running;
     op.attempt += 1;
     tx.commit().await?;
     Ok(Some(op))
 }
 
+pub async fn deactivate_placement_after_stop(
+    pool: &PgPool,
+    worker_id: Uuid,
+    op: &OperationRecord,
+) -> Result<()> {
+    let expected_state = match op.kind {
+        OperationKind::Stop | OperationKind::Restart => ObservedState::Stopping,
+        OperationKind::Snapshot => ObservedState::Snapshotting,
+        OperationKind::Reset => ObservedState::Resetting,
+        _ => bail!("operation kind cannot deactivate a server placement"),
+    };
+    if op.worker_id != Some(worker_id) {
+        bail!("placement deactivation worker identity does not match the operation");
+    }
+
+    let mut tx = pool.begin().await?;
+    let server = lock_server(&mut tx, op.server_id).await?;
+    if server.generation != op.generation || server.observed_state != expected_state {
+        bail!("placement deactivation no longer matches the current server generation and state");
+    }
+    lock_claim(&mut tx, op, None).await?;
+    let placement = lock_placement(&mut tx, op.server_id)
+        .await?
+        .context("placement deactivation lost its server placement")?;
+    validate_placement(op, &placement)?;
+    if placement.active {
+        sqlx::query(
+            "UPDATE placements SET active = false, updated_at = now()
+             WHERE server_id = $1 AND worker_id = $2 AND generation = $3 AND active",
+        )
+        .bind(op.server_id)
+        .bind(worker_id)
+        .bind(op.generation)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn recover_running_operations(pool: &PgPool, worker_id: Uuid) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE operations
+        "UPDATE operations o
          SET status = 'pending', claimed_at = NULL, next_attempt_at = now(), updated_at = now()
-         WHERE worker_id = $1 AND status = 'running'",
+         FROM servers s
+         WHERE s.id = o.server_id AND o.worker_id = $1 AND o.status = 'running'
+           AND o.generation = s.generation",
     )
     .bind(worker_id)
     .execute(pool)
@@ -104,11 +150,8 @@ pub async fn begin_snapshot_retry(pool: &PgPool, op: &OperationRecord) -> Result
     }
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
-    if server.generation != op.generation
-        || server.desired_state != DesiredState::Running
-        || server.observed_state != ObservedState::Online
-    {
-        bail!("snapshot retry no longer matches the online server generation");
+    if server.generation != op.generation || server.desired_state != DesiredState::Running {
+        bail!("snapshot retry no longer matches the current running server generation");
     }
     if !lock_claim(&mut tx, op, None).await? {
         bail!("snapshot retry claim is no longer running");
@@ -117,6 +160,13 @@ pub async fn begin_snapshot_retry(pool: &PgPool, op: &OperationRecord) -> Result
         .await?
         .context("snapshot retry lost placement")?;
     validate_placement(op, &placement)?;
+    if server.observed_state == ObservedState::Snapshotting && !placement.active {
+        tx.commit().await?;
+        return Ok(());
+    }
+    if server.observed_state != ObservedState::Online {
+        bail!("snapshot retry no longer matches the online server generation");
+    }
     if !placement.active {
         bail!("snapshot retry requires an active placement");
     }
@@ -159,11 +209,8 @@ pub async fn defer_snapshot_operation(
     }
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
-    if server.generation != op.generation
-        || server.desired_state != DesiredState::Running
-        || server.observed_state != ObservedState::Snapshotting
-    {
-        bail!("snapshot deferral no longer matches the current server generation");
+    if server.generation != op.generation || server.desired_state != DesiredState::Running {
+        bail!("snapshot deferral no longer matches the current running server generation");
     }
     if !lock_claim(&mut tx, op, None).await? {
         bail!("snapshot deferral claim is no longer running");
@@ -172,6 +219,13 @@ pub async fn defer_snapshot_operation(
         .await?
         .context("snapshot deferral lost placement")?;
     validate_placement(op, &placement)?;
+    if server.observed_state == ObservedState::Online && placement.active {
+        tx.commit().await?;
+        return Ok(());
+    }
+    if server.observed_state != ObservedState::Snapshotting {
+        bail!("snapshot deferral no longer matches the snapshotting server generation");
+    }
     if placement.active {
         bail!("snapshot deferral requires the stopped placement fence");
     }

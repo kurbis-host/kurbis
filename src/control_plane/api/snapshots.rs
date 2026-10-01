@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::model::{ObservedState, SnapshotRecord as DbSnapshot};
 
-use super::internal::require_server_owner;
+use super::internal::require_server_access;
 use super::server::ServerActionResponse;
 use super::types::Snapshot;
 use super::{ApiError, AppState, lifecycle_error};
@@ -19,7 +19,7 @@ pub(super) async fn snapshots(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<Snapshot>>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let snapshots = sqlx::query_as::<_, DbSnapshot>(
         "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete,
                 created_at
@@ -41,7 +41,7 @@ pub(super) async fn restore_snapshot(
     headers: HeaderMap,
     Path((server_id, generation)): Path<(Uuid, i64)>,
 ) -> Result<Json<ServerActionResponse>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     if server.observed_state != ObservedState::Sleeping {
         return Err(ApiError::with_code(
             StatusCode::CONFLICT,

@@ -38,14 +38,7 @@ async fn concurrent_publishers_serialize_before_allocating_generations() {
     tokio::fs::write(second.path().join("level.dat"), b"second world")
         .await
         .unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     let mut guard = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
         .bind(server.to_string())
@@ -78,6 +71,8 @@ async fn concurrent_publishers_serialize_before_allocating_generations() {
     let b = tasks.remove(0).await.unwrap();
     assert_ne!(a.generation, b.generation);
     assert_eq!(a.generation.max(b.generation), 2);
+    let current = if a.generation > b.generation { &a } else { &b };
+    publish_test_snapshot(&pool, server, current.generation, current.size_bytes).await;
     assert_eq!(
         manager
             .restore_latest(server, restored.path())
@@ -111,20 +106,15 @@ async fn damaged_reused_chunk_cannot_publish_and_retry_recovers() {
     tokio::fs::write(source.path().join("level.dat"), bytes)
         .await
         .unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     let initial = manager
         .create(server, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server, initial.generation, initial.size_bytes).await;
     let chunk = objects
         .path()
+        .join(format!("servers/{server}"))
         .join("chunks")
         .join(blake3::hash(bytes).to_hex().as_str());
     tokio::fs::write(&chunk, b"wrong world").await.unwrap();
@@ -149,6 +139,7 @@ async fn damaged_reused_chunk_cannot_publish_and_retry_recovers() {
         .create(server, source.path(), SnapshotReason::Shutdown)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server, retry.generation, retry.size_bytes).await;
     assert_eq!(retry.generation, 3);
     assert_eq!(
         manager
@@ -185,19 +176,17 @@ async fn manifest_upload_failure_preserves_current_and_releases_publication_lock
         .unwrap();
     let manager = SnapshotManager::new(
         single_connection_pool,
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
-    manager
+        local_snapshot_store(objects.path()).await,
+    );
+    let initial = manager
         .create(server, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server, initial.generation, initial.size_bytes).await;
     // Keep completed objects intact, but prevent the next manifest write.
-    let manifests = objects.path().join("snapshots");
-    let preserved = objects.path().join("preserved-snapshots");
+    let object_prefix = objects.path().join(format!("servers/{server}"));
+    let manifests = object_prefix.join("snapshots");
+    let preserved = object_prefix.join("preserved-snapshots");
     tokio::fs::rename(&manifests, &preserved).await.unwrap();
     tokio::fs::write(&manifests, b"unavailable object-store prefix")
         .await
@@ -243,6 +232,7 @@ async fn manifest_upload_failure_preserves_current_and_releases_publication_lock
     .await
     .unwrap()
     .unwrap();
+    publish_test_snapshot(&pool, server, retry.generation, retry.size_bytes).await;
     assert_eq!(retry.generation, 3);
     assert_eq!(
         manager
@@ -276,14 +266,7 @@ async fn cancelled_publisher_does_not_leave_a_lock_in_the_pool() {
         .connect(&std::env::var("TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
-    let manager = SnapshotManager::new(
-        limited_pool,
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = SnapshotManager::new(limited_pool, local_snapshot_store(objects.path()).await);
     let mut guard = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
         .bind(server.to_string())
@@ -308,6 +291,7 @@ async fn cancelled_publisher_does_not_leave_a_lock_in_the_pool() {
     .await
     .unwrap()
     .unwrap();
+    publish_test_snapshot(&pool, server, snapshot.generation, snapshot.size_bytes).await;
     assert_eq!(snapshot.generation, 1);
     cleanup(&pool, owner).await;
 }
@@ -320,14 +304,7 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
     let objects = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     let restored = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     tokio::fs::write(source.path().join("level.dat"), b"selected restore source")
         .await
         .unwrap();
@@ -335,6 +312,7 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
         .create(server, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server, selected.generation, selected.size_bytes).await;
     let operation = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO operations(id, server_id, kind, generation, payload)
@@ -348,6 +326,7 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
     .unwrap();
     let selected_chunk = objects
         .path()
+        .join(format!("servers/{server}"))
         .join("chunks")
         .join(blake3::hash(b"selected restore source").to_hex().as_str());
     for status in ["pending", "running"] {
@@ -364,12 +343,16 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
             )
             .await
             .unwrap();
-            manager
+            let snapshot = manager
                 .create(server, source.path(), SnapshotReason::Restore)
                 .await
                 .unwrap();
+            publish_test_snapshot(&pool, server, snapshot.generation, snapshot.size_bytes).await;
         }
-        manager.collect_garbage().await.unwrap();
+        let gc_store = local_snapshot_store(objects.path()).await;
+        SnapshotManager::collect_garbage_with(&pool, gc_store)
+            .await
+            .unwrap();
         assert!(
             selected_chunk.exists(),
             "active restore source chunk must remain"
@@ -393,11 +376,15 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
         .execute(&pool)
         .await
         .unwrap();
-    manager
+    let latest = manager
         .create(server, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
-    manager.collect_garbage().await.unwrap();
+    publish_test_snapshot(&pool, server, latest.generation, latest.size_bytes).await;
+    let gc_store = local_snapshot_store(objects.path()).await;
+    SnapshotManager::collect_garbage_with(&pool, gc_store)
+        .await
+        .unwrap();
     assert!(
         !selected_chunk.exists(),
         "completed restore must release its retention pin"

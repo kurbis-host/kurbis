@@ -8,7 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::internal::require_server_owner;
+use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -84,7 +84,7 @@ pub(super) async fn activity(
     Path(server_id): Path<uuid::Uuid>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<Vec<ActivityEntry>>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let rows = sqlx::query_as::<_, EventRow>(
         "SELECT id, event_type, created_at
          FROM server_events

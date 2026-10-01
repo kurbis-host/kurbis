@@ -36,6 +36,77 @@ pub(super) async fn resolve(
     Ok(Json(target))
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct BedrockSignalTarget {
+    server_id: Uuid,
+    worker_address: String,
+    bedrock_port: u16,
+    signal_address: String,
+    signal_port: u16,
+    generation: i64,
+}
+
+pub(super) async fn bedrock_signal_target(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
+) -> Result<Json<BedrockSignalTarget>, ApiError> {
+    require_internal(&state, &headers)?;
+    let target = sqlx::query_as::<_, (Uuid, String, i32, String, i32, i64)>(
+        "SELECT p.server_id, w.address, p.bedrock_port,
+                w.signal_address, p.signal_port, p.generation
+         FROM placements p
+         JOIN servers s ON s.id = p.server_id
+         JOIN workers w ON w.id = p.worker_id
+         JOIN users u ON u.id = s.owner_id
+         WHERE p.server_id = $1 AND p.active
+           AND p.generation = s.generation
+           AND s.desired_state = 'running' AND s.observed_state = 'online'
+           AND u.account_status = 'active'
+           AND w.signal_address <> ''
+           AND w.heartbeat_at > now() - interval '30 seconds'",
+    )
+    .bind(server_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| {
+        ApiError::with_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signal_target_unavailable",
+            "server signaling target is unavailable",
+        )
+    })?;
+    if !crate::model::is_private_signal_address(&target.3) {
+        return Err(ApiError::with_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signal_target_unavailable",
+            "server signaling target is unavailable",
+        ));
+    }
+    let bedrock_port = u16::try_from(target.2).map_err(|_| {
+        ApiError::with_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_signal_target",
+            "server public target is invalid",
+        )
+    })?;
+    let signal_port = u16::try_from(target.4).map_err(|_| {
+        ApiError::with_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_signal_target",
+            "server signaling target is invalid",
+        )
+    })?;
+    Ok(Json(BedrockSignalTarget {
+        server_id: target.0,
+        worker_address: target.1,
+        bedrock_port,
+        signal_address: target.3,
+        signal_port,
+        generation: target.5,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AdmissionRequest {
@@ -363,22 +434,53 @@ pub(super) async fn require_active_user(
     Ok(user)
 }
 
-pub(super) async fn require_server_owner(
+pub(super) async fn require_server_access(
     state: &AppState,
     headers: &HeaderMap,
     server_id: Uuid,
 ) -> Result<ServerRecord, ApiError> {
-    let user = require_active_user(state, headers).await?;
-    server_by_id(&state.pool, server_id)
-        .await?
-        .filter(|server| server.owner_id == user.id)
-        .ok_or_else(|| {
+    let owner_error = match require_active_user(state, headers).await {
+        Ok(user) => {
+            if let Some(server) = server_by_id(&state.pool, server_id)
+                .await?
+                .filter(|server| server.owner_id == user.id)
+            {
+                return Ok(server);
+            }
             ApiError::with_code(
                 StatusCode::NOT_FOUND,
                 "server_not_found",
                 "server not found",
             )
-        })
+        }
+        Err(error) => error,
+    };
+
+    let server_session_id =
+        super::server_access::server_session_server_id(&state.pool, headers).await?;
+    if server_session_id == Some(server_id) {
+        return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::NOT_FOUND,
+                "server_not_found",
+                "server not found",
+            )
+        });
+    }
+
+    let capability_server_id =
+        super::server_access::instance_capability_server_id(&state.pool, headers).await?;
+    if capability_server_id == Some(server_id) {
+        return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::NOT_FOUND,
+                "server_not_found",
+                "server not found",
+            )
+        });
+    }
+
+    Err(owner_error)
 }
 
 pub(super) fn require_internal(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

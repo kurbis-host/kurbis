@@ -1,8 +1,9 @@
 mod common;
 
+use std::{path::Path, sync::Arc};
+
 use common::{create_user, test_pool};
 use kurbis_hoster::{
-    config::ObjectStoreConfig,
     model::{SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason},
     worker::snapshot::SnapshotManager,
 };
@@ -11,6 +12,15 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+pub(crate) async fn local_snapshot_manager(pool: &PgPool, root: &Path) -> SnapshotManager {
+    SnapshotManager::new(pool.clone(), local_snapshot_store(root).await)
+}
+
+pub(crate) async fn local_snapshot_store(root: &Path) -> Arc<dyn object_store::ObjectStore> {
+    tokio::fs::create_dir_all(root).await.unwrap();
+    Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap())
+}
 
 async fn create_server(pool: &PgPool) -> (Uuid, Uuid) {
     let server_id = Uuid::new_v4();
@@ -41,6 +51,24 @@ async fn cleanup(pool: &PgPool, user_id: Uuid) {
         .unwrap();
 }
 
+pub(crate) async fn publish_test_snapshot(
+    pool: &PgPool,
+    server_id: Uuid,
+    generation: i64,
+    size_bytes: i64,
+) {
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3
+         WHERE id = $1",
+    )
+    .bind(server_id)
+    .bind(generation)
+    .bind(size_bytes)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn published_snapshot_restores_and_keeps_a_bounded_recovery_window() {
     let _serial = DB_TEST_LOCK.lock().await;
@@ -49,14 +77,7 @@ async fn published_snapshot_restores_and_keeps_a_bounded_recovery_window() {
     let object_root = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     let restore = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: object_root.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, object_root.path()).await;
 
     tokio::fs::create_dir_all(source.path().join("world"))
         .await
@@ -85,6 +106,7 @@ async fn published_snapshot_restores_and_keeps_a_bounded_recovery_window() {
             .create(server_id, source.path(), SnapshotReason::Periodic)
             .await
             .unwrap();
+        publish_test_snapshot(&pool, server_id, snapshot.generation, snapshot.size_bytes).await;
         assert_eq!(snapshot.generation, generation);
         assert!(snapshot.complete);
     }
@@ -128,14 +150,7 @@ async fn restore_rejects_a_corrupted_published_manifest() {
     let object_root = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     let restore = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: object_root.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, object_root.path()).await;
     tokio::fs::write(source.path().join("level.dat"), b"world")
         .await
         .unwrap();
@@ -143,9 +158,15 @@ async fn restore_rejects_a_corrupted_published_manifest() {
         .create(server_id, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
-    tokio::fs::write(object_root.path().join(&snapshot.manifest_key), b"corrupt")
-        .await
-        .unwrap();
+    publish_test_snapshot(&pool, server_id, snapshot.generation, snapshot.size_bytes).await;
+    tokio::fs::write(
+        object_root
+            .path()
+            .join(format!("servers/{server_id}/{}", snapshot.manifest_key)),
+        b"corrupt",
+    )
+    .await
+    .unwrap();
 
     let error = manager
         .restore_latest(server_id, restore.path())
@@ -164,14 +185,7 @@ async fn incomplete_newer_generation_is_never_selected_for_restore() {
     let object_root = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     let restore = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: object_root.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, object_root.path()).await;
     tokio::fs::write(source.path().join("level.dat"), b"published")
         .await
         .unwrap();
@@ -179,6 +193,7 @@ async fn incomplete_newer_generation_is_never_selected_for_restore() {
         .create(server_id, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server_id, published.generation, published.size_bytes).await;
     sqlx::query(
         "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
          VALUES($1, $2, $3, 'partial', 0, 'partial', 'periodic', false)",

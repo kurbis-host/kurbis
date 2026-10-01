@@ -114,7 +114,22 @@ async fn verify_migration(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    all_migrations.run(pool).await?;
+    // This target exercises the historical identity migration in an isolated
+    // schema. Migration 0014 provisions global worker roles and deliberately
+    // references the public control-plane tables, so it is covered by the
+    // fresh public-schema worker_isolation target instead of this legacy-schema
+    // fixture.
+    let pre_worker_migrations = Migrator {
+        migrations: Cow::Owned(
+            all_migrations
+                .iter()
+                .filter(|migration| migration.version < 14)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    pre_worker_migrations.run(pool).await?;
 
     let identities: Vec<LegacyIdentity> = sqlx::query_as(
         "SELECT user_id, provider, subject, email, email_normalized, email_verified

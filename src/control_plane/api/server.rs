@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::control_plane::lifecycle::LifecycleActor;
 use crate::model::{
     ObservedState, OperationRecord as DbOperation, SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES,
     ServerRecord, SnapshotRecord as DbSnapshot, validate_subdomain,
 };
 
-use super::internal::{require_active_user, require_server_owner};
+use super::internal::{require_active_user, require_server_access};
 use super::types::{
     LifecycleStatus, Operation, Problem, Server, ServerSettings, ServerSettingsPatch, Snapshot,
     StorageUsage,
@@ -122,7 +123,7 @@ pub(super) async fn get_server(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Option<Server>>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(Some(
         server_view(&state.pool, server, &state.config.root_domain).await?,
     )))
@@ -232,7 +233,7 @@ pub(super) async fn update_server(
     Path(server_id): Path<Uuid>,
     Json(input): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, ApiError> {
-    require_server_owner(&state, &headers, server_id).await?;
+    require_server_access(&state, &headers, server_id).await?;
     let mut tx = state.pool.begin().await?;
     let current = sqlx::query_as::<_, ServerRecord>(
         "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
@@ -296,7 +297,7 @@ pub(super) async fn delete_server(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ServerActionResponse>), ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let observed_state = state
         .lifecycle
         .request_delete(server.id)
@@ -329,7 +330,7 @@ pub(super) async fn server_action(
     Path(server_id): Path<Uuid>,
     Json(input): Json<ServerActionRequest>,
 ) -> Result<Json<ServerActionResponse>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let observed_state = match input.action {
         ServerAction::Start => state
             .lifecycle
@@ -338,7 +339,7 @@ pub(super) async fn server_action(
             .map_err(lifecycle_error)?,
         ServerAction::Stop => state
             .lifecycle
-            .request_stop(server.id, "manual")
+            .request_stop_for_actor(LifecycleActor::Owner, server.id, "manual")
             .await
             .map_err(lifecycle_error)?,
         ServerAction::Restart => state
@@ -356,7 +357,11 @@ pub(super) async fn server_action(
             }
             state
                 .lifecycle
-                .request_snapshot(server.id)
+                .request_snapshot_for_actor(
+                    LifecycleActor::Owner,
+                    server.id,
+                    crate::model::SnapshotReason::Manual,
+                )
                 .await
                 .map_err(lifecycle_error)?
         }
@@ -376,7 +381,7 @@ pub(super) async fn reset_server(
     Path(server_id): Path<Uuid>,
     Json(input): Json<ResetServerRequest>,
 ) -> Result<(StatusCode, Json<ServerActionResponse>), ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     if !matches!(input.mode.as_str(), "world" | "full") {
         return Err(ApiError::with_code(
             StatusCode::UNPROCESSABLE_ENTITY,

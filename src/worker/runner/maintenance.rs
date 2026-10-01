@@ -3,8 +3,8 @@ use super::*;
 
 impl WorkerRunner {
     pub(super) async fn maintain_online_servers(&mut self) -> Result<()> {
-        let server_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT s.id
+        let server_placements: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT s.id, p.generation
              FROM servers s
              JOIN placements p ON p.server_id = s.id
              WHERE p.worker_id = $1 AND p.active AND s.observed_state = 'online'",
@@ -13,8 +13,8 @@ impl WorkerRunner {
         .fetch_all(&self.pool)
         .await?;
 
-        let idle_server_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT s.id
+        let idle_server_placements: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT s.id, p.generation
              FROM servers s
              JOIN placements p ON p.server_id = s.id
              WHERE p.worker_id = $1 AND p.generation = s.generation
@@ -25,19 +25,27 @@ impl WorkerRunner {
         .fetch_all(&self.pool)
         .await?;
 
-        self.idle_since.retain(|id, _| idle_server_ids.contains(id));
-        self.last_snapshot.retain(|id, _| server_ids.contains(id));
-        for server_id in server_ids {
+        self.idle_since.retain(|id, _| {
+            idle_server_placements
+                .iter()
+                .any(|(server_id, _)| server_id == id)
+        });
+        self.last_snapshot.retain(|id, _| {
+            server_placements
+                .iter()
+                .any(|(server_id, _)| server_id == id)
+        });
+        for (server_id, generation) in server_placements {
             let server_dir = self.server_dir(server_id);
             if !self.runtime.server_is_running(server_id).await? {
                 tracing::error!(%server_id, "Pumpkin runtime stopped unexpectedly");
-                mark_runtime_lost(
-                    &self.pool,
-                    self.config.id,
-                    server_id,
-                    "Pumpkin runtime stopped unexpectedly",
-                )
-                .await?;
+                self.control_plane
+                    .mark_runtime_lost(
+                        server_id,
+                        generation,
+                        "Pumpkin runtime stopped unexpectedly",
+                    )
+                    .await?;
                 clear_players(&self.pool, server_id).await?;
                 self.idle_since.remove(&server_id);
                 self.last_snapshot.remove(&server_id);
@@ -46,8 +54,8 @@ impl WorkerRunner {
             let size = persistent_size(&server_dir)?;
             if size > SERVER_STORAGE_BYTES {
                 tracing::warn!(%server_id, size, "storage quota exceeded; stopping server");
-                self.lifecycle
-                    .request_stop(server_id, "storage_quota")
+                self.control_plane
+                    .request_stop(server_id, generation, "storage_quota")
                     .await?;
                 continue;
             }
@@ -88,8 +96,8 @@ impl WorkerRunner {
                         .entry(server_id)
                         .or_insert_with(|| IdleTimer::new(&status, now));
                     if idle.expired(&status, now, self.config.idle_timeout) {
-                        self.lifecycle
-                            .request_stop(server_id, "idle_timeout")
+                        self.control_plane
+                            .request_stop(server_id, generation, "idle_timeout")
                             .await?;
                         continue;
                     }
@@ -106,8 +114,8 @@ impl WorkerRunner {
                 .or_insert_with(|| SnapshotSchedule::new(Instant::now()));
             if last.due(Instant::now(), self.config.snapshot_interval) {
                 let result = self
-                    .lifecycle
-                    .request_snapshot_with_reason(server_id, SnapshotReason::Periodic)
+                    .control_plane
+                    .request_snapshot(server_id, generation, SnapshotReason::Periodic)
                     .await;
                 let schedule = self
                     .last_snapshot
@@ -120,17 +128,7 @@ impl WorkerRunner {
                     Err(error) => {
                         schedule.failed(Instant::now());
                         tracing::warn!(%server_id, ?error, "periodic snapshot deferred; retaining the active runtime");
-                        sqlx::query(
-                            "UPDATE servers s SET last_error = $3, updated_at = now()
-                            WHERE s.id = $1 AND s.observed_state = 'online'
-                              AND EXISTS(SELECT 1 FROM placements p WHERE p.server_id = s.id
-                                AND p.worker_id = $2 AND p.active AND p.generation = s.generation)",
-                        )
-                        .bind(server_id)
-                        .bind(self.config.id)
-                        .bind(format!("Periodic snapshot failed: {error:#}"))
-                        .execute(&self.pool)
-                        .await?;
+                        tracing::warn!(%server_id, ?error, "periodic snapshot request was rejected");
                     }
                 }
             }
@@ -163,7 +161,7 @@ impl WorkerRunner {
 
     pub(super) async fn placement(&self, server_id: Uuid) -> Result<PlacementRecord> {
         sqlx::query_as::<_, PlacementRecord>(
-            "SELECT server_id, worker_id, generation, lease_token, java_port, bedrock_port,
+            "SELECT server_id, worker_id, generation, lease_token, java_port, bedrock_port, signal_port,
                     active, updated_at
              FROM placements WHERE server_id = $1",
         )

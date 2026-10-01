@@ -1,20 +1,34 @@
-use std::path::Path as FsPath;
+use std::{collections::HashSet, path::Path as FsPath, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use futures::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::{
-    config::ObjectStoreConfig,
-    model::{SERVER_STORAGE_BYTES, SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason, SnapshotRecord},
+use crate::model::{
+    SERVER_STORAGE_BYTES, SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason, SnapshotRecord,
 };
 
 use super::files::{collect_files, safe_relative_path};
-use super::{ManifestFile, SnapshotManager, SnapshotManifest};
+use super::{
+    ManifestFile, ObjectKind, SnapshotManager, SnapshotManifest, WorkerObjectAssignment,
+    WorkerObjectClient, WorkerObjectKey, object_key::MAX_MANIFEST_BYTES, physical_object_path,
+};
+
+const SNAPSHOT_CHUNK_PART_BYTES: usize = 8 * 1024 * 1024;
 
 impl SnapshotManager {
+    pub(super) fn object_path(&self, server_id: Uuid, key: &str) -> Result<Path> {
+        if self.worker_client.is_some() {
+            Ok(WorkerObjectKey::parse(key)?.path().clone())
+        } else {
+            Ok(physical_object_path(server_id, key)?)
+        }
+    }
+
     pub(super) async fn storage_guard(&self, exclusive: bool) -> Result<PoolConnection<Postgres>> {
         let mut connection = self.pool.acquire().await?;
         connection.close_on_drop();
@@ -26,9 +40,57 @@ impl SnapshotManager {
         sqlx::query(query).execute(&mut *connection).await?;
         Ok(connection)
     }
-    pub async fn new(pool: PgPool, config: &ObjectStoreConfig) -> Result<Self> {
-        let store = config.build().await?;
-        Ok(Self { pool, store })
+    pub fn new(pool: PgPool, store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            pool,
+            store,
+            worker_client: None,
+        }
+    }
+
+    pub fn new_worker(pool: PgPool, client: WorkerObjectClient) -> Self {
+        Self {
+            pool,
+            store: Arc::new(client.unscoped()),
+            worker_client: Some(client),
+        }
+    }
+
+    pub fn for_operation(&self, server_id: Uuid, operation_id: Uuid, generation: i64) -> Self {
+        self.for_assignment(
+            server_id,
+            WorkerObjectAssignment::Operation {
+                operation_id,
+                generation,
+            },
+        )
+    }
+
+    pub fn for_placement(&self, server_id: Uuid, generation: i64) -> Self {
+        self.for_assignment(server_id, WorkerObjectAssignment::Placement { generation })
+    }
+
+    pub fn for_export(&self, server_id: Uuid, export_id: Uuid, generation: i64) -> Self {
+        self.for_assignment(
+            server_id,
+            WorkerObjectAssignment::Export {
+                export_id,
+                generation,
+            },
+        )
+    }
+
+    fn for_assignment(&self, server_id: Uuid, assignment: WorkerObjectAssignment) -> Self {
+        let store = self
+            .worker_client
+            .as_ref()
+            .map(|client| Arc::new(client.scoped(server_id, assignment)) as Arc<dyn ObjectStore>)
+            .unwrap_or_else(|| self.store.clone());
+        Self {
+            pool: self.pool.clone(),
+            store,
+            worker_client: self.worker_client.clone(),
+        }
     }
 
     pub async fn create(
@@ -37,7 +99,7 @@ impl SnapshotManager {
         root: &FsPath,
         reason: SnapshotReason,
     ) -> Result<SnapshotRecord> {
-        // Serialize allocation, upload, publication and retention across workers.
+        // Serialize allocation, upload, and retention across workers.
         // Releasing the allocator lock before upload allowed older uploads to
         // overwrite the current pointer and race retention of their manifests.
         let mut publication_guard = self.storage_guard(false).await?;
@@ -68,22 +130,18 @@ impl SnapshotManager {
         let mut manifest_files = Vec::with_capacity(files.len());
         let mut total_bytes = 0_u64;
         for file in files {
-            let bytes = tokio::fs::read(&file.absolute).await?;
-            let size = bytes.len() as u64;
+            let (size, hash) = hash_file(&file.absolute).await?;
             total_bytes = total_bytes
                 .checked_add(size)
                 .context("snapshot size overflow")?;
             if total_bytes > SERVER_STORAGE_BYTES as u64 {
                 bail!("server storage quota exceeded");
             }
-            let hash = blake3::hash(&bytes).to_hex().to_string();
-            let chunk_path = Path::from(format!("chunks/{hash}"));
+            let chunk_path = self.object_path(server_id, &format!("chunks/{hash}"))?;
             match self.store.head(&chunk_path).await {
                 Ok(_) => {}
                 Err(object_store::Error::NotFound { .. }) => {
-                    self.store
-                        .put(&chunk_path, Bytes::from(bytes).into())
-                        .await?;
+                    self.upload_file(&chunk_path, &file.absolute, size).await?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -94,7 +152,7 @@ impl SnapshotManager {
             };
             // Existence alone cannot prove a reused or newly uploaded chunk is
             // intact. Validate stored bytes before making this generation usable.
-            self.read_verified_chunk(&manifest_file).await?;
+            self.verify_stored_chunk(server_id, &manifest_file).await?;
             manifest_files.push(manifest_file);
         }
         manifest_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -104,20 +162,22 @@ impl SnapshotManager {
             files: manifest_files,
         };
         let manifest_bytes = serde_json::to_vec(&manifest)?;
+        anyhow::ensure!(
+            manifest_bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+            "snapshot manifest exceeds the maximum object size"
+        );
         let checksum = blake3::hash(&manifest_bytes).to_hex().to_string();
-        let manifest_key = format!("snapshots/{server_id}/{generation}-{checksum}.json");
+        let manifest_key = format!("snapshots/{generation}-{checksum}.json");
+        let manifest_path = self.object_path(server_id, &manifest_key)?;
         self.store
-            .put(
-                &Path::from(manifest_key.clone()),
-                Bytes::from(manifest_bytes).into(),
-            )
+            .put(&manifest_path, Bytes::from(manifest_bytes).into())
             .await?;
-        self.validate_manifest_object(&manifest_key, &checksum)
+        self.validate_manifest_object(&manifest_path, &checksum)
             .await?;
 
         let total_bytes = i64::try_from(total_bytes)?;
         let mut tx = publication_guard.begin().await?;
-        sqlx::query("SELECT id FROM servers WHERE id = $1 FOR UPDATE")
+        sqlx::query("SELECT id FROM servers WHERE id = $1")
             .bind(server_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -131,15 +191,6 @@ impl SnapshotManager {
         .bind(&manifest_key)
         .bind(total_bytes)
         .bind(&checksum)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3, updated_at = now()
-             WHERE id = $1 AND (current_snapshot_generation IS NULL OR current_snapshot_generation < $2)",
-        )
-        .bind(server_id)
-        .bind(generation)
-        .bind(total_bytes)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -162,21 +213,69 @@ impl SnapshotManager {
         Ok(snapshot)
     }
 
-    async fn read_verified_chunk(&self, file: &ManifestFile) -> Result<Bytes> {
-        let bytes = self
+    async fn verify_stored_chunk(&self, server_id: Uuid, file: &ManifestFile) -> Result<()> {
+        let object = self
             .store
-            .get(&Path::from(format!("chunks/{}", file.blake3)))
-            .await?
-            .bytes()
+            .get(&self.object_path(server_id, &format!("chunks/{}", file.blake3))?)
             .await?;
-        if bytes.len() as u64 != file.size || blake3::hash(&bytes).to_hex().as_str() != file.blake3
-        {
+        let mut stream = object.into_stream();
+        let mut hasher = blake3::Hasher::new();
+        let mut size = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .context("snapshot chunk size overflow")?;
+            hasher.update(&chunk);
+        }
+        if size != file.size || hasher.finalize().to_hex().as_str() != file.blake3 {
             bail!(
                 "snapshot chunk failed integrity validation for {}",
                 file.path
             );
         }
-        Ok(bytes)
+        Ok(())
+    }
+
+    async fn upload_file(&self, key: &Path, source: &FsPath, size: u64) -> Result<()> {
+        if size <= SNAPSHOT_CHUNK_PART_BYTES as u64 {
+            let bytes = tokio::fs::read(source).await?;
+            if bytes.len() as u64 != size {
+                bail!("snapshot source changed while it was being read");
+            }
+            self.store.put(key, Bytes::from(bytes).into()).await?;
+            return Ok(());
+        }
+
+        let mut file = tokio::fs::File::open(source).await?;
+        let mut upload = self.store.put_multipart(key).await?;
+        let result = async {
+            let mut buffer = vec![0; SNAPSHOT_CHUNK_PART_BYTES];
+            let mut uploaded = 0_u64;
+            loop {
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                uploaded = uploaded
+                    .checked_add(read as u64)
+                    .context("snapshot source size overflow")?;
+                upload
+                    .put_part(Bytes::copy_from_slice(&buffer[..read]).into())
+                    .await?;
+            }
+            if uploaded != size {
+                bail!("snapshot source changed while it was being read");
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = upload.abort().await;
+            return Err(error);
+        }
+        upload.complete().await?;
+        Ok(())
     }
 
     pub async fn restore_latest(&self, server_id: Uuid, root: &FsPath) -> Result<Option<i64>> {
@@ -211,17 +310,83 @@ impl SnapshotManager {
     }
 
     async fn restore_manifest(&self, root: &FsPath, manifest: SnapshotManifest) -> Result<()> {
-        tokio::fs::create_dir_all(root).await?;
-        for file in manifest.files {
+        ensure_safe_directory_chain(root, root).await?;
+        let mut entries = Vec::with_capacity(manifest.files.len());
+        let mut paths = HashSet::with_capacity(manifest.files.len());
+        let mut total_size = 0_u64;
+        for file in &manifest.files {
             let relative = safe_relative_path(&file.path)?;
-            let bytes = self.read_verified_chunk(&file).await?;
+            anyhow::ensure!(
+                paths.insert(relative.clone()),
+                "snapshot manifest contains a duplicate path"
+            );
+            anyhow::ensure!(
+                WorkerObjectKey::parse(&format!("chunks/{}", file.blake3))
+                    .is_ok_and(|key| matches!(key.kind(), ObjectKind::Chunk)),
+                "snapshot manifest contains an invalid chunk hash"
+            );
+            total_size = total_size
+                .checked_add(file.size)
+                .context("snapshot manifest size overflow")?;
+            anyhow::ensure!(
+                total_size <= SERVER_STORAGE_BYTES as u64,
+                "snapshot manifest exceeds the server storage quota"
+            );
             let target = root.join(relative);
             if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                ensure_existing_safe_directory_chain(root, parent).await?;
+            }
+            entries.push((file.clone(), target));
+        }
+
+        // Every manifest path and existing parent has been checked before the
+        // first destination is touched. Directory creation is therefore only
+        // a completion step for already-validated paths.
+        for (file, target) in entries {
+            if let Some(parent) = target.parent() {
+                ensure_safe_directory_chain(root, parent).await?;
             }
             let temp = target.with_extension(format!("kurbis-restore-{}", Uuid::new_v4()));
-            tokio::fs::write(&temp, &bytes).await?;
+            let result = self
+                .restore_chunk_to_file(manifest.server_id, &file, &temp)
+                .await;
+            if let Err(error) = result {
+                let _ = tokio::fs::remove_file(&temp).await;
+                return Err(error);
+            }
             tokio::fs::rename(temp, target).await?;
+        }
+        Ok(())
+    }
+
+    async fn restore_chunk_to_file(
+        &self,
+        server_id: Uuid,
+        file: &ManifestFile,
+        destination: &FsPath,
+    ) -> Result<()> {
+        let object = self
+            .store
+            .get(&self.object_path(server_id, &format!("chunks/{}", file.blake3))?)
+            .await?;
+        let mut stream = object.into_stream();
+        let mut output = tokio::fs::File::create(destination).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut size = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .context("snapshot chunk size overflow")?;
+            hasher.update(&chunk);
+            output.write_all(&chunk).await?;
+        }
+        output.flush().await?;
+        if size != file.size || hasher.finalize().to_hex().as_str() != file.blake3 {
+            bail!(
+                "snapshot chunk failed integrity validation for {}",
+                file.path
+            );
         }
         Ok(())
     }
@@ -257,12 +422,15 @@ impl SnapshotManager {
         &self,
         snapshot: &SnapshotRecord,
     ) -> Result<SnapshotManifest> {
-        let manifest_bytes = self
+        let manifest = self
             .store
-            .get(&Path::from(snapshot.manifest_key.clone()))
-            .await?
-            .bytes()
+            .get(&self.object_path(snapshot.server_id, &snapshot.manifest_key)?)
             .await?;
+        anyhow::ensure!(
+            manifest.meta.size <= MAX_MANIFEST_BYTES,
+            "snapshot manifest exceeds the maximum object size"
+        );
+        let manifest_bytes = manifest.bytes().await?;
         let actual_checksum = blake3::hash(&manifest_bytes).to_hex().to_string();
         if actual_checksum != snapshot.checksum {
             bail!("snapshot manifest checksum mismatch");
@@ -271,6 +439,7 @@ impl SnapshotManager {
         if manifest.server_id != snapshot.server_id || manifest.generation != snapshot.generation {
             bail!("snapshot manifest identity mismatch");
         }
+        validate_manifest_structure(&manifest)?;
 
         Ok(manifest)
     }
@@ -312,6 +481,7 @@ impl SnapshotManager {
     }
 
     pub async fn delete_server_manifests(&self, server_id: Uuid) -> Result<()> {
+        let _guard = self.storage_guard(false).await?;
         let manifest_keys: Vec<String> = sqlx::query_scalar(
             "SELECT manifest_key FROM snapshots WHERE server_id = $1 AND manifest_key <> ''",
         )
@@ -319,7 +489,11 @@ impl SnapshotManager {
         .fetch_all(&self.pool)
         .await?;
         for manifest_key in manifest_keys {
-            match self.store.delete(&Path::from(manifest_key)).await {
+            match self
+                .store
+                .delete(&self.object_path(server_id, &manifest_key)?)
+                .await
+            {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -327,18 +501,19 @@ impl SnapshotManager {
         Ok(())
     }
 
-    async fn validate_manifest_object(&self, manifest_key: &str, checksum: &str) -> Result<()> {
-        let bytes = self
-            .store
-            .get(&Path::from(manifest_key.to_owned()))
-            .await?
-            .bytes()
-            .await?;
+    async fn validate_manifest_object(&self, manifest_path: &Path, checksum: &str) -> Result<()> {
+        let object = self.store.get(manifest_path).await?;
+        anyhow::ensure!(
+            object.meta.size <= MAX_MANIFEST_BYTES,
+            "uploaded snapshot manifest exceeds the maximum object size"
+        );
+        let bytes = object.bytes().await?;
         let actual = blake3::hash(&bytes).to_hex().to_string();
         if actual != checksum {
             bail!("uploaded snapshot manifest checksum mismatch");
         }
-        let _: SnapshotManifest = serde_json::from_slice(&bytes)?;
+        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)?;
+        validate_manifest_structure(&manifest)?;
         Ok(())
     }
 
@@ -376,7 +551,11 @@ impl SnapshotManager {
         .fetch_all(&mut *connection)
         .await?;
         for (snapshot_id, manifest_key) in stale {
-            match self.store.delete(&Path::from(manifest_key)).await {
+            match self
+                .store
+                .delete(&self.object_path(server_id, &manifest_key)?)
+                .await
+            {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -413,5 +592,105 @@ impl SnapshotManager {
         .await?;
         tx.commit().await?;
         Ok(generation)
+    }
+}
+
+async fn hash_file(path: &FsPath) -> Result<(u64, String)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0; 64 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .context("snapshot file size overflow")?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((size, hasher.finalize().to_hex().to_string()))
+}
+
+async fn ensure_safe_directory_chain(root: &FsPath, target: &FsPath) -> Result<()> {
+    let relative = target
+        .strip_prefix(root)
+        .context("restore target is outside its server directory")?;
+    ensure_safe_directory(root).await?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("restore target contains an unsafe directory component");
+        };
+        current.push(component);
+        ensure_safe_directory(&current).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_existing_safe_directory_chain(root: &FsPath, target: &FsPath) -> Result<()> {
+    let relative = target
+        .strip_prefix(root)
+        .context("restore target is outside its server directory")?;
+    ensure_safe_directory(root).await?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("restore target contains an unsafe directory component");
+        };
+        current.push(component);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!("restore target directory is not a real directory")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_manifest_structure(manifest: &SnapshotManifest) -> Result<()> {
+    anyhow::ensure!(
+        manifest.generation > 0,
+        "snapshot manifest generation is invalid"
+    );
+    let mut paths = HashSet::with_capacity(manifest.files.len());
+    let mut total_size = 0_u64;
+    for file in &manifest.files {
+        let relative = safe_relative_path(&file.path)?;
+        anyhow::ensure!(
+            paths.insert(relative),
+            "snapshot manifest contains a duplicate path"
+        );
+        anyhow::ensure!(
+            WorkerObjectKey::parse(&format!("chunks/{}", file.blake3))
+                .is_ok_and(|key| matches!(key.kind(), ObjectKind::Chunk)),
+            "snapshot manifest contains an invalid chunk hash"
+        );
+        total_size = total_size
+            .checked_add(file.size)
+            .context("snapshot manifest size overflow")?;
+        anyhow::ensure!(
+            total_size <= SERVER_STORAGE_BYTES as u64,
+            "snapshot manifest exceeds the server storage quota"
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_safe_directory(path: &FsPath) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("restore target directory is not a real directory")
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(path).await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }

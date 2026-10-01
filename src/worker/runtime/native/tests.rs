@@ -6,6 +6,8 @@ async fn runtime(root: &Path, worker: Uuid) -> NativeRuntime {
         root.to_path_buf(),
         worker,
         "native-test-token-at-least-thirty-two-bytes".into(),
+        "127.0.0.1".parse().unwrap(),
+        "127.0.0.1".parse().unwrap(),
     )
     .await
     .unwrap()

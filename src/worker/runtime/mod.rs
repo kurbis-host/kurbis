@@ -85,11 +85,13 @@ pub trait ServerRuntime: Send + Sync {
         server_dir: &Path,
         max_wait: Duration,
     ) -> Result<()> {
-        timeout(max_wait, async {
+        let mut last_error = None;
+        let result = timeout(max_wait, async {
             loop {
                 match self.player_status(server_dir).await {
                     Ok(_) => return Ok(()),
                     Err(error) => {
+                        last_error = Some(error.to_string());
                         if !self.server_is_running(server_id).await? {
                             return Err(error).context("Pumpkin exited before readiness");
                         }
@@ -99,7 +101,40 @@ pub trait ServerRuntime: Send + Sync {
                 }
             }
         })
-        .await
-        .context("Pumpkin readiness deadline exceeded")?
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(readiness_timeout_message(
+                last_error.as_deref()
+            ))),
+        }
+    }
+}
+
+fn readiness_timeout_message(last_error: Option<&str>) -> String {
+    let Some(error) = last_error else {
+        return "Pumpkin readiness deadline exceeded".to_owned();
+    };
+    let bounded: String = error.chars().take(512).collect();
+    format!("Pumpkin readiness deadline exceeded; last host-control error: {bounded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readiness_timeout_message;
+
+    #[test]
+    fn readiness_timeout_reports_bounded_host_control_error() {
+        let message = readiness_timeout_message(Some("host-control connection timed out"));
+        assert_eq!(
+            message,
+            "Pumpkin readiness deadline exceeded; last host-control error: host-control connection timed out"
+        );
+
+        let message = readiness_timeout_message(Some(&"x".repeat(600)));
+        assert!(message.len() < 600);
+        assert!(
+            message.starts_with("Pumpkin readiness deadline exceeded; last host-control error: ")
+        );
     }
 }

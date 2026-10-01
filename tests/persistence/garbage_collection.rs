@@ -2,7 +2,7 @@ use super::*;
 use std::time::Duration;
 
 #[tokio::test]
-async fn garbage_collection_preserves_shared_chunks_and_retained_recovery_generations() {
+async fn garbage_collection_preserves_server_scoped_chunks_and_retained_recovery_generations() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let (owner_a, a) = create_server(&pool).await;
@@ -11,24 +11,18 @@ async fn garbage_collection_preserves_shared_chunks_and_retained_recovery_genera
     let source_a = tempfile::tempdir().unwrap();
     let source_b = tempfile::tempdir().unwrap();
     let restore = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     tokio::fs::write(source_a.path().join("shared.dat"), b"shared data")
         .await
         .unwrap();
     tokio::fs::write(source_b.path().join("shared.dat"), b"shared data")
         .await
         .unwrap();
-    manager
+    let snapshot_b = manager
         .create(b, source_b.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, b, snapshot_b.generation, snapshot_b.size_bytes).await;
     for generation in 1..=SNAPSHOT_RETENTION_GENERATIONS + 2 {
         tokio::fs::write(
             source_a.path().join("level.dat"),
@@ -36,22 +30,43 @@ async fn garbage_collection_preserves_shared_chunks_and_retained_recovery_genera
         )
         .await
         .unwrap();
-        manager
+        let snapshot_a = manager
             .create(a, source_a.path(), SnapshotReason::Periodic)
             .await
             .unwrap();
+        publish_test_snapshot(&pool, a, snapshot_a.generation, snapshot_a.size_bytes).await;
     }
-    let orphan = objects.path().join("chunks/orphan");
-    let orphan_manifest = objects.path().join("snapshots/orphan.json");
+    let orphan = objects.path().join(format!(
+        "servers/{a}/chunks/{}",
+        blake3::hash(b"partial upload").to_hex()
+    ));
+    let orphan_manifest = objects.path().join(format!(
+        "servers/{a}/snapshots/999-{}.json",
+        blake3::hash(b"unpublished manifest").to_hex()
+    ));
+    let abandoned_upload = objects
+        .path()
+        .join(format!("control-plane-object-staging/{a}/orphan"));
     tokio::fs::write(&orphan, b"partial upload").await.unwrap();
     tokio::fs::write(&orphan_manifest, b"unpublished manifest")
         .await
         .unwrap();
-    let report = manager.collect_garbage().await.unwrap();
+    tokio::fs::create_dir_all(abandoned_upload.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&abandoned_upload, b"unpublished object body")
+        .await
+        .unwrap();
+    let gc_store = local_snapshot_store(objects.path()).await;
+    let report = SnapshotManager::collect_garbage_with(&pool, gc_store)
+        .await
+        .unwrap();
     assert_eq!(report.chunks_deleted, 3); // Two expired worlds plus the partial upload.
     assert_eq!(report.manifests_deleted, 1);
+    assert_eq!(report.staging_deleted, 1);
     assert!(!orphan.exists());
-    let chunks: Vec<_> = std::fs::read_dir(objects.path().join("chunks"))
+    assert!(!abandoned_upload.exists());
+    let chunks: Vec<_> = std::fs::read_dir(objects.path().join(format!("servers/{a}/chunks")))
         .unwrap()
         .collect();
     assert_eq!(chunks.len(), SNAPSHOT_RETENTION_GENERATIONS as usize + 1);
@@ -63,8 +78,14 @@ async fn garbage_collection_preserves_shared_chunks_and_retained_recovery_genera
         b"world-7"
     );
     cleanup(&pool, owner_a).await;
-    let report = manager.collect_garbage().await.unwrap();
-    assert_eq!(report.chunks_deleted, SNAPSHOT_RETENTION_GENERATIONS as u64);
+    let gc_store = local_snapshot_store(objects.path()).await;
+    let report = SnapshotManager::collect_garbage_with(&pool, gc_store)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.chunks_deleted,
+        (SNAPSHOT_RETENTION_GENERATIONS + 1) as u64
+    );
     manager.restore_latest(b, restore.path()).await.unwrap();
     assert_eq!(
         tokio::fs::read(restore.path().join("shared.dat"))
@@ -73,7 +94,14 @@ async fn garbage_collection_preserves_shared_chunks_and_retained_recovery_genera
         b"shared data"
     );
     cleanup(&pool, owner_b).await;
-    assert_eq!(manager.collect_garbage().await.unwrap().chunks_deleted, 1);
+    let gc_store = local_snapshot_store(objects.path()).await;
+    assert_eq!(
+        SnapshotManager::collect_garbage_with(&pool, gc_store)
+            .await
+            .unwrap()
+            .chunks_deleted,
+        1
+    );
 }
 
 #[tokio::test]
@@ -83,14 +111,7 @@ async fn corrupt_retained_manifest_aborts_before_any_garbage_is_deleted() {
     let (owner, server) = create_server(&pool).await;
     let objects = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     tokio::fs::write(source.path().join("level.dat"), b"saved world")
         .await
         .unwrap();
@@ -98,14 +119,25 @@ async fn corrupt_retained_manifest_aborts_before_any_garbage_is_deleted() {
         .create(server, source.path(), SnapshotReason::Periodic)
         .await
         .unwrap();
-    let manifest_path = objects.path().join(snapshot.manifest_key);
+    publish_test_snapshot(&pool, server, snapshot.generation, snapshot.size_bytes).await;
+    let manifest_path = objects
+        .path()
+        .join(format!("servers/{server}/{}", snapshot.manifest_key));
     let valid_manifest = tokio::fs::read(&manifest_path).await.unwrap();
-    let orphan = objects.path().join("chunks/orphan");
+    let orphan = objects.path().join(format!(
+        "servers/{server}/chunks/{}",
+        blake3::hash(b"unreferenced").to_hex()
+    ));
     tokio::fs::write(&orphan, b"unreferenced").await.unwrap();
     tokio::fs::write(&manifest_path, b"corrupted")
         .await
         .unwrap();
-    assert!(manager.collect_garbage().await.is_err());
+    let gc_store = local_snapshot_store(objects.path()).await;
+    assert!(
+        SnapshotManager::collect_garbage_with(&pool, gc_store)
+            .await
+            .is_err()
+    );
     assert!(
         orphan.exists(),
         "marking failure must prevent every deletion"
@@ -113,7 +145,14 @@ async fn corrupt_retained_manifest_aborts_before_any_garbage_is_deleted() {
     tokio::fs::write(manifest_path, valid_manifest)
         .await
         .unwrap();
-    assert_eq!(manager.collect_garbage().await.unwrap().chunks_deleted, 1);
+    let gc_store = local_snapshot_store(objects.path()).await;
+    assert_eq!(
+        SnapshotManager::collect_garbage_with(&pool, gc_store)
+            .await
+            .unwrap()
+            .chunks_deleted,
+        1
+    );
     cleanup(&pool, owner).await;
 }
 
@@ -128,22 +167,21 @@ async fn collector_waits_for_a_publisher_before_deciding_chunk_reachability() {
     tokio::fs::write(source.path().join("level.dat"), bytes)
         .await
         .unwrap();
-    tokio::fs::create_dir(objects.path().join("chunks"))
+    tokio::fs::create_dir_all(objects.path().join(format!("servers/{server}/chunks")))
         .await
         .unwrap();
     let chunk = objects
         .path()
+        .join(format!("servers/{server}"))
         .join("chunks")
         .join(blake3::hash(bytes).to_hex().as_str());
     tokio::fs::write(&chunk, bytes).await.unwrap();
-    let manager = SnapshotManager::new(
-        pool.clone(),
-        &ObjectStoreConfig::Local {
-            root: objects.path().to_path_buf(),
-        },
-    )
-    .await
-    .unwrap();
+    let orphan = objects.path().join(format!(
+        "servers/{server}/chunks/{}",
+        blake3::hash(b"abandoned chunk").to_hex()
+    ));
+    tokio::fs::write(&orphan, b"abandoned chunk").await.unwrap();
+    let manager = local_snapshot_manager(&pool, objects.path()).await;
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
         .bind(server.to_string())
@@ -159,8 +197,13 @@ async fn collector_waits_for_a_publisher_before_deciding_chunk_reachability() {
             .unwrap()
     });
     super::publication::wait_for_publishers(&pool, server, 1).await;
-    let collector_manager = manager.clone();
-    let collector = tokio::spawn(async move { collector_manager.collect_garbage().await.unwrap() });
+    let gc_store = local_snapshot_store(objects.path()).await;
+    let gc_pool = pool.clone();
+    let collector = tokio::spawn(async move {
+        SnapshotManager::collect_garbage_with(&gc_pool, gc_store)
+            .await
+            .unwrap()
+    });
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let waiters: i64 = sqlx::query_scalar(
@@ -181,9 +224,11 @@ async fn collector_waits_for_a_publisher_before_deciding_chunk_reachability() {
     assert!(chunk.exists());
     assert!(!collector.is_finished());
     blocker.commit().await.unwrap();
-    publisher.await.unwrap();
-    assert_eq!(collector.await.unwrap().chunks_deleted, 0);
+    let snapshot = publisher.await.unwrap();
+    publish_test_snapshot(&pool, server, snapshot.generation, snapshot.size_bytes).await;
+    assert_eq!(collector.await.unwrap().chunks_deleted, 1);
     assert!(chunk.exists());
+    assert!(!orphan.exists());
     let restore = tempfile::tempdir().unwrap();
     assert_eq!(
         manager

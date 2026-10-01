@@ -41,7 +41,8 @@ pub(super) fn collect_files(root: &FsPath) -> Result<Vec<ScannedFile>> {
 
 pub(super) fn safe_relative_path(value: &str) -> Result<PathBuf> {
     let path = FsPath::new(value);
-    if path.is_absolute()
+    if value.is_empty()
+        || path.is_absolute()
         || path
             .components()
             .any(|part| !matches!(part, std::path::Component::Normal(_)))

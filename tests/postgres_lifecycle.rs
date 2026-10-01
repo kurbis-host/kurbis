@@ -152,9 +152,15 @@ async fn runtime_loss_deactivates_the_placement() {
         .expect("start operation");
     complete_start(&pool, &start, 0).await.unwrap();
 
-    mark_runtime_lost(&pool, worker_id, server_id, "runtime exited")
-        .await
-        .unwrap();
+    mark_runtime_lost(
+        &pool,
+        worker_id,
+        server_id,
+        start.generation,
+        "runtime exited",
+    )
+    .await
+    .unwrap();
 
     let (state, active, desired, reserved_memory): (
         ObservedState,
@@ -458,9 +464,21 @@ async fn active_failed_placement_is_fenced_from_reassignment() {
     assert_eq!(placement_worker, first_worker);
     assert_eq!(second_reserved, 0);
 
-    mark_runtime_lost(&pool, first_worker, server_id, "confirmed stopped")
-        .await
-        .unwrap();
+    let expected_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM placements WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    mark_runtime_lost(
+        &pool,
+        first_worker,
+        server_id,
+        expected_generation,
+        "confirmed stopped",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         lifecycle
             .request_start(server_id, "retry_after_fence")
@@ -631,12 +649,19 @@ async fn delete_cancels_an_unclaimed_start_and_releases_its_reservation() {
     .await
     .unwrap();
     assert_eq!(cancelled_starts, 1);
-    let delete = claim_operation(&pool, cleanup_worker)
+    let delete_worker: Uuid = sqlx::query_scalar(
+        "SELECT worker_id FROM operations WHERE server_id = $1 AND kind = 'delete' AND status = 'pending'",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = claim_operation(&pool, delete_worker)
         .await
         .unwrap()
         .expect("delete cleanup operation");
     assert_eq!(delete.kind, OperationKind::Delete);
-    assert_eq!(delete.worker_id, Some(cleanup_worker));
+    assert_eq!(delete.worker_id, Some(delete_worker));
 
     cleanup_test_entities(&pool, user_id, &[placement_worker, cleanup_worker]).await;
 }
@@ -683,12 +708,19 @@ async fn online_delete_finishes_shutdown_then_exposes_cleanup_to_any_worker() {
     assert_eq!(state, ObservedState::Deleted);
     assert!(!active);
 
-    let delete = claim_operation(&pool, cleanup_worker)
+    let delete_worker: Uuid = sqlx::query_scalar(
+        "SELECT worker_id FROM operations WHERE server_id = $1 AND kind = 'delete' AND status = 'pending'",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = claim_operation(&pool, delete_worker)
         .await
         .unwrap()
         .expect("delete cleanup operation");
     assert_eq!(delete.kind, OperationKind::Delete);
-    assert_eq!(delete.worker_id, Some(cleanup_worker));
+    assert_eq!(delete.worker_id, Some(delete_worker));
 
     cleanup_test_entities(&pool, user_id, &[runtime_worker, cleanup_worker]).await;
 }
@@ -711,9 +743,21 @@ async fn runtime_loss_preserves_delete_intent_and_schedules_cleanup() {
     let cleanup_worker = create_test_worker(&pool, "worker-delete-loss-cleanup", 28400).await;
     lifecycle.request_delete(server_id).await.unwrap();
 
-    mark_runtime_lost(&pool, runtime_worker, server_id, "worker disappeared")
-        .await
-        .unwrap();
+    let expected_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM placements WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    mark_runtime_lost(
+        &pool,
+        runtime_worker,
+        server_id,
+        expected_generation,
+        "worker disappeared",
+    )
+    .await
+    .unwrap();
     let (desired, state): (kurbis_hoster::model::DesiredState, ObservedState) =
         sqlx::query_as("SELECT desired_state, observed_state FROM servers WHERE id = $1")
             .bind(server_id)
@@ -722,7 +766,14 @@ async fn runtime_loss_preserves_delete_intent_and_schedules_cleanup() {
             .unwrap();
     assert_eq!(desired, kurbis_hoster::model::DesiredState::Deleted);
     assert_eq!(state, ObservedState::Deleted);
-    let delete = claim_operation(&pool, cleanup_worker)
+    let delete_worker: Uuid = sqlx::query_scalar(
+        "SELECT worker_id FROM operations WHERE server_id = $1 AND kind = 'delete' AND status = 'pending'",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = claim_operation(&pool, delete_worker)
         .await
         .unwrap()
         .expect("delete cleanup after runtime loss");
@@ -737,7 +788,8 @@ async fn stopped_server_ports_are_reused_without_losing_its_cached_placement() {
     let pool = test_pool().await;
     clean_test_rows(&pool).await;
     let worker = create_test_worker(&pool, "worker-port-reuse", 29000).await;
-    sqlx::query("UPDATE workers SET port_max = port_min + 1 WHERE id = $1")
+    // Java, Bedrock, and private signal each consume one leased port.
+    sqlx::query("UPDATE workers SET port_max = port_min + 2 WHERE id = $1")
         .bind(worker)
         .execute(&pool)
         .await

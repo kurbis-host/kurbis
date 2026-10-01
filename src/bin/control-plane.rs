@@ -6,6 +6,7 @@ use kurbis_hoster::{
     control_plane::{
         api::{AppState, router, spawn_queue_drain},
         lifecycle::Lifecycle,
+        maintenance::{WorkerMaintenance, spawn_worker_maintenance},
     },
     db, init_tracing,
 };
@@ -19,6 +20,7 @@ async fn main() -> Result<()> {
     db::migrate(&pool).await?;
     let lifecycle = Lifecycle::new(pool.clone());
     spawn_queue_drain(lifecycle.clone());
+    spawn_worker_maintenance(WorkerMaintenance::new(pool.clone(), object_store.clone()));
     let listen = config.listen;
     let state = Arc::new(AppState {
         pool,

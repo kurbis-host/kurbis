@@ -10,7 +10,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::internal::require_server_owner;
+use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -86,6 +86,6 @@ pub(super) async fn players(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<PlayerPresence>>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(player_list(&state.pool, server.id).await?))
 }

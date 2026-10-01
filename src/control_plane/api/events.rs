@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::model::{OperationRecord as DbOperation, SnapshotRecord as DbSnapshot};
 
 use super::activity::{EventRow, ServerEventKind};
-use super::internal::{require_server_owner, server_by_id};
+use super::internal::{require_server_access, server_by_id};
 use super::logs::LogEntry;
 use super::players::player_list;
 use super::server::server_view;
@@ -184,7 +184,7 @@ pub(super) async fn server_events(
     Path(server_id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let cursor = event_cursor(&headers, &query)?;
 
     // LISTEN before the first durable read. A commit between these two steps is
@@ -202,7 +202,7 @@ pub(super) async fn server_events(
     };
     let output = stream::unfold(stream_state, |mut stream_state| async move {
         loop {
-            if let Err(error) = require_server_owner(
+            if let Err(error) = require_server_access(
                 &stream_state.state,
                 &stream_state.headers,
                 stream_state.server_id,

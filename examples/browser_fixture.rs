@@ -295,6 +295,13 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .create(op.server_id, &root, SnapshotReason::Shutdown)
                 .await
                 .map_err(err)?;
+            publish_fixture_snapshot(
+                &f.pool,
+                op.server_id,
+                snapshot.generation,
+                snapshot.size_bytes,
+            )
+            .await?;
             complete_stop(&f.pool, &op, snapshot.generation, snapshot.size_bytes)
                 .await
                 .map_err(err)?;
@@ -313,6 +320,13 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .create(op.server_id, &root, SnapshotReason::Manual)
                 .await
                 .map_err(err)?;
+            publish_fixture_snapshot(
+                &f.pool,
+                op.server_id,
+                snapshot.generation,
+                snapshot.size_bytes,
+            )
+            .await?;
             complete_snapshot(&f.pool, &op, snapshot.generation)
                 .await
                 .map_err(err)?;
@@ -338,6 +352,13 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .create(op.server_id, &root, SnapshotReason::Restore)
                 .await
                 .map_err(err)?;
+            publish_fixture_snapshot(
+                &f.pool,
+                op.server_id,
+                snapshot.generation,
+                snapshot.size_bytes,
+            )
+            .await?;
             complete_restore(
                 &f.pool,
                 &op,
@@ -383,6 +404,13 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .create(op.server_id, &root, SnapshotReason::Reset)
                 .await
                 .map_err(err)?;
+            publish_fixture_snapshot(
+                &f.pool,
+                op.server_id,
+                snapshot.generation,
+                snapshot.size_bytes,
+            )
+            .await?;
             complete_reset(
                 &f.pool,
                 &op,
@@ -396,6 +424,25 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
     }
     f.lifecycle.drain_queue_once().await.map_err(err)?;
     Ok(Json(json!({"operation":op.kind})))
+}
+
+async fn publish_fixture_snapshot(
+    pool: &PgPool,
+    server_id: Uuid,
+    generation: i64,
+    size_bytes: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3
+         WHERE id = $1",
+    )
+    .bind(server_id)
+    .bind(generation)
+    .bind(size_bytes)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(err)
 }
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -412,7 +459,8 @@ async fn main() -> Result<()> {
     let panel_origin =
         std::env::var("PANEL_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:18082".to_owned());
     let root = std::path::PathBuf::from(std::env::var("TEST_ARTIFACT_ROOT")?);
-    let snapshots = SnapshotManager::new(pool.clone(), &ObjectStoreConfig::from_env()?).await?;
+    let object_store = ObjectStoreConfig::from_env()?.build().await?;
+    let snapshots = SnapshotManager::new(pool.clone(), object_store);
     let fixture = Fixture {
         lifecycle: Lifecycle::new(pool.clone()),
         pool,

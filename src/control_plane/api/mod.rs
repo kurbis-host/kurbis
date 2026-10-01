@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{any, get, post, put},
 };
 use object_store::ObjectStore;
 use reqwest::Client;
@@ -26,10 +26,14 @@ mod internal;
 mod logs;
 mod players;
 mod server;
+mod server_access;
 mod session;
 mod snapshots;
 mod types;
 mod whitelist;
+mod worker_auth;
+mod worker_control;
+mod worker_objects;
 
 #[cfg(test)]
 mod tests;
@@ -146,6 +150,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/{provider}/link", get(auth::link_oauth))
         .route("/auth/{provider}/callback", get(auth::callback))
         .route("/auth/minecraft/redeem", post(auth::redeem_minecraft))
+        .route(
+            "/auth/server/redeem",
+            post(server_access::redeem_server_login),
+        )
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/session", get(session::session))
         .route("/api/v1/account", get(account::account))
@@ -160,6 +168,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/servers",
             get(server::list_servers).post(server::create_server),
+        )
+        .route(
+            "/api/v1/server/login-links",
+            post(server_access::mint_server_login_link),
         )
         .route(
             "/api/v1/servers/{server_id}",
@@ -212,11 +224,91 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(whitelist::remove_whitelist_entry),
         )
         .route("/internal/resolve/{hostname}", get(internal::resolve))
+        .route(
+            "/internal/bedrock-signal/{server_id}",
+            get(internal::bedrock_signal_target),
+        )
         .route("/internal/wake/{hostname}", post(internal::wake))
         .route("/internal/admission", post(internal::admit))
         .route(
             "/internal/minecraft-login-links",
             post(internal::mint_minecraft_link),
+        )
+        .route(
+            "/internal/worker/server-capabilities",
+            post(server_access::ensure_server_capability),
+        )
+        .route(
+            "/internal/worker/servers/{server_id}/objects/{*key}",
+            any(worker_objects::object),
+        )
+        .route(
+            "/internal/worker/control/recover",
+            post(worker_control::recover),
+        )
+        .route(
+            "/internal/worker/control/heartbeat",
+            post(worker_control::heartbeat),
+        )
+        .route(
+            "/internal/worker/control/operations/claim",
+            post(worker_control::claim_operation),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/progress",
+            post(worker_control::operation_progress),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/retry",
+            post(worker_control::retry_operation),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/begin-snapshot-retry",
+            post(worker_control::begin_snapshot_retry),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/defer-snapshot",
+            post(worker_control::defer_snapshot),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/complete",
+            post(worker_control::complete_operation),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/validate-delete",
+            post(worker_control::validate_delete_operation),
+        )
+        .route(
+            "/internal/worker/control/operations/{operation_id}/deactivate-placement",
+            post(worker_control::deactivate_placement),
+        )
+        .route(
+            "/internal/worker/control/runtime-lost",
+            post(worker_control::runtime_lost),
+        )
+        .route(
+            "/internal/worker/control/servers/{server_id}/stop",
+            post(worker_control::request_stop),
+        )
+        .route(
+            "/internal/worker/control/servers/{server_id}/snapshot",
+            post(worker_control::request_snapshot),
+        )
+        .route(
+            "/internal/worker/control/servers/{server_id}/snapshots/publish",
+            post(worker_control::publish_snapshot),
+        )
+        .route(
+            "/internal/worker/control/exports/claim",
+            post(worker_control::claim_export),
+        )
+        .route(
+            "/internal/worker/control/exports/{export_id}/complete",
+            post(worker_control::complete_export),
+        )
+        .route(
+            "/internal/worker/control/exports/{export_id}/fail",
+            post(worker_control::fail_export),
         )
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,

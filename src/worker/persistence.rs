@@ -59,7 +59,14 @@ pub async fn prepare_server_data(
 pub(crate) fn is_runtime_file(relative: &Path) -> bool {
     matches!(
         relative.to_str(),
-        Some("pumpkin.toml" | "advanced_config.toml" | "nethernet-key.der" | "whitelist.json")
+        Some(
+            "pumpkin.toml"
+                | "advanced_config.toml"
+                | "nethernet-key.der"
+                | "whitelist.json"
+                | "plugins/kurbis-control.wasm"
+                | "plugins/data/kurbis-control/config.json"
+        )
     ) || relative
         .components()
         .next()
@@ -79,6 +86,8 @@ mod tests {
             "whitelist.json",
             "logs/latest.log",
             "run/host-control.sock",
+            "plugins/kurbis-control.wasm",
+            "plugins/data/kurbis-control/config.json",
         ] {
             assert!(is_runtime_file(Path::new(path)));
         }
@@ -86,6 +95,7 @@ mod tests {
             "plugins/other-plugin/plugin.wasm",
             "plugins/data/other-plugin/config.json",
             "plugins/data/other-plugin/whitelist.json",
+            "plugins/data/kurbis-control/operator-config.json",
         ] {
             assert!(!is_runtime_file(Path::new(path)));
         }

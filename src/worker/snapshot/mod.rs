@@ -9,12 +9,17 @@ mod export;
 mod files;
 mod gc;
 mod manager;
+mod object_key;
+mod remote;
 
 #[cfg(test)]
 mod tests;
 
 pub use export::WorldArchive;
 pub use gc::GarbageCollection;
+pub use object_key::{InvalidObjectKey, physical_object_path};
+pub(crate) use object_key::{ObjectKind, WorkerObjectKey};
+pub use remote::{WorkerObjectAssignment, WorkerObjectClient};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
@@ -34,4 +39,5 @@ pub struct ManifestFile {
 pub struct SnapshotManager {
     pool: PgPool,
     store: Arc<dyn ObjectStore>,
+    worker_client: Option<WorkerObjectClient>,
 }

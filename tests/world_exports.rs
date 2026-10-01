@@ -1,12 +1,12 @@
 mod common;
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use async_zip::tokio::read::seek::ZipFileReader;
 use common::{create_user, test_pool};
-use kurbis_hoster::{
-    config::ObjectStoreConfig, model::SnapshotReason, worker::snapshot::SnapshotManager,
-};
+use kurbis_hoster::worker::snapshot::physical_object_path;
+use kurbis_hoster::{model::SnapshotReason, worker::snapshot::SnapshotManager};
+use object_store::ObjectStore;
 use sqlx::PgPool;
 use tempfile::TempDir;
 use tokio::{fs, io::BufReader};
@@ -30,6 +30,19 @@ async fn create_server(pool: &PgPool, owner_id: Uuid) -> Uuid {
         .await
         .unwrap();
     server_id
+}
+
+async fn publish_test_snapshot(pool: &PgPool, server_id: Uuid, generation: i64, size_bytes: i64) {
+    sqlx::query(
+        "UPDATE servers SET current_snapshot_generation = $2, storage_bytes = $3
+         WHERE id = $1",
+    )
+    .bind(server_id)
+    .bind(generation)
+    .bind(size_bytes)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -92,14 +105,16 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
     write(&server_root, "logs/latest.log", b"server log").await;
     write(&server_root, "run/host-control.sock", b"socket").await;
 
-    let object_config = ObjectStoreConfig::Local { root: object_root };
-    let snapshots = SnapshotManager::new(pool.clone(), &object_config)
-        .await
-        .unwrap();
+    fs::create_dir_all(&object_root).await.unwrap();
+    let snapshots = SnapshotManager::new(
+        pool.clone(),
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&object_root).unwrap()),
+    );
     let source = snapshots
         .create(server_id, &server_root, SnapshotReason::Manual)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server_id, source.generation, source.size_bytes).await;
     sqlx::query(
         "INSERT INTO world_exports(id, server_id, requested_by, status, stage, source_generation)
          VALUES($1, $2, $3, 'running', 'archiving', $4)",
@@ -113,10 +128,11 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
     .unwrap();
 
     for _ in 0..5 {
-        snapshots
+        let retained = snapshots
             .create(server_id, &server_root, SnapshotReason::Periodic)
             .await
             .unwrap();
+        publish_test_snapshot(&pool, server_id, retained.generation, retained.size_bytes).await;
     }
     let pinned: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2)",
@@ -204,9 +220,10 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
     drop(player_reader);
 
     snapshots.upload_world_archive(&archive).await.unwrap();
-    let archive_store = object_config.build().await.unwrap();
+    let archive_store =
+        object_store::local::LocalFileSystem::new_with_prefix(&object_root).unwrap();
     let uploaded = archive_store
-        .get(&object_store::path::Path::from(archive.archive_key.clone()))
+        .get(&physical_object_path(server_id, &archive.archive_key).unwrap())
         .await
         .unwrap()
         .bytes()
@@ -231,10 +248,11 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
     .execute(&pool)
     .await
     .unwrap();
-    snapshots
+    let released = snapshots
         .create(server_id, &server_root, SnapshotReason::Periodic)
         .await
         .unwrap();
+    publish_test_snapshot(&pool, server_id, released.generation, released.size_bytes).await;
     let pin_released: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2)",
     )

@@ -173,11 +173,11 @@ pub(super) async fn sync_operators(
     let owners = owner_profiles(pool, server_id).await?;
     runtime.replace_operators(server_dir, &owners).await?;
     let result = sqlx::query(
-        "INSERT INTO server_operator_state(server_id, revision, applied_revision, updated_at)
-         VALUES($1,$2,$2,now())
+        "INSERT INTO server_operator_state(server_id, applied_revision)
+         VALUES($1,$2)
          ON CONFLICT(server_id) DO UPDATE
-           SET applied_revision = EXCLUDED.revision, updated_at = now()
-         WHERE server_operator_state.revision = EXCLUDED.revision",
+           SET applied_revision = EXCLUDED.applied_revision
+         WHERE server_operator_state.revision = EXCLUDED.applied_revision",
     )
     .bind(server_id)
     .bind(revision)
@@ -373,11 +373,11 @@ pub(super) async fn sync_whitelist(
         .replace_whitelist(server_dir, enabled, &entries)
         .await?;
     let result = sqlx::query(
-        "INSERT INTO server_whitelist_state(server_id, revision, applied_revision, updated_at)
-         VALUES($1,$2,$2,now())
+        "INSERT INTO server_whitelist_state(server_id, applied_revision)
+         VALUES($1,$2)
          ON CONFLICT(server_id) DO UPDATE
-           SET applied_revision = EXCLUDED.applied_revision, updated_at = now()
-         WHERE server_whitelist_state.revision = EXCLUDED.revision",
+           SET applied_revision = EXCLUDED.applied_revision
+         WHERE server_whitelist_state.revision = EXCLUDED.applied_revision",
     )
     .bind(server_id)
     .bind(revision)

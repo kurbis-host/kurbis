@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::internal::require_server_owner;
+use super::internal::require_server_access;
 use super::{ApiError, AppState, mutation_error};
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -76,7 +76,7 @@ pub(super) async fn whitelist(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Whitelist>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(whitelist_state(&state.pool, server.id).await?))
 }
 
@@ -105,7 +105,7 @@ pub(super) async fn add_whitelist_entry(
     Path(server_id): Path<Uuid>,
     Json(input): Json<WhitelistMutation>,
 ) -> Result<(StatusCode, Json<Whitelist>), ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let name = validate_player_name(&input.name)?;
     let result = sqlx::query(
         "INSERT INTO whitelist_entries(server_id, player_id, name)
@@ -136,7 +136,7 @@ pub(super) async fn remove_whitelist_entry(
     Path(server_id): Path<Uuid>,
     Query(query): Query<WhitelistDeleteQuery>,
 ) -> Result<Json<Whitelist>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let result = sqlx::query(
         "DELETE FROM whitelist_entries
          WHERE server_id = $1 AND player_id = $2",

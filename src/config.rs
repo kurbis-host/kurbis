@@ -1,6 +1,11 @@
-use std::{env, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    env, fmt,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -111,10 +116,11 @@ impl ControlPlaneConfig {
 
 #[derive(Clone)]
 pub struct WorkerConfig {
-    pub common: CommonConfig,
+    pub database_url: String,
     pub id: uuid::Uuid,
     pub name: String,
     pub address: String,
+    pub signal_address: IpAddr,
     pub root: PathBuf,
     pub storage_mode: StorageMode,
     pub runtime: RuntimeConfig,
@@ -124,9 +130,13 @@ pub struct WorkerConfig {
     pub port_min: i32,
     pub port_max: i32,
     pub host_control_token: String,
+    pub control_plane_url: String,
+    pub public_base_url: String,
+    pub api_token: String,
+    pub allow_insecure_local_control_plane_http: bool,
+    pub plugin_wasm: Option<PathBuf>,
     pub snapshot_interval: Duration,
     pub idle_timeout: Duration,
-    pub object_store: ObjectStoreConfig,
 }
 
 impl WorkerConfig {
@@ -136,6 +146,12 @@ impl WorkerConfig {
         let id: uuid::Uuid = required("WORKER_ID")?
             .parse()
             .context("invalid WORKER_ID")?;
+        let signal_address = required("WORKER_SIGNAL_ADDRESS")?;
+        ensure!(
+            crate::model::is_private_signal_address(&signal_address),
+            "WORKER_SIGNAL_ADDRESS must be a private worker address"
+        );
+        let signal_address = signal_address.parse::<IpAddr>()?;
         let native_root = format!("data/native-worker-{id}");
         let root = PathBuf::from(value(
             "WORKER_ROOT",
@@ -150,11 +166,35 @@ impl WorkerConfig {
         } else {
             env::current_dir()?.join(root)
         };
+        let plugin_profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let plugin_wasm = match env::var_os("KURBIS_CONTROL_PLUGIN_WASM") {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                Some(if path.is_absolute() {
+                    path
+                } else {
+                    env::current_dir()?.join(path)
+                })
+            }
+            None if native => Some(
+                env::current_dir()?.join(
+                    PathBuf::from("plugins/kurbis-control/target/wasm32-wasip2")
+                        .join(plugin_profile)
+                        .join("kurbis_control.wasm"),
+                ),
+            ),
+            None => None,
+        };
         Ok(Self {
-            common: CommonConfig::from_env()?,
+            database_url: required("WORKER_DATABASE_URL")?,
             id,
             name: required("WORKER_NAME")?,
             address: required("WORKER_ADDRESS")?,
+            signal_address,
             root,
             storage_mode: StorageMode::from_env(native)?,
             runtime,
@@ -172,11 +212,19 @@ impl WorkerConfig {
             port_min: value("WORKER_PORT_MIN", "20000").parse()?,
             port_max: value("WORKER_PORT_MAX", "40000").parse()?,
             host_control_token: required("PUMPKIN_HOST_CONTROL_TOKEN")?,
+            control_plane_url: required("CONTROL_PLANE_URL")?,
+            public_base_url: required("PUBLIC_BASE_URL")?,
+            api_token: required("WORKER_API_TOKEN")?,
+            allow_insecure_local_control_plane_http: value(
+                "WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP",
+                "false",
+            )
+            .parse()?,
+            plugin_wasm,
             snapshot_interval: Duration::from_secs(
                 value("SNAPSHOT_INTERVAL_SECONDS", "300").parse()?,
             ),
             idle_timeout: Duration::from_secs(value("IDLE_TIMEOUT_SECONDS", "300").parse()?),
-            object_store: ObjectStoreConfig::from_env()?,
         })
     }
 }
@@ -235,6 +283,9 @@ pub struct GatewayConfig {
     pub common: CommonConfig,
     pub java_listen: SocketAddr,
     pub bedrock_listen: SocketAddr,
+    pub bedrock_public_port: u16,
+    pub bedrock_tls_certificate: PathBuf,
+    pub bedrock_tls_private_key: PathBuf,
     pub waiting_java_address: SocketAddr,
     pub waiting_bedrock_address: SocketAddr,
     pub waiting_control_socket: PathBuf,
@@ -248,10 +299,20 @@ pub struct GatewayConfig {
 
 impl GatewayConfig {
     pub fn from_env() -> Result<Self> {
+        let bedrock_public_port: u16 = required("BEDROCK_PUBLIC_PORT")?
+            .parse()
+            .context("invalid BEDROCK_PUBLIC_PORT")?;
+        anyhow::ensure!(
+            bedrock_public_port != 0,
+            "BEDROCK_PUBLIC_PORT must be non-zero"
+        );
         Ok(Self {
             common: CommonConfig::from_env()?,
             java_listen: value("JAVA_LISTEN", "0.0.0.0:25565").parse()?,
             bedrock_listen: value("BEDROCK_LISTEN", "0.0.0.0:19132").parse()?,
+            bedrock_public_port,
+            bedrock_tls_certificate: PathBuf::from(required("BEDROCK_TLS_CERT_FILE")?),
+            bedrock_tls_private_key: PathBuf::from(required("BEDROCK_TLS_KEY_FILE")?),
             waiting_java_address: value("WAITING_JAVA_ADDRESS", "127.0.0.1:25566").parse()?,
             waiting_bedrock_address: value("WAITING_BEDROCK_ADDRESS", "127.0.0.1:19133").parse()?,
             waiting_control_socket: PathBuf::from(value(

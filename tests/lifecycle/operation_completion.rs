@@ -133,9 +133,15 @@ async fn failed_start_is_fenced_until_removal_then_replays_preserve_other_reserv
             .await
             .is_err()
     );
-    super::mark_runtime_lost(&pool, worker, server_a, "container removal confirmed")
-        .await
-        .unwrap();
+    super::mark_runtime_lost(
+        &pool,
+        worker,
+        server_a,
+        start.generation,
+        "container removal confirmed",
+    )
+    .await
+    .unwrap();
     lifecycle.request_start(server_b, "test").await.unwrap();
     fail_operation(&pool, &start, "duplicate failure")
         .await

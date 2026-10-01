@@ -70,7 +70,7 @@ impl SnapshotManager {
         let checksum = hash_file(&output).await?;
         Ok(WorldArchive {
             server_id,
-            archive_key: format!("exports/{server_id}/{export_id}/{attempt}.zip"),
+            archive_key: format!("exports/{export_id}/{attempt}.zip"),
             path: output,
             size_bytes: i64::try_from(size_bytes)
                 .context("world archive exceeds supported size")?,
@@ -103,7 +103,7 @@ impl SnapshotManager {
             }
             let object = self
                 .store
-                .get(&Path::from(format!("chunks/{}", file.blake3)))
+                .get(&self.object_path(manifest.server_id, &format!("chunks/{}", file.blake3))?)
                 .await?;
             let mut stream = object.into_stream();
             let entry = ZipEntryBuilder::new(archive_path.into(), Compression::Deflate);
@@ -143,7 +143,8 @@ impl SnapshotManager {
     }
 
     pub async fn upload_world_archive(&self, archive: &WorldArchive) -> Result<()> {
-        let key = Path::from(archive.archive_key.clone());
+        let _guard = self.storage_guard(false).await?;
+        let key = self.object_path(archive.server_id, &archive.archive_key)?;
         let mut upload = self.store.put_multipart(&key).await?;
         let result = stream_archive_parts(&mut upload, &archive.path).await;
         if let Err(error) = result {
@@ -159,8 +160,9 @@ impl SnapshotManager {
         Ok(())
     }
 
-    pub async fn delete_world_archive(&self, archive_key: &str) -> Result<()> {
-        let key = Path::from(archive_key.to_owned());
+    pub async fn delete_world_archive(&self, server_id: Uuid, archive_key: &str) -> Result<()> {
+        let _guard = self.storage_guard(false).await?;
+        let key = self.object_path(server_id, archive_key)?;
         match self.store.delete(&key).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.into()),
@@ -169,20 +171,6 @@ impl SnapshotManager {
 
     pub async fn remove_world_archive_staging(&self, archive: &WorldArchive) {
         let _ = tokio::fs::remove_file(&archive.path).await;
-    }
-
-    pub async fn remove_stale_world_archives(
-        &self,
-        server_id: Uuid,
-        export_id: Uuid,
-    ) -> Result<()> {
-        let prefix = Path::from(format!("exports/{server_id}/{export_id}"));
-        let objects = self.store.list(Some(&prefix)).collect::<Vec<_>>().await;
-        for object in objects {
-            let object = object?;
-            self.store.delete(&object.location).await?;
-        }
-        Ok(())
     }
 }
 

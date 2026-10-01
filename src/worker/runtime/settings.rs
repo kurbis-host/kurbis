@@ -1,8 +1,17 @@
+use std::net::{IpAddr, SocketAddr};
+
 use serde_json::Value;
 
 use crate::model::DEFAULT_SERVER_MOTD;
 
-pub(crate) fn render_pumpkin_config(settings: &Value, java_port: u16, bedrock_port: u16) -> String {
+pub(crate) fn render_pumpkin_config(
+    settings: &Value,
+    java_port: u16,
+    bedrock_port: u16,
+    signal_address: SocketAddr,
+    external_ip: IpAddr,
+    external_port: u16,
+) -> String {
     let motd = setting_str(settings, "motd", DEFAULT_SERVER_MOTD);
     let difficulty = setting_str(settings, "difficulty", "Normal");
     let gamemode = setting_str(settings, "gamemode", "Survival");
@@ -42,9 +51,17 @@ pub(crate) fn render_pumpkin_config(settings: &Value, java_port: u16, bedrock_po
          [networking.bedrock.nethernet]\n\
          enabled = true\n\
          address = \"0.0.0.0:{bedrock_port}\"\n\
-         external_ip = \"\"\n\
+         signal_address = \"{signal_address}\"\n\
+         external_ip = \"{external_ip}\"\n\
+         external_port = {external_port}\n\
          identity_key = \"nethernet-key.der\"\n\
-         stun_servers = []\n",
+         stun_servers = []\n\
+         [plugins]\n\
+         allow_unsigned = false\n\
+         [plugins.overrides.kurbis-control]\n\
+         enabled = true\n\
+         allow_unsigned = true\n\
+         allowed_permissions = [\"fs.read.data\", \"http.outbound\"]\n",
         difficulty = serde_json::to_string(difficulty).expect("string serialization cannot fail"),
         gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
         motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
@@ -72,7 +89,14 @@ mod tests {
 
     #[test]
     fn hosted_runtime_requires_online_java_and_full_bedrock_authentication() {
-        let config = render_pumpkin_config(&Value::Null, 25565, 19132);
+        let config = render_pumpkin_config(
+            &Value::Null,
+            25565,
+            19132,
+            "0.0.0.0:19132".parse().unwrap(),
+            "192.0.2.20".parse().unwrap(),
+            19132,
+        );
         assert!(
             config.contains(
                 "[networking.java]\nenabled = true\nonline_mode = true\nencryption = true"
@@ -81,8 +105,25 @@ mod tests {
         assert!(config.contains("[networking.bedrock]\nenabled = true\nonline_mode = true"));
         assert!(config.contains("[networking.bedrock.authentication]\nenabled = true"));
         assert!(config.contains(
-            "[networking.bedrock.nethernet]\nenabled = true\naddress = \"0.0.0.0:19132\"\nexternal_ip = \"\"\nidentity_key = \"nethernet-key.der\"\nstun_servers = []"
+            "[networking.bedrock.nethernet]\nenabled = true\naddress = \"0.0.0.0:19132\"\nsignal_address = \"0.0.0.0:19132\"\nexternal_ip = \"192.0.2.20\"\nexternal_port = 19132\nidentity_key = \"nethernet-key.der\"\nstun_servers = []"
         ));
         assert!(!config.contains("[networking.bedrock]\nencryption ="));
+    }
+
+    #[test]
+    fn hosted_runtime_grants_only_the_managed_plugin_permissions() {
+        let config = render_pumpkin_config(
+            &Value::Null,
+            25565,
+            19132,
+            "0.0.0.0:19132".parse().unwrap(),
+            "192.0.2.20".parse().unwrap(),
+            19132,
+        );
+        assert!(config.contains("[plugins]\nallow_unsigned = false"));
+        assert!(config.contains(
+            "[plugins.overrides.kurbis-control]\nenabled = true\nallow_unsigned = true\nallowed_permissions = [\"fs.read.data\", \"http.outbound\"]"
+        ));
+        assert!(!config.contains("ask_permission_confirmation = false"));
     }
 }

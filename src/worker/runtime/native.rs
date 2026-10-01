@@ -1,6 +1,7 @@
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -35,6 +36,8 @@ pub struct NativeRuntime {
     root: PathBuf,
     sockets: PathBuf,
     control: PumpkinControl,
+    public_address: IpAddr,
+    signal_address: IpAddr,
     children: Mutex<HashMap<Uuid, Child>>,
 }
 
@@ -44,6 +47,8 @@ impl NativeRuntime {
         root: PathBuf,
         worker_id: Uuid,
         token: String,
+        public_address: IpAddr,
+        signal_address: IpAddr,
     ) -> Result<Self> {
         let binary = fs::canonicalize(binary)
             .await
@@ -59,6 +64,8 @@ impl NativeRuntime {
             root,
             sockets,
             control: PumpkinControl::new(token),
+            public_address,
+            signal_address,
             children: Mutex::new(HashMap::new()),
         })
     }
@@ -145,6 +152,9 @@ impl ServerRuntime for NativeRuntime {
             render_pumpkin_config(
                 settings,
                 placement.java_port.try_into()?,
+                placement.bedrock_port.try_into()?,
+                SocketAddr::new(self.signal_address, placement.signal_port.try_into()?),
+                self.public_address,
                 placement.bedrock_port.try_into()?,
             ),
         )

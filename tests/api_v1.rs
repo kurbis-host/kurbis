@@ -1,23 +1,22 @@
 mod common;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use common::{create_user, test_pool};
+use common::{api_state, create_user, test_pool};
 use futures::StreamExt;
 use futures::future::join_all;
-use kurbis_hoster::{
-    config::{CommonConfig, ControlPlaneConfig, OAuthConfig, OAuthProviderConfig},
-    control_plane::{
-        api::{AppState, router},
-        lifecycle::{Lifecycle, healthy_worker_template, heartbeat_worker},
-    },
+use kurbis_hoster::control_plane::{
+    api::{AppState, router},
+    lifecycle::{healthy_worker_template, heartbeat_worker},
 };
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use kurbis_hoster::worker::snapshot::physical_object_path;
+use object_store::ObjectStore;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -27,38 +26,11 @@ use uuid::Uuid;
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn state(pool: PgPool) -> Arc<AppState> {
-    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is configured");
-    Arc::new(AppState {
-        lifecycle: Lifecycle::new(pool.clone()),
+    api_state(
         pool,
-        config: ControlPlaneConfig {
-            common: CommonConfig { database_url },
-            listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            public_base_url: "https://panel.example.test".to_owned(),
-            root_domain: "mc.example.test".to_owned(),
-            internal_token: "api-v1-test-token".to_owned(),
-            oauth: OAuthConfig {
-                google: OAuthProviderConfig {
-                    client_id: "google-client".to_owned(),
-                    client_secret: "google-secret".to_owned(),
-                    authorize_url: "https://identity.example.test/authorize".to_owned(),
-                    token_url: "https://identity.example.test/token".to_owned(),
-                    userinfo_url: "https://identity.example.test/userinfo".to_owned(),
-                    scopes: "openid email profile".to_owned(),
-                },
-                discord: OAuthProviderConfig {
-                    client_id: "discord-client".to_owned(),
-                    client_secret: "discord-secret".to_owned(),
-                    authorize_url: "https://identity.example.test/authorize".to_owned(),
-                    token_url: "https://identity.example.test/token".to_owned(),
-                    userinfo_url: "https://identity.example.test/userinfo".to_owned(),
-                    scopes: "identify email".to_owned(),
-                },
-            },
-        },
-        http: reqwest::Client::new(),
-        object_store: Arc::new(object_store::memory::InMemory::new()),
-    })
+        "api-v1-test-token",
+        Arc::new(object_store::memory::InMemory::new()),
+    )
 }
 
 async fn user_session(pool: &PgPool, status: &str) -> (Uuid, String) {
@@ -97,6 +69,37 @@ fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) 
         .unwrap()
 }
 
+fn bearer_request(method: Method, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .unwrap()
+}
+
+fn server_session_request(
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, format!("kurbis_server_session={token}"));
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .unwrap()
+}
+
 fn internal_admission_request(
     hostname: &str,
     identity: Option<Value>,
@@ -121,6 +124,21 @@ fn internal_admission_request(
 async fn json_body(response: axum::response::Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn register_worker_api_token(pool: &PgPool, worker_id: Uuid) -> String {
+    let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    sqlx::query(
+        "INSERT INTO worker_auth.credentials(worker_id, api_token_hash, database_role)
+         VALUES($1, $2, $3)",
+    )
+    .bind(worker_id)
+    .bind(blake3::hash(token.as_bytes()).as_bytes().to_vec())
+    .bind(format!("test_worker_{}", worker_id.simple()))
+    .execute(pool)
+    .await
+    .unwrap();
+    token
 }
 
 #[tokio::test]
@@ -623,10 +641,13 @@ async fn world_exports_require_a_retained_source_and_enforce_ownership_cancellat
     .execute(&pool)
     .await
     .unwrap();
-    let key = format!("exports/{server_id}/{completed_id}/1.zip");
+    let key = format!("exports/{completed_id}/1.zip");
     let archive = Bytes::from_static(b"zip64 archive test fixture");
     object_store
-        .put(&ObjectPath::from(key.clone()), archive.clone().into())
+        .put(
+            &physical_object_path(server_id, &key).unwrap(),
+            archive.clone().into(),
+        )
         .await
         .unwrap();
     sqlx::query(
@@ -1138,6 +1159,595 @@ async fn sse_replays_durable_events_after_last_event_id() {
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn current_placement_capability_and_redeemed_session_share_server_scope() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner_id, owner_token) = user_session(&pool, "active").await;
+    let (other_owner_id, other_owner_token) = user_session(&pool, "active").await;
+    let app = router(state(pool.clone()));
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let created = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/v1/servers",
+            Some(&owner_token),
+            Some(json!({
+                "subdomain": format!("scope-{}", &suffix[..12]),
+                "settings": {
+                    "motd": "Scoped API",
+                    "difficulty": "Normal",
+                    "gamemode": "Survival",
+                    "view_distance": 12,
+                    "simulation_distance": 8,
+                    "hardcore": false,
+                    "whitelist": true
+                }
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let server_id = Uuid::parse_str(json_body(created).await["id"].as_str().unwrap()).unwrap();
+    let other_created = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/v1/servers",
+            Some(&other_owner_token),
+            Some(json!({
+                "subdomain": format!("other-{}", &suffix[..12]),
+                "settings": {
+                    "motd": "Other server",
+                    "difficulty": "Normal",
+                    "gamemode": "Survival",
+                    "view_distance": 12,
+                    "simulation_distance": 8,
+                    "hardcore": false,
+                    "whitelist": true
+                }
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_created.status(), StatusCode::CREATED);
+    let other_server_id =
+        Uuid::parse_str(json_body(other_created).await["id"].as_str().unwrap()).unwrap();
+
+    let mut worker_id = Uuid::new_v4();
+    let original_worker_id = worker_id;
+    let worker = healthy_worker_template(
+        worker_id,
+        format!("scoped-api-worker-{worker_id}"),
+        "127.0.0.1".to_owned(),
+        8 * 1024 * 1024 * 1024,
+        40 * 1024 * 1024 * 1024,
+        4000,
+        24000,
+        24100,
+    );
+    heartbeat_worker(&pool, &worker).await.unwrap();
+    let worker_api_token = register_worker_api_token(&pool, worker_id).await;
+    sqlx::query("UPDATE servers SET generation = 1 WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO placements(server_id, worker_id, generation, lease_token,
+                                java_port, bedrock_port, signal_port, active)
+         VALUES($1, $2, 1, $3, 24000, 24001, 24002, true)",
+    )
+    .bind(server_id)
+    .bind(worker_id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let shared_token_response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/internal/worker/server-capabilities",
+            "api-v1-test-token",
+            Some(json!({"server_id":server_id,"generation":1})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(shared_token_response.status(), StatusCode::UNAUTHORIZED);
+    let spoofed_worker_response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/internal/worker/server-capabilities",
+            &worker_api_token,
+            Some(json!({
+                "server_id": server_id,
+                "worker_identity": Uuid::new_v4(),
+                "generation": 1
+            })),
+        ))
+        .await
+        .unwrap();
+    assert!(spoofed_worker_response.status().is_client_error());
+
+    let capability_response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/internal/worker/server-capabilities",
+            &worker_api_token,
+            Some(json!({
+                "server_id": server_id,
+                "generation": 1
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(capability_response.status(), StatusCode::OK);
+    assert_eq!(
+        capability_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap(),
+        "no-store"
+    );
+    let capability = json_body(capability_response).await["capability"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let scoped_paths = [
+        format!("/api/v1/servers/{server_id}"),
+        format!("/api/v1/servers/{server_id}/players"),
+        format!("/api/v1/servers/{server_id}/logs"),
+        format!("/api/v1/servers/{server_id}/activity"),
+        format!("/api/v1/servers/{server_id}/snapshots"),
+        format!("/api/v1/servers/{server_id}/whitelist"),
+    ];
+    for path in scoped_paths {
+        let response = app
+            .clone()
+            .oneshot(bearer_request(Method::GET, &path, &capability, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let events = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}/events"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+    let first_event = tokio::time::timeout(
+        Duration::from_secs(2),
+        events.into_body().into_data_stream().next(),
+    )
+    .await
+    .expect("server event stream should deliver the durable catch-up event")
+    .expect("server event stream should remain open")
+    .unwrap();
+    assert!(String::from_utf8_lossy(&first_event).contains("event: server"));
+
+    let patched = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::PATCH,
+            &format!("/api/v1/servers/{server_id}"),
+            &capability,
+            Some(json!({"settings":{"motd":"Capability updated"}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+
+    let action = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            &format!("/api/v1/servers/{server_id}/actions"),
+            &capability,
+            Some(json!({"action":"snapshot"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(action.status(), StatusCode::CONFLICT);
+
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes,
+                               checksum, reason, complete)
+         VALUES($1, $2, 1, 'scoped-restore', 10, 'scoped-checksum', 'manual', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let restored = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            &format!("/api/v1/servers/{server_id}/snapshots/1/restore"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    // The route accepts the capability, then the lifecycle rejects the restore
+    // because a live fenced placement must stop before snapshot recovery.
+    assert_eq!(restored.status(), StatusCode::CONFLICT);
+
+    let account_route = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            "/api/v1/servers",
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(account_route.status(), StatusCode::UNAUTHORIZED);
+    let cross_server = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{other_server_id}/players"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_server.status(), StatusCode::UNAUTHORIZED);
+
+    // The handler does not extract a body: a forged identifier may be sent but
+    // cannot override scope, which must remain derived from the bearer token.
+    let minted = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/api/v1/server/login-links",
+            &capability,
+            Some(json!({"server_id": other_server_id})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(minted.status(), StatusCode::OK);
+    assert_eq!(
+        minted.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let login_url = json_body(minted).await["url"].as_str().unwrap().to_owned();
+    let login_token = login_url
+        .split_once("#token=")
+        .expect("login link includes its one-time fragment")
+        .1
+        .to_owned();
+
+    let expiring_link = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/api/v1/server/login-links",
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expiring_link.status(), StatusCode::OK);
+    let expiring_token = json_body(expiring_link).await["url"]
+        .as_str()
+        .unwrap()
+        .split_once("#token=")
+        .unwrap()
+        .1
+        .to_owned();
+    sqlx::query(
+        "UPDATE server_login_tokens SET expires_at = now() - interval '1 second'
+         WHERE token_hash = $1",
+    )
+    .bind(blake3::hash(expiring_token.as_bytes()).as_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let expired_redemption = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/server/redeem")
+        .header(header::ORIGIN, "https://panel.example.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token":&expiring_token}).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(expired_redemption)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    for attempt in 3..=6 {
+        let response = app
+            .clone()
+            .oneshot(bearer_request(
+                Method::POST,
+                "/api/v1/server/login-links",
+                &capability,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if attempt == 6 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            },
+            "login link mint attempt {attempt}"
+        );
+    }
+
+    let cross_origin = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/server/redeem")
+        .header(header::ORIGIN, "https://attacker.example")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token":&login_token}).to_string()))
+        .unwrap();
+    let rejected = app.clone().oneshot(cross_origin).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let redemption = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/server/redeem")
+        .header(header::ORIGIN, "https://panel.example.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token":&login_token}).to_string()))
+        .unwrap();
+    let redeemed = app.clone().oneshot(redemption).await.unwrap();
+    assert_eq!(redeemed.status(), StatusCode::OK);
+    assert_eq!(
+        redeemed.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let server_session = redeemed
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("kurbis_server_session=")
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        json_body(redeemed).await["server_id"],
+        server_id.to_string()
+    );
+
+    let session_access = app
+        .clone()
+        .oneshot(server_session_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}/players"),
+            &server_session,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_access.status(), StatusCode::OK);
+    let session_cross_server = app
+        .clone()
+        .oneshot(server_session_request(
+            Method::GET,
+            &format!("/api/v1/servers/{other_server_id}"),
+            &server_session,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_cross_server.status(), StatusCode::UNAUTHORIZED);
+    let session_account_route = app
+        .clone()
+        .oneshot(server_session_request(
+            Method::GET,
+            "/api/v1/servers",
+            &server_session,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_account_route.status(), StatusCode::UNAUTHORIZED);
+
+    sqlx::query(
+        "UPDATE server_sessions SET expires_at = now() - interval '1 second'
+         WHERE token_hash = $1",
+    )
+    .bind(blake3::hash(server_session.as_bytes()).as_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let expired_session = app
+        .clone()
+        .oneshot(server_session_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}/players"),
+            &server_session,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired_session.status(), StatusCode::UNAUTHORIZED);
+
+    let replay = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/server/redeem")
+        .header(header::ORIGIN, "https://panel.example.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token":&login_token}).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(replay).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let relocated_worker_id = Uuid::new_v4();
+    let relocated_worker = healthy_worker_template(
+        relocated_worker_id,
+        format!("scoped-api-relocated-worker-{relocated_worker_id}"),
+        "127.0.0.1".to_owned(),
+        8 * 1024 * 1024 * 1024,
+        40 * 1024 * 1024 * 1024,
+        4000,
+        40000,
+        40100,
+    );
+    heartbeat_worker(&pool, &relocated_worker).await.unwrap();
+    let relocated_worker_api_token = register_worker_api_token(&pool, relocated_worker_id).await;
+    sqlx::query("UPDATE placements SET worker_id = $2 WHERE server_id = $1")
+        .bind(server_id)
+        .bind(relocated_worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stale_link_after_relocation = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/api/v1/server/login-links",
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_link_after_relocation.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let relocated_response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            "/internal/worker/server-capabilities",
+            &relocated_worker_api_token,
+            Some(json!({
+                "server_id": server_id,
+                "generation": 1,
+                "current_capability": capability
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(relocated_response.status(), StatusCode::OK);
+    let relocated_capability = json_body(relocated_response).await["capability"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(relocated_capability, capability);
+    worker_id = relocated_worker_id;
+
+    sqlx::query("UPDATE servers SET generation = 2 WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE placements SET generation = 2 WHERE server_id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rotated_response = router(state(pool.clone()))
+        .oneshot(bearer_request(
+            Method::POST,
+            "/internal/worker/server-capabilities",
+            &relocated_worker_api_token,
+            Some(json!({
+                "server_id": server_id,
+                "generation": 2,
+                "current_capability": relocated_capability
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rotated_response.status(), StatusCode::OK);
+    let rotated_capability = json_body(rotated_response).await["capability"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(rotated_capability, capability);
+
+    let stale_capability = router(state(pool.clone()))
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_capability.status(), StatusCode::UNAUTHORIZED);
+    let current_capability = router(state(pool.clone()))
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}"),
+            &rotated_capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current_capability.status(), StatusCode::OK);
+
+    sqlx::query("UPDATE placements SET active = false WHERE server_id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let inactive_capability = router(state(pool.clone()))
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}"),
+            &rotated_capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inactive_capability.status(), StatusCode::UNAUTHORIZED);
+    let owner_access = router(state(pool.clone()))
+        .oneshot(request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}"),
+            Some(&owner_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_access.status(), StatusCode::OK);
+
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![owner_id, other_owner_id])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workers WHERE id = ANY($1)")
+        .bind(vec![original_worker_id, worker_id])
         .execute(&pool)
         .await
         .unwrap();

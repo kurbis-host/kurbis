@@ -9,12 +9,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use object_store::path::Path as ObjectPath;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::internal::require_server_owner;
+use crate::worker::snapshot::physical_object_path;
+
+use super::internal::require_server_access;
 use super::{ApiError, AppState, lifecycle_error};
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -62,7 +63,7 @@ pub(super) async fn list_exports(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<WorldExport>>, ApiError> {
-    require_server_owner(&state, &headers, server_id).await?;
+    require_server_access(&state, &headers, server_id).await?;
     let exports = sqlx::query_as::<_, WorldExport>(
         "SELECT id, server_id, status, stage, source_generation, archive_key, archive_size,
                 archive_checksum, last_error, created_at, updated_at, expires_at
@@ -79,7 +80,7 @@ pub(super) async fn create_export(
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<WorldExport>), ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let user_id = server.owner_id;
     let export_id = state
         .lifecycle
@@ -95,7 +96,7 @@ pub(super) async fn get_export(
     headers: HeaderMap,
     Path((server_id, export_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<WorldExport>, ApiError> {
-    require_server_owner(&state, &headers, server_id).await?;
+    require_server_access(&state, &headers, server_id).await?;
     Ok(Json(export_by_id(&state, server_id, export_id).await?))
 }
 
@@ -104,7 +105,7 @@ pub(super) async fn cancel_export(
     headers: HeaderMap,
     Path((server_id, export_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<WorldExport>, ApiError> {
-    require_server_owner(&state, &headers, server_id).await?;
+    require_server_access(&state, &headers, server_id).await?;
     let result = sqlx::query(
         "UPDATE world_exports SET status = 'cancelled', stage = 'cancelled', updated_at = now()
          WHERE id = $1 AND server_id = $2 AND status IN ('pending', 'running')",
@@ -129,7 +130,7 @@ pub(super) async fn download_export(
     headers: HeaderMap,
     Path((server_id, export_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Response, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let export = export_by_id(&state, server_id, export_id).await?;
     if export.status != "completed" || export.expires_at.is_none_or(|expiry| expiry <= Utc::now()) {
         return Err(ApiError::with_code(
@@ -142,7 +143,7 @@ pub(super) async fn download_export(
         .archive_key
         .as_deref()
         .filter(|key| {
-            key.strip_prefix(&format!("exports/{server_id}/{export_id}/"))
+            key.strip_prefix(&format!("exports/{export_id}/"))
                 .and_then(|attempt| attempt.strip_suffix(".zip"))
                 .is_some_and(|attempt| {
                     !attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit())
@@ -155,17 +156,20 @@ pub(super) async fn download_export(
                 "world export archive path is invalid",
             )
         })?;
-    let archive = state
-        .object_store
-        .get(&ObjectPath::from(key.to_owned()))
-        .await
-        .map_err(|_| {
-            ApiError::with_code(
-                StatusCode::GONE,
-                "export_archive_missing",
-                "world export archive has expired",
-            )
-        })?;
+    let object_path = physical_object_path(server_id, key).map_err(|_| {
+        ApiError::with_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_archive_invalid",
+            "world export archive path is invalid",
+        )
+    })?;
+    let archive = state.object_store.get(&object_path).await.map_err(|_| {
+        ApiError::with_code(
+            StatusCode::GONE,
+            "export_archive_missing",
+            "world export archive has expired",
+        )
+    })?;
     if export
         .archive_size
         .is_some_and(|size| size != archive.meta.size as i64)

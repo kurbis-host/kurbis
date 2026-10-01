@@ -8,7 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::internal::require_server_owner;
+use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Deserialize)]
@@ -36,7 +36,7 @@ pub(super) async fn logs(
     Path(server_id): Path<uuid::Uuid>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<LogPage>, ApiError> {
-    let server = require_server_owner(&state, &headers, server_id).await?;
+    let server = require_server_access(&state, &headers, server_id).await?;
     let limit = query.limit.unwrap_or(200).clamp(1, 500);
     if query.after_id.is_some_and(|cursor| cursor < 0) {
         return Err(ApiError::with_code(

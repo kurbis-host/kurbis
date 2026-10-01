@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Type;
@@ -9,6 +11,26 @@ pub const SERVER_CPU_MILLIS: i64 = 1000;
 pub const DEFAULT_SERVER_MOTD: &str = "Hosted by Kurbis";
 pub const DEFAULT_IDLE_SECONDS: i64 = 5 * 60;
 pub const SNAPSHOT_RETENTION_GENERATIONS: i64 = 5;
+
+pub fn is_private_signal_address(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            !address.is_unspecified()
+                && !address.is_broadcast()
+                && !address.is_multicast()
+                && (address.is_private() || address.is_loopback())
+        }
+        Ok(IpAddr::V6(address)) => {
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && (address.is_unique_local() || address.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "server_desired_state", rename_all = "snake_case")]
@@ -93,6 +115,7 @@ pub struct WorkerRecord {
     pub id: Uuid,
     pub name: String,
     pub address: String,
+    pub signal_address: String,
     pub total_memory_bytes: i64,
     pub total_disk_bytes: i64,
     pub total_cpu_millis: i64,
@@ -133,6 +156,7 @@ pub struct PlacementRecord {
     pub lease_token: Uuid,
     pub java_port: i32,
     pub bedrock_port: i32,
+    pub signal_port: i32,
     pub active: bool,
     pub updated_at: DateTime<Utc>,
 }
@@ -250,6 +274,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "w".into(),
             address: "127.0.0.1".into(),
+            signal_address: "127.0.0.1".into(),
             total_memory_bytes: 16 * 1024 * 1024 * 1024,
             total_disk_bytes: 100 * 1024 * 1024 * 1024,
             total_cpu_millis: 8000,
