@@ -112,6 +112,9 @@ provision_worker_bundle() {
   mkdir -p "$(dirname "$bundle_path")"
   local -a args=(--worker-id "$worker_id" --database-url "$database_url")
   local -a provision_env=(
+    "WORKER_NAME=$WORKER_NAME"
+    "WORKER_ADDRESS=$WORKER_ADDRESS"
+    "WORKER_SIGNAL_ADDRESS=$WORKER_SIGNAL_ADDRESS"
     "WORKER_CONTROL_PLANE_URL=$control_plane_url"
     "PUBLIC_BASE_URL=$PUBLIC_BASE_URL"
     "WORKER_RUNTIME=$runtime"
@@ -121,6 +124,11 @@ provision_worker_bundle() {
     "SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-300}"
     "IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-300}"
   )
+  for variable_name in WORKER_MEMORY_GIB WORKER_DISK_GIB WORKER_CPU_MILLIS WORKER_PORT_MIN WORKER_PORT_MAX; do
+    if [[ -n ${!variable_name:-} ]]; then
+      provision_env+=("$variable_name=${!variable_name}")
+    fi
+  done
   [[ -n $pumpkin_binary ]] && provision_env+=("PUMPKIN_BINARY=$pumpkin_binary")
   [[ -n $pumpkin_image ]] && provision_env+=("PUMPKIN_IMAGE=$pumpkin_image")
   [[ -n $plugin_wasm ]] && provision_env+=("KURBIS_CONTROL_PLUGIN_WASM=$plugin_wasm")
