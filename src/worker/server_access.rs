@@ -3,10 +3,9 @@ use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::{OpenOptionsExt, PermissionsExt},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{RuntimeConfig, WorkerConfig};
+use crate::worker::control_plane::WorkerControl;
 
 const PLUGIN_NAME: &str = "kurbis-control";
 
@@ -24,21 +24,16 @@ pub struct ServerAccess {
     allow_insecure_local_http: bool,
     plugin_wasm: Option<PathBuf>,
     enabled: bool,
-    api_token: String,
+    control_plane: WorkerControl,
     root: PathBuf,
-    http: reqwest::Client,
 }
 
 impl ServerAccess {
-    pub fn new(config: &WorkerConfig) -> Result<Self> {
+    pub fn new(config: &WorkerConfig, control_plane: WorkerControl) -> Result<Self> {
         crate::worker::control_plane::validate_control_plane_url(
             &config.control_plane_url,
             config.allow_insecure_local_control_plane_http,
         )?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
         Ok(Self {
             control_plane_url: config.control_plane_url.trim_end_matches('/').to_owned(),
             public_base_url: config.public_base_url.trim_end_matches('/').to_owned(),
@@ -46,9 +41,8 @@ impl ServerAccess {
             plugin_wasm: config.plugin_wasm.clone(),
             enabled: config.plugin_wasm.is_some()
                 || matches!(&config.runtime, RuntimeConfig::Docker { .. }),
-            api_token: config.api_token.clone(),
+            control_plane,
             root: config.root.clone(),
-            http,
         })
     }
 
@@ -86,13 +80,13 @@ impl ServerAccess {
 
     async fn ensure_capability(&self, server_id: Uuid, generation: i64) -> Result<String> {
         let current = read_capability(&self.capability_path(server_id)).ok();
+        let endpoint = reqwest::Url::parse(&format!(
+            "{}/internal/worker/server-capabilities",
+            self.control_plane_url
+        ))?;
         let response = self
-            .http
-            .post(format!(
-                "{}/internal/worker/server-capabilities",
-                self.control_plane_url
-            ))
-            .bearer_auth(&self.api_token)
+            .control_plane
+            .authorized_request(reqwest::Method::POST, endpoint)?
             .json(&serde_json::json!({
                 "server_id": server_id,
                 "generation": generation,
@@ -231,6 +225,7 @@ fn copy_plugin_binary(server_dir: &Path, source: &Path) -> Result<()> {
 }
 
 fn atomic_replace_at(directory: &File, name: &str, bytes: &[u8], mode: u32) -> Result<()> {
+    let directory_metadata = directory.metadata()?;
     let temporary = format!(".{name}.{}.tmp", Uuid::new_v4());
     let temporary_c = std::ffi::CString::new(temporary.as_str())?;
     let name_c = std::ffi::CString::new(name)?;
@@ -248,6 +243,15 @@ fn atomic_replace_at(directory: &File, name: &str, bytes: &[u8], mode: u32) -> R
     }
     let write_result = (|| -> Result<()> {
         let mut file = unsafe { File::from_raw_fd(fd) };
+        if let Some((uid, gid)) = managed_file_owner(
+            unsafe { libc::geteuid() },
+            directory_metadata.uid(),
+            directory_metadata.gid(),
+        ) && unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("set managed plugin file ownership");
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         if unsafe {
@@ -269,6 +273,14 @@ fn atomic_replace_at(directory: &File, name: &str, bytes: &[u8], mode: u32) -> R
         }
     }
     write_result
+}
+
+fn managed_file_owner(
+    worker_uid: u32,
+    directory_uid: u32,
+    directory_gid: u32,
+) -> Option<(u32, u32)> {
+    (worker_uid == 0).then_some((directory_uid, directory_gid))
 }
 
 fn open_dir(path: &Path) -> std::io::Result<File> {
@@ -303,4 +315,15 @@ fn ensure_dir_at(parent: &File, name: &str) -> Result<File> {
         }
     }
     open_dir_at(parent, name).context("open plugin data directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::managed_file_owner;
+
+    #[test]
+    fn root_worker_publishes_managed_files_with_the_parent_directory_owner() {
+        assert_eq!(managed_file_owner(0, 2613, 2613), Some((2613, 2613)));
+        assert_eq!(managed_file_owner(501, 2613, 2613), None);
+    }
 }

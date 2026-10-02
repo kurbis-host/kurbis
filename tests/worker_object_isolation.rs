@@ -10,15 +10,15 @@ use bytes::Bytes;
 use common::{api_state, create_user, test_pool};
 use futures::{StreamExt, TryStreamExt, stream};
 use kurbis_hoster::{
+    contracts::worker::WorkerAssignment,
     control_plane::{
         api::router,
         lifecycle::{healthy_worker_template, heartbeat_worker},
+        snapshots::SnapshotStore,
     },
     model::SnapshotReason,
-    worker::snapshot::{
-        ManifestFile, SnapshotManager, SnapshotManifest, WorkerObjectAssignment,
-        WorkerObjectClient, physical_object_path,
-    },
+    snapshot::{ManifestFile, SnapshotManifest, physical_object_path},
+    worker::snapshot::{SnapshotManager, WorkerObjectClient},
 };
 use object_store::{ObjectStore, path::Path as ObjectPath};
 use sqlx::PgPool;
@@ -63,18 +63,15 @@ async fn create_worker(pool: &PgPool, name: &str, ports: (i32, i32)) -> (Uuid, S
     )
     .await
     .unwrap();
-    let token = if name == "worker-a" {
-        "a".repeat(43)
-    } else {
-        "b".repeat(43)
-    };
+    let token = format!("{}{}", worker_id.simple(), Uuid::new_v4().simple())[..43].to_owned();
+    let lease_id = worker_lease_id(&token);
     sqlx::query(
-        "INSERT INTO worker_auth.credentials(worker_id, api_token_hash, database_role)
-         VALUES($1, $2, $3::name)",
+        "INSERT INTO worker_credentials(worker_id, api_token_hash, lease_id, lease_expires_at)
+         VALUES($1, $2, $3, now() + interval '1 hour')",
     )
     .bind(worker_id)
     .bind(blake3::hash(token.as_bytes()).as_bytes().to_vec())
-    .bind(format!("worker_test_{}", worker_id.simple()))
+    .bind(lease_id)
     .execute(pool)
     .await
     .unwrap();
@@ -114,8 +111,24 @@ async fn assign_server(
 async fn create_snapshot_operation(pool: &PgPool, server_id: Uuid, worker_id: Uuid) -> Uuid {
     let operation_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO operations(id, server_id, worker_id, kind, status, generation)
-         VALUES($1, $2, $3, 'snapshot', 'running', 1)",
+        "INSERT INTO operations(id, server_id, worker_id, kind, status, generation, attempt, payload)
+         VALUES($1, $2, $3, 'snapshot', 'running', 1, 1, jsonb_build_object('reason', 'manual'))",
+    )
+    .bind(operation_id)
+    .bind(server_id)
+    .bind(worker_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    operation_id
+}
+
+async fn create_restart_operation(pool: &PgPool, server_id: Uuid, worker_id: Uuid) -> Uuid {
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO operations(id, server_id, worker_id, kind, status, generation, attempt, payload)
+         VALUES($1, $2, $3, 'restart', 'running', 1, 1,
+                jsonb_build_object('stage', 'stopped', 'reason', 'manual_restart'))",
     )
     .bind(operation_id)
     .bind(server_id)
@@ -140,7 +153,11 @@ async fn publish_test_snapshot(pool: &PgPool, server_id: Uuid, generation: i64, 
 }
 
 fn operation_query(operation_id: Uuid, generation: i64) -> String {
-    format!("assignment=operation&operation_id={operation_id}&generation={generation}")
+    format!("assignment=operation&operation_id={operation_id}&generation={generation}&attempt=1")
+}
+
+fn worker_lease_id(token: &str) -> Uuid {
+    Uuid::from_slice(&blake3::hash(token.as_bytes()).as_bytes()[..16]).unwrap()
 }
 
 fn placement_query(generation: i64) -> String {
@@ -164,6 +181,7 @@ async fn api_request(
                     "/internal/worker/servers/{server_id}/objects/{key}?{query}"
                 ))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("x-worker-lease", worker_lease_id(token).to_string())
                 .body(body)
                 .unwrap(),
         )
@@ -192,6 +210,92 @@ fn gated_body(bytes: Bytes) -> (Body, oneshot::Receiver<()>, oneshot::Sender<()>
         Ok::<_, std::io::Error>(bytes)
     }));
     (body, started_rx, release_tx)
+}
+
+#[tokio::test]
+async fn restart_operation_can_publish_and_restore_snapshot_objects_through_worker_api() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let owner = create_user(
+        &pool,
+        "google",
+        &format!("worker-object-restart-{}", Uuid::new_v4()),
+        "Worker Object Restart",
+        "active",
+        None,
+    )
+    .await;
+    let server_id = create_server(&pool, owner, "restart-object").await;
+    let (worker_id, token) = create_worker(&pool, "restart-worker", (22400, 22500)).await;
+    assign_server(&pool, server_id, worker_id, 1, (22401, 22402, 22403)).await;
+    let operation_id = create_restart_operation(&pool, server_id, worker_id).await;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let app = router(api_state(
+        pool.clone(),
+        "worker-object-restart-test",
+        object_store.clone(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address: SocketAddr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = WorkerObjectClient::new_with_lease(
+        &format!("http://{address}"),
+        &token,
+        true,
+        worker_lease_id(&token),
+    )
+    .unwrap();
+    let snapshots =
+        SnapshotManager::new_worker(client).for_operation(server_id, operation_id, 1, 1);
+    let source = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(source.path().join("world"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        source.path().join("world/level.dat"),
+        b"restart snapshot world",
+    )
+    .await
+    .unwrap();
+
+    let snapshot = snapshots
+        .create(server_id, source.path(), SnapshotReason::Shutdown)
+        .await
+        .unwrap();
+    publish_test_snapshot(&pool, server_id, snapshot.generation, snapshot.size_bytes).await;
+    let manifest_path = physical_object_path(server_id, &snapshot.manifest_key).unwrap();
+    assert!(object_store.head(&manifest_path).await.is_ok());
+
+    let restored = tempfile::tempdir().unwrap();
+    assert_eq!(
+        snapshots
+            .restore_latest(server_id, restored.path())
+            .await
+            .unwrap(),
+        Some(snapshot.generation)
+    );
+    assert_eq!(
+        tokio::fs::read(restored.path().join("world/level.dat"))
+            .await
+            .unwrap(),
+        b"restart snapshot world"
+    );
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workers WHERE id = $1")
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    server_task.abort();
 }
 
 #[tokio::test]
@@ -290,8 +394,8 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     let unplaced_server = create_server(&pool, owner_a, "unplaced-delete").await;
     let delete_operation = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO operations(id, server_id, worker_id, kind, status, generation)
-         VALUES($1, $2, $3, 'delete', 'running', 1)",
+        "INSERT INTO operations(id, server_id, worker_id, kind, status, generation, attempt)
+         VALUES($1, $2, $3, 'delete', 'running', 1, 1)",
     )
     .bind(delete_operation)
     .bind(unplaced_server)
@@ -356,7 +460,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     .unwrap();
     let unplaced_export_key = format!("exports/{unplaced_export_id}/1.zip");
     let unplaced_export_query =
-        format!("assignment=export&export_id={unplaced_export_id}&generation=1");
+        format!("assignment=export&export_id={unplaced_export_id}&generation=1&attempt=1");
     let unplaced_export_put = api_request(
         &app,
         Method::PUT,
@@ -425,6 +529,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
                 operation_query(operation_a, 1)
             ))
             .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+            .header("x-worker-lease", worker_lease_id(&token_a).to_string())
             .body(Body::empty())
             .unwrap(),
         )
@@ -433,12 +538,15 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     assert_eq!(list_response.status(), StatusCode::NOT_FOUND);
 
     let local_base_url = format!("http://{address}");
-    let client_a = WorkerObjectClient::new(&local_base_url, &token_a, true).unwrap();
-    let snapshots = SnapshotManager::new_worker(pool.clone(), client_a.clone()).for_operation(
-        server_a,
-        operation_a,
-        1,
-    );
+    let client_a = WorkerObjectClient::new_with_lease(
+        &local_base_url,
+        &token_a,
+        true,
+        worker_lease_id(&token_a),
+    )
+    .unwrap();
+    let snapshots =
+        SnapshotManager::new_worker(client_a.clone()).for_operation(server_a, operation_a, 1, 1);
     let source = tempfile::tempdir().unwrap();
     let world_payload = deterministic_payload(12 * 1024 * 1024);
     tokio::fs::create_dir_all(source.path().join("world"))
@@ -521,10 +629,11 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     .execute(&pool)
     .await
     .unwrap();
-    let export_manager = SnapshotManager::new_worker(pool.clone(), client_a.clone()).for_export(
+    let export_manager = SnapshotManager::new_worker(client_a.clone()).for_export(
         server_a,
         export_id,
         snapshot.generation,
+        3,
     );
     let staging = tempfile::tempdir().unwrap();
     let archive = export_manager
@@ -549,9 +658,10 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     );
     let export_store = client_a.scoped(
         server_a,
-        WorkerObjectAssignment::Export {
+        WorkerAssignment::Export {
             export_id,
             generation: snapshot.generation,
+            attempt: 3,
         },
     );
     let archive_key = ObjectPath::from(archive.archive_key.clone());
@@ -605,11 +715,12 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     let upload_request = Request::builder()
         .method(Method::PUT)
         .uri(format!(
-            "/internal/worker/servers/{server_a}/objects/{}?assignment=export&export_id={export_id}&generation={}",
+            "/internal/worker/servers/{server_a}/objects/{}?assignment=export&export_id={export_id}&generation={}&attempt=3",
             archive.archive_key,
             snapshot.generation
         ))
         .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+        .header("x-worker-lease", worker_lease_id(&token_a).to_string())
         .body(upload_body)
         .unwrap();
     let upload_task = tokio::spawn(app.clone().oneshot(upload_request));
@@ -617,7 +728,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     let gc_pool = pool.clone();
     let gc_store = object_store.clone();
     let gc_task = tokio::spawn(async move {
-        SnapshotManager::collect_garbage_with(&gc_pool, gc_store)
+        SnapshotStore::collect_garbage_with(&gc_pool, gc_store)
             .await
             .unwrap()
     });
@@ -668,7 +779,13 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     assert!(export_store.head(&archive_key).await.is_err());
     export_manager.remove_world_archive_staging(&archive).await;
 
-    let client_b = WorkerObjectClient::new(&local_base_url, &token_b, true).unwrap();
+    let client_b = WorkerObjectClient::new_with_lease(
+        &local_base_url,
+        &token_b,
+        true,
+        worker_lease_id(&token_b),
+    )
+    .unwrap();
 
     let stalled_server = create_server(&pool, owner_a, "stalled-read").await;
     assign_server(&pool, stalled_server, worker_a, 1, (22010, 22011, 22012)).await;
@@ -746,6 +863,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
             operation_query(operation_a, 1)
         ))
         .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+        .header("x-worker-lease", worker_lease_id(&token_a).to_string())
         .body(in_flight_body)
         .unwrap();
     let in_flight_task = tokio::spawn(app.clone().oneshot(in_flight_request));
@@ -753,7 +871,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     let gc_pool = pool.clone();
     let gc_store = object_store.clone();
     let gc_task = tokio::spawn(async move {
-        SnapshotManager::collect_garbage_with(&gc_pool, gc_store)
+        SnapshotStore::collect_garbage_with(&gc_pool, gc_store)
             .await
             .unwrap()
     });
@@ -830,8 +948,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     .await;
     assert_eq!(old_worker_request.status(), StatusCode::NOT_FOUND);
     assert!(export_store.head(&archive_key).await.is_err());
-    let reassigned =
-        SnapshotManager::new_worker(pool.clone(), client_b.clone()).for_placement(server_a, 2);
+    let reassigned = SnapshotManager::new_worker(client_b.clone()).for_placement(server_a, 2);
     let reassigned_restore = tempfile::tempdir().unwrap();
     assert_eq!(
         reassigned
@@ -847,7 +964,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
         world_payload
     );
 
-    sqlx::query("UPDATE worker_auth.credentials SET revoked_at = now() WHERE worker_id = $1")
+    sqlx::query("UPDATE worker_credentials SET revoked_at = now() WHERE worker_id = $1")
         .bind(worker_b)
         .execute(&pool)
         .await
@@ -932,7 +1049,7 @@ async fn worker_object_access_is_server_and_assignment_scoped_with_streamed_snap
     tokio::fs::write(&outside_sentinel, b"unchanged")
         .await
         .unwrap();
-    let control_plane_snapshots = SnapshotManager::new(pool.clone(), object_store.clone());
+    let control_plane_snapshots = SnapshotStore::new(pool.clone(), object_store.clone());
     assert!(
         control_plane_snapshots
             .restore_latest(server_a, forged_restore.path())

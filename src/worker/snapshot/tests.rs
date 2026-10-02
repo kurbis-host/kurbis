@@ -1,4 +1,4 @@
-use super::files::safe_relative_path;
+use crate::snapshot::files::safe_relative_path;
 
 #[test]
 fn rejects_snapshot_path_traversal() {

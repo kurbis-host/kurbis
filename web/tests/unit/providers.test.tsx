@@ -2,15 +2,18 @@ import { useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppProviders } from "../../components/providers";
-import type { Server } from "../../lib/contracts";
+import type { components } from "../../lib/api/generated";
 import { queryKeys } from "../../lib/query";
 import { server, session } from "./fixtures";
 
-const navigation = vi.hoisted(() => ({ pathname: "/app/servers/server-1" }));
+type Server = components["schemas"]["Server"];
+
+const navigation = vi.hoisted(() => ({ pathname: "/manage/server-1" }));
 vi.mock("next/navigation", () => ({ usePathname: () => navigation.pathname }));
 
 class EventSourceStub {
   static instance: EventSourceStub | null = null;
+  static url: string | null = null;
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   readonly close = vi.fn();
@@ -27,14 +30,15 @@ class EventSourceStub {
     this.listeners.get(type)?.(event);
   }
 
-  constructor() {
+  constructor(url?: string) {
     EventSourceStub.instance = this;
+    EventSourceStub.url = url ?? null;
   }
 }
 
-function EventStatus() {
+function EventStatus({ serverId = server.id }: { serverId?: string }) {
   const { data } = useQuery({
-    queryKey: queryKeys.eventStatus(server.id),
+    queryKey: queryKeys.eventStatus(serverId),
     queryFn: async () => "unknown",
     staleTime: Infinity,
   });
@@ -51,9 +55,10 @@ function ServerState() {
 
 afterEach(() => {
   cleanup();
-  navigation.pathname = `/app/servers/${server.id}`;
+  navigation.pathname = `/manage/${server.id}`;
   vi.unstubAllGlobals();
   EventSourceStub.instance = null;
+  EventSourceStub.url = null;
 });
 
 describe("event reconnect state", () => {
@@ -68,6 +73,20 @@ describe("event reconnect state", () => {
 
     await waitFor(() => expect(screen.getByText("connecting")).toBeVisible());
     expect(EventSourceStub.instance).not.toBeNull();
+  });
+
+  it("uses the server named by the shared /manage route even when it is not default", async () => {
+    const other = { ...server, id: "server-2", subdomain: "other-world", is_default: false };
+    navigation.pathname = `/manage/${other.id}/players`;
+    vi.stubGlobal("EventSource", EventSourceStub);
+    render(
+      <AppProviders session={session} servers={[server, other]}>
+        <EventStatus serverId={other.id} />
+      </AppProviders>,
+    );
+
+    await waitFor(() => expect(screen.getByText("connecting")).toBeVisible());
+    expect(EventSourceStub.url).toBe(`/api/v1/servers/${other.id}/events`);
   });
 
   it("moves from connecting to live and reconnecting as EventSource changes state", async () => {

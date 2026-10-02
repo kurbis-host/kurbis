@@ -1,6 +1,8 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { logEntrySchema, serverEventSchema, serverSchema, type ServerEvent } from "./contracts";
+import type { components } from "./api/generated";
 import { queryKeys } from "./query";
+
+type ServerEvent = components["schemas"]["ServerEvent"];
 
 export function applyServerEvent(queryClient: QueryClient, serverId: string, event: ServerEvent) {
   const serverKey = queryKeys.server(serverId);
@@ -16,7 +18,7 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
     case "server":
       if (event.data) {
         void queryClient.cancelQueries({ queryKey: serverKey, exact: true });
-        queryClient.setQueryData(serverKey, serverSchema.parse(event.data));
+        queryClient.setQueryData(serverKey, event.data);
       } else {
         void queryClient.invalidateQueries({ queryKey: serverKey });
       }
@@ -47,7 +49,7 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
       break;
     case "log":
       if (event.data) {
-        const entry = logEntrySchema.parse(event.data);
+        const entry = event.data;
         void queryClient.cancelQueries({ queryKey: logsKey, exact: true });
         queryClient.setQueryData(logsKey, (current: { items: typeof entry[]; next_after_id: number | null } | undefined) => {
           if (!current || current.items.some((item) => item.id === entry.id)) return current;
@@ -59,6 +61,14 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
 }
 
 export function parseServerEvent(raw: string) {
-  try { return serverEventSchema.safeParse(JSON.parse(raw)); }
-  catch { return { success: false as const, error: new Error("Invalid SSE JSON") }; }
+  try {
+    const value = JSON.parse(raw) as Partial<ServerEvent>;
+    if (typeof value.id !== "number" || !Number.isInteger(value.id)
+      || !["server", "operation", "snapshot", "players", "whitelist", "log"].includes(value.type ?? "")) {
+      return { success: false as const, error: new Error("Invalid server event") };
+    }
+    return { success: true as const, data: value as ServerEvent };
+  } catch {
+    return { success: false as const, error: new Error("Invalid SSE JSON") };
+  }
 }

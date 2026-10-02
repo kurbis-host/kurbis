@@ -13,8 +13,9 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
+    contracts::worker::WorkerExportTask,
     model::{OperationKind, OperationRecord, OperationStatus, SERVER_STORAGE_BYTES},
-    worker::snapshot::{ObjectKind, SnapshotManifest, WorkerObjectKey, physical_object_path},
+    snapshot::{ObjectKind, SnapshotManifest, WorkerObjectKey, physical_object_path},
 };
 
 use super::export_not_found;
@@ -156,7 +157,7 @@ fn snapshot_reason_for_operation(operation: &OperationRecord) -> Result<String, 
     Ok(reason)
 }
 
-async fn verify_snapshot_manifest(
+pub(in crate::control_plane::api) async fn verify_snapshot_manifest(
     store: &dyn ObjectStore,
     server_id: Uuid,
     generation: i64,
@@ -248,7 +249,7 @@ struct LockedExport {
 pub(in crate::control_plane::api) async fn claim_export(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Option<crate::worker::control_plane::WorkerExportTask>>, ApiError> {
+) -> Result<Json<Option<WorkerExportTask>>, ApiError> {
     let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -359,11 +360,9 @@ async fn lock_server_with_worker_export(
     Ok(server.bind(worker_id).fetch_optional(&mut **tx).await?)
 }
 
-fn export_task_from_row(
-    row: &sqlx::postgres::PgRow,
-) -> Result<crate::worker::control_plane::WorkerExportTask, ApiError> {
+fn export_task_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkerExportTask, ApiError> {
     let source_generation: Option<i64> = row.try_get("source_generation")?;
-    let task = crate::worker::control_plane::WorkerExportTask {
+    let task = WorkerExportTask {
         id: row.try_get("id")?,
         server_id: row.try_get("server_id")?,
         source_generation: source_generation.ok_or_else(export_not_found)?,

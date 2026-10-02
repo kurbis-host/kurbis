@@ -1,30 +1,28 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct LogQuery {
     after_id: Option<i64>,
     limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, JsonSchema)]
 pub struct LogEntry {
     pub id: i64,
     pub created_at: DateTime<Utc>,
     pub line: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct LogPage {
     pub items: Vec<LogEntry>,
     pub next_after_id: Option<i64>,
@@ -32,10 +30,11 @@ pub struct LogPage {
 
 pub(super) async fn logs(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<uuid::Uuid>,
-    Query(query): Query<LogQuery>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiQuery(query): ApiQuery<LogQuery>,
 ) -> Result<Json<LogPage>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let limit = query.limit.unwrap_or(200).clamp(1, 500);
     if query.after_id.is_some_and(|cursor| cursor < 0) {

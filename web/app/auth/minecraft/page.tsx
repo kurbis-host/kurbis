@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Gamepad2 } from "lucide-react";
+import { ApiError, errorMessage } from "../../../lib/api/client";
+import { browserApi } from "../../../lib/api/operations";
 
 type PageState = "reading" | "redeeming" | "error";
 
@@ -34,24 +36,13 @@ export default function MinecraftLoginPage() {
     setState("redeeming");
     setMessage("Signing in to Kurbis…");
     try {
-      const response = await fetch("/auth/minecraft/redeem", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({ token: loginToken }),
-      });
-      if (!response.ok) {
-        let detail = "This sign-in link is invalid, expired, or already used.";
-        try {
-          const payload = (await response.json()) as { message?: string };
-          if (payload.message) detail = payload.message;
-        } catch {}
-        throw new Error(detail);
-      }
+      await browserApi.redeemMinecraft(loginToken);
       window.location.replace("/app");
     } catch (error) {
       setState("error");
-      setMessage(error instanceof Error ? error.message : "Sign-in could not be completed. Try again with a fresh link.");
+      setMessage(error instanceof ApiError && error.status === 400
+        ? "This sign-in link is invalid, expired, or already used."
+        : errorMessage(error));
     } finally {
       inFlight.current = false;
     }

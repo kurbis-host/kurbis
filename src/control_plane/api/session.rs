@@ -1,18 +1,15 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
+use schemars::JsonSchema;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::model::{DEFAULT_IDLE_SECONDS, SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES};
 
-use super::{ApiError, AppState, internal::authenticated_user};
+use super::{ApiAccountHeaders, ApiError, AppState, internal::authenticated_user};
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     Active,
@@ -35,13 +32,13 @@ impl TryFrom<&str> for AccountStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Session {
     pub user: SessionUser,
     pub limits: ServiceLimits,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct SessionUser {
     pub id: Uuid,
     pub email: Option<String>,
@@ -49,7 +46,7 @@ pub struct SessionUser {
     pub account_status: AccountStatus,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct ServiceLimits {
     pub memory_bytes: i64,
     pub storage_bytes: i64,
@@ -59,7 +56,7 @@ pub struct ServiceLimits {
 
 pub(super) async fn session(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    headers: ApiAccountHeaders,
 ) -> Result<Json<Session>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
     Ok(Json(Session {

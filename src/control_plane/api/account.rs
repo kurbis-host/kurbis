@@ -2,26 +2,28 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::State,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::model::ObservedState;
 
-use super::{ApiError, AppState, auth, internal::authenticated_user};
+use super::actor::{AccountSessionPath, ServerIdPath};
+use super::{ApiAccountHeaders, ApiError, ApiPath, AppState, auth, internal::authenticated_user};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Account {
     pub identities: Vec<AccountIdentity>,
     pub sessions: Vec<AccountSession>,
     pub worlds: Vec<AccountWorld>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, sqlx::FromRow, JsonSchema)]
 pub struct AccountWorld {
     pub id: Uuid,
     pub subdomain: String,
@@ -30,7 +32,7 @@ pub struct AccountWorld {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, sqlx::FromRow, JsonSchema)]
 pub struct AccountIdentity {
     pub id: Uuid,
     pub provider: String,
@@ -40,7 +42,7 @@ pub struct AccountIdentity {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct AccountSession {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
@@ -58,7 +60,7 @@ struct SessionRow {
 
 pub(super) async fn account(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    headers: ApiAccountHeaders,
 ) -> Result<Json<Account>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
     let identities = sqlx::query_as::<_, AccountIdentity>(
@@ -101,9 +103,10 @@ pub(super) async fn account(
 
 pub(super) async fn make_default_world(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiAccountHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<StatusCode, ApiError> {
+    let server_id = path.server_id;
     let user = authenticated_user(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
     let account_status: Option<String> =
@@ -149,9 +152,10 @@ pub(super) async fn make_default_world(
 
 pub(super) async fn revoke_session(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(session_id): Path<Uuid>,
+    headers: ApiAccountHeaders,
+    ApiPath(path): ApiPath<AccountSessionPath>,
 ) -> Result<Response, ApiError> {
+    let session_id = path.session_id;
     let user = authenticated_user(&state, &headers).await?;
     let current_hash = auth::current_session_hash(&headers);
     let revoked: Option<Vec<u8>> = sqlx::query_scalar(

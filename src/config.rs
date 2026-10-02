@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -61,7 +62,7 @@ impl fmt::Debug for OAuthProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthProvider {
     Google,
@@ -116,7 +117,6 @@ impl ControlPlaneConfig {
 
 #[derive(Clone)]
 pub struct WorkerConfig {
-    pub database_url: String,
     pub id: uuid::Uuid,
     pub name: String,
     pub address: String,
@@ -190,7 +190,6 @@ impl WorkerConfig {
             None => None,
         };
         Ok(Self {
-            database_url: required("WORKER_DATABASE_URL")?,
             id,
             name: required("WORKER_NAME")?,
             address: required("WORKER_ADDRESS")?,

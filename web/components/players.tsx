@@ -5,9 +5,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2, UserRoundCheck, UsersRound } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
-import { apiVoid, errorMessage, jsonBody } from "../lib/api/client";
-import { fetchPlayers, fetchServer, fetchWhitelist } from "../lib/api/queries";
-import type { PlayerPresence, Server, WhitelistEntry, WhitelistState } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
 import { queryKeys } from "../lib/query";
 import {
   whitelistFormSchema,
@@ -22,6 +22,11 @@ import {
   PageHeader,
   Surface,
 } from "./ui";
+
+type PlayerPresence = components["schemas"]["PlayerPresence"];
+type Server = components["schemas"]["Server"];
+type WhitelistEntry = components["schemas"]["WhitelistEntry"];
+type WhitelistState = components["schemas"]["Whitelist"];
 
 const listItem =
   "grid grid-cols-[38px_minmax(0,1fr)_auto] items-center gap-3 border-t border-[#ddd4c3] py-[13px]";
@@ -47,17 +52,17 @@ export function Players({
   const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
     queryKey: queryKeys.server(serverId),
-    queryFn: () => fetchServer(serverId),
+    queryFn: () => browserApi.getServer(serverId),
     initialData: initialServer,
   });
   const { data: players = initialPlayers } = useQuery({
     queryKey: queryKeys.players(serverId),
-    queryFn: () => fetchPlayers(serverId),
+    queryFn: () => browserApi.getPlayers(serverId),
     initialData: initialPlayers,
   });
   const { data: whitelist = initialWhitelist } = useQuery({
     queryKey: queryKeys.whitelist(serverId),
-    queryFn: () => fetchWhitelist(serverId),
+    queryFn: () => browserApi.getWhitelist(serverId),
     initialData: initialWhitelist,
   });
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -70,10 +75,7 @@ export function Players({
 
   const add = useMutation({
     mutationFn: ({ player_id, name }: WhitelistFormValues) =>
-      apiVoid(`/api/v1/servers/${serverId}/whitelist`, {
-        method: "POST",
-        body: jsonBody({ player_id, name }),
-      }),
+      browserApi.addWhitelistEntry(serverId, { player_id, name }),
     onMutate: () => setRequestError(null),
     onSuccess: () => {
       form.reset();
@@ -83,9 +85,7 @@ export function Players({
   });
   const remove = useMutation({
     mutationFn: (entry: WhitelistEntry) =>
-      apiVoid(`/api/v1/servers/${serverId}/whitelist?player_id=${entry.player_id}`, {
-        method: "DELETE",
-      }),
+      browserApi.removeWhitelistEntry(serverId, entry.player_id),
     onMutate: () => setRequestError(null),
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist(serverId) }),

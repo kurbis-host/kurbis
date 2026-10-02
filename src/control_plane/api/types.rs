@@ -1,5 +1,6 @@
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -11,7 +12,7 @@ use crate::model::{
 
 use super::ApiError;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum Difficulty {
     Peaceful,
     Easy,
@@ -19,7 +20,7 @@ pub enum Difficulty {
     Hard,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum GameMode {
     Survival,
     Creative,
@@ -27,7 +28,7 @@ pub enum GameMode {
     Spectator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSettings {
     pub motd: String,
@@ -53,7 +54,7 @@ impl Default for ServerSettings {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ServerSettingsPatch {
     motd: Option<String>,
@@ -129,14 +130,14 @@ impl ServerSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LifecycleStatus {
     pub desired_state: DesiredState,
     pub observed_state: ObservedState,
     pub stage: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Problem {
     pub code: &'static str,
     pub message: String,
@@ -144,7 +145,7 @@ pub struct Problem {
     pub retryable: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Operation {
     pub id: Uuid,
     pub kind: OperationKind,
@@ -188,7 +189,7 @@ impl From<DbOperation> for Operation {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Snapshot {
     pub generation: i64,
     pub size_bytes: i64,
@@ -207,7 +208,7 @@ impl From<DbSnapshot> for Snapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StorageUsage {
     #[serde(rename = "storage_bytes")]
     pub used_bytes: i64,
@@ -215,7 +216,7 @@ pub struct StorageUsage {
     pub limit_bytes: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Server {
     pub id: Uuid,
     pub subdomain: String,

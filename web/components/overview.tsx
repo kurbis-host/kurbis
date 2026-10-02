@@ -5,13 +5,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, ExternalLink, Play, RotateCcw, Square } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { apiVoid, errorMessage, jsonBody } from "../lib/api/client";
-import { fetchActivity, fetchServer } from "../lib/api/queries";
-import type { Activity as ActivityItem, Server } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
 import { formatBytes, formatDateTime, formatRelative } from "../lib/format";
 import { lifecycle, lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
 import { Button, EmptyState, Notice, PageHeader, Surface } from "./ui";
+
+type ActivityItem = components["schemas"]["ActivityEntry"];
+type Server = components["schemas"]["Server"];
 
 function AddressRow({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
@@ -74,12 +77,12 @@ export function Overview({
   const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
     queryKey: queryKeys.server(serverId),
-    queryFn: () => fetchServer(serverId),
+    queryFn: () => browserApi.getServer(serverId),
     initialData: initialServer,
   });
   const { data: activity = initialActivity } = useQuery({
     queryKey: queryKeys.activity(serverId),
-    queryFn: () => fetchActivity(serverId),
+    queryFn: () => browserApi.getActivity(serverId),
     initialData: initialActivity,
   });
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -91,10 +94,7 @@ export function Overview({
   }, []);
   const action = useMutation({
     mutationFn: async (name: "start" | "stop" | "restart") =>
-      apiVoid(`/api/v1/servers/${serverId}/actions`, {
-        method: "POST",
-        body: jsonBody({ action: name }),
-      }),
+      browserApi.command(serverId, { command: name }),
     onMutate: async (name) => {
       setRequestError(null);
       const serverKey = queryKeys.server(serverId);
@@ -353,7 +353,7 @@ export function Overview({
           )}
           <Link
             className="mt-[22px] inline-flex items-center gap-[7px] text-[13px] font-[780] text-sky-deep no-underline"
-            href={`${panelBasePath ?? `/app/servers/${serverId}`}/backups`}
+            href={`${panelBasePath ?? `/manage/${serverId}`}/backups`}
           >
             Open backup history <ExternalLink size={14} />
           </Link>

@@ -1,9 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use chrono::Utc;
-use serde_json::json;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use super::{LifecycleFailure, bail};
+use crate::contracts::worker::OperationPayload;
 use crate::model::{
     DesiredState, ObservedState, OperationKind, PlacementRecord, SERVER_CPU_MILLIS,
     SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES, ServerRecord, WorkerRecord,
@@ -15,7 +16,7 @@ pub(super) async fn lock_server(
 ) -> Result<ServerRecord> {
     lock_server_optional(tx, server_id)
         .await?
-        .context("server not found")
+        .ok_or_else(|| LifecycleFailure::NotFound("server not found".to_owned()).into())
 }
 
 pub(super) async fn lock_server_optional(
@@ -48,7 +49,6 @@ pub(super) async fn lock_placement(
 
 pub(super) async fn select_worker(
     tx: &mut Transaction<'_, Postgres>,
-    server: &ServerRecord,
 ) -> Result<Option<WorkerRecord>> {
     Ok(sqlx::query_as::<_, WorkerRecord>(
         "SELECT w.id, w.name, w.address, w.signal_address, w.total_memory_bytes, w.total_disk_bytes,
@@ -56,13 +56,11 @@ pub(super) async fn select_worker(
                 w.reserved_cpu_millis, w.heartbeat_at, w.draining,
                 w.port_min, w.port_max
          FROM workers w
-         LEFT JOIN worker_snapshot_cache c
-           ON c.worker_id = w.id AND c.server_id = $1 AND c.generation = $2
          WHERE NOT w.draining
            AND w.heartbeat_at > now() - interval '30 seconds'
-           AND w.total_memory_bytes - w.reserved_memory_bytes >= $3
-           AND w.total_disk_bytes - w.reserved_disk_bytes >= $4
-           AND w.total_cpu_millis - w.reserved_cpu_millis >= $5
+           AND w.total_memory_bytes - w.reserved_memory_bytes >= $1
+           AND w.total_disk_bytes - w.reserved_disk_bytes >= $2
+           AND w.total_cpu_millis - w.reserved_cpu_millis >= $3
            AND EXISTS (
                SELECT 1 FROM generate_series(w.port_min, w.port_max - 2) AS candidate(port)
                WHERE NOT EXISTS (
@@ -72,15 +70,12 @@ pub(super) async fn select_worker(
                )
            )
            AND w.signal_address <> ''
-         ORDER BY (c.worker_id IS NOT NULL) DESC,
-                  (w.total_memory_bytes - w.reserved_memory_bytes - $3) ASC,
-                  (w.total_disk_bytes - w.reserved_disk_bytes - $4) ASC,
+         ORDER BY (w.total_memory_bytes - w.reserved_memory_bytes - $1) ASC,
+                  (w.total_disk_bytes - w.reserved_disk_bytes - $2) ASC,
                   w.id
          FOR UPDATE OF w SKIP LOCKED
          LIMIT 1",
     )
-    .bind(server.id)
-    .bind(server.current_snapshot_generation.unwrap_or(0))
     .bind(SERVER_MEMORY_BYTES)
     .bind(SERVER_STORAGE_BYTES)
     .bind(SERVER_CPU_MILLIS)
@@ -101,7 +96,10 @@ pub(super) async fn place_and_enqueue_start(
         DesiredState::Running,
         ObservedState::Restoring,
         OperationKind::Start,
-        json!({"reason": reason}),
+        super::operation_payload(OperationPayload {
+            reason: Some(reason.to_owned()),
+            ..OperationPayload::default()
+        })?,
     )
     .await?;
     sqlx::query("DELETE FROM start_requests WHERE server_id = $1")
@@ -118,7 +116,7 @@ pub(super) async fn place_and_enqueue_worker_operation(
     desired_state: DesiredState,
     observed_state: ObservedState,
     kind: OperationKind,
-    mut payload: serde_json::Value,
+    payload: serde_json::Value,
 ) -> Result<()> {
     let base_port: Option<i32> = sqlx::query_scalar(
         "SELECT p
@@ -135,7 +133,9 @@ pub(super) async fn place_and_enqueue_worker_operation(
     .bind(worker.port_max)
     .fetch_optional(&mut **tx)
     .await?;
-    let base_port = base_port.context("selected worker lost its free port triple")?;
+    let base_port = base_port.ok_or_else(|| {
+        LifecycleFailure::Unavailable("selected worker lost its free port triple".to_owned())
+    })?;
 
     if let Some(old) = lock_placement(tx, server.id).await? {
         sqlx::query("DELETE FROM port_leases WHERE server_id = $1")
@@ -213,10 +213,6 @@ pub(super) async fn place_and_enqueue_worker_operation(
     .bind(generation)
     .execute(&mut **tx)
     .await?;
-    let payload_object = payload
-        .as_object_mut()
-        .context("worker operation payload must be a JSON object")?;
-    payload_object.insert("lease_token".into(), json!(lease_token));
     enqueue_operation(tx, server.id, Some(worker.id), kind, generation, payload).await?;
     Ok(())
 }
@@ -275,7 +271,10 @@ pub(super) async fn enqueue_delete(
         worker_id,
         OperationKind::Delete,
         generation,
-        json!({"reason":"delete"}),
+        super::operation_payload(OperationPayload {
+            reason: Some("delete".to_owned()),
+            ..OperationPayload::default()
+        })?,
     )
     .await
 }

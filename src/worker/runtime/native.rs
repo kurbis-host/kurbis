@@ -257,7 +257,7 @@ impl ServerRuntime for NativeRuntime {
             .collect())
     }
 
-    async fn abort_start(&self, server_id: Uuid) -> Result<()> {
+    async fn remove_runtime(&self, server_id: Uuid) -> Result<()> {
         if let Some(mut child) = self.children.lock().await.remove(&server_id) {
             if child.try_wait()?.is_none() {
                 child.kill().await?;

@@ -14,7 +14,11 @@ use pumpkin_plugin_api::{
 };
 use serde_json::Value;
 
-use crate::{PERMISSION, api};
+use crate::{
+    PERMISSION,
+    actions::{self, LifecycleAction},
+    api,
+};
 
 const PAGE_SIZE: usize = 18;
 
@@ -40,34 +44,6 @@ impl View {
             Self::Whitelist(_) => Some(Self::Whitelist(page)),
             Self::Snapshots(_) => Some(Self::Snapshots(page)),
             _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum LifecycleAction {
-    Start,
-    Stop,
-    Restart,
-    Snapshot,
-}
-
-impl LifecycleAction {
-    fn api_name(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Restart => "restart",
-            Self::Snapshot => "snapshot",
-        }
-    }
-
-    fn confirmation(self) -> &'static str {
-        match self {
-            Self::Start => "Start this server and consume available capacity?",
-            Self::Stop => "Stop this server and disconnect its players?",
-            Self::Restart => "Restart this server and disconnect its players?",
-            Self::Snapshot => "Create a snapshot of this server now?",
         }
     }
 }
@@ -254,55 +230,28 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
             render_page(&gui, &mut actions, &view, &data)?;
         }
         View::Controls => {
-            button(
-                &gui,
-                &mut actions,
-                20,
-                "lime_concrete",
-                "Start",
-                "Review and confirm this action",
-                Some(Action::Open(View::LifecycleConfirm(LifecycleAction::Start))),
-            );
-            button(
-                &gui,
-                &mut actions,
-                22,
-                "red_concrete",
-                "Stop",
-                "Review and confirm this action",
-                Some(Action::Open(View::LifecycleConfirm(LifecycleAction::Stop))),
-            );
-            button(
-                &gui,
-                &mut actions,
-                24,
-                "orange_concrete",
-                "Restart",
-                "Review and confirm this action",
-                Some(Action::Open(View::LifecycleConfirm(
-                    LifecycleAction::Restart,
-                ))),
-            );
-            button(
-                &gui,
-                &mut actions,
-                31,
-                "chest",
-                "Create snapshot",
-                "Review and confirm this action",
-                Some(Action::Open(View::LifecycleConfirm(
-                    LifecycleAction::Snapshot,
-                ))),
-            );
+            for spec in actions::prompted_actions() {
+                button(
+                    &gui,
+                    &mut actions,
+                    spec.control_slot
+                        .expect("prompted actions have a control slot"),
+                    spec.material,
+                    spec.label,
+                    "Review and confirm this action",
+                    Some(Action::Open(View::LifecycleConfirm(spec.action))),
+                );
+            }
         }
         View::LifecycleConfirm(action) => {
+            let spec = actions::spec(*action);
             button(
                 &gui,
                 &mut actions,
                 22,
-                "lime_concrete",
-                &format!("Confirm {}", action.api_name()),
-                action.confirmation(),
+                spec.material,
+                &format!("Confirm {}", spec.command),
+                spec.confirmation,
                 Some(Action::Execute(*action)),
             );
             button(
@@ -316,12 +265,13 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
             );
         }
         View::RestoreConfirm { generation, page } => {
+            let restore = actions::spec(LifecycleAction::Restore);
             button(
                 &gui,
                 &mut actions,
                 22,
-                "barrier",
-                "Restore snapshot",
+                restore.material,
+                restore.label,
                 &format!(
                     "Replace the current world with generation {generation}. Click to confirm."
                 ),
@@ -706,8 +656,8 @@ fn activate(player: &Player, action: Action) -> Result<()> {
             tell(player, &format!("One-use login link (15 minutes): {url}"));
         }
         Action::Execute(lifecycle_action) => {
-            let action = lifecycle_action.api_name();
-            let response = api::server_action(action)?;
+            let action = actions::spec(lifecycle_action).command;
+            let response = api::server_command(lifecycle_action, None)?;
             tell(
                 player,
                 &format!(
@@ -717,7 +667,7 @@ fn activate(player: &Player, action: Action) -> Result<()> {
             );
         }
         Action::Restore { generation, page } => {
-            api::restore_snapshot(generation)?;
+            api::server_command(LifecycleAction::Restore, Some(generation))?;
             tell(
                 player,
                 &format!("Restore of snapshot {generation} requested."),

@@ -4,9 +4,12 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Players } from "../../components/players";
-import type { PlayerPresence, WhitelistState } from "../../lib/contracts";
+import type { components } from "../../lib/api/generated";
 import { queryKeys } from "../../lib/query";
 import { server } from "./fixtures";
+
+type PlayerPresence = components["schemas"]["PlayerPresence"];
+type WhitelistState = components["schemas"]["Whitelist"];
 
 const player: PlayerPresence = {
   player_id: "00000000-0000-0000-0000-000000000001",
@@ -38,19 +41,21 @@ describe("whitelist interactions", () => {
   it("whitelists a live player using the persisted game-profile UUID and removes them", async () => {
     let present = false;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(input);
-      const method = init?.method ?? "GET";
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const method = request.method;
       if (path === `/api/v1/servers/${server.id}/whitelist` && method === "POST") {
-        expect(JSON.parse(String(init?.body))).toEqual({ player_id: player.player_id, name: "Alex" });
+        expect(await request.json()).toEqual({ player_id: player.player_id, name: "Alex" });
         present = true;
-        return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
+        return Response.json(emptyWhitelist, { status: 201 });
       }
-      if (path.startsWith(`/api/v1/servers/${server.id}/whitelist?player_id=`) && method === "DELETE") {
-        expect(path).toContain(player.player_id);
+      if (path === `/api/v1/servers/${server.id}/whitelist` && method === "DELETE") {
+        expect(url.searchParams.get("player_id")).toBe(player.player_id);
         present = false;
-        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+        return Response.json(emptyWhitelist, { status: 200 });
       }
-      if (path === `/api/v1/servers/${server.id}/whitelist`) {
+      if (path === `/api/v1/servers/${server.id}/whitelist` && method === "GET") {
         const data: WhitelistState = present
           ? {
               enabled: true,
@@ -96,12 +101,10 @@ describe("whitelist interactions", () => {
 
   it("shows API failures and validates manual UUID input", async () => {
     cleanup();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        Response.json({ message: "player name is already whitelisted" }, { status: 409 }),
-      ),
+    const fetchMock = vi.fn(async () =>
+      Response.json({ message: "player name is already whitelisted" }, { status: 409 }),
     );
+    vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({
       defaultOptions: { queries: { staleTime: Infinity, retry: false }, mutations: { retry: false } },
     });
@@ -117,7 +120,7 @@ describe("whitelist interactions", () => {
     await user.type(screen.getByPlaceholderText("00000000-0000-0000-0000-000000000000"), "not-a-uuid");
     await user.click(screen.getByRole("button", { name: "Add player" }));
     expect(screen.getByText("Enter a valid Minecraft player UUID.")).toBeVisible();
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
 
     await user.clear(screen.getByPlaceholderText("00000000-0000-0000-0000-000000000000"));
     await user.type(
@@ -125,7 +128,7 @@ describe("whitelist interactions", () => {
       "00000000-0000-4000-8000-000000000002",
     );
     await user.click(screen.getByRole("button", { name: "Add player" }));
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await waitFor(() =>
       expect(screen.getByText("player name is already whitelisted")).toBeVisible(),
     );

@@ -4,8 +4,11 @@ use std::{path::Path, sync::Arc};
 
 use async_zip::tokio::read::seek::ZipFileReader;
 use common::{create_user, test_pool};
-use kurbis_hoster::worker::snapshot::physical_object_path;
-use kurbis_hoster::{model::SnapshotReason, worker::snapshot::SnapshotManager};
+use kurbis_hoster::{
+    control_plane::snapshots::SnapshotStore,
+    model::SnapshotReason,
+    snapshot::{SnapshotManifest, physical_object_path},
+};
 use object_store::ObjectStore;
 use sqlx::PgPool;
 use tempfile::TempDir;
@@ -104,16 +107,36 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
     write(&server_root, "ops.json", b"operator credentials").await;
     write(&server_root, "logs/latest.log", b"server log").await;
     write(&server_root, "run/host-control.sock", b"socket").await;
+    write(
+        &server_root,
+        "run/host-control-token",
+        b"per-worker-host-control-secret",
+    )
+    .await;
 
     fs::create_dir_all(&object_root).await.unwrap();
-    let snapshots = SnapshotManager::new(
-        pool.clone(),
-        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&object_root).unwrap()),
-    );
+    let object_store =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&object_root).unwrap());
+    let snapshots = SnapshotStore::new(pool.clone(), object_store.clone());
     let source = snapshots
         .create(server_id, &server_root, SnapshotReason::Manual)
         .await
         .unwrap();
+    let manifest_bytes = object_store
+        .get(&physical_object_path(server_id, &source.manifest_key).unwrap())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert!(
+        manifest
+            .files
+            .iter()
+            .all(|file| file.path != "run/host-control-token"),
+        "per-worker runtime credentials must not enter durable snapshots"
+    );
     publish_test_snapshot(&pool, server_id, source.generation, source.size_bytes).await;
     sqlx::query(
         "INSERT INTO world_exports(id, server_id, requested_by, status, stage, source_generation)
@@ -189,6 +212,7 @@ async fn exports_stream_zip64_anvil_files_normalize_pumpkin_progress_and_pin_sou
         "ops.json",
         "latest.log",
         "host-control.sock",
+        "host-control-token",
     ] {
         assert!(
             !names.iter().any(|name| name == excluded),

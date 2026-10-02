@@ -23,7 +23,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - Worker scheduling with resource reservations.
 - Persistent world snapshots using S3-compatible object storage.
 - Server lifecycle operations with PostgreSQL-backed locking and recovery.
-- OP-only `/kurbis` in-game management, with a one-use login link that opens a one-hour panel session for that server without signing into a Kurbis account.
+- OP-only `/kurbis` in-game management, with a one-use 15-minute login link that opens a persistent, independently revocable panel grant for that server without signing into a Kurbis account. Grant authorization remains bound to one server and is also denied after server deletion or owner suspension.
 - Container isolation through Docker.
 
 ## Repository Layout
@@ -60,24 +60,13 @@ cargo build
 Run Rust tests:
 
 ```bash
-TEST_DATABASE_URL=postgres://localhost/melon_hoster_test cargo test --all-targets
+TEST_DATABASE_URL=postgres://localhost/melon_hoster_test \
+  cargo test --locked --all-targets -- --test-threads=1
 ```
 
-`tests/identity_migration.rs` intentionally uses a separate disposable database
-schema for the historical migrations through 0013. Migration 0014 creates
-global `worker_auth` roles and must be validated in a fresh public-schema
-database, as the worker isolation targets do:
-
-```bash
-TEST_DATABASE_URL=postgres://localhost/melon_hoster_worker_test \
-  cargo test --test worker_isolation --test worker_control_api \
-  --test worker_object_isolation --test worker_maintenance -- --test-threads=1
-TEST_DATABASE_URL=postgres://localhost/melon_hoster_identity_test \
-  cargo test --test identity_migration -- --test-threads=1
-```
-
-Do not reuse the same database between these commands; each target applies a
-different migration fixture and cleans up its own test roles and rows.
+Use a disposable local database. The schema is bootstrapped from the canonical
+empty-database definition; historical migration fixtures and upgrade
+compatibility are not supported.
 
 Local panel development uses an isolated PostgreSQL database and the loopback OAuth fixture, so it does not need production OAuth credentials. The checked-out local settings live in the ignored `web/.env.local` file. Create the database once:
 

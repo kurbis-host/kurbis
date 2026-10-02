@@ -3,7 +3,7 @@ use std::path::{Path as FsPath, PathBuf};
 use anyhow::Result;
 
 use super::WorkerRunner;
-use crate::worker::{control_plane::WorkerExportTask, snapshot::SnapshotManager};
+use crate::{contracts::worker::WorkerExportTask, worker::snapshot::SnapshotManager};
 
 impl WorkerRunner {
     async fn claim_world_export(&self) -> Result<Option<WorkerExportTask>> {
@@ -24,9 +24,12 @@ impl WorkerRunner {
         let Some(task) = self.claim_world_export().await? else {
             return Ok(());
         };
-        let snapshots = self
-            .snapshots
-            .for_export(task.server_id, task.id, task.source_generation);
+        let snapshots = self.snapshots.for_export(
+            task.server_id,
+            task.id,
+            task.source_generation,
+            task.attempt,
+        );
         let control_plane = self.control_plane.clone();
         let staging_root = self.config.root.join("exports");
         self.world_export_task = Some(tokio::spawn(async move {

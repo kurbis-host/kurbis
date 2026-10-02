@@ -55,7 +55,7 @@ impl Endpoint {
             bail!("API base URL is invalid");
         }
         if matches!(&scheme, Scheme::Http)
-            && !(allow_insecure_local_http && is_local_http_authority(&authority))
+            && !(allow_insecure_local_http && is_local_http_authority(authority))
         {
             bail!("unencrypted API URLs are only allowed for local development");
         }
@@ -133,26 +133,42 @@ pub(crate) fn create_login_link() -> Result<String> {
         .context("login link response omitted its URL")
 }
 
-pub(crate) fn server_action(action: &str) -> Result<Value> {
-    let action = validated_server_action(action)?;
+pub(crate) fn server_command(
+    action: crate::actions::LifecycleAction,
+    generation: Option<i64>,
+) -> Result<Value> {
     post(
-        &server_path("/actions")?,
-        &serde_json::json!({ "action": action }),
+        &server_path("/commands")?,
+        &server_command_body(action, generation)?,
     )
 }
 
-fn validated_server_action(action: &str) -> Result<&str> {
-    anyhow::ensure!(
-        matches!(action, "start" | "stop" | "restart" | "snapshot"),
-        "unsupported server action"
-    );
-    Ok(action)
-}
+fn server_command_body(
+    action: crate::actions::LifecycleAction,
+    generation: Option<i64>,
+) -> Result<Value> {
+    use crate::actions::ActionArgument;
 
-pub(crate) fn restore_snapshot(generation: i64) -> Result<()> {
-    anyhow::ensure!(generation > 0, "snapshot generation must be positive");
-    post_empty(&server_path(&format!("/snapshots/{generation}/restore"))?)?;
-    Ok(())
+    let spec = crate::actions::spec(action);
+    match (spec.argument, generation) {
+        (ActionArgument::None, None) => Ok(serde_json::json!({ "command": spec.command })),
+        (ActionArgument::SnapshotGeneration, Some(generation)) => {
+            anyhow::ensure!(generation > 0, "snapshot generation must be positive");
+            Ok(serde_json::json!({
+                "command": spec.command,
+                "generation": generation,
+            }))
+        }
+        (ActionArgument::None, Some(_)) => {
+            anyhow::bail!(
+                "{} command does not accept a snapshot generation",
+                spec.command
+            )
+        }
+        (ActionArgument::SnapshotGeneration, None) => {
+            anyhow::bail!("{} command requires a snapshot generation", spec.command)
+        }
+    }
 }
 
 fn request(method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -343,12 +359,25 @@ mod tests {
     }
 
     #[test]
-    fn server_actions_are_limited_to_the_management_menu_actions() {
-        for action in ["start", "stop", "restart", "snapshot"] {
-            assert_eq!(validated_server_action(action).unwrap(), action);
+    fn action_registry_builds_the_canonical_server_command_bodies() {
+        for action in [
+            crate::actions::LifecycleAction::Start,
+            crate::actions::LifecycleAction::Stop,
+            crate::actions::LifecycleAction::Restart,
+            crate::actions::LifecycleAction::Snapshot,
+        ] {
+            let spec = crate::actions::spec(action);
+            assert_eq!(
+                server_command_body(action, None).unwrap(),
+                serde_json::json!({"command": spec.command}),
+            );
         }
-        for action in ["", "delete", "login", "shutdown", "restore"] {
-            assert!(validated_server_action(action).is_err(), "{action}");
-        }
+        assert_eq!(
+            server_command_body(crate::actions::LifecycleAction::Restore, Some(17)).unwrap(),
+            serde_json::json!({"command":"restore","generation":17}),
+        );
+        assert!(server_command_body(crate::actions::LifecycleAction::Restore, None).is_err());
+        assert!(server_command_body(crate::actions::LifecycleAction::Restore, Some(0)).is_err());
+        assert!(server_command_body(crate::actions::LifecycleAction::Start, Some(17)).is_err());
     }
 }

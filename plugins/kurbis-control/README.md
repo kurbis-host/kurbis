@@ -17,7 +17,8 @@ whitelist, snapshots, and server controls. The command form supports the same
 views, settings and whitelist changes, lifecycle actions with an explicit
 confirmation step, and a two-step snapshot restore. `/kurbis login` prints a
 one-use browser link for this server. The link expires after 15 minutes; its
-redeemed browser session lasts one hour and does not sign in to a Kurbis account.
+redeemed browser grant does not sign in to a Kurbis account and remains active
+until revoked or the server is removed or suspended.
 
 Docker workers use the plugin baked into the hosted Pumpkin image. Native
 workers build it from this crate by default; `KURBIS_CONTROL_PLUGIN_WASM` can

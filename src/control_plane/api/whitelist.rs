@@ -1,19 +1,18 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
+use garde::Validate;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::actor::{ApiJson, ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState, mutation_error};
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, JsonSchema)]
 pub struct WhitelistEntry {
     pub player_id: Uuid,
     pub name: String,
@@ -21,7 +20,7 @@ pub struct WhitelistEntry {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Whitelist {
     pub enabled: bool,
     pub revision: i64,
@@ -73,17 +72,21 @@ pub(super) async fn whitelist_state(pool: &PgPool, server_id: Uuid) -> Result<Wh
 
 pub(super) async fn whitelist(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Whitelist>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(whitelist_state(&state.pool, server.id).await?))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(super) struct WhitelistMutation {
+    #[garde(skip)]
     player_id: Uuid,
+    #[garde(length(min = 1, max = 64))]
     name: String,
 }
 
@@ -101,10 +104,11 @@ fn validate_player_name(name: &str) -> Result<&str, ApiError> {
 
 pub(super) async fn add_whitelist_entry(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(input): Json<WhitelistMutation>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiJson(input): ApiJson<WhitelistMutation>,
 ) -> Result<(StatusCode, Json<Whitelist>), ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let name = validate_player_name(&input.name)?;
     let result = sqlx::query(
@@ -125,17 +129,18 @@ pub(super) async fn add_whitelist_entry(
     ))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct WhitelistDeleteQuery {
     player_id: Uuid,
 }
 
 pub(super) async fn remove_whitelist_entry(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Query(query): Query<WhitelistDeleteQuery>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiQuery(query): ApiQuery<WhitelistDeleteQuery>,
 ) -> Result<Json<Whitelist>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let result = sqlx::query(
         "DELETE FROM whitelist_entries

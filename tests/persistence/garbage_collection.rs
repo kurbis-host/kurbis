@@ -58,7 +58,7 @@ async fn garbage_collection_preserves_server_scoped_chunks_and_retained_recovery
         .await
         .unwrap();
     let gc_store = local_snapshot_store(objects.path()).await;
-    let report = SnapshotManager::collect_garbage_with(&pool, gc_store)
+    let report = SnapshotStore::collect_garbage_with(&pool, gc_store)
         .await
         .unwrap();
     assert_eq!(report.chunks_deleted, 3); // Two expired worlds plus the partial upload.
@@ -79,7 +79,7 @@ async fn garbage_collection_preserves_server_scoped_chunks_and_retained_recovery
     );
     cleanup(&pool, owner_a).await;
     let gc_store = local_snapshot_store(objects.path()).await;
-    let report = SnapshotManager::collect_garbage_with(&pool, gc_store)
+    let report = SnapshotStore::collect_garbage_with(&pool, gc_store)
         .await
         .unwrap();
     assert_eq!(
@@ -96,7 +96,7 @@ async fn garbage_collection_preserves_server_scoped_chunks_and_retained_recovery
     cleanup(&pool, owner_b).await;
     let gc_store = local_snapshot_store(objects.path()).await;
     assert_eq!(
-        SnapshotManager::collect_garbage_with(&pool, gc_store)
+        SnapshotStore::collect_garbage_with(&pool, gc_store)
             .await
             .unwrap()
             .chunks_deleted,
@@ -134,7 +134,7 @@ async fn corrupt_retained_manifest_aborts_before_any_garbage_is_deleted() {
         .unwrap();
     let gc_store = local_snapshot_store(objects.path()).await;
     assert!(
-        SnapshotManager::collect_garbage_with(&pool, gc_store)
+        SnapshotStore::collect_garbage_with(&pool, gc_store)
             .await
             .is_err()
     );
@@ -147,7 +147,7 @@ async fn corrupt_retained_manifest_aborts_before_any_garbage_is_deleted() {
         .unwrap();
     let gc_store = local_snapshot_store(objects.path()).await;
     assert_eq!(
-        SnapshotManager::collect_garbage_with(&pool, gc_store)
+        SnapshotStore::collect_garbage_with(&pool, gc_store)
             .await
             .unwrap()
             .chunks_deleted,
@@ -200,7 +200,7 @@ async fn collector_waits_for_a_publisher_before_deciding_chunk_reachability() {
     let gc_store = local_snapshot_store(objects.path()).await;
     let gc_pool = pool.clone();
     let collector = tokio::spawn(async move {
-        SnapshotManager::collect_garbage_with(&gc_pool, gc_store)
+        SnapshotStore::collect_garbage_with(&gc_pool, gc_store)
             .await
             .unwrap()
     });

@@ -22,16 +22,16 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("overview lifecycle mutations", () => {
   it("shows optimistic lifecycle feedback and rolls back on REST failure", async () => {
-    let rejectRequest: ((reason?: unknown) => void) | undefined;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        () =>
-          new Promise<Response>((_resolve, reject) => {
-            rejectRequest = reject;
-          }),
-      ),
-    );
+    let rejectCommand: ((reason?: unknown) => void) | undefined;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.method === "POST") {
+        return new Promise<Response>((_resolve, reject) => { rejectCommand = reject; });
+      }
+      const url = new URL(request.url);
+      return url.pathname.endsWith("/activity") ? Response.json([]) : Response.json(server);
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({
       defaultOptions: { queries: { staleTime: Infinity, retry: false }, mutations: { retry: false } },
     });
@@ -48,7 +48,7 @@ describe("overview lifecycle mutations", () => {
       observed_state: "queued",
     });
 
-    rejectRequest?.(new Error("control plane unavailable"));
+    rejectCommand?.(new Error("control plane unavailable"));
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sleeping" })).toBeVisible());
     expect(screen.getByText("control plane unavailable")).toBeVisible();
     expect(client.getQueryData(queryKeys.server(server.id))).toMatchObject({

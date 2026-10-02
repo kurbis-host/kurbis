@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -48,7 +48,8 @@ impl ServerRuntime for DockerRuntime {
         &self.host_control
     }
     fn socket_path(&self, server_dir: &Path) -> Result<PathBuf> {
-        Ok(control_socket_directory(server_dir)?.join("host-control.sock"))
+        let server_id = server_id_from_directory(server_dir)?;
+        Ok(control_socket_alias_for_server(server_id))
     }
 
     async fn start(
@@ -88,8 +89,7 @@ impl ServerRuntime for DockerRuntime {
         )
         .await?;
         let (runtime_uid, runtime_gid) = ensure_pumpkin_ownership(server_dir).await?;
-        let control_dir = control_socket_directory_for_server(server_id);
-        prepare_control_socket_directory(&control_dir, runtime_uid, runtime_gid).await?;
+        prepare_control_socket_alias(server_id, server_dir).await?;
 
         let java = format!("{}:25565/tcp", placement.java_port);
         let bedrock_udp = format!("{}:19132/udp", placement.bedrock_port);
@@ -102,7 +102,6 @@ impl ServerRuntime for DockerRuntime {
         let server_label = format!("kurbis.server_id={server_id}");
         let memory = SERVER_MEMORY_BYTES.to_string();
         let runtime_user = format!("{runtime_uid}:{runtime_gid}");
-        let control_volume = format!("{}:/pumpkin/run", control_dir.display());
         let output = Command::new("docker")
             .args([
                 "run",
@@ -146,8 +145,6 @@ impl ServerRuntime for DockerRuntime {
                 &bedrock_signal,
                 "--volume",
                 &volume,
-                "--volume",
-                &control_volume,
                 &self.image,
             ])
             .stdin(Stdio::null())
@@ -184,7 +181,11 @@ impl ServerRuntime for DockerRuntime {
     }
 
     async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>> {
-        self.running_generation(&container_name(server_id)).await
+        let generation = self.running_generation(&container_name(server_id)).await?;
+        if generation.is_none() {
+            remove_control_socket_alias(server_id).await?;
+        }
+        Ok(generation)
     }
 
     async fn logs_since(&self, server_id: Uuid, since: &str) -> Result<Vec<String>> {
@@ -209,7 +210,7 @@ impl ServerRuntime for DockerRuntime {
             .collect())
     }
 
-    async fn abort_start(&self, server_id: Uuid) -> Result<()> {
+    async fn remove_runtime(&self, server_id: Uuid) -> Result<()> {
         let output = Command::new("docker")
             .args(["rm", "-f", &container_name(server_id)])
             .output()
@@ -217,33 +218,32 @@ impl ServerRuntime for DockerRuntime {
         if output.status.success()
             || String::from_utf8_lossy(&output.stderr).contains("No such container")
         {
-            let control_dir = control_socket_directory_for_server(server_id);
-            match tokio::fs::remove_dir_all(control_dir).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("remove Docker host-control directory"),
-            }
+            remove_control_socket_alias(server_id).await?;
             return Ok(());
         }
         bail!(
-            "failed to remove failed-start container: {}",
+            "failed to remove Docker runtime: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
 }
 
-fn control_socket_directory(server_dir: &Path) -> Result<PathBuf> {
-    let server_id: Uuid = server_dir
+fn server_id_from_directory(server_dir: &Path) -> Result<Uuid> {
+    server_dir
         .file_name()
         .and_then(|name| name.to_str())
         .context("Docker server directory has no UUID")?
         .parse()
-        .context("Docker server directory has an invalid UUID")?;
-    Ok(control_socket_directory_for_server(server_id))
+        .context("Docker server directory has an invalid UUID")
 }
 
-fn control_socket_directory_for_server(server_id: Uuid) -> PathBuf {
-    std::env::temp_dir().join(format!("kurbis-docker-{}", server_id.simple()))
+fn control_socket_alias_for_server(server_id: Uuid) -> PathBuf {
+    let name = format!("kurbis-docker-{}.sock", server_id.simple());
+    let system_temp = std::env::temp_dir().join(&name);
+    if system_temp.to_string_lossy().len() < 100 {
+        return system_temp;
+    }
+    PathBuf::from("/tmp").join(name)
 }
 
 impl DockerRuntime {
@@ -310,31 +310,41 @@ async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<(u32, u32)> {
     Ok(container_identity(uid, gid))
 }
 
-async fn prepare_control_socket_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    tokio::fs::create_dir_all(path).await?;
-    let metadata = tokio::fs::symlink_metadata(path).await?;
-    anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "Docker host-control directory is not a regular directory"
-    );
-    let socket = path.join("host-control.sock");
+async fn prepare_control_socket_alias(server_id: Uuid, server_dir: &Path) -> Result<()> {
+    let socket = server_dir.join("run/host-control.sock");
     match tokio::fs::remove_file(&socket).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("remove stale Docker host-control socket"),
     }
-    if metadata.uid() != uid || metadata.gid() != gid {
-        let status = Command::new("chown")
-            .arg(format!("{uid}:{gid}"))
-            .arg(path)
-            .status()
-            .await?;
-        if !status.success() {
-            bail!("failed to set Docker host-control directory ownership");
+
+    let alias = control_socket_alias_for_server(server_id);
+    match tokio::fs::symlink_metadata(&alias).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            tokio::fs::remove_file(&alias)
+                .await
+                .context("remove stale Docker host-control socket alias")?;
         }
+        Ok(_) => bail!(
+            "refusing to replace non-symlink Docker host-control socket alias {}",
+            alias.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect Docker host-control socket alias"),
     }
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+
+    tokio::fs::symlink(&socket, &alias)
+        .await
+        .context("create Docker host-control socket alias")?;
     Ok(())
+}
+
+async fn remove_control_socket_alias(server_id: Uuid) -> Result<()> {
+    match tokio::fs::remove_file(control_socket_alias_for_server(server_id)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove Docker host-control socket alias"),
+    }
 }
 
 fn container_identity(uid: u32, gid: u32) -> (u32, u32) {
@@ -372,15 +382,37 @@ mod tests {
     }
 
     #[test]
-    fn docker_host_control_socket_uses_a_short_host_path() {
+    fn docker_host_control_socket_uses_a_short_alias_into_the_quota_volume() {
         let server_id = Uuid::new_v4();
         let server_dir = PathBuf::from(format!(
             "/opt/melon-hoster-verification/melon-runtime-long-root/worker-0/servers/{server_id}"
         ));
-        let socket = control_socket_directory(&server_dir)
-            .unwrap()
-            .join("host-control.sock");
+        let socket = control_socket_alias_for_server(server_id);
         assert!(socket.to_string_lossy().len() < 100);
-        assert!(socket.ends_with("host-control.sock"));
+        assert!(socket.ends_with(format!("kurbis-docker-{}.sock", server_id.simple())));
+        assert_eq!(
+            server_dir.join("run/host-control.sock"),
+            server_dir.join("run").join("host-control.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_host_control_alias_points_inside_server_storage() {
+        let server_id = Uuid::new_v4();
+        let root = tempfile::tempdir().unwrap();
+        let server_dir = root.path().join(server_id.to_string());
+        tokio::fs::create_dir_all(server_dir.join("run"))
+            .await
+            .unwrap();
+
+        prepare_control_socket_alias(server_id, &server_dir)
+            .await
+            .unwrap();
+        let alias = control_socket_alias_for_server(server_id);
+        assert_eq!(
+            tokio::fs::read_link(&alias).await.unwrap(),
+            server_dir.join("run/host-control.sock")
+        );
+        tokio::fs::remove_file(alias).await.unwrap();
     }
 }

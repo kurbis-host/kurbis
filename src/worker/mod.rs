@@ -1,7 +1,6 @@
 pub mod control_plane;
 pub mod docker;
 mod idle;
-pub mod lease;
 mod panel_state;
 pub mod persistence;
 pub mod runner;

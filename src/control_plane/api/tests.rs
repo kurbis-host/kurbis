@@ -7,6 +7,7 @@ use crate::model::subdomain_from_hostname;
 use axum::{
     body::{Body, to_bytes},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
+    response::IntoResponse,
 };
 use serde_json::Value;
 use sqlx::PgPool;
@@ -21,6 +22,167 @@ use crate::{
 };
 
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[test]
+fn openapi_matches_the_public_route_inventory_and_security_contracts() {
+    let document = serde_json::to_value(super::openapi_document()).unwrap();
+    let paths = document["paths"].as_object().unwrap();
+    let schemas = document["components"]["schemas"].as_object().unwrap();
+    let schemes = document["components"]["securitySchemes"]
+        .as_object()
+        .unwrap();
+    assert!(schemes.contains_key("accountSessionCookie"));
+    assert!(schemes.contains_key("serverGrantCookie"));
+    assert!(schemes.contains_key("serverCapabilityBearer"));
+    assert!(schemes.contains_key("workerBearer"));
+    assert!(schemes.contains_key("workerLease"));
+    assert!(schemes.contains_key("gatewayBearer"));
+
+    for (path, item) in paths {
+        let required: Vec<&str> = path
+            .split('/')
+            .filter_map(|part| part.strip_prefix('{')?.strip_suffix('}'))
+            .collect();
+        for (method, operation) in item.as_object().unwrap() {
+            if !matches!(method.as_str(), "get" | "post" | "put" | "patch" | "delete") {
+                continue;
+            }
+            let path_parameters = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|parameter| parameter["in"] == "path")
+                .map(|parameter| parameter["name"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                path_parameters.len(),
+                required.len(),
+                "path parameter count for {method} {path}"
+            );
+            for name in &required {
+                assert!(
+                    path_parameters.contains(name),
+                    "missing {name} on {method} {path}"
+                );
+            }
+            for requirement in operation["security"].as_array().into_iter().flatten() {
+                for scheme in requirement.as_object().unwrap().keys() {
+                    assert!(
+                        schemes.contains_key(scheme),
+                        "undefined security scheme {scheme}"
+                    );
+                }
+            }
+            for status in [
+                "400", "401", "403", "404", "409", "415", "422", "500", "503",
+            ] {
+                if let Some(response) = operation["responses"].get(status) {
+                    assert_eq!(
+                        response["content"]["application/json"]["schema"]["$ref"],
+                        "#/components/schemas/ApiErrorResponse",
+                        "structured API error schema for {method} {path} {status}"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(paths.contains_key("/api/v1/servers/{server_id}/commands"));
+    for removed in [
+        "/api/v1/servers/{server_id}/actions",
+        "/api/v1/servers/{server_id}/reset",
+        "/api/v1/servers/{server_id}/snapshots/{generation}/restore",
+        "/internal/wake/{hostname}",
+        "/internal/worker/control/servers/{server_id}/stop",
+        "/internal/worker/control/servers/{server_id}/snapshot",
+    ] {
+        assert!(
+            !paths.contains_key(removed),
+            "legacy lifecycle route {removed} leaked into OpenAPI"
+        );
+    }
+    assert!(schemas.contains_key("ServerCommandRequest"));
+    assert!(schemas.contains_key("CommandResponse"));
+    assert!(schemas.contains_key("ApiErrorResponse"));
+    assert!(
+        !schemas["WorldExport"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("archive_key")
+    );
+    assert!(
+        paths["/api/v1/servers/{server_id}/events"]["get"]["responses"]["200"]["content"]
+            .get("text/event-stream")
+            .is_some()
+    );
+    assert!(paths["/api/v1/servers/{server_id}/exports/{export_id}/download"]["get"]["responses"]["200"]["content"].get("application/zip").is_some());
+}
+
+#[tokio::test]
+async fn lifecycle_errors_keep_state_conflicts_distinct_from_infrastructure_failures() {
+    let rejected = super::lifecycle_error(anyhow::Error::new(super::LifecycleFailure::Conflict(
+        "internal placement detail".to_owned(),
+    )))
+    .into_response();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    let rejected_body = to_bytes(rejected.into_body(), 4096).await.unwrap();
+    let rejected_body: Value = serde_json::from_slice(&rejected_body).unwrap();
+    assert_eq!(rejected_body["code"], "invalid_lifecycle_state");
+    assert_eq!(
+        rejected_body["message"],
+        "the command conflicts with the server's current state"
+    );
+    assert!(
+        !rejected_body
+            .to_string()
+            .contains("internal placement detail")
+    );
+
+    let infrastructure =
+        super::lifecycle_error(anyhow::anyhow!("database disconnect detail")).into_response();
+    assert_eq!(infrastructure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let infrastructure_body = to_bytes(infrastructure.into_body(), 4096).await.unwrap();
+    let infrastructure_body: Value = serde_json::from_slice(&infrastructure_body).unwrap();
+    assert_eq!(infrastructure_body["code"], "lifecycle_service_error");
+    assert_eq!(
+        infrastructure_body["message"],
+        "the lifecycle service could not complete the request"
+    );
+    assert!(
+        !infrastructure_body
+            .to_string()
+            .contains("database disconnect detail")
+    );
+
+    for (failure, status, code) in [
+        (
+            super::LifecycleCommandError::NotFound,
+            StatusCode::NOT_FOUND,
+            "lifecycle_resource_not_found",
+        ),
+        (
+            super::LifecycleCommandError::Forbidden,
+            StatusCode::FORBIDDEN,
+            "lifecycle_command_forbidden",
+        ),
+        (
+            super::LifecycleCommandError::Invalid,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_lifecycle_command",
+        ),
+        (
+            super::LifecycleCommandError::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lifecycle_capacity_unavailable",
+        ),
+    ] {
+        let response = super::lifecycle_error(failure).into_response();
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], code);
+    }
+}
 
 async fn test_pool() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")

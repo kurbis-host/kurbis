@@ -12,12 +12,12 @@ use kurbis_hoster::{
     config::ObjectStoreConfig,
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_delete, complete_reset, complete_restore,
-        complete_snapshot, complete_start, complete_stop, healthy_worker_template,
-        heartbeat_worker, validate_delete,
+        complete_snapshot, complete_start, complete_stop, deactivate_placement_after_stop,
+        healthy_worker_template, heartbeat_worker, validate_delete,
     },
+    control_plane::snapshots::SnapshotStore,
     db,
     model::{OperationKind, SnapshotReason},
-    worker::snapshot::SnapshotManager,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,7 +37,7 @@ struct Fixture {
     identity: Arc<Mutex<String>>,
     paused: Arc<Mutex<bool>>,
     email_verified: Arc<Mutex<bool>>,
-    snapshots: SnapshotManager,
+    snapshots: SnapshotStore,
     root: std::path::PathBuf,
 }
 #[derive(Deserialize)]
@@ -219,25 +219,18 @@ async fn reset(State(f): State<Fixture>) -> Result<StatusCode, String> {
         .execute(&f.pool)
         .await
         .map_err(err)?;
-    sqlx::query(
-        "DELETE FROM users WHERE id IN (
-             SELECT user_id FROM identities
-             WHERE provider IN ('google', 'discord')
-               AND subject IN ('browser-user', 'browser-other-user')
-         )",
-    )
-    .execute(&f.pool)
-    .await
-    .map_err(err)?;
-    sqlx::query(
-        "DELETE FROM users WHERE id IN (
-             SELECT user_id FROM identities
-             WHERE provider IN ('minecraft_java', 'minecraft_bedrock')
-         )",
-    )
-    .execute(&f.pool)
-    .await
-    .map_err(err)?;
+    sqlx::query("DELETE FROM server_instance_capabilities")
+        .execute(&f.pool)
+        .await
+        .map_err(err)?;
+    sqlx::query("DELETE FROM placements")
+        .execute(&f.pool)
+        .await
+        .map_err(err)?;
+    sqlx::query("DELETE FROM users")
+        .execute(&f.pool)
+        .await
+        .map_err(err)?;
     sqlx::query("DELETE FROM workers WHERE id = $1")
         .bind(f.worker)
         .execute(&f.pool)
@@ -290,6 +283,9 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
             .map_err(err)?;
         }
         OperationKind::Stop | OperationKind::Restart => {
+            deactivate_placement_after_stop(&f.pool, f.worker, &op)
+                .await
+                .map_err(err)?;
             let snapshot = f
                 .snapshots
                 .create(op.server_id, &root, SnapshotReason::Shutdown)
@@ -460,7 +456,7 @@ async fn main() -> Result<()> {
         std::env::var("PANEL_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:18082".to_owned());
     let root = std::path::PathBuf::from(std::env::var("TEST_ARTIFACT_ROOT")?);
     let object_store = ObjectStoreConfig::from_env()?.build().await?;
-    let snapshots = SnapshotManager::new(pool.clone(), object_store);
+    let snapshots = SnapshotStore::new(pool.clone(), object_store);
     let fixture = Fixture {
         lifecycle: Lifecycle::new(pool.clone()),
         pool,

@@ -15,7 +15,7 @@ Usage:
   ./start.sh stop                    Stop the dashboard and Compose services.
   ./start.sh setup                   Create .env with fresh secrets.
   ./start.sh worker-bundle [id] [--rotate]
-                                      Provision private API and database credentials.
+                                      Provision a scoped control-plane credential.
 
 Native mode defaults to release. On first use, setup creates .env; edit its
 URLs, worker address, and OAuth credentials before starting either mode.
@@ -81,17 +81,13 @@ provision_worker_bundle() {
   local mode=$1 worker_id=${2:-$WORKER_ID} rotate=${3:-false} profile=${4:-release}
   local database_url bundle_path control_plane_url runtime storage_mode pumpkin_binary
   local pumpkin_image plugin_wasm
-  case "${WORKER_PROVISIONING_DATABASE_URL:-}" in
-    ?*) database_url=$WORKER_PROVISIONING_DATABASE_URL ;;
-    *)
-      case "$mode" in
-        native) database_url=$DATABASE_URL_NATIVE ;;
-        docker)
-          database_url="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${DATABASE_PORT}/${POSTGRES_DB}"
-          ;;
-        *) die "unsupported worker provisioning mode: $mode" ;;
-      esac
+  local variable_name
+  case "$mode" in
+    native) database_url=$DATABASE_URL_NATIVE ;;
+    docker)
+      database_url="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${DATABASE_PORT}/${POSTGRES_DB}"
       ;;
+    *) die "unsupported worker provisioning mode: $mode" ;;
   esac
   case "$mode" in
     native)
@@ -114,9 +110,8 @@ provision_worker_bundle() {
   esac
   bundle_path=$(worker_bundle_path "$worker_id")
   mkdir -p "$(dirname "$bundle_path")"
-  local -a args=(--worker-id "$worker_id")
+  local -a args=(--worker-id "$worker_id" --database-url "$database_url")
   local -a provision_env=(
-    "WORKER_PROVISIONING_DATABASE_URL=$database_url"
     "WORKER_CONTROL_PLANE_URL=$control_plane_url"
     "PUBLIC_BASE_URL=$PUBLIC_BASE_URL"
     "WORKER_RUNTIME=$runtime"
@@ -132,7 +127,20 @@ provision_worker_bundle() {
   if [[ $rotate == true ]]; then
     args+=(--rotate)
   fi
-  env "${provision_env[@]}" cargo run --quiet --bin worker-bundle -- \
+
+  # Bundle provisioning is an operator action. Give it only the database
+  # credential it needs to register the worker plus build/runtime metadata;
+  # control-plane object-store, OAuth, and internal credentials must not become
+  # ambient inputs to worker provisioning.
+  local -a clean_env=(env -i "PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}" "HOME=${HOME:-/}")
+  for variable_name in \
+    LANG LC_ALL TMPDIR CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR RUSTC_WRAPPER \
+    RUSTFLAGS RUSTUP_TOOLCHAIN SSL_CERT_FILE SSL_CERT_DIR; do
+    if [[ -n ${!variable_name:-} ]]; then
+      clean_env+=("$variable_name=${!variable_name}")
+    fi
+  done
+  "${clean_env[@]}" "${provision_env[@]}" cargo run --quiet --bin worker-bundle -- \
     "${args[@]}" --output "$bundle_path"
 }
 

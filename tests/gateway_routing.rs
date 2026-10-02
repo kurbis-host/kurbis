@@ -1,17 +1,37 @@
 mod common;
 
-use common::{create_user, test_pool};
+#[path = "persistence/source_boundaries.rs"]
+mod source_boundaries;
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
+use common::{api_state, create_user, test_pool};
 use kurbis_hoster::{
+    config::{CommonConfig, GatewayConfig},
+    contracts::lifecycle::ServerCommandRequest,
+    control_plane::api::router,
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_start, healthy_worker_template, heartbeat_worker,
     },
-    gateway::routes::RouteCache,
+    gateway::{routes::RouteCache, wake::request_wake},
     model::ObservedState,
 };
 use sqlx::PgPool;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn gateway_routing_stays_behind_the_shared_repository_boundary() {
+    source_boundaries::assert_rust_tree_excludes(
+        "src/gateway",
+        &["crate::control_plane", "control_plane::api", "sqlx::query"],
+    );
+    let routes = source_boundaries::rust_source("src/gateway/routes.rs");
+    assert!(routes.contains("routing::RouteRepository"));
+    assert!(routes.contains("repository: RouteRepository"));
+}
 
 async fn clean_routes(pool: &PgPool) {
     sqlx::query(
@@ -22,7 +42,15 @@ async fn clean_routes(pool: &PgPool) {
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM workers WHERE name LIKE 'route-worker-%'")
+    sqlx::query("DELETE FROM server_instance_capabilities")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM placements")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workers")
         .execute(pool)
         .await
         .unwrap();
@@ -48,6 +76,101 @@ async fn server(pool: &PgPool) -> (Uuid, Uuid, String) {
         .await
         .unwrap();
     (owner, id, subdomain)
+}
+
+fn gateway_config(control_plane_url: String, internal_token: String) -> GatewayConfig {
+    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is configured");
+    GatewayConfig {
+        common: CommonConfig { database_url },
+        java_listen: "127.0.0.1:0".parse().unwrap(),
+        bedrock_listen: "127.0.0.1:0".parse().unwrap(),
+        bedrock_public_port: 19132,
+        bedrock_tls_certificate: PathBuf::new(),
+        bedrock_tls_private_key: PathBuf::new(),
+        waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+        waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+        waiting_control_socket: PathBuf::new(),
+        waiting_control_token: "test".into(),
+        control_plane_url,
+        internal_token,
+        root_domain: "mc.example.test".into(),
+        wake_timeout: Duration::from_secs(90),
+        allow_offline_waiting_for_tests: false,
+    }
+}
+
+#[tokio::test]
+async fn gateway_join_starts_server_only_through_the_canonical_command_route() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_routes(&pool).await;
+    let (owner, server_id, subdomain) = server(&pool).await;
+    let token = "gateway-command-test-token";
+    let app = router(api_state(
+        pool.clone(),
+        token,
+        Arc::new(object_store::memory::InMemory::new()),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address: SocketAddr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = gateway_config(format!("http://{address}"), token.to_owned());
+
+    request_wake(&config, server_id).await.unwrap();
+    request_wake(&config, server_id).await.unwrap();
+
+    let (state, desired, queued): (ObservedState, String, bool) = sqlx::query_as(
+        "SELECT s.observed_state, s.desired_state::text,
+                EXISTS(SELECT 1 FROM start_requests r WHERE r.server_id = s.id)
+         FROM servers s WHERE s.id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (state, desired.as_str(), queued),
+        (ObservedState::Queued, "running", true)
+    );
+    let request_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM start_requests WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(request_count, 1, "repeat joins share the queued start");
+
+    let client = reqwest::Client::new();
+    let forbidden = client
+        .post(format!(
+            "http://{address}/api/v1/servers/{server_id}/commands"
+        ))
+        .bearer_auth(token)
+        .json(&ServerCommandRequest::Start {
+            reason: Some("manual".into()),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let removed_wake_route = client
+        .post(format!(
+            "http://{address}/internal/wake/{subdomain}.mc.example.test"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed_wake_route.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server_task.abort();
+    assert!(server_task.await.unwrap_err().is_cancelled());
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

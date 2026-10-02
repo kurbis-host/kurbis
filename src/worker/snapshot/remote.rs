@@ -14,8 +14,12 @@ use reqwest::{Method, StatusCode, Url, header};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::object_key::WorkerObjectKey;
-use crate::worker::control_plane::WorkerControl;
+use crate::{
+    contracts::worker::{WorkerAssignment, WorkerSnapshotReservation},
+    model::{SnapshotReason, SnapshotRecord},
+    snapshot::WorkerObjectKey,
+    worker::control_plane::WorkerControl,
+};
 
 const MULTIPART_CHANNEL_DEPTH: usize = 2;
 
@@ -24,25 +28,128 @@ pub struct WorkerObjectClient {
     control: WorkerControl,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum WorkerObjectAssignment {
-    Placement { generation: i64 },
-    Operation { operation_id: Uuid, generation: i64 },
-    Export { export_id: Uuid, generation: i64 },
-}
-
 impl WorkerObjectClient {
-    pub fn new(
+    pub fn from_control_plane(control: WorkerControl) -> Self {
+        Self { control }
+    }
+
+    pub fn new_with_lease(
         control_plane_url: &str,
         api_token: &str,
         allow_insecure_local_http: bool,
+        lease_id: Uuid,
     ) -> Result<Self> {
         Ok(Self {
-            control: WorkerControl::new(control_plane_url, api_token, allow_insecure_local_http)?,
+            control: WorkerControl::new_with_lease(
+                control_plane_url,
+                api_token,
+                allow_insecure_local_http,
+                lease_id,
+            )?,
         })
     }
 
-    pub fn scoped(&self, server_id: Uuid, assignment: WorkerObjectAssignment) -> WorkerObjectStore {
+    pub async fn current_snapshot(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+    ) -> Result<Option<SnapshotRecord>> {
+        self.control
+            .current_snapshot_metadata(server_id, assignment)
+            .await
+    }
+
+    pub async fn snapshot(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        generation: i64,
+    ) -> Result<SnapshotRecord> {
+        self.control
+            .snapshot_metadata(server_id, assignment, generation)
+            .await
+    }
+
+    pub async fn reserve_snapshot(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        reason: SnapshotReason,
+    ) -> Result<WorkerSnapshotReservation> {
+        let WorkerAssignment::Operation {
+            operation_id,
+            generation,
+            attempt,
+        } = assignment
+        else {
+            anyhow::bail!("snapshot allocation requires a running worker operation")
+        };
+        self.control
+            .reserve_snapshot(server_id, operation_id, generation, attempt, reason)
+            .await
+    }
+
+    pub async fn publish_snapshot_metadata(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        snapshot_generation: i64,
+        manifest_key: &str,
+        size_bytes: i64,
+        checksum: &str,
+    ) -> Result<()> {
+        let WorkerAssignment::Operation {
+            operation_id,
+            generation,
+            attempt,
+        } = assignment
+        else {
+            anyhow::bail!("snapshot publication requires a running worker operation")
+        };
+        self.control
+            .publish_snapshot_metadata(
+                server_id,
+                operation_id,
+                generation,
+                attempt,
+                snapshot_generation,
+                manifest_key,
+                size_bytes,
+                checksum,
+            )
+            .await
+    }
+
+    pub async fn delete_snapshot_manifests(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+    ) -> Result<()> {
+        let WorkerAssignment::Operation {
+            operation_id,
+            generation,
+            attempt,
+        } = assignment
+        else {
+            anyhow::bail!("snapshot cleanup requires a running worker operation")
+        };
+        self.control
+            .delete_snapshot_manifests(server_id, operation_id, generation, attempt)
+            .await
+    }
+
+    pub async fn export_is_running(
+        &self,
+        export_id: Uuid,
+        generation: i64,
+        attempt: i32,
+    ) -> Result<bool> {
+        self.control
+            .export_is_running(export_id, generation, attempt)
+            .await
+    }
+
+    pub fn scoped(&self, server_id: Uuid, assignment: WorkerAssignment) -> WorkerObjectStore {
         WorkerObjectStore {
             client: self.clone(),
             server_id,
@@ -63,7 +170,7 @@ impl WorkerObjectClient {
 pub struct WorkerObjectStore {
     client: WorkerObjectClient,
     server_id: Uuid,
-    assignment: Option<WorkerObjectAssignment>,
+    assignment: Option<WorkerAssignment>,
 }
 
 impl fmt::Display for WorkerObjectStore {
@@ -97,25 +204,29 @@ impl WorkerObjectStore {
         {
             let mut query = url.query_pairs_mut();
             match assignment {
-                WorkerObjectAssignment::Placement { generation } => {
+                WorkerAssignment::Placement { generation } => {
                     query.append_pair("assignment", "placement");
                     query.append_pair("generation", &generation.to_string());
                 }
-                WorkerObjectAssignment::Operation {
+                WorkerAssignment::Operation {
                     operation_id,
                     generation,
+                    attempt,
                 } => {
                     query.append_pair("assignment", "operation");
                     query.append_pair("operation_id", &operation_id.to_string());
                     query.append_pair("generation", &generation.to_string());
+                    query.append_pair("attempt", &attempt.to_string());
                 }
-                WorkerObjectAssignment::Export {
+                WorkerAssignment::Export {
                     export_id,
                     generation,
+                    attempt,
                 } => {
                     query.append_pair("assignment", "export");
                     query.append_pair("export_id", &export_id.to_string());
                     query.append_pair("generation", &generation.to_string());
+                    query.append_pair("attempt", &attempt.to_string());
                 }
             }
         }
@@ -415,28 +526,27 @@ mod tests {
     use tokio::{net::TcpListener, sync::mpsc};
     use uuid::Uuid;
 
-    use super::{WorkerObjectAssignment, WorkerObjectClient};
+    use crate::contracts::worker::WorkerAssignment;
+
+    use super::WorkerObjectClient;
+
+    fn client(url: &str, token: &str, allow_http: bool) -> anyhow::Result<WorkerObjectClient> {
+        WorkerObjectClient::new_with_lease(url, token, allow_http, Uuid::new_v4())
+    }
 
     #[test]
     fn client_rejects_non_http_urls_and_malformed_worker_tokens() {
-        assert!(WorkerObjectClient::new("file:///tmp/store", &"a".repeat(43), true).is_err());
-        assert!(
-            WorkerObjectClient::new("https://user:pass@example.test", &"a".repeat(43), false)
-                .is_err()
-        );
-        assert!(
-            WorkerObjectClient::new("https://example.test", "shared-internal-token", false)
-                .is_err()
-        );
-        assert!(WorkerObjectClient::new("http://example.test", &"a".repeat(43), true).is_err());
-        assert!(WorkerObjectClient::new("http://127.0.0.1:8080", &"a".repeat(43), false).is_err());
-        assert!(WorkerObjectClient::new("http://127.0.0.1:8080", &"a".repeat(43), true).is_ok());
+        assert!(client("file:///tmp/store", &"a".repeat(43), true).is_err());
+        assert!(client("https://user:pass@example.test", &"a".repeat(43), false).is_err());
+        assert!(client("https://example.test", "shared-internal-token", false).is_err());
+        assert!(client("http://example.test", &"a".repeat(43), true).is_err());
+        assert!(client("http://127.0.0.1:8080", &"a".repeat(43), false).is_err());
+        assert!(client("http://127.0.0.1:8080", &"a".repeat(43), true).is_ok());
     }
 
     #[tokio::test]
     async fn every_unscoped_or_unsupported_operation_fails_closed() {
-        let client =
-            WorkerObjectClient::new("https://example.test", &"a".repeat(43), false).unwrap();
+        let client = client("https://example.test", &"a".repeat(43), false).unwrap();
         let store = client.unscoped();
         let key = Path::from(format!("chunks/{}", "a".repeat(64)));
         assert!(store.head(&key).await.is_err());
@@ -457,9 +567,10 @@ mod tests {
 
         let _scoped = client.scoped(
             Uuid::new_v4(),
-            WorkerObjectAssignment::Operation {
+            WorkerAssignment::Operation {
                 operation_id: Uuid::new_v4(),
                 generation: 4,
+                attempt: 1,
             },
         );
     }
@@ -504,12 +615,10 @@ mod tests {
             axum::serve(redirect_listener, redirect_app).await.unwrap();
         });
 
-        let client =
-            WorkerObjectClient::new(&format!("http://{redirect_address}"), &"a".repeat(43), true)
-                .unwrap();
+        let client = client(&format!("http://{redirect_address}"), &"a".repeat(43), true).unwrap();
         let store = client.scoped(
             Uuid::new_v4(),
-            WorkerObjectAssignment::Placement { generation: 1 },
+            WorkerAssignment::Placement { generation: 1 },
         );
         let key = Path::from(format!("chunks/{}", "a".repeat(64)));
         assert!(store.get(&key).await.is_err());

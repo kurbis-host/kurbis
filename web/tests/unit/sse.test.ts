@@ -1,9 +1,11 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
-import type { ServerEvent } from "../../lib/contracts";
+import type { components } from "../../lib/api/generated";
 import { applyServerEvent } from "../../lib/sse";
 import { queryKeys } from "../../lib/query";
 import { server } from "./fixtures";
+
+type ServerEvent = components["schemas"]["ServerEvent"];
 
 describe("server event integration", () => {
   it("patches authoritative server state into the shared cache", () => {
@@ -78,11 +80,11 @@ describe("server event integration", () => {
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, "invalidateQueries");
     const events: ServerEvent[] = [
-      { id: 1, type: "server" },
+      { id: 1, type: "server", data: server },
       { id: 2, type: "operation" },
       { id: 3, type: "snapshot" },
-      { id: 4, type: "players" },
-      { id: 5, type: "whitelist" },
+      { id: 4, type: "players", data: [] },
+      { id: 5, type: "whitelist", data: { enabled: false, revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
       { id: 6, type: "log" },
     ];
 

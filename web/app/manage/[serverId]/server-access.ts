@@ -7,10 +7,9 @@ export async function withServerAccess<T>(load: () => Promise<T>): Promise<T> {
   try {
     return await load();
   } catch (error) {
-    if (error instanceof ServerApiError && error.status === 401) {
-      redirect("/manage/access-expired");
+    if (error instanceof ServerApiError && [401, 403, 404].includes(error.status)) {
+      redirect("/manage/access-unavailable");
     }
-    if (error instanceof ServerApiError && error.status === 404) notFound();
     throw error;
   }
 }

@@ -5,8 +5,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRight } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Controller, useForm } from "react-hook-form";
-import { apiRequest, errorMessage, jsonBody } from "../lib/api/client";
-import { serverSchema } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import { browserApi } from "../lib/api/operations";
 import { queryKeys } from "../lib/query";
 import { setupSchema, type SetupValues } from "../lib/schemas";
 import {
@@ -62,13 +62,10 @@ export function Setup() {
         hardcore: values.hardcore,
         whitelist: values.whitelist,
       };
-      const server = await apiRequest("/api/v1/servers", serverSchema, {
-        method: "POST",
-        body: jsonBody({ subdomain: values.subdomain, settings }),
-      });
+      const server = await browserApi.createServer({ subdomain: values.subdomain, settings });
       queryClient.setQueryData(queryKeys.server(server.id), server);
       queryClient.setQueryData(queryKeys.servers, [server]);
-      router.replace(`/app/servers/${server.id}`);
+      router.replace(`/manage/${server.id}`);
     } catch (error) {
       form.setError("root", { message: errorMessage(error) });
     }

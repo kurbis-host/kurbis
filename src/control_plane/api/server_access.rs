@@ -7,14 +7,18 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use garde::Validate;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::{ApiError, AppState, auth, worker_auth};
+use super::{
+    ApiAccountOrServerGrantHeaders, ApiError, ApiJson, ApiPath, ApiServerCapabilityHeaders,
+    ApiServerGrantHeaders, AppState, ServerScopedSessionPath, auth, worker_auth,
+};
 
 const LOGIN_TOKEN_TTL_SECONDS: i64 = 15 * 60;
-const SERVER_SESSION_TTL_SECONDS: i64 = 60 * 60;
 const SERVER_SESSION_COOKIE: &str = "kurbis_server_session";
 const MAX_LINKS_PER_MINUTE: i32 = 5;
 
@@ -126,7 +130,7 @@ pub(super) async fn ensure_server_capability(
     Ok(no_store(Json(CapabilityResponse { capability })))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct LoginLinkResponse {
     url: String,
     expires_in_seconds: i64,
@@ -134,8 +138,8 @@ pub(super) struct LoginLinkResponse {
 
 pub(super) async fn mint_server_login_link(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
+    headers: ApiServerCapabilityHeaders,
+) -> Result<aide::UseApi<Response, Json<LoginLinkResponse>>, ApiError> {
     let capability = bearer_token(&headers).filter(|value| valid_token(value));
     let Some(capability) = capability else {
         return Err(invalid_capability());
@@ -207,16 +211,19 @@ pub(super) async fn mint_server_login_link(
             state.config.public_base_url.trim_end_matches('/')
         ),
         expires_in_seconds: LOGIN_TOKEN_TTL_SECONDS,
-    })))
+    }))
+    .into())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(super) struct ServerRedeemRequest {
+    #[garde(length(equal = 43))]
     token: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct ServerRedeemResponse {
     server_id: Uuid,
 }
@@ -224,8 +231,8 @@ pub(super) struct ServerRedeemResponse {
 pub(super) async fn redeem_server_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ServerRedeemRequest>,
-) -> Result<Response, ApiError> {
+    ApiJson(request): ApiJson<ServerRedeemRequest>,
+) -> Result<aide::UseApi<Response, Json<ServerRedeemResponse>>, ApiError> {
     if !auth::same_origin(&headers, &state.config.public_base_url) {
         return Err(ApiError::with_code(
             StatusCode::FORBIDDEN,
@@ -257,17 +264,15 @@ pub(super) async fn redeem_server_login(
             "login link is invalid, expired, or already used",
         ));
     };
-    sqlx::query("DELETE FROM server_sessions WHERE expires_at <= now()")
-        .execute(&mut *tx)
-        .await?;
-    let session = random_token();
+    let (grant_id, grant_token) = server_session_grant(&mut tx, &headers).await?;
     sqlx::query(
-        "INSERT INTO server_sessions(token_hash, server_id, expires_at)
-         VALUES($1, $2, now() + make_interval(secs => $3))",
+        "INSERT INTO server_sessions(id, grant_id, server_id, created_at)
+         VALUES($1, $2, $3, now())
+         ON CONFLICT(grant_id, server_id) DO NOTHING",
     )
-    .bind(auth::token_hash(&session))
+    .bind(Uuid::new_v4())
+    .bind(grant_id)
     .bind(server_id)
-    .bind(SERVER_SESSION_TTL_SECONDS as f64)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -276,12 +281,12 @@ pub(super) async fn redeem_server_login(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "{SERVER_SESSION_COOKIE}={session}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={SERVER_SESSION_TTL_SECONDS}"
+            "{SERVER_SESSION_COOKIE}={grant_token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2147483647"
         )
         .parse()
         .expect("generated server session cookie is valid"),
     );
-    Ok(response)
+    Ok(response.into())
 }
 
 fn no_store(response: impl IntoResponse) -> Response {
@@ -292,24 +297,204 @@ fn no_store(response: impl IntoResponse) -> Response {
     response
 }
 
-pub(super) async fn server_session_server_id(
+pub(super) async fn server_session_server_ids(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    Ok(server_session_scopes(pool, headers)
+        .await?
+        .into_iter()
+        .map(|scope| scope.server_id)
+        .collect())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(super) struct ServerSessionScope {
+    pub server_id: Uuid,
+    pub grant_id: Uuid,
+    pub session_id: Uuid,
+}
+
+pub(super) async fn server_session_scopes(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+) -> Result<Vec<ServerSessionScope>, sqlx::Error> {
+    let Some(token) =
+        auth::cookie_value(headers, SERVER_SESSION_COOKIE).filter(|token| valid_token(token))
+    else {
+        return Ok(Vec::new());
+    };
+    sqlx::query_as::<_, ServerSessionScope>(
+        "SELECT ss.server_id, ss.grant_id, ss.id AS session_id
+         FROM server_sessions ss
+         JOIN server_session_grants g ON g.id = ss.grant_id
+         JOIN servers s ON s.id = ss.server_id AND s.desired_state <> 'deleted'
+         JOIN users u ON u.id = s.owner_id AND u.account_status = 'active'
+         WHERE g.token_hash = $1
+         ORDER BY ss.server_id, ss.id",
+    )
+    .bind(auth::token_hash(token))
+    .fetch_all(pool)
+    .await
+}
+
+async fn server_session_grant(
+    tx: &mut Transaction<'_, Postgres>,
+    headers: &HeaderMap,
+) -> Result<(Uuid, String), ApiError> {
+    if let Some(token) =
+        auth::cookie_value(headers, SERVER_SESSION_COOKIE).filter(|token| valid_token(token))
+    {
+        let grant: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM server_session_grants WHERE token_hash = $1 FOR UPDATE",
+        )
+        .bind(auth::token_hash(token))
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(grant_id) = grant {
+            return Ok((grant_id, token.to_owned()));
+        }
+    }
+
+    let token = random_token();
+    let grant_id = Uuid::new_v4();
+    let grant_id = sqlx::query_scalar(
+        "INSERT INTO server_session_grants(id, token_hash, created_at)
+         VALUES($1, $2, now()) RETURNING id",
+    )
+    .bind(grant_id)
+    .bind(auth::token_hash(&token))
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((grant_id, token))
+}
+
+#[derive(Debug, Serialize, JsonSchema, sqlx::FromRow)]
+pub struct ServerScopedSession {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub(super) async fn list_server_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: ApiAccountOrServerGrantHeaders,
+) -> Result<Json<Vec<ServerScopedSession>>, ApiError> {
+    let grant_id = current_server_session_grant_id(&state.pool, &headers).await?;
+    let Some(grant_id) = grant_id else {
+        if auth::authenticate(&state.pool, &headers).await.is_ok() {
+            return Ok(Json(Vec::new()));
+        }
+        return Err(ApiError::with_code(
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "authentication required",
+        ));
+    };
+    let sessions = sqlx::query_as::<_, ServerScopedSession>(
+        "SELECT ss.id, ss.server_id, ss.created_at
+         FROM server_sessions ss
+         JOIN servers s ON s.id = ss.server_id AND s.desired_state <> 'deleted'
+         JOIN users u ON u.id = s.owner_id AND u.account_status = 'active'
+         WHERE ss.grant_id = $1
+         ORDER BY ss.created_at, ss.id",
+    )
+    .bind(grant_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(sessions))
+}
+
+pub(super) async fn revoke_server_session(
+    State(state): State<Arc<AppState>>,
+    headers: ApiServerGrantHeaders,
+    ApiPath(path): ApiPath<ServerScopedSessionPath>,
+) -> Result<Response, ApiError> {
+    let session_id = path.session_id;
+    let mut tx = state.pool.begin().await?;
+    let grant_id = current_server_session_grant_id_in_tx(&mut tx, &headers).await?;
+    let Some(grant_id) = grant_id else {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "server_session_not_found",
+            "server session not found",
+        ));
+    };
+    let removed = sqlx::query("DELETE FROM server_sessions WHERE id = $1 AND grant_id = $2")
+        .bind(session_id)
+        .bind(grant_id)
+        .execute(&mut *tx)
+        .await?;
+    if removed.rows_affected() == 0 {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "server_session_not_found",
+            "server session not found",
+        ));
+    }
+    let has_retained_sessions: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM server_sessions ss
+            JOIN servers s ON s.id = ss.server_id AND s.desired_state <> 'deleted'
+            WHERE ss.grant_id = $1
+         )",
+    )
+    .bind(grant_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !has_retained_sessions {
+        sqlx::query("DELETE FROM server_session_grants WHERE id = $1")
+            .bind(grant_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if !has_retained_sessions {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            format!("{SERVER_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+                .parse()
+                .expect("static cookie expiration is valid"),
+        );
+    }
+    Ok(response)
+}
+
+async fn current_server_session_grant_id(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let Some(token) = cookie_value(headers, SERVER_SESSION_COOKIE) else {
+    let Some(token) =
+        auth::cookie_value(headers, SERVER_SESSION_COOKIE).filter(|token| valid_token(token))
+    else {
         return Ok(None);
     };
-    if !valid_token(token) {
-        return Ok(None);
-    }
     sqlx::query_scalar(
-        "SELECT ss.server_id FROM server_sessions ss
-         JOIN servers s ON s.id = ss.server_id AND s.desired_state <> 'deleted'
-         JOIN users u ON u.id = s.owner_id AND u.account_status = 'active'
-         WHERE ss.token_hash = $1 AND ss.expires_at > now()",
+        "SELECT id FROM server_session_grants
+         WHERE token_hash = $1",
     )
     .bind(auth::token_hash(token))
     .fetch_optional(pool)
+    .await
+}
+
+async fn current_server_session_grant_id_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    headers: &HeaderMap,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let Some(token) =
+        auth::cookie_value(headers, SERVER_SESSION_COOKIE).filter(|token| valid_token(token))
+    else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(
+        "SELECT id FROM server_session_grants
+         WHERE token_hash = $1
+         FOR UPDATE",
+    )
+    .bind(auth::token_hash(token))
+    .fetch_optional(&mut **tx)
     .await
 }
 
@@ -317,10 +502,20 @@ pub(super) async fn instance_capability_server_id(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    Ok(instance_capability_scope(pool, headers)
+        .await?
+        .map(|(server_id, _)| server_id))
+}
+
+pub(super) async fn instance_capability_scope(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+) -> Result<Option<(Uuid, Vec<u8>)>, sqlx::Error> {
     let Some(capability) = bearer_token(headers).filter(|value| valid_token(value)) else {
         return Ok(None);
     };
-    sqlx::query_scalar(
+    let token_hash = auth::token_hash(capability);
+    let server_id = sqlx::query_scalar(
         "SELECT c.server_id
          FROM server_instance_capabilities c
          JOIN placements p ON p.server_id = c.server_id
@@ -330,9 +525,10 @@ pub(super) async fn instance_capability_server_id(
          JOIN users u ON u.id = s.owner_id AND u.account_status = 'active'
          WHERE c.token_hash = $1 AND s.desired_state <> 'deleted'",
     )
-    .bind(auth::token_hash(capability))
+    .bind(&token_hash)
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(server_id.map(|server_id| (server_id, token_hash)))
 }
 
 fn random_token() -> String {
@@ -352,18 +548,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
-            let (key, value) = part.trim().split_once('=')?;
-            (key == name).then_some(value)
-        })
 }
 
 fn invalid_capability() -> ApiError {

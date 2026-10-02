@@ -108,8 +108,6 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-      args:
-        CONTROL_PLANE_INTERNAL_URL: http://control-plane:8080
     ports:
       - ${PANEL_PORT}:3000
     environment:

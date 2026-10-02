@@ -1,32 +1,28 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use futures::future::try_join_all;
-use serde::{Deserialize, Serialize};
+use garde::Validate;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::control_plane::lifecycle::LifecycleActor;
 use crate::model::{
     ObservedState, OperationRecord as DbOperation, SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES,
     ServerRecord, SnapshotRecord as DbSnapshot, validate_subdomain,
 };
 
+use super::actor::{
+    ApiAccountHeaders, ApiAccountOrServerGrantHeaders, ApiJson, ApiPath, ApiServerHeaders,
+    ServerIdPath,
+};
 use super::internal::{require_active_user, require_server_access};
 use super::types::{
     LifecycleStatus, Operation, Problem, Server, ServerSettings, ServerSettingsPatch, Snapshot,
     StorageUsage,
 };
-use super::{ApiError, AppState, lifecycle_error, mutation_error};
-
-#[derive(Debug, Serialize)]
-pub struct ServerActionResponse {
-    pub observed_state: ObservedState,
-}
+use super::{ApiError, AppState, mutation_error};
 
 pub(super) async fn insert_server_record(
     tx: &mut Transaction<'_, Postgres>,
@@ -120,9 +116,10 @@ pub(super) async fn server_view(
 
 pub(super) async fn get_server(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Option<Server>>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(Some(
         server_view(&state.pool, server, &state.config.root_domain).await?,
@@ -131,32 +128,46 @@ pub(super) async fn get_server(
 
 pub(super) async fn list_servers(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    headers: ApiAccountOrServerGrantHeaders,
 ) -> Result<Json<Vec<Server>>, ApiError> {
-    let user = require_active_user(&state, &headers).await?;
+    let account_result = require_active_user(&state, &headers).await;
+    let scoped_server_ids =
+        super::server_access::server_session_server_ids(&state.pool, &headers).await?;
+    let owner_id = match account_result {
+        Ok(user) => Some(user.id),
+        Err(error) if scoped_server_ids.is_empty() => return Err(error),
+        Err(_) => None,
+    };
     let servers = sqlx::query_as::<_, ServerRecord>(
         "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings,
                 storage_bytes, generation, current_snapshot_generation, last_error,
                 created_at, updated_at
-         FROM servers WHERE owner_id = $1 AND desired_state <> 'deleted'
-         ORDER BY is_default DESC, created_at, id",
+         FROM servers
+         WHERE desired_state <> 'deleted'
+           AND (($1::uuid IS NOT NULL AND owner_id = $1) OR id = ANY($2))
+         ORDER BY (is_default AND owner_id = $1) DESC, created_at, id",
     )
-    .bind(user.id)
+    .bind(owner_id)
+    .bind(&scoped_server_ids)
     .fetch_all(&state.pool)
     .await?;
-    let views = try_join_all(
-        servers
-            .into_iter()
-            .map(|server| server_view(&state.pool, server, &state.config.root_domain)),
-    )
+    let views = try_join_all(servers.into_iter().map(|mut server| {
+        if Some(server.owner_id) != owner_id {
+            server.is_default = false;
+        }
+        server_view(&state.pool, server, &state.config.root_domain)
+    }))
     .await?;
     Ok(Json(views))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(super) struct CreateServerRequest {
+    #[garde(length(min = 3, max = 32))]
     subdomain: String,
+    #[garde(skip)]
     #[serde(default)]
     settings: ServerSettings,
 }
@@ -211,8 +222,8 @@ pub(super) async fn create_server_for_user(
 
 pub(super) async fn create_server(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(input): Json<CreateServerRequest>,
+    headers: ApiAccountHeaders,
+    ApiJson(input): ApiJson<CreateServerRequest>,
 ) -> Result<(StatusCode, Json<Server>), ApiError> {
     let user = require_active_user(&state, &headers).await?;
     let server = create_server_for_user(&state, user.id, &input.subdomain, input.settings).await?;
@@ -220,19 +231,23 @@ pub(super) async fn create_server(
     Ok((StatusCode::CREATED, Json(view)))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(super) struct UpdateServerRequest {
+    #[garde(skip)]
     subdomain: Option<String>,
+    #[garde(skip)]
     settings: Option<ServerSettingsPatch>,
 }
 
 pub(super) async fn update_server(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(input): Json<UpdateServerRequest>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiJson(input): ApiJson<UpdateServerRequest>,
 ) -> Result<Json<Server>, ApiError> {
+    let server_id = path.server_id;
     require_server_access(&state, &headers, server_id).await?;
     let mut tx = state.pool.begin().await?;
     let current = sqlx::query_as::<_, ServerRecord>(
@@ -289,114 +304,5 @@ pub(super) async fn update_server(
     tx.commit().await?;
     Ok(Json(
         server_view(&state.pool, server, &state.config.root_domain).await?,
-    ))
-}
-
-pub(super) async fn delete_server(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-) -> Result<(StatusCode, Json<ServerActionResponse>), ApiError> {
-    let server = require_server_access(&state, &headers, server_id).await?;
-    let observed_state = state
-        .lifecycle
-        .request_delete(server.id)
-        .await
-        .map_err(lifecycle_error)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ServerActionResponse { observed_state }),
-    ))
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ServerAction {
-    Start,
-    Stop,
-    Restart,
-    Snapshot,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ServerActionRequest {
-    action: ServerAction,
-}
-
-pub(super) async fn server_action(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(input): Json<ServerActionRequest>,
-) -> Result<Json<ServerActionResponse>, ApiError> {
-    let server = require_server_access(&state, &headers, server_id).await?;
-    let observed_state = match input.action {
-        ServerAction::Start => state
-            .lifecycle
-            .request_start(server.id, "manual")
-            .await
-            .map_err(lifecycle_error)?,
-        ServerAction::Stop => state
-            .lifecycle
-            .request_stop_for_actor(LifecycleActor::Owner, server.id, "manual")
-            .await
-            .map_err(lifecycle_error)?,
-        ServerAction::Restart => state
-            .lifecycle
-            .request_restart(server.id)
-            .await
-            .map_err(lifecycle_error)?,
-        ServerAction::Snapshot => {
-            if server.observed_state != ObservedState::Online {
-                return Err(ApiError::with_code(
-                    StatusCode::CONFLICT,
-                    "server_not_online",
-                    "manual snapshots require an online server",
-                ));
-            }
-            state
-                .lifecycle
-                .request_snapshot_for_actor(
-                    LifecycleActor::Owner,
-                    server.id,
-                    crate::model::SnapshotReason::Manual,
-                )
-                .await
-                .map_err(lifecycle_error)?
-        }
-    };
-    Ok(Json(ServerActionResponse { observed_state }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ResetServerRequest {
-    mode: String,
-}
-
-pub(super) async fn reset_server(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(input): Json<ResetServerRequest>,
-) -> Result<(StatusCode, Json<ServerActionResponse>), ApiError> {
-    let server = require_server_access(&state, &headers, server_id).await?;
-    if !matches!(input.mode.as_str(), "world" | "full") {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_reset_mode",
-            "reset mode must be world or full",
-        ));
-    }
-    let defaults = ServerSettings::default().into_stored();
-    let observed_state = state
-        .lifecycle
-        .request_reset(server.id, &input.mode, defaults)
-        .await
-        .map_err(lifecycle_error)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ServerActionResponse { observed_state }),
     ))
 }

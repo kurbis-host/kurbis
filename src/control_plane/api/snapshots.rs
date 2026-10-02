@@ -1,24 +1,19 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-};
-use uuid::Uuid;
+use crate::model::SnapshotRecord as DbSnapshot;
+use axum::{Json, extract::State};
 
-use crate::model::{ObservedState, SnapshotRecord as DbSnapshot};
-
+use super::actor::{ApiPath, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
-use super::server::ServerActionResponse;
 use super::types::Snapshot;
-use super::{ApiError, AppState, lifecycle_error};
+use super::{ApiError, AppState};
 
 pub(super) async fn snapshots(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Vec<Snapshot>>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let snapshots = sqlx::query_as::<_, DbSnapshot>(
         "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete,
@@ -34,43 +29,4 @@ pub(super) async fn snapshots(
     .map(Snapshot::from)
     .collect();
     Ok(Json(snapshots))
-}
-
-pub(super) async fn restore_snapshot(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((server_id, generation)): Path<(Uuid, i64)>,
-) -> Result<Json<ServerActionResponse>, ApiError> {
-    let server = require_server_access(&state, &headers, server_id).await?;
-    if server.observed_state != ObservedState::Sleeping {
-        return Err(ApiError::with_code(
-            StatusCode::CONFLICT,
-            "server_not_sleeping",
-            "snapshot restore requires a sleeping server",
-        ));
-    }
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM snapshots
-            WHERE server_id = $1 AND generation = $2 AND complete
-         )",
-    )
-    .bind(server.id)
-    .bind(generation)
-    .fetch_one(&state.pool)
-    .await?;
-    if !exists {
-        return Err(ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "snapshot_not_found",
-            "snapshot not found",
-        ));
-    }
-
-    let observed_state = state
-        .lifecycle
-        .request_restore(server.id, generation)
-        .await
-        .map_err(lifecycle_error)?;
-    Ok(Json(ServerActionResponse { observed_state }))
 }

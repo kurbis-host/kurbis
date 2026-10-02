@@ -1,41 +1,35 @@
+use std::collections::HashSet;
+
 use super::WorkerRunner;
 use super::*;
+use crate::contracts::worker::WorkerAssignment;
 
 impl WorkerRunner {
     pub(super) async fn maintain_online_servers(&mut self) -> Result<()> {
-        let server_placements: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT s.id, p.generation
-             FROM servers s
-             JOIN placements p ON p.server_id = s.id
-             WHERE p.worker_id = $1 AND p.active AND s.observed_state = 'online'",
-        )
-        .bind(self.config.id)
-        .fetch_all(&self.pool)
-        .await?;
+        let states = self.control_plane.worker_servers().await?;
+        let online = states
+            .iter()
+            .filter(|state| state.placement.active && state.observed_state == ObservedState::Online)
+            .map(|state| (state.placement.server_id, state.placement.generation))
+            .collect::<Vec<_>>();
+        let idle = states
+            .iter()
+            .filter(|state| {
+                state.placement.generation > 0
+                    && state.desired_state == DesiredState::Running
+                    && matches!(
+                        state.observed_state,
+                        ObservedState::Online | ObservedState::Snapshotting
+                    )
+            })
+            .map(|state| state.placement.server_id)
+            .collect::<HashSet<_>>();
 
-        let idle_server_placements: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT s.id, p.generation
-             FROM servers s
-             JOIN placements p ON p.server_id = s.id
-             WHERE p.worker_id = $1 AND p.generation = s.generation
-               AND s.desired_state = 'running'
-               AND s.observed_state IN ('online', 'snapshotting')",
-        )
-        .bind(self.config.id)
-        .fetch_all(&self.pool)
-        .await?;
+        self.idle_since.retain(|id, _| idle.contains(id));
+        self.last_snapshot
+            .retain(|id, _| online.iter().any(|(server_id, _)| server_id == id));
 
-        self.idle_since.retain(|id, _| {
-            idle_server_placements
-                .iter()
-                .any(|(server_id, _)| server_id == id)
-        });
-        self.last_snapshot.retain(|id, _| {
-            server_placements
-                .iter()
-                .any(|(server_id, _)| server_id == id)
-        });
-        for (server_id, generation) in server_placements {
+        for (server_id, generation) in online {
             let server_dir = self.server_dir(server_id);
             if !self.runtime.server_is_running(server_id).await? {
                 tracing::error!(%server_id, "Pumpkin runtime stopped unexpectedly");
@@ -46,7 +40,7 @@ impl WorkerRunner {
                         "Pumpkin runtime stopped unexpectedly",
                     )
                     .await?;
-                clear_players(&self.pool, server_id).await?;
+                clear_players(&self.control_plane, server_id, generation).await?;
                 self.idle_since.remove(&server_id);
                 self.last_snapshot.remove(&server_id);
                 continue;
@@ -55,7 +49,7 @@ impl WorkerRunner {
             if size > SERVER_STORAGE_BYTES {
                 tracing::warn!(%server_id, size, "storage quota exceeded; stopping server");
                 self.control_plane
-                    .request_stop(server_id, generation, "storage_quota")
+                    .command_stop(server_id, generation, "storage_quota")
                     .await?;
                 continue;
             }
@@ -63,15 +57,22 @@ impl WorkerRunner {
             match self.runtime.player_status(&server_dir).await {
                 Ok(status) => {
                     match self.runtime.players(&server_dir).await {
-                        Ok(players) => sync_players(&self.pool, server_id, &players).await?,
+                        Ok(players) => {
+                            sync_players(&self.control_plane, server_id, generation, &players)
+                                .await?
+                        }
                         Err(error) => {
-                            tracing::warn!(%server_id, ?error, "failed to persist player presence");
+                            tracing::warn!(%server_id, ?error, "failed to persist player presence")
                         }
                     }
+                    let context = self
+                        .control_plane
+                        .server_context(server_id, WorkerAssignment::Placement { generation })
+                        .await?;
                     if let Err(error) = sync_whitelist(
-                        &self.pool,
+                        &self.control_plane,
                         self.runtime.as_ref(),
-                        server_id,
+                        &context,
                         &server_dir,
                         false,
                     )
@@ -80,9 +81,9 @@ impl WorkerRunner {
                         tracing::warn!(%server_id, ?error, "failed to synchronize whitelist state");
                     }
                     if let Err(error) = sync_operators(
-                        &self.pool,
+                        &self.control_plane,
                         self.runtime.as_ref(),
-                        server_id,
+                        &context,
                         &server_dir,
                         false,
                     )
@@ -97,7 +98,7 @@ impl WorkerRunner {
                         .or_insert_with(|| IdleTimer::new(&status, now));
                     if idle.expired(&status, now, self.config.idle_timeout) {
                         self.control_plane
-                            .request_stop(server_id, generation, "idle_timeout")
+                            .command_stop(server_id, generation, "idle_timeout")
                             .await?;
                         continue;
                     }
@@ -113,31 +114,26 @@ impl WorkerRunner {
                 .entry(server_id)
                 .or_insert_with(|| SnapshotSchedule::new(Instant::now()));
             if last.due(Instant::now(), self.config.snapshot_interval) {
-                let result = self
+                match self
                     .control_plane
-                    .request_snapshot(server_id, generation, SnapshotReason::Periodic)
-                    .await;
-                let schedule = self
-                    .last_snapshot
-                    .get_mut(&server_id)
-                    .expect("snapshot schedule initialized");
-                match result {
-                    Ok(_) => {
-                        schedule.succeeded(Instant::now());
-                    }
+                    .command_snapshot(server_id, generation, SnapshotReason::Periodic)
+                    .await
+                {
+                    Ok(_) => last.succeeded(Instant::now()),
                     Err(error) => {
-                        schedule.failed(Instant::now());
+                        last.failed(Instant::now());
                         tracing::warn!(%server_id, ?error, "periodic snapshot deferred; retaining the active runtime");
-                        tracing::warn!(%server_id, ?error, "periodic snapshot request was rejected");
                     }
                 }
             }
-            self.collect_logs(server_id).await?;
+            if let Err(error) = self.collect_logs(server_id, generation).await {
+                tracing::warn!(%server_id, ?error, "failed to collect runtime logs");
+            }
         }
         Ok(())
     }
 
-    pub(super) async fn collect_logs(&mut self, server_id: Uuid) -> Result<()> {
+    pub(super) async fn collect_logs(&mut self, server_id: Uuid, generation: i64) -> Result<()> {
         let since = self
             .last_log_read
             .get(&server_id)
@@ -148,52 +144,101 @@ impl WorkerRunner {
             .runtime
             .logs_since(server_id, &since.to_rfc3339())
             .await?;
-        for line in lines.into_iter().take(2000) {
-            sqlx::query("INSERT INTO server_logs(server_id, line) VALUES($1, $2)")
-                .bind(server_id)
-                .bind(line)
-                .execute(&self.pool)
-                .await?;
-        }
+        self.control_plane
+            .append_logs(
+                server_id,
+                generation,
+                &lines.into_iter().take(2000).collect::<Vec<_>>(),
+            )
+            .await?;
         self.last_log_read.insert(server_id, next);
         Ok(())
     }
 
-    pub(super) async fn placement(&self, server_id: Uuid) -> Result<PlacementRecord> {
-        sqlx::query_as::<_, PlacementRecord>(
-            "SELECT server_id, worker_id, generation, lease_token, java_port, bedrock_port, signal_port,
-                    active, updated_at
-             FROM placements WHERE server_id = $1",
-        )
-        .bind(server_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .context("placement not found")
+    pub(super) async fn context_for_operation(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<WorkerServerContext> {
+        self.control_plane
+            .server_context(
+                operation.server_id,
+                WorkerAssignment::Operation {
+                    operation_id: operation.id,
+                    generation: operation.generation,
+                    attempt: operation.attempt,
+                },
+            )
+            .await
     }
 
-    pub(super) async fn mark_cached(&self, server_id: Uuid, generation: i64) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
-             VALUES($1,$2,$3)
-             ON CONFLICT(worker_id, server_id) DO UPDATE
-               SET generation = EXCLUDED.generation, updated_at = now()",
-        )
-        .bind(self.config.id)
-        .bind(server_id)
-        .bind(generation)
-        .execute(&self.pool)
-        .await?;
+    pub(super) async fn reconcile_failed_starts(&self) -> Result<()> {
+        for state in self.control_plane.worker_servers().await? {
+            let server_id = state.placement.server_id;
+            let generation = state.placement.generation;
+            let server_dir = self.server_dir(server_id);
+            if state.observed_state != ObservedState::Failed {
+                continue;
+            }
+            if state.failed_start {
+                match self.runtime.remove_runtime(server_id).await {
+                    Ok(()) => {
+                        self.control_plane
+                            .mark_runtime_lost(
+                                server_id,
+                                generation,
+                                "Failed-start runtime removal confirmed; retry from the panel",
+                            )
+                            .await?
+                    }
+                    Err(error) => {
+                        tracing::error!(%server_id, ?error, "failed-start cleanup failed; preserving placement fence and retrying")
+                    }
+                }
+            }
+            if state.failed_snapshot {
+                match self.runtime.server_is_running(server_id).await {
+                    Ok(true) => match self.runtime.graceful_stop(server_id, &server_dir).await {
+                        Ok(()) => {
+                            self.control_plane
+                                .mark_runtime_lost(
+                                    server_id,
+                                    generation,
+                                    "Snapshot runtime stopped after retry exhaustion",
+                                )
+                                .await?;
+                            clear_players(&self.control_plane, server_id, generation).await?;
+                        }
+                        Err(error) => {
+                            tracing::error!(%server_id, ?error, "failed snapshot runtime cleanup failed; preserving placement fence")
+                        }
+                    },
+                    Ok(false) => {
+                        self.control_plane
+                            .mark_runtime_lost(
+                                server_id,
+                                generation,
+                                "Snapshot runtime removal confirmed after retry exhaustion",
+                            )
+                            .await?
+                    }
+                    Err(error) => {
+                        tracing::error!(%server_id, ?error, "could not verify failed snapshot runtime cleanup")
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     pub(super) async fn gc_stale_local_storage(&self) -> Result<()> {
+        let retained = self
+            .control_plane
+            .retained_server_ids()
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
         for server_id in self.storage.managed_server_ids().await? {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)")
-                    .bind(server_id)
-                    .fetch_one(&self.pool)
-                    .await?;
-            if !exists {
+            if !retained.contains(&server_id) {
                 tracing::info!(%server_id, "removing orphaned worker-local server storage");
                 self.storage.remove(server_id).await?;
             }

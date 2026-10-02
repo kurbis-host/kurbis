@@ -1,6 +1,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -23,11 +24,13 @@ use kurbis_hoster::control_plane::{
 struct TestWorker {
     id: Uuid,
     token: String,
+    lease_id: Uuid,
 }
 
 async fn create_worker(pool: &PgPool, label: &str) -> TestWorker {
     let id = Uuid::new_v4();
     let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let lease_id = worker_lease_id(&token);
     let name = format!("{label}-{}", id.simple());
     sqlx::query(
         "INSERT INTO workers(
@@ -42,16 +45,20 @@ async fn create_worker(pool: &PgPool, label: &str) -> TestWorker {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO worker_auth.credentials(worker_id, api_token_hash, database_role)
-         VALUES($1, $2, $3)",
+        "INSERT INTO worker_credentials(worker_id, api_token_hash, lease_id, lease_expires_at)
+         VALUES($1, $2, $3, now() + interval '1 hour')",
     )
     .bind(id)
     .bind(blake3::hash(token.as_bytes()).as_bytes().to_vec())
-    .bind(format!("test_{}", id.simple()))
+    .bind(lease_id)
     .execute(pool)
     .await
     .unwrap();
-    TestWorker { id, token }
+    TestWorker {
+        id,
+        token,
+        lease_id,
+    }
 }
 
 async fn create_server(pool: &PgPool, label: &str) -> Uuid {
@@ -90,6 +97,7 @@ async fn lifecycle_stop_actor_path_is_shared_and_worker_fenced() {
             LifecycleActor::AssignedWorker {
                 worker_id: other_worker.id,
                 expected_generation: 1,
+                lease_id: other_worker.lease_id,
             },
             server_id,
             "idle_timeout",
@@ -102,6 +110,7 @@ async fn lifecycle_stop_actor_path_is_shared_and_worker_fenced() {
             LifecycleActor::AssignedWorker {
                 worker_id: worker.id,
                 expected_generation: 1,
+                lease_id: worker.lease_id,
             },
             server_id,
             "idle_timeout",
@@ -112,7 +121,7 @@ async fn lifecycle_stop_actor_path_is_shared_and_worker_fenced() {
 }
 
 #[tokio::test]
-async fn worker_stop_route_matches_owner_command_fence_and_rejects_foreign_actor() {
+async fn worker_stop_command_uses_the_shared_command_route_and_rejects_foreign_actor() {
     let pool = test_pool().await;
     let worker = create_worker(&pool, "route-stop").await;
     let foreign = create_worker(&pool, "route-stop-foreign").await;
@@ -120,8 +129,8 @@ async fn worker_stop_route_matches_owner_command_fence_and_rejects_foreign_actor
     set_server_state(&pool, server_id, 1, "running", "online").await;
     add_placement(&pool, server_id, worker.id, 1, true).await;
     let service = app(pool.clone(), Arc::new(InMemory::new()));
-    let uri = format!("/internal/worker/control/servers/{server_id}/stop");
-    let body = json!({"generation": 1, "reason": "idle_timeout"});
+    let uri = format!("/api/v1/servers/{server_id}/commands");
+    let body = json!({"command":"stop", "generation": 1, "reason": "idle_timeout"});
 
     let (status, _) = send_json(
         service.clone(),
@@ -133,7 +142,7 @@ async fn worker_stop_route_matches_owner_command_fence_and_rejects_foreign_actor
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     let (status, _) = send_json(service, Method::POST, &uri, Some(&worker.token), body).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::ACCEPTED);
     let observed: String =
         sqlx::query_scalar("SELECT observed_state::text FROM servers WHERE id = $1")
             .bind(server_id)
@@ -141,6 +150,176 @@ async fn worker_stop_route_matches_owner_command_fence_and_rejects_foreign_actor
             .await
             .unwrap();
     assert_eq!(observed, "stopping");
+}
+
+#[tokio::test]
+async fn worker_command_rechecks_lease_after_waiting_for_server_lock() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "command-lease-race").await;
+    let server_id = create_server(&pool, "command-lease-race").await;
+    set_server_state(&pool, server_id, 1, "running", "online").await;
+    let placement_lease = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO placements(
+             server_id, worker_id, generation, lease_token, java_port, bedrock_port,
+             signal_port, active
+         ) VALUES($1, $2, 1, $3, 22000, 22001, 22002, true)",
+    )
+    .bind(server_id)
+    .bind(worker.id)
+    .bind(placement_lease)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut server_lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM servers WHERE id = $1 FOR UPDATE")
+        .bind(server_id)
+        .execute(&mut *server_lock)
+        .await
+        .unwrap();
+
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let token = worker.token.clone();
+    let command_uri = format!("/api/v1/servers/{server_id}/commands");
+    let request = tokio::spawn(async move {
+        worker_api_request(
+            service,
+            &command_uri,
+            &token,
+            Some(worker_lease_id(&token)),
+            json!({"command":"stop", "generation":1, "reason":"idle_timeout"}),
+        )
+        .await
+    });
+
+    let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%FROM servers WHERE id = $1 FOR UPDATE%'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if blocked.is_err() {
+        request.abort();
+        server_lock.rollback().await.unwrap();
+        let _ = request.await;
+        panic!("worker command did not block on the held server row lock");
+    }
+
+    let next_lease = Uuid::new_v4();
+    let mut credential_rotation = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE worker_credentials
+         SET lease_id = $2, lease_expires_at = now() + interval '1 hour'
+         WHERE worker_id = $1",
+    )
+    .bind(worker.id)
+    .bind(next_lease)
+    .execute(&mut *credential_rotation)
+    .await
+    .unwrap();
+    credential_rotation.commit().await.unwrap();
+    server_lock.commit().await.unwrap();
+
+    assert_eq!(request.await.unwrap(), StatusCode::CONFLICT);
+    let unchanged: (String, String, i64, i64, Uuid, i64, Uuid, bool) = sqlx::query_as(
+        "SELECT s.desired_state::text, s.observed_state::text, s.generation,
+                (SELECT count(*) FROM operations WHERE server_id = s.id),
+                p.worker_id, p.generation, p.lease_token, p.active
+         FROM servers s JOIN placements p ON p.server_id = s.id
+         WHERE s.id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unchanged,
+        (
+            "running".to_owned(),
+            "online".to_owned(),
+            1,
+            0,
+            worker.id,
+            1,
+            placement_lease,
+            true,
+        )
+    );
+
+    assert_eq!(
+        worker_api_request(
+            app(pool.clone(), Arc::new(InMemory::new())),
+            &format!("/api/v1/servers/{server_id}/commands"),
+            &worker.token,
+            Some(next_lease),
+            json!({"command":"stop", "generation":1, "reason":"idle_timeout"}),
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    let stopped: (String, String, i64) = sqlx::query_as(
+        "SELECT desired_state::text, observed_state::text,
+                (SELECT count(*) FROM operations WHERE server_id = $1)
+         FROM servers WHERE id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stopped, ("stopped".to_owned(), "stopping".to_owned(), 1));
+}
+
+#[tokio::test]
+async fn workers_cannot_reset_or_delete_through_the_shared_command_route() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "destructive-denial").await;
+    let server_id = create_server(&pool, "destructive-denial").await;
+    set_server_state(&pool, server_id, 1, "stopped", "sleeping").await;
+    add_placement(&pool, server_id, worker.id, 1, true).await;
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let uri = format!("/api/v1/servers/{server_id}/commands");
+
+    for command in [
+        json!({"command":"reset", "mode":"world"}),
+        json!({"command":"delete"}),
+    ] {
+        let (status, _) = send_json(
+            service.clone(),
+            Method::POST,
+            &uri,
+            Some(&worker.token),
+            command,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    let (observed, desired, generation): (String, String, i64) = sqlx::query_as(
+        "SELECT observed_state::text, desired_state::text, generation FROM servers WHERE id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (observed.as_str(), desired.as_str(), generation),
+        ("sleeping", "stopped", 1)
+    );
 }
 
 async fn set_server_state(
@@ -231,6 +410,7 @@ async fn send_json(
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(token) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        builder = builder.header("x-worker-lease", worker_lease_id(token).to_string());
     }
     let request = builder.body(Body::from(body.to_string())).unwrap();
     let response = app.oneshot(request).await.unwrap();
@@ -240,6 +420,238 @@ async fn send_json(
         .unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+fn worker_lease_id(token: &str) -> Uuid {
+    Uuid::from_slice(&blake3::hash(token.as_bytes()).as_bytes()[..16]).unwrap()
+}
+
+async fn worker_api_request(
+    app: Router,
+    uri: &str,
+    token: &str,
+    lease_id: Option<Uuid>,
+    body: Value,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(lease_id) = lease_id {
+        builder = builder.header("x-worker-lease", lease_id.to_string());
+    }
+    app.oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn control_plane_lease_excludes_a_second_process_and_fences_expired_owners() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "lease-api").await;
+    sqlx::query("UPDATE worker_credentials SET lease_id = NULL, lease_expires_at = NULL WHERE worker_id = $1")
+        .bind(worker.id).execute(&pool).await.unwrap();
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let endpoint = "/internal/worker/control/lease";
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let acquire = |lease_id| json!({"lease_id": lease_id, "signal_address":"127.0.0.1"});
+
+    let (status, response) = send_json(
+        service.clone(),
+        Method::POST,
+        endpoint,
+        Some(&worker.token),
+        acquire(first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["worker_id"], worker.id.to_string());
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            endpoint,
+            &worker.token,
+            None,
+            acquire(second)
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            "/internal/worker/control/heartbeat",
+            &worker.token,
+            Some(first),
+            json!({})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    sqlx::query("UPDATE worker_credentials SET lease_expires_at = now() - interval '1 second' WHERE worker_id = $1")
+        .bind(worker.id).execute(&pool).await.unwrap();
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            "/internal/worker/control/heartbeat",
+            &worker.token,
+            Some(first),
+            json!({})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            endpoint,
+            &worker.token,
+            Some(first),
+            acquire(second)
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        worker_api_request(
+            service,
+            "/internal/worker/control/heartbeat",
+            &worker.token,
+            Some(first),
+            json!({})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn worker_state_reads_and_runtime_sync_are_assignment_scoped() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "state-worker").await;
+    let foreign = create_worker(&pool, "state-foreign").await;
+    let server = create_server(&pool, "state-owned").await;
+    let foreign_server = create_server(&pool, "state-foreign-world").await;
+    set_server_state(&pool, server, 3, "running", "online").await;
+    set_server_state(&pool, foreign_server, 7, "running", "online").await;
+    add_placement(&pool, server, worker.id, 3, true).await;
+    add_placement(&pool, foreign_server, foreign.id, 7, true).await;
+    let app = app(pool.clone(), Arc::new(InMemory::new()));
+
+    let (status, states) = send_json(
+        app.clone(),
+        Method::GET,
+        "/internal/worker/control/servers",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(states.as_array().unwrap().len(), 1);
+    assert_eq!(states[0]["placement"]["server_id"], server.to_string());
+    assert_eq!(states[0]["placement"]["generation"], 3);
+    assert_eq!(states[0]["observed_state"], "online");
+
+    let context_uri = format!(
+        "/internal/worker/control/servers/{server}/context?assignment=placement&generation=3"
+    );
+    let (status, context) = send_json(
+        app.clone(),
+        Method::GET,
+        &context_uri,
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(context["placement"]["worker_id"], worker.id.to_string());
+    assert_eq!(context["settings"], json!({}));
+    assert!(context["owners"].as_array().unwrap().is_empty());
+
+    let wrong_worker_uri = format!(
+        "/internal/worker/control/servers/{server}/context?assignment=placement&generation=3"
+    );
+    let (status, _) = send_json(
+        app.clone(),
+        Method::GET,
+        &wrong_worker_uri,
+        Some(&foreign.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let stale_uri = format!(
+        "/internal/worker/control/servers/{server}/context?assignment=placement&generation=2"
+    );
+    let (status, _) = send_json(
+        app.clone(),
+        Method::GET,
+        &stale_uri,
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let player_id = Uuid::new_v4();
+    let players_uri = format!("/internal/worker/control/servers/{server}/players");
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        &players_uri,
+        Some(&worker.token),
+        json!({
+            "generation":3,
+            "players":[{
+                "connection_id":Uuid::new_v4(),
+                "id":player_id,
+                "name":"CurrentPlayer",
+                "edition":"java",
+                "server_address":"play.example.test",
+                "ready_for_transfer":true
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let players: (i64, Option<String>) =
+        sqlx::query_as("SELECT count(*), max(name) FROM server_players WHERE server_id=$1")
+            .bind(server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(players, (1, Some("CurrentPlayer".to_owned())));
+
+    let logs_uri = format!("/internal/worker/control/servers/{server}/logs");
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        &logs_uri,
+        Some(&worker.token),
+        json!({"generation":3,"lines":["one line", "another line"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let logs: i64 = sqlx::query_scalar("SELECT count(*) FROM server_logs WHERE server_id=$1")
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(logs, 2);
+
+    let (status, _) = send_json(
+        app,
+        Method::POST,
+        &format!("/internal/worker/control/servers/{server}/players"),
+        Some(&worker.token),
+        json!({"generation":2,"players":[]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -389,9 +801,9 @@ async fn a_worker_cannot_mutate_another_workers_operation_or_server() {
     let (status, _) = send_json(
         service.clone(),
         Method::POST,
-        &format!("/internal/worker/control/servers/{server_b}/stop"),
+        &format!("/api/v1/servers/{server_b}/commands"),
         Some(&worker_a.token),
-        json!({ "generation": 7, "reason":"idle_timeout" }),
+        json!({ "command":"stop", "generation": 7, "reason":"idle_timeout" }),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);

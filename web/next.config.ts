@@ -1,18 +1,4 @@
 import type { NextConfig } from "next";
-import { controlPlaneOrigin } from "./lib/control-plane";
-
-const controlPlane = controlPlaneOrigin();
-const authPaths = [
-  "/auth/google/login",
-  "/auth/google/link",
-  "/auth/google/callback",
-  "/auth/discord/login",
-  "/auth/discord/link",
-  "/auth/discord/callback",
-  "/auth/minecraft/redeem",
-  "/auth/server/redeem",
-  "/auth/logout",
-];
 const isProduction = process.env.NODE_ENV === "production";
 const securityHeaders = [
   { key: "Content-Security-Policy", value: [
@@ -42,12 +28,6 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
-  },
-  async rewrites() {
-    return [
-      { source: "/api/:path*", destination: `${controlPlane}/api/:path*` },
-      ...authPaths.map((source) => ({ source, destination: `${controlPlane}${source}` })),
-    ];
   },
 };
 

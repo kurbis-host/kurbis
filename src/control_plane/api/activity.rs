@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerEventKind {
     Server,
@@ -55,7 +53,7 @@ impl ServerEventKind {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct ActivityEntry {
     pub id: i64,
     #[serde(rename = "type")]
@@ -66,7 +64,7 @@ pub struct ActivityEntry {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct LimitQuery {
     limit: Option<i64>,
 }
@@ -80,10 +78,11 @@ pub(super) struct EventRow {
 
 pub(super) async fn activity(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<uuid::Uuid>,
-    Query(query): Query<LimitQuery>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiQuery(query): ApiQuery<LimitQuery>,
 ) -> Result<Json<Vec<ActivityEntry>>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let rows = sqlx::query_as::<_, EventRow>(
         "SELECT id, event_type, created_at

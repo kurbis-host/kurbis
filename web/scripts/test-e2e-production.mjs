@@ -8,7 +8,7 @@ if (!Number.isInteger(portBase) || portBase < 1024 || portBase > 65533) {
 
 const env = {
   ...process.env,
-  NEXT_DIST_DIR: `.next-e2e-${portBase}`,
+  NEXT_DIST_DIR: process.env.NEXT_DIST_DIR ?? `.next-e2e-${portBase}-${process.pid}`,
   CONTROL_PLANE_INTERNAL_URL: `http://127.0.0.1:${portBase}`,
 };
 const generatedTypeFiles = ["next-env.d.ts", "tsconfig.json"];

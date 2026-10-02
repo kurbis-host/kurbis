@@ -5,46 +5,19 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     control_plane::identity,
-    model::{ObservedState, RouteTarget, ServerRecord, subdomain_from_hostname},
-    pumpkin_control::VerifiedMinecraftIdentity,
+    model::ServerRecord,
+    routing::{AdmissionRequest, AdmissionResponse, BedrockSignalTarget, RouteRepository},
 };
 
 use super::auth;
 use super::auth::CurrentUser;
-use super::server::ServerActionResponse;
 use super::types::ServerSettings;
-use super::{ApiError, AppState, lifecycle_error};
-
-pub(super) async fn resolve(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(hostname): Path<String>,
-) -> Result<Json<RouteTarget>, ApiError> {
-    require_internal(&state, &headers)?;
-    let subdomain = subdomain_from_hostname(&hostname, &state.config.root_domain)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown hostname"))?;
-    let target = resolve_subdomain(&state.pool, &subdomain)
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown hostname"))?;
-    Ok(Json(target))
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct BedrockSignalTarget {
-    server_id: Uuid,
-    worker_address: String,
-    bedrock_port: u16,
-    signal_address: String,
-    signal_port: u16,
-    generation: i64,
-}
+use super::{ApiError, AppState};
 
 pub(super) async fn bedrock_signal_target(
     State(state): State<Arc<AppState>>,
@@ -107,28 +80,15 @@ pub(super) async fn bedrock_signal_target(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AdmissionRequest {
-    hostname: String,
-    identity: Option<VerifiedMinecraftIdentity>,
-    minecraft_player_id: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct AdmissionResponse {
-    target: RouteTarget,
-    private_message: Option<String>,
-    created: bool,
-}
-
 pub(super) async fn admit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<AdmissionRequest>,
 ) -> Result<Json<AdmissionResponse>, ApiError> {
     require_internal(&state, &headers)?;
-    let subdomain = subdomain_from_hostname(&request.hostname, &state.config.root_domain)
+    let routes = RouteRepository::new(state.pool.clone(), state.config.root_domain.clone());
+    let subdomain = routes
+        .subdomain_for_hostname(&request.hostname)
         .ok_or_else(|| {
             ApiError::with_code(
                 StatusCode::NOT_FOUND,
@@ -136,7 +96,7 @@ pub(super) async fn admit(
                 "unknown server address",
             )
         })?;
-    if let Some(target) = resolve_subdomain(&state.pool, &subdomain).await? {
+    if let Some(target) = routes.resolve_subdomain(&subdomain).await? {
         return Ok(Json(AdmissionResponse {
             target,
             private_message: None,
@@ -206,24 +166,21 @@ pub(super) async fn admit(
         ));
     }
 
-    let existing_address = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM servers WHERE subdomain = $1 AND desired_state <> 'deleted'",
+    let existing_address: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE subdomain = $1 AND desired_state <> 'deleted')",
     )
     .bind(&subdomain)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    if let Some(server_id) = existing_address {
+    if existing_address {
         tx.commit().await?;
-        let target = resolve_subdomain(&state.pool, &subdomain)
-            .await?
-            .ok_or_else(|| {
-                ApiError::with_code(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "route_unavailable",
-                    "server route is temporarily unavailable",
-                )
-            })?;
-        let _ = server_id;
+        let target = routes.resolve_subdomain(&subdomain).await?.ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "route_unavailable",
+                "server route is temporarily unavailable",
+            )
+        })?;
         return Ok(Json(AdmissionResponse {
             target,
             private_message: None,
@@ -237,16 +194,17 @@ pub(super) async fn admit(
             .fetch_one(&mut *tx)
             .await?;
 
-    let default_server: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, subdomain FROM servers WHERE owner_id = $1 AND desired_state <> 'deleted'
+    let default_subdomain: Option<String> = sqlx::query_scalar(
+        "SELECT subdomain FROM servers WHERE owner_id = $1 AND desired_state <> 'deleted'
          ORDER BY is_default DESC, created_at, id LIMIT 1",
     )
     .bind(owner_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((server_id, default_subdomain)) = default_server {
+    if let Some(default_subdomain) = default_subdomain {
         tx.commit().await?;
-        let target = resolve_subdomain(&state.pool, &default_subdomain)
+        let target = routes
+            .resolve_subdomain(&default_subdomain)
             .await?
             .ok_or_else(|| {
                 ApiError::with_code(
@@ -255,7 +213,6 @@ pub(super) async fn admit(
                     "default server route is temporarily unavailable",
                 )
             })?;
-        let _ = server_id;
         let address = format!("{default_subdomain}.{}", state.config.root_domain);
         return Ok(Json(AdmissionResponse {
             target,
@@ -280,11 +237,11 @@ pub(super) async fn admit(
         ServerSettings::default().into_stored(),
     )
     .await;
-    let server_id = match insert {
-        Ok(server) => server.id,
+    match insert {
+        Ok(_) => {}
         Err(error) => {
             tx.rollback().await?;
-            if let Some(target) = resolve_subdomain(&state.pool, &subdomain).await? {
+            if let Some(target) = routes.resolve_subdomain(&subdomain).await? {
                 return Ok(Json(AdmissionResponse {
                     target,
                     private_message: None,
@@ -296,51 +253,21 @@ pub(super) async fn admit(
                 "server address or account already exists",
             ));
         }
-    };
+    }
     tx.commit().await?;
 
-    state
-        .lifecycle
-        .request_start(server_id, "gateway_join")
-        .await
-        .map_err(lifecycle_error)?;
-    let target = resolve_subdomain(&state.pool, &subdomain)
-        .await?
-        .ok_or_else(|| {
-            ApiError::with_code(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "route_unavailable",
-                "server is being prepared",
-            )
-        })?;
+    let target = routes.resolve_subdomain(&subdomain).await?.ok_or_else(|| {
+        ApiError::with_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "route_unavailable",
+            "server route is unavailable",
+        )
+    })?;
     Ok(Json(AdmissionResponse {
         target,
         private_message: None,
         created: true,
     }))
-}
-
-pub(super) async fn wake(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(hostname): Path<String>,
-) -> Result<Json<ServerActionResponse>, ApiError> {
-    require_internal(&state, &headers)?;
-    let subdomain = subdomain_from_hostname(&hostname, &state.config.root_domain)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown hostname"))?;
-    let server_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM servers WHERE subdomain = $1 AND desired_state <> 'deleted'",
-    )
-    .bind(&subdomain)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown hostname"))?;
-    let observed_state = state
-        .lifecycle
-        .request_start(server_id, "gateway_join")
-        .await
-        .map_err(lifecycle_error)?;
-    Ok(Json(ServerActionResponse { observed_state }))
 }
 
 pub(super) async fn mint_minecraft_link(
@@ -350,60 +277,6 @@ pub(super) async fn mint_minecraft_link(
 ) -> Result<Json<auth::MinecraftLinkResponse>, ApiError> {
     require_internal(&state, &headers)?;
     auth::create_minecraft_link(State(state), request).await
-}
-
-pub async fn resolve_subdomain(
-    pool: &PgPool,
-    subdomain: &str,
-) -> Result<Option<RouteTarget>, sqlx::Error> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        server_id: Uuid,
-        subdomain: String,
-        state: ObservedState,
-        account_suspended: bool,
-        worker_healthy: Option<bool>,
-        worker_valid_until: Option<DateTime<Utc>>,
-        worker_address: Option<String>,
-        java_port: Option<i32>,
-        bedrock_port: Option<i32>,
-    }
-    let row = sqlx::query_as::<_, Row>(
-        "SELECT s.id AS server_id, s.subdomain, s.observed_state AS state,
-                u.account_status <> 'active' AS account_suspended,
-                CASE WHEN p.server_id IS NULL THEN NULL
-                     ELSE w.heartbeat_at > now() - interval '30 seconds'
-                END AS worker_healthy,
-                w.heartbeat_at + interval '30 seconds' AS worker_valid_until,
-                CASE WHEN u.account_status = 'active' AND p.active
-                           AND w.heartbeat_at > now() - interval '30 seconds'
-                     THEN w.address END AS worker_address,
-                CASE WHEN u.account_status = 'active' AND p.active
-                           AND w.heartbeat_at > now() - interval '30 seconds'
-                     THEN p.java_port END AS java_port,
-                CASE WHEN u.account_status = 'active' AND p.active
-                           AND w.heartbeat_at > now() - interval '30 seconds'
-                     THEN p.bedrock_port END AS bedrock_port
-         FROM servers s
-         JOIN users u ON u.id = s.owner_id
-         LEFT JOIN placements p ON p.server_id = s.id
-         LEFT JOIN workers w ON w.id = p.worker_id
-         WHERE s.subdomain = $1 AND s.desired_state <> 'deleted'",
-    )
-    .bind(subdomain)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|row| RouteTarget {
-        server_id: row.server_id,
-        subdomain: row.subdomain,
-        state: row.state,
-        account_suspended: row.account_suspended,
-        worker_healthy: row.worker_healthy,
-        worker_valid_until: row.worker_valid_until,
-        worker_address: row.worker_address,
-        java_port: row.java_port.and_then(|value| u16::try_from(value).ok()),
-        bedrock_port: row.bedrock_port.and_then(|value| u16::try_from(value).ok()),
-    }))
 }
 
 pub(super) async fn authenticated_user(
@@ -456,9 +329,9 @@ pub(super) async fn require_server_access(
         Err(error) => error,
     };
 
-    let server_session_id =
-        super::server_access::server_session_server_id(&state.pool, headers).await?;
-    if server_session_id == Some(server_id) {
+    let server_session_ids =
+        super::server_access::server_session_server_ids(&state.pool, headers).await?;
+    if server_session_ids.contains(&server_id) {
         return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
             ApiError::with_code(
                 StatusCode::NOT_FOUND,
@@ -478,6 +351,14 @@ pub(super) async fn require_server_access(
                 "server not found",
             )
         });
+    }
+
+    if !server_session_ids.is_empty() || capability_server_id.is_some() {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "server_not_found",
+            "server not found",
+        ));
     }
 
     Err(owner_error)

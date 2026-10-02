@@ -3,22 +3,24 @@ use std::sync::Arc;
 use axum::{
     Json,
     body::Body,
-    extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::State,
+    http::{HeaderValue, StatusCode, header},
     response::Response,
 };
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
+use schemars::JsonSchema;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::worker::snapshot::physical_object_path;
+use crate::snapshot::physical_object_path;
 
+use super::actor::{ApiPath, ApiServerHeaders, ServerExportPath, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState, lifecycle_error};
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, FromRow, JsonSchema)]
 pub(super) struct WorldExport {
     id: Uuid,
     server_id: Uuid,
@@ -26,6 +28,7 @@ pub(super) struct WorldExport {
     stage: String,
     source_generation: Option<i64>,
     #[serde(skip_serializing)]
+    #[schemars(skip)]
     archive_key: Option<String>,
     archive_size: Option<i64>,
     archive_checksum: Option<String>,
@@ -60,9 +63,10 @@ async fn export_by_id(
 
 pub(super) async fn list_exports(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Vec<WorldExport>>, ApiError> {
+    let server_id = path.server_id;
     require_server_access(&state, &headers, server_id).await?;
     let exports = sqlx::query_as::<_, WorldExport>(
         "SELECT id, server_id, status, stage, source_generation, archive_key, archive_size,
@@ -77,9 +81,10 @@ pub(super) async fn list_exports(
 
 pub(super) async fn create_export(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<(StatusCode, Json<WorldExport>), ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let user_id = server.owner_id;
     let export_id = state
@@ -93,18 +98,22 @@ pub(super) async fn create_export(
 
 pub(super) async fn get_export(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((server_id, export_id)): Path<(Uuid, Uuid)>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerExportPath>,
 ) -> Result<Json<WorldExport>, ApiError> {
+    let server_id = path.server_id;
+    let export_id = path.export_id;
     require_server_access(&state, &headers, server_id).await?;
     Ok(Json(export_by_id(&state, server_id, export_id).await?))
 }
 
 pub(super) async fn cancel_export(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((server_id, export_id)): Path<(Uuid, Uuid)>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerExportPath>,
 ) -> Result<Json<WorldExport>, ApiError> {
+    let server_id = path.server_id;
+    let export_id = path.export_id;
     require_server_access(&state, &headers, server_id).await?;
     let result = sqlx::query(
         "UPDATE world_exports SET status = 'cancelled', stage = 'cancelled', updated_at = now()
@@ -127,9 +136,11 @@ pub(super) async fn cancel_export(
 
 pub(super) async fn download_export(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((server_id, export_id)): Path<(Uuid, Uuid)>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerExportPath>,
 ) -> Result<Response, ApiError> {
+    let server_id = path.server_id;
+    let export_id = path.export_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let export = export_by_id(&state, server_id, export_id).await?;
     if export.status != "completed" || export.expires_at.is_none_or(|expiry| expiry <= Utc::now()) {

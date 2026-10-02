@@ -2,6 +2,7 @@ export const queryKeys = {
   session: ["session"] as const,
   account: ["account"] as const,
   servers: ["servers"] as const,
+  serverSessions: ["server-sessions"] as const,
   server: (serverId: string) => ["servers", serverId] as const,
   activity: (serverId: string) => ["servers", serverId, "activity"] as const,
   logs: (serverId: string) => ["servers", serverId, "logs"] as const,
@@ -13,6 +14,6 @@ export const queryKeys = {
 };
 
 export function selectedServerId(pathname: string) {
-  const match = pathname.match(/^\/app\/servers\/([^/]+)/);
+  const match = pathname.match(/^\/manage\/([^/]+)/);
   return match ? decodeURIComponent(match[1]) : null;
 }

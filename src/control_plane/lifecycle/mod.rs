@@ -1,12 +1,49 @@
-use anyhow::{Context, Result, bail};
-use serde_json::json;
+use anyhow::{Context, Result};
+use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+macro_rules! lifecycle_bail {
+    (not_found: $($message:tt)*) => {
+        return Err(::anyhow::Error::new(
+            $crate::control_plane::lifecycle::LifecycleFailure::NotFound(format!($($message)*)),
+        ))
+    };
+    (forbidden: $($message:tt)*) => {
+        return Err(::anyhow::Error::new(
+            $crate::control_plane::lifecycle::LifecycleFailure::Forbidden(format!($($message)*)),
+        ))
+    };
+    (invalid: $($message:tt)*) => {
+        return Err(::anyhow::Error::new(
+            $crate::control_plane::lifecycle::LifecycleFailure::Invalid(format!($($message)*)),
+        ))
+    };
+    (unavailable: $($message:tt)*) => {
+        return Err(::anyhow::Error::new(
+            $crate::control_plane::lifecycle::LifecycleFailure::Unavailable(format!($($message)*)),
+        ))
+    };
+    ($($message:tt)*) => {
+        return Err(::anyhow::Error::new(
+            $crate::control_plane::lifecycle::LifecycleFailure::Conflict(format!($($message)*)),
+        ))
+    };
+}
+pub(crate) use lifecycle_bail as bail;
+
+use crate::contracts::{
+    lifecycle::ResetMode,
+    worker::{OperationPayload, OperationStage},
+};
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus, ServerRecord};
 
+mod commands;
 mod operations;
 mod placement;
+
+use commands::authorize_actor;
+pub use commands::{LifecycleActor, LifecycleCommand, LifecycleCommandError, LifecycleFailure};
 
 pub use operations::{
     begin_snapshot_retry, claim_operation, complete_delete, complete_reset, complete_restore,
@@ -28,28 +65,25 @@ pub struct Lifecycle {
     pool: PgPool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum LifecycleActor {
-    Owner,
-    AssignedWorker {
-        worker_id: Uuid,
-        expected_generation: i64,
-    },
-}
-
 impl Lifecycle {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
     pub async fn request_start(&self, server_id: Uuid, reason: &str) -> Result<ObservedState> {
-        self.admit_start(server_id, reason, false)
+        self.admit_start(LifecycleActor::Owner, server_id, reason, false)
             .await?
-            .context("unconditional start admission returned no state")
+            .ok_or_else(|| {
+                LifecycleFailure::Conflict(
+                    "unconditional start admission returned no state".to_owned(),
+                )
+                .into()
+            })
     }
 
     async fn admit_start(
         &self,
+        actor: LifecycleActor,
         server_id: Uuid,
         reason: &str,
         queued_only: bool,
@@ -66,8 +100,9 @@ impl Lifecycle {
                 tx.commit().await?;
                 return Ok(None);
             }
-            None => bail!("server not found"),
+            None => bail!(not_found: "server not found"),
         };
+        authorize_actor(&mut tx, &server, actor.clone(), false).await?;
         if has_live_reset(&mut tx, server_id).await? {
             bail!("server reset is in progress");
         }
@@ -100,13 +135,13 @@ impl Lifecycle {
                 tx.commit().await?;
                 return Ok(None);
             }
-            bail!("server owner is suspended");
+            bail!(forbidden: "server owner is suspended");
         }
 
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
-            bail!("server is deleted");
+            bail!(not_found: "server is deleted");
         }
         if matches!(
             server.observed_state,
@@ -140,7 +175,7 @@ impl Lifecycle {
         .fetch_optional(&mut *tx)
         .await?;
         let worker = if queue_head.is_none_or(|head| head == server_id) {
-            select_worker(&mut tx, &server).await?
+            select_worker(&mut tx).await?
         } else {
             None
         };
@@ -189,45 +224,19 @@ impl Lifecycle {
         Ok(state)
     }
 
-    pub async fn request_worker_stop(
-        &self,
-        worker_id: Uuid,
-        server_id: Uuid,
-        expected_generation: i64,
-        reason: &str,
-    ) -> Result<ObservedState> {
-        self.request_stop_for_actor(
-            LifecycleActor::AssignedWorker {
-                worker_id,
-                expected_generation,
-            },
-            server_id,
-            reason,
-        )
-        .await
-    }
-
-    pub async fn request_worker_snapshot(
-        &self,
-        worker_id: Uuid,
-        server_id: Uuid,
-        expected_generation: i64,
-        reason: crate::model::SnapshotReason,
-    ) -> Result<ObservedState> {
-        self.request_snapshot_for_actor(
-            LifecycleActor::AssignedWorker {
-                worker_id,
-                expected_generation,
-            },
-            server_id,
-            reason,
-        )
-        .await
-    }
-
     pub async fn request_restart(&self, server_id: Uuid) -> Result<ObservedState> {
+        self.request_restart_for_actor(LifecycleActor::Owner, server_id)
+            .await
+    }
+
+    pub async fn request_restart_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        authorize_actor(&mut tx, &server, actor.clone(), true).await?;
         if has_live_reset(&mut tx, server_id).await? {
             bail!("server reset is in progress");
         }
@@ -237,11 +246,19 @@ impl Lifecycle {
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
-            bail!("server is deleted");
+            bail!(not_found: "server is deleted");
         }
         if server.observed_state == ObservedState::Sleeping {
             tx.commit().await?;
-            return self.request_start(server_id, "restart").await;
+            return self
+                .admit_start(actor, server_id, "restart", false)
+                .await?
+                .ok_or_else(|| {
+                    LifecycleFailure::Conflict(
+                        "restart start admission returned no state".to_owned(),
+                    )
+                    .into()
+                });
         }
         if server.observed_state == ObservedState::Queued {
             tx.commit().await?;
@@ -260,9 +277,9 @@ impl Lifecycle {
             tx.commit().await?;
             return Ok(server.observed_state);
         }
-        let placement = lock_placement(&mut tx, server_id)
-            .await?
-            .context("server has no placement to restart")?;
+        let placement = lock_placement(&mut tx, server_id).await?.ok_or_else(|| {
+            LifecycleFailure::Conflict("server has no placement to restart".to_owned())
+        })?;
         sqlx::query("UPDATE servers SET desired_state = 'running', observed_state = 'stopping', updated_at = now() WHERE id = $1")
             .bind(server_id)
             .execute(&mut *tx)
@@ -273,7 +290,10 @@ impl Lifecycle {
             Some(placement.worker_id),
             OperationKind::Restart,
             server.generation,
-            json!({"reason":"manual_restart"}),
+            operation_payload(OperationPayload {
+                reason: Some("manual_restart".to_owned()),
+                ..OperationPayload::default()
+            })?,
         )
         .await?;
         tx.commit().await?;
@@ -318,7 +338,7 @@ impl Lifecycle {
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
-            bail!("server is deleted");
+            bail!(not_found: "server is deleted");
         }
         let has_live_operation: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM operations
@@ -334,9 +354,9 @@ impl Lifecycle {
         let export_id = Uuid::new_v4();
         match server.observed_state {
             ObservedState::Online if server.desired_state == DesiredState::Running => {
-                let placement = lock_placement(&mut tx, server_id)
-                    .await?
-                    .context("online server has no placement")?;
+                let placement = lock_placement(&mut tx, server_id).await?.ok_or_else(|| {
+                    LifecycleFailure::Conflict("online server has no placement".to_owned())
+                })?;
                 if !placement.active || placement.generation != server.generation {
                     bail!("online server placement is not active for the current generation");
                 }
@@ -356,7 +376,10 @@ impl Lifecycle {
                     Some(placement.worker_id),
                     OperationKind::Snapshot,
                     server.generation,
-                    json!({"reason":"export", "stage":"requested"}),
+                    operation_payload(OperationPayload {
+                        reason: Some("export".to_owned()),
+                        ..OperationPayload::default()
+                    })?,
                 )
                 .await?;
                 sqlx::query(
@@ -368,9 +391,11 @@ impl Lifecycle {
                 .await?;
             }
             ObservedState::Sleeping if server.desired_state == DesiredState::Stopped => {
-                let generation = server
-                    .current_snapshot_generation
-                    .context("uninitialized worlds must be started before exporting")?;
+                let generation = server.current_snapshot_generation.ok_or_else(|| {
+                    LifecycleFailure::Conflict(
+                        "uninitialized worlds must be started before exporting".to_owned(),
+                    )
+                })?;
                 let complete: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM snapshots
                      WHERE server_id = $1 AND generation = $2 AND complete)",
@@ -405,6 +430,16 @@ impl Lifecycle {
         server_id: Uuid,
         target_generation: i64,
     ) -> Result<ObservedState> {
+        self.request_restore_for_actor(LifecycleActor::Owner, server_id, target_generation)
+            .await
+    }
+
+    pub async fn request_restore_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+        target_generation: i64,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(724513, 1)")
             .execute(&mut *tx)
@@ -416,19 +451,20 @@ impl Lifecycle {
             .execute(&mut *tx)
             .await?;
         let server = lock_server(&mut tx, server_id).await?;
+        authorize_actor(&mut tx, &server, actor, true).await?;
         if has_live_reset(&mut tx, server_id).await? {
             bail!("server reset is in progress");
         }
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
-            bail!("server is deleted");
+            bail!(not_found: "server is deleted");
         }
         if server.observed_state != ObservedState::Sleeping {
             bail!("snapshot restore requires a sleeping server");
         }
         if target_generation < 1 {
-            bail!("invalid snapshot generation");
+            bail!(invalid: "invalid snapshot generation");
         }
         let retained: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -442,16 +478,18 @@ impl Lifecycle {
         .fetch_one(&mut *tx)
         .await?;
         if !retained {
-            bail!("snapshot not found");
+            bail!(not_found: "snapshot not found");
         }
         if let Some(placement) = lock_placement(&mut tx, server_id).await?
             && placement.active
         {
             bail!("server still has an active fenced placement");
         }
-        let worker = select_worker(&mut tx, &server)
-            .await?
-            .context("no worker capacity available for snapshot restore")?;
+        let worker = select_worker(&mut tx).await?.ok_or_else(|| {
+            LifecycleFailure::Unavailable(
+                "no worker capacity available for snapshot restore".to_owned(),
+            )
+        })?;
         place_and_enqueue_worker_operation(
             &mut tx,
             &server,
@@ -459,7 +497,10 @@ impl Lifecycle {
             DesiredState::Stopped,
             ObservedState::Restoring,
             OperationKind::Restore,
-            json!({"target_generation": target_generation}),
+            operation_payload(OperationPayload {
+                target_generation: Some(target_generation),
+                ..OperationPayload::default()
+            })?,
         )
         .await?;
         tx.commit().await?;
@@ -467,8 +508,18 @@ impl Lifecycle {
     }
 
     pub async fn request_delete(&self, server_id: Uuid) -> Result<ObservedState> {
+        self.request_delete_for_actor(LifecycleActor::Owner, server_id)
+            .await
+    }
+
+    pub async fn request_delete_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        authorize_actor(&mut tx, &server, actor, true).await?;
         if has_live_reset(&mut tx, server_id).await? {
             bail!("server reset is in progress");
         }
@@ -541,7 +592,10 @@ impl Lifecycle {
                 Some(placement.worker_id),
                 OperationKind::Stop,
                 server.generation,
-                json!({"reason":"delete"}),
+                operation_payload(OperationPayload {
+                    reason: Some("delete".to_owned()),
+                    ..OperationPayload::default()
+                })?,
             )
             .await?;
             sqlx::query(
@@ -574,7 +628,10 @@ impl Lifecycle {
 
         let mut started = 0;
         for server_id in server_ids {
-            match self.admit_start(server_id, "queued", true).await? {
+            match self
+                .admit_start(LifecycleActor::Owner, server_id, "queued", true)
+                .await?
+            {
                 Some(ObservedState::Restoring) => started += 1,
                 Some(ObservedState::Queued) => break,
                 _ => {}
@@ -586,18 +643,27 @@ impl Lifecycle {
     pub async fn request_reset(
         &self,
         server_id: Uuid,
-        mode: &str,
+        mode: ResetMode,
         full_reset_settings: serde_json::Value,
     ) -> Result<ObservedState> {
-        if !matches!(mode, "world" | "full") {
-            bail!("unsupported reset mode");
-        }
+        self.request_reset_for_actor(LifecycleActor::Owner, server_id, mode, full_reset_settings)
+            .await
+    }
+
+    pub async fn request_reset_for_actor(
+        &self,
+        actor: LifecycleActor,
+        server_id: Uuid,
+        mode: ResetMode,
+        full_reset_settings: serde_json::Value,
+    ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
+        authorize_actor(&mut tx, &server, actor, true).await?;
         if server.desired_state == DesiredState::Deleted
             || server.observed_state == ObservedState::Deleted
         {
-            bail!("server is deleted");
+            bail!(not_found: "server is deleted");
         }
         let live_operation: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM operations
@@ -615,9 +681,9 @@ impl Lifecycle {
             bail!("reset requires an online or sleeping server");
         }
         let worker_id = if was_running {
-            let placement = lock_placement(&mut tx, server_id)
-                .await?
-                .context("online server has no worker placement")?;
+            let placement = lock_placement(&mut tx, server_id).await?.ok_or_else(|| {
+                LifecycleFailure::Conflict("online server has no worker placement".to_owned())
+            })?;
             if !placement.active || placement.generation != server.generation {
                 bail!("online server placement is not active for the current generation");
             }
@@ -642,10 +708,14 @@ impl Lifecycle {
             )
             .fetch_optional(&mut *tx)
             .await?;
-            Some(healthy_worker.context("no worker is available to reset this server")?)
+            Some(healthy_worker.ok_or_else(|| {
+                LifecycleFailure::Unavailable(
+                    "no worker is available to reset this server".to_owned(),
+                )
+            })?)
         };
 
-        if mode == "full" {
+        if mode == ResetMode::Full {
             sqlx::query("UPDATE servers SET settings = $2 WHERE id = $1")
                 .bind(server_id)
                 .bind(full_reset_settings)
@@ -698,42 +768,16 @@ impl Lifecycle {
             worker_id,
             OperationKind::Reset,
             server.generation + 1,
-            json!({"mode": mode, "was_running": was_running, "stage": "requested"}),
+            operation_payload(OperationPayload {
+                mode: Some(mode),
+                was_running: Some(was_running),
+                ..OperationPayload::default()
+            })?,
         )
         .await?;
         tx.commit().await?;
         Ok(ObservedState::Resetting)
     }
-}
-
-async fn authorize_actor(
-    tx: &mut Transaction<'_, Postgres>,
-    server: &ServerRecord,
-    actor: LifecycleActor,
-    require_active: bool,
-) -> Result<()> {
-    let LifecycleActor::AssignedWorker {
-        worker_id,
-        expected_generation,
-    } = actor
-    else {
-        return Ok(());
-    };
-    let placement: Option<(Uuid, i64, bool)> =
-        sqlx::query_as("SELECT worker_id, generation, active FROM placements WHERE server_id = $1")
-            .bind(server.id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let (placement_worker_id, placement_generation, placement_active) =
-        placement.context("server has no worker placement for lifecycle command")?;
-    if server.generation != expected_generation
-        || placement_generation != expected_generation
-        || placement_worker_id != worker_id
-        || (require_active && !placement_active)
-    {
-        bail!("lifecycle command no longer matches the assigned worker generation");
-    }
-    Ok(())
 }
 
 async fn has_live_reset(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {
@@ -816,9 +860,9 @@ async fn request_stop_in_transaction(
             .bind(server_id)
             .fetch_optional(&mut **tx)
             .await?;
-            let placement = lock_placement(tx, server_id)
-                .await?
-                .context("server has no placement to stop")?;
+            let placement = lock_placement(tx, server_id).await?.ok_or_else(|| {
+                LifecycleFailure::Conflict("server has no placement to stop".to_owned())
+            })?;
 
             if let Some((id, OperationStatus::Pending)) = live_start {
                 sqlx::query(
@@ -844,7 +888,10 @@ async fn request_stop_in_transaction(
                     Some(placement.worker_id),
                     OperationKind::Stop,
                     server.generation,
-                    json!({"reason": reason}),
+                    operation_payload(OperationPayload {
+                        reason: Some(reason.to_owned()),
+                        ..OperationPayload::default()
+                    })?,
                 )
                 .await?;
                 sqlx::query(
@@ -878,17 +925,24 @@ async fn request_snapshot_in_transaction(
     }
     let placement = lock_placement(tx, server_id)
         .await?
-        .context("online server has no placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("online server has no placement".to_owned()))?;
     if !placement.active || placement.generation != server.generation {
         bail!("online server placement is not active for the current generation");
     }
+    let reason = serde_json::to_value(reason)?
+        .as_str()
+        .context("snapshot reason must serialize as a string")?
+        .to_owned();
     enqueue_operation(
         tx,
         server_id,
         Some(placement.worker_id),
         OperationKind::Snapshot,
         server.generation,
-        json!({"reason":reason}),
+        operation_payload(OperationPayload {
+            reason: Some(reason),
+            ..OperationPayload::default()
+        })?,
     )
     .await?;
     sqlx::query(
@@ -898,6 +952,11 @@ async fn request_snapshot_in_transaction(
     .execute(&mut **tx)
     .await?;
     Ok(ObservedState::Snapshotting)
+}
+
+pub(super) fn operation_payload(mut payload: OperationPayload) -> Result<Value> {
+    payload.stage = OperationStage::Requested;
+    serde_json::to_value(payload).context("lifecycle operation payload must be serializable")
 }
 
 async fn has_live_snapshot(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) -> Result<bool> {

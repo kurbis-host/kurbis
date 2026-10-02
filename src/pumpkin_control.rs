@@ -13,21 +13,21 @@ use uuid::Uuid;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayerEdition {
     Java,
     Bedrock,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerifiedMinecraftIdentity {
     Java { uuid: Uuid },
     Bedrock { xuid: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WaitingPlayer {
     pub connection_id: Uuid,
     pub id: Uuid,
@@ -39,7 +39,8 @@ pub struct WaitingPlayer {
     pub verified_identity: Option<VerifiedMinecraftIdentity>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WhitelistEntry {
     #[serde(rename = "uuid")]
     pub id: Uuid,

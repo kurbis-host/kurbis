@@ -36,11 +36,23 @@ if [[ $service == worker ]]; then
   }
   cd "$root"
   source "$worker_bundle"
+  for variable_name in WORKER_ID WORKER_NAME WORKER_ADDRESS WORKER_SIGNAL_ADDRESS \
+    WORKER_API_TOKEN PUMPKIN_HOST_CONTROL_TOKEN CONTROL_PLANE_URL PUBLIC_BASE_URL \
+    WORKER_RUNTIME WORKER_STORAGE_MODE WORKER_ROOT; do
+    if [[ -z ${!variable_name:-} ]]; then
+      echo "worker credential bundle is missing $variable_name" >&2
+      exit 2
+    fi
+  done
+  if [[ ! $WORKER_API_TOKEN =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+    echo "worker credential bundle contains a malformed WORKER_API_TOKEN" >&2
+    exit 2
+  fi
   worker_env=(env -i "PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}" "HOME=${HOME:-/}")
   for variable_name in \
     LANG LC_ALL TMPDIR SSL_CERT_FILE SSL_CERT_DIR RUST_LOG DOCKER_HOST DOCKER_CONFIG \
     DOCKER_TLS_VERIFY DOCKER_CERT_PATH WORKER_ID WORKER_NAME WORKER_ADDRESS \
-    WORKER_SIGNAL_ADDRESS WORKER_DATABASE_URL WORKER_API_TOKEN \
+    WORKER_SIGNAL_ADDRESS WORKER_API_TOKEN \
     WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP WORKER_ROOT WORKER_STORAGE_MODE \
     WORKER_RUNTIME WORKER_MEMORY_GIB WORKER_DISK_GIB WORKER_CPU_MILLIS \
     WORKER_PORT_MIN WORKER_PORT_MAX PUMPKIN_HOST_CONTROL_TOKEN CONTROL_PLANE_URL \

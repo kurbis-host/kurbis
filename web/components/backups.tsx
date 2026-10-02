@@ -3,10 +3,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Archive, Camera, Download, RotateCcw, X } from "lucide-react";
 import { useState } from "react";
-import { apiRequest, apiVoid, errorMessage, jsonBody } from "../lib/api/client";
-import { fetchServer, fetchSnapshots, fetchWorldExports } from "../lib/api/queries";
-import type { Server, Snapshot } from "../lib/contracts";
-import { worldExportSchema } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
+import { worldExportDownloadPath } from "../lib/api/paths";
 import { formatBytes, formatDateTime } from "../lib/format";
 import { lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
@@ -18,6 +18,9 @@ import {
   PageHeader,
   Surface,
 } from "./ui";
+
+type Server = components["schemas"]["Server"];
+type Snapshot = components["schemas"]["Snapshot"];
 
 function snapshotReason(reason: Snapshot["reason"]) {
   if (reason === "manual") return "Manual backup";
@@ -38,17 +41,17 @@ export function Backups({
   const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
     queryKey: queryKeys.server(serverId),
-    queryFn: () => fetchServer(serverId),
+    queryFn: () => browserApi.getServer(serverId),
     initialData: initialServer,
   });
   const { data: snapshots = initialSnapshots } = useQuery({
     queryKey: queryKeys.snapshots(serverId),
-    queryFn: () => fetchSnapshots(serverId),
+    queryFn: () => browserApi.getSnapshots(serverId),
     initialData: initialSnapshots,
   });
   const { data: exports = [] } = useQuery({
     queryKey: queryKeys.exports(serverId),
-    queryFn: () => fetchWorldExports(serverId),
+    queryFn: () => browserApi.getWorldExports(serverId),
     refetchInterval: (query) =>
       query.state.data?.some((item) => item.status === "pending" || item.status === "running")
         ? 2000
@@ -60,11 +63,7 @@ export function Backups({
 
   const allowed = lifecycleActions(server);
   const manual = useMutation({
-    mutationFn: () =>
-      apiVoid(`/api/v1/servers/${serverId}/actions`, {
-        method: "POST",
-        body: jsonBody({ action: "snapshot" }),
-      }),
+    mutationFn: () => browserApi.command(serverId, { command: "snapshot", reason: "manual" }),
     onMutate: () => setRequestError(null),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) });
@@ -73,12 +72,7 @@ export function Backups({
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const createExport = useMutation({
-    mutationFn: () =>
-      apiRequest(
-        `/api/v1/servers/${serverId}/exports`,
-        worldExportSchema,
-        { method: "POST" },
-      ),
+    mutationFn: () => browserApi.createWorldExport(serverId),
     onMutate: () => setRequestError(null),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.exports(serverId) });
@@ -87,12 +81,7 @@ export function Backups({
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const cancelExport = useMutation({
-    mutationFn: (exportId: string) =>
-      apiRequest(
-        `/api/v1/servers/${serverId}/exports/${exportId}`,
-        worldExportSchema,
-        { method: "DELETE" },
-      ),
+    mutationFn: (exportId: string) => browserApi.cancelWorldExport(serverId, exportId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.exports(serverId) }),
     onError: (error) => setRequestError(errorMessage(error)),
   });
@@ -100,9 +89,7 @@ export function Backups({
   async function restore(snapshot: Snapshot) {
     setRequestError(null);
     try {
-      await apiVoid(`/api/v1/servers/${serverId}/snapshots/${snapshot.generation}/restore`, {
-        method: "POST",
-      });
+      await browserApi.command(serverId, { command: "restore", generation: snapshot.generation });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.snapshots(serverId) }),
@@ -232,7 +219,7 @@ export function Backups({
                     {item.status === "completed" ? (
                       <a
                         className="inline-flex min-h-9 items-center gap-1.5 rounded bg-forest px-3 text-xs font-bold text-white no-underline"
-                        href={`/api/v1/servers/${serverId}/exports/${item.id}/download`}
+                        href={worldExportDownloadPath(serverId, item.id)}
                         download
                       >
                         <Download size={14} /> Download
@@ -254,7 +241,7 @@ export function Backups({
                   {item.status === "failed" && item.last_error ? (
                     <p className="mt-2 mb-0 text-[11px] text-red-800">{item.last_error}</p>
                   ) : null}
-                  {item.archive_size !== null ? (
+                  {item.archive_size != null ? (
                     <span className="mt-2 block text-[11px] text-ink-soft">
                       {formatBytes(item.archive_size)}{item.expires_at ? ` · expires ${formatDateTime(item.expires_at)}` : ""}
                     </span>

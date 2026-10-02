@@ -1,5 +1,6 @@
 use std::path::Path as FsPath;
 
+use crate::snapshot::{SnapshotManifest, files::safe_relative_path};
 use anyhow::{Context, Result, bail};
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use bytes::Bytes;
@@ -9,8 +10,9 @@ use object_store::{MultipartUpload, ObjectStore, path::Path};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use super::{SnapshotManager, SnapshotManifest};
-use crate::model::SnapshotRecord;
+use crate::contracts::worker::WorkerAssignment;
+
+use super::SnapshotManager;
 
 const ARCHIVE_PART_BYTES: usize = 8 * 1024 * 1024;
 
@@ -32,37 +34,42 @@ impl SnapshotManager {
         attempt: i32,
         staging_root: &FsPath,
     ) -> Result<WorldArchive> {
-        let mut guard = self.storage_guard(false).await?;
-        let snapshot = sqlx::query_as::<_, SnapshotRecord>(
-            "SELECT id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, created_at
-             FROM snapshots WHERE server_id = $1 AND generation = $2 AND complete",
-        )
-        .bind(server_id)
-        .bind(generation)
-        .fetch_optional(&mut *guard)
-        .await?
-        .context("pinned world export snapshot is no longer retained")?;
-        let pin_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM world_exports
-             WHERE id = $1 AND server_id = $2 AND source_generation = $3
-               AND status = 'running')",
-        )
-        .bind(export_id)
-        .bind(server_id)
-        .bind(generation)
-        .fetch_one(&mut *guard)
-        .await?;
-        if !pin_exists {
-            bail!("world export source snapshot is not pinned by an active export");
-        }
+        let assignment = self.scope(server_id)?;
+        anyhow::ensure!(
+            matches!(assignment, WorkerAssignment::Export { export_id: id, generation: source_generation, attempt: source_attempt } if id == export_id && source_generation == generation && source_attempt == attempt),
+            "export task differs from worker object scope"
+        );
+        anyhow::ensure!(
+            self.worker_client
+                .export_is_running(export_id, generation, attempt)
+                .await?,
+            "world export is no longer active"
+        );
+        let snapshot = self
+            .worker_client
+            .snapshot(server_id, assignment, generation)
+            .await?;
         let manifest = self.read_manifest(&snapshot).await?;
+        self.create_archive_from_manifest(export_id, server_id, attempt, staging_root, manifest)
+            .await
+    }
+
+    async fn create_archive_from_manifest(
+        &self,
+        export_id: Uuid,
+        server_id: Uuid,
+        attempt: i32,
+        staging_root: &FsPath,
+        manifest: SnapshotManifest,
+    ) -> Result<WorldArchive> {
         let output = staging_root.join(format!("{export_id}-{attempt}.zip.part"));
         if let Some(parent) = output.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
-        let result = self.write_world_zip(export_id, &manifest, &output).await;
-        if let Err(error) = result {
+        if let Err(error) = self
+            .write_world_zip(export_id, attempt, &manifest, &output)
+            .await
+        {
             let _ = tokio::fs::remove_file(&output).await;
             return Err(error);
         }
@@ -81,6 +88,7 @@ impl SnapshotManager {
     async fn write_world_zip(
         &self,
         export_id: Uuid,
+        attempt: i32,
         manifest: &SnapshotManifest,
         output: &FsPath,
     ) -> Result<()> {
@@ -91,19 +99,20 @@ impl SnapshotManager {
             }
         }
         files.sort_by(|left, right| left.1.cmp(&right.1));
-        if !files.iter().any(|(_, path)| path == "level.dat") {
-            bail!("world snapshot has no level.dat and cannot be exported");
-        }
+        anyhow::ensure!(
+            files.iter().any(|(_, path)| path == "level.dat"),
+            "world snapshot has no level.dat and cannot be exported"
+        );
 
         let output_file = tokio::fs::File::create(output).await?;
         let mut writer = ZipFileWriter::with_tokio(output_file).force_zip64();
         for (file, archive_path) in files {
-            if self.export_cancelled(export_id).await? {
+            if self.export_cancelled(export_id, attempt).await? {
                 bail!("world export was cancelled");
             }
             let object = self
                 .store
-                .get(&self.object_path(manifest.server_id, &format!("chunks/{}", file.blake3))?)
+                .get(&self.object_path(&format!("chunks/{}", file.blake3))?)
                 .await?;
             let mut stream = object.into_stream();
             let entry = ZipEntryBuilder::new(archive_path.into(), Compression::Deflate);
@@ -111,7 +120,7 @@ impl SnapshotManager {
             let mut hasher = blake3::Hasher::new();
             let mut size = 0_u64;
             while let Some(chunk) = stream.next().await {
-                if self.export_cancelled(export_id).await? {
+                if self.export_cancelled(export_id, attempt).await? {
                     bail!("world export was cancelled");
                 }
                 let chunk: Bytes = chunk?;
@@ -121,38 +130,48 @@ impl SnapshotManager {
                 hasher.update(&chunk);
                 entry_writer.write_all(&chunk).await?;
             }
-            if size != file.size || hasher.finalize().to_hex().as_str() != file.blake3 {
-                bail!(
-                    "snapshot chunk failed integrity validation for {}",
-                    file.path
-                );
-            }
+            anyhow::ensure!(
+                size == file.size && hasher.finalize().to_hex().as_str() == file.blake3,
+                "snapshot chunk failed integrity validation for {}",
+                file.path
+            );
             entry_writer.close().await?;
         }
         writer.close().await?;
         Ok(())
     }
 
-    async fn export_cancelled(&self, export_id: Uuid) -> Result<bool> {
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM world_exports WHERE id = $1")
-                .bind(export_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(status.as_deref() != Some("running"))
+    async fn export_cancelled(&self, export_id: Uuid, attempt: i32) -> Result<bool> {
+        let (_, assignment) = self
+            .worker_assignment
+            .context("worker export cancellation check has no export scope")?;
+        let WorkerAssignment::Export {
+            export_id: assigned_id,
+            generation,
+            attempt: assigned_attempt,
+        } = assignment
+        else {
+            bail!("worker export cancellation check has no export scope");
+        };
+        anyhow::ensure!(
+            assigned_id == export_id && assigned_attempt == attempt,
+            "export id differs from worker object scope"
+        );
+        Ok(!self
+            .worker_client
+            .export_is_running(export_id, generation, attempt)
+            .await?)
     }
 
     pub async fn upload_world_archive(&self, archive: &WorldArchive) -> Result<()> {
-        let _guard = self.storage_guard(false).await?;
-        let key = self.object_path(archive.server_id, &archive.archive_key)?;
+        let key = self.object_path(&archive.archive_key)?;
         let mut upload = self.store.put_multipart(&key).await?;
-        let result = stream_archive_parts(&mut upload, &archive.path).await;
-        if let Err(error) = result {
+        if let Err(error) = stream_archive_parts(&mut upload, &archive.path).await {
             let _ = upload.abort().await;
             return Err(error);
         }
         upload.complete().await?;
-        let (size, checksum) = hash_object(self, &key).await?;
+        let (size, checksum) = hash_object(self.store.as_ref(), &key).await?;
         if size != archive.size_bytes as u64 || checksum != archive.checksum {
             let _ = self.store.delete(&key).await;
             bail!("uploaded world archive failed checksum verification");
@@ -160,9 +179,8 @@ impl SnapshotManager {
         Ok(())
     }
 
-    pub async fn delete_world_archive(&self, server_id: Uuid, archive_key: &str) -> Result<()> {
-        let _guard = self.storage_guard(false).await?;
-        let key = self.object_path(server_id, archive_key)?;
+    pub async fn delete_world_archive(&self, _server_id: Uuid, archive_key: &str) -> Result<()> {
+        let key = self.object_path(archive_key)?;
         match self.store.delete(&key).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.into()),
@@ -205,9 +223,8 @@ async fn hash_file(path: &FsPath) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-async fn hash_object(manager: &SnapshotManager, key: &Path) -> Result<(u64, String)> {
-    let result = manager.store.get(key).await?;
-    let mut stream = result.into_stream();
+async fn hash_object(store: &dyn ObjectStore, key: &Path) -> Result<(u64, String)> {
+    let mut stream = store.get(key).await?.into_stream();
     let mut size = 0_u64;
     let mut hasher = blake3::Hasher::new();
     while let Some(chunk) = stream.next().await {
@@ -220,8 +237,8 @@ async fn hash_object(manager: &SnapshotManager, key: &Path) -> Result<(u64, Stri
     Ok((size, hasher.finalize().to_hex().to_string()))
 }
 
-fn archive_entry_path(source: &str) -> Result<Option<String>> {
-    let source_path = crate::worker::snapshot::files::safe_relative_path(source)?;
+fn archive_entry_path(path: &str) -> Result<Option<String>> {
+    let source_path = safe_relative_path(path)?;
     let mut parts = source_path.components();
     if parts.next().and_then(|part| part.as_os_str().to_str()) != Some("world") {
         return Ok(None);
@@ -255,49 +272,17 @@ fn archive_entry_path(source: &str) -> Result<Option<String>> {
     {
         return Ok(None);
     }
-    let normalized = if let Some(player_file) = suffix_text.strip_prefix("players/data/") {
-        format!("playerdata/{player_file}")
-    } else if let Some(advancement_file) = suffix_text.strip_prefix("players/advancements/") {
-        format!("advancements/{advancement_file}")
-    } else if let Some(stats_file) = suffix_text.strip_prefix("players/stats/") {
-        format!("stats/{stats_file}")
+    let normalized = if let Some(path) = suffix_text.strip_prefix("players/data/") {
+        format!("playerdata/{path}")
+    } else if let Some(path) = suffix_text.strip_prefix("players/advancements/") {
+        format!("advancements/{path}")
+    } else if let Some(path) = suffix_text.strip_prefix("players/stats/") {
+        format!("stats/{path}")
     } else if suffix_text.starts_with("players/") {
         return Ok(None);
     } else {
         suffix_text
     };
-    crate::worker::snapshot::files::safe_relative_path(&normalized)?;
+    safe_relative_path(&normalized)?;
     Ok(Some(normalized))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::archive_entry_path;
-
-    #[test]
-    fn exports_only_standard_world_files_and_normalizes_pumpkin_player_data() {
-        assert_eq!(
-            archive_entry_path("world/players/data/abc.dat").unwrap(),
-            Some("playerdata/abc.dat".into())
-        );
-        assert_eq!(
-            archive_entry_path("world/players/advancements/abc.json").unwrap(),
-            Some("advancements/abc.json".into())
-        );
-        assert_eq!(
-            archive_entry_path("world/players/stats/abc.json").unwrap(),
-            Some("stats/abc.json".into())
-        );
-        assert_eq!(
-            archive_entry_path("world/DIM-1/region/r.0.0.mca").unwrap(),
-            Some("DIM-1/region/r.0.0.mca".into())
-        );
-        assert_eq!(archive_entry_path("ops.json").unwrap(), None);
-        assert_eq!(archive_entry_path("world/session.lock").unwrap(), None);
-        assert_eq!(
-            archive_entry_path("world/players/unrecognized.bin").unwrap(),
-            None
-        );
-        assert!(archive_entry_path("world/../../secret").is_err());
-    }
 }

@@ -18,4 +18,4 @@ until docker info > /dev/null 2>&1; do
     sleep 1
 done
 docker load
-python3 /verification/verify_worker_runtime.py --bin-dir /usr/local/bin --pumpkin-image melon-pumpkin:offline-verification --output /results
+python3 /verification/verify_worker_runtime.py --bin-dir /usr/local/bin --pumpkin-image "${PUMPKIN_IMAGE:?PUMPKIN_IMAGE must name the offline Pumpkin image for this verification run}" --output /results

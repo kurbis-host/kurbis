@@ -10,6 +10,7 @@ use crate::{
     gateway::{routes::RouteCache, wake::request_wake},
     model::{ObservedState, RouteTarget},
     pumpkin_control::{PlayerEdition, PumpkinControl, VerifiedMinecraftIdentity, WaitingPlayer},
+    routing::{AdmissionRequest, AdmissionResponse},
 };
 
 struct WaitingState {
@@ -261,7 +262,7 @@ async fn handle_player(
         .last_wake
         .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
     {
-        request_wake(config, admitted_hostname).await?;
+        request_wake(config, target.server_id).await?;
         state.last_wake = Some(Instant::now());
     }
 
@@ -292,21 +293,6 @@ struct MinecraftLinkRequest<'a> {
     display_name: &'a str,
 }
 
-#[derive(Serialize)]
-struct AdmissionRequest<'a> {
-    hostname: &'a str,
-    identity: Option<&'a VerifiedMinecraftIdentity>,
-    minecraft_player_id: Option<Uuid>,
-}
-
-#[derive(Deserialize)]
-struct AdmissionResponse {
-    target: RouteTarget,
-    private_message: Option<String>,
-    #[allow(dead_code)]
-    created: bool,
-}
-
 async fn request_admission(
     config: &GatewayConfig,
     http: &reqwest::Client,
@@ -318,8 +304,8 @@ async fn request_admission(
     ))
     .bearer_auth(&config.internal_token)
     .json(&AdmissionRequest {
-        hostname: &player.server_address,
-        identity: player.verified_identity.as_ref(),
+        hostname: player.server_address.clone(),
+        identity: player.verified_identity.clone(),
         minecraft_player_id: player.verified_identity.as_ref().map(|_| player.id),
     })
     .send()

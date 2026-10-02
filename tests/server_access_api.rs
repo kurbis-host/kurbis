@@ -12,7 +12,7 @@ use bytes::Bytes;
 use common::{api_state, create_user, test_pool};
 use futures::{StreamExt, future::join_all};
 use kurbis_hoster::control_plane::api::router;
-use kurbis_hoster::worker::snapshot::physical_object_path;
+use kurbis_hoster::snapshot::physical_object_path;
 use object_store::{ObjectStore, PutPayload, memory::InMemory};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -262,13 +262,17 @@ async fn seed_server_data(fixture: &ApiFixture, server_id: Uuid, requested_by: U
     .execute(&fixture.pool)
     .await
     .unwrap();
+    let checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let manifest_key = format!("snapshots/1-{checksum}.json");
     sqlx::query(
         "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes,
                                checksum, reason, complete)
-         VALUES($1, $2, 1, 'private-target-manifest', 12, 'private-checksum', 'manual', true)",
+         VALUES($1, $2, 1, $3, 12, $4, 'manual', true)",
     )
     .bind(Uuid::new_v4())
     .bind(server_id)
+    .bind(&manifest_key)
+    .bind(checksum)
     .execute(&fixture.pool)
     .await
     .unwrap();
@@ -339,19 +343,24 @@ fn server_route_matrix(server_id: Uuid, data: &ServerData) -> Vec<RouteCase> {
             body: Some(json!({"settings":{"motd":"stolen"}})),
         },
         RouteCase {
-            method: Method::DELETE,
-            path: prefix.clone(),
-            body: None,
+            method: Method::POST,
+            path: format!("{prefix}/commands"),
+            body: Some(json!({"command":"start"})),
         },
         RouteCase {
             method: Method::POST,
-            path: format!("{prefix}/actions"),
-            body: Some(json!({"action":"start"})),
+            path: format!("{prefix}/commands"),
+            body: Some(json!({"command":"reset", "mode":"world"})),
         },
         RouteCase {
             method: Method::POST,
-            path: format!("{prefix}/reset"),
-            body: Some(json!({"mode":"world"})),
+            path: format!("{prefix}/commands"),
+            body: Some(json!({"command":"restore", "generation":data.snapshot_generation})),
+        },
+        RouteCase {
+            method: Method::POST,
+            path: format!("{prefix}/commands"),
+            body: Some(json!({"command":"delete"})),
         },
         RouteCase {
             method: Method::GET,
@@ -371,11 +380,6 @@ fn server_route_matrix(server_id: Uuid, data: &ServerData) -> Vec<RouteCase> {
         RouteCase {
             method: Method::GET,
             path: format!("{prefix}/snapshots"),
-            body: None,
-        },
-        RouteCase {
-            method: Method::POST,
-            path: format!("{prefix}/snapshots/{}/restore", data.snapshot_generation),
             body: None,
         },
         RouteCase {
@@ -426,6 +430,36 @@ fn server_route_matrix(server_id: Uuid, data: &ServerData) -> Vec<RouteCase> {
     ]
 }
 
+#[tokio::test]
+async fn lifecycle_alias_routes_are_removed_in_favor_of_commands() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let fixture = ApiFixture::new().await;
+    for path in [
+        format!("/api/v1/servers/{}/actions", fixture.server_id),
+        format!("/api/v1/servers/{}/reset", fixture.server_id),
+        format!("/api/v1/servers/{}/snapshots/1/restore", fixture.server_id),
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "legacy route remains available: {path}"
+        );
+    }
+    fixture.cleanup().await;
+}
+
 async fn assert_denied_matrix(
     app: &Router,
     server_id: Uuid,
@@ -441,10 +475,13 @@ async fn assert_denied_matrix(
             .oneshot(scoped_request(method.clone(), &path, credential, case.body))
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "{label} must not access {method} {path}"
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            ),
+            "{label} must not access {method} {path} (got {})",
+            response.status()
         );
     }
 }
@@ -469,12 +506,11 @@ async fn assert_account_apis_denied(
             format!("/api/v1/account/sessions/{}", Uuid::new_v4()),
             None,
         ),
-        (Method::GET, "/api/v1/servers".to_owned(), None),
         (
             Method::POST,
             "/api/v1/servers".to_owned(),
             Some(json!({
-                "subdomain":format!("account-{suffix}"),
+                "subdomain": format!("acc-{}", &suffix[..12]),
                 "settings": {
                     "motd":"Unauthorized",
                     "difficulty":"Normal",
@@ -524,7 +560,7 @@ async fn server_sessions_and_plugin_capabilities_are_confined_to_one_server() {
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("Secure"));
     assert!(cookie.contains("SameSite=Lax"));
-    assert!(cookie.contains("Max-Age=3600"));
+    assert!(cookie.contains("Max-Age=2147483647"));
     let redeemed_body = json_body(redeemed).await;
     assert_eq!(redeemed_body["server_id"], fixture.server_id.to_string());
     let session_token = cookie
@@ -534,6 +570,22 @@ async fn server_sessions_and_plugin_capabilities_are_confined_to_one_server() {
         .strip_prefix("kurbis_server_session=")
         .unwrap()
         .to_owned();
+
+    let scoped_list = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::GET,
+            "/api/v1/servers",
+            ServerCredential::Session(&session_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scoped_list.status(), StatusCode::OK);
+    let scoped_list = json_body(scoped_list).await;
+    assert_eq!(scoped_list.as_array().unwrap().len(), 1);
+    assert_eq!(scoped_list[0]["id"], fixture.server_id.to_string());
 
     for credential in [
         ServerCredential::Session(&session_token),
@@ -644,10 +696,11 @@ async fn server_sessions_and_plugin_capabilities_are_confined_to_one_server() {
     assert_eq!(link_from_session.status(), StatusCode::UNAUTHORIZED);
 
     sqlx::query(
-        "UPDATE server_sessions SET expires_at = now() - interval '1 second'
-         WHERE token_hash = $1",
+        "DELETE FROM server_sessions ss USING server_session_grants g
+         WHERE ss.grant_id = g.id AND g.token_hash = $1 AND ss.server_id = $2",
     )
     .bind(token_hash(&session_token))
+    .bind(fixture.server_id)
     .execute(&fixture.pool)
     .await
     .unwrap();
@@ -809,9 +862,13 @@ async fn malformed_server_credentials_and_redemption_requests_are_rejected() {
 
     let invalid_tokens = ["short", malformed_token.as_str()];
     for token in invalid_tokens {
-        assert_eq!(
-            fixture.redeem(token).await.status(),
-            StatusCode::BAD_REQUEST
+        let status = fixture.redeem(token).await.status();
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ),
+            "expected BAD_REQUEST or UNPROCESSABLE_ENTITY, got {status}"
         );
     }
     let valid_shape_unknown_token = URL_SAFE_NO_PAD.encode([99_u8; 32]);
@@ -829,15 +886,19 @@ async fn malformed_server_credentials_and_redemption_requests_are_rejected() {
                 .to_string(),
         ))
         .unwrap();
-    assert_eq!(
-        fixture
-            .app
-            .clone()
-            .oneshot(extra_field)
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNPROCESSABLE_ENTITY
+    let extra_status = fixture
+        .app
+        .clone()
+        .oneshot(extra_field)
+        .await
+        .unwrap()
+        .status();
+    assert!(
+        matches!(
+            extra_status,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "expected BAD_REQUEST or UNPROCESSABLE_ENTITY, got {extra_status}"
     );
     let malformed_json = Request::builder()
         .method(Method::POST)

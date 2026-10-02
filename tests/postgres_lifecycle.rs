@@ -2,13 +2,13 @@ mod common;
 
 use common::{create_user, test_pool};
 use kurbis_hoster::{
-    control_plane::api::resolve_subdomain,
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_reset, complete_start, complete_stop,
         healthy_worker_template, heartbeat_worker, mark_runtime_lost, recover_running_operations,
         retry_operation, update_operation_payload,
     },
     model::{ObservedState, OperationKind},
+    routing::resolve_subdomain,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex;

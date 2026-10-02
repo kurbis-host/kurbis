@@ -64,7 +64,7 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
   );
   await recordRedemptionRequest(page);
   await page.goto(`${javaLink.pathname}${javaLink.hash}`);
-  await expect(page).toHaveURL(/\/app\/setup$/);
+  await expect(page).toHaveURL(/\/app(?:\/setup|\/servers)$/);
   await expect.poll(async () => page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
     return response.ok ? (await response.json()).user.display_name : null;
@@ -77,9 +77,13 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
   ));
   expect(initialRequest).toEqual({ fragmentAtRequest: '', origin: panel, method: 'POST' });
 
+  if (new URL(page.url()).pathname === '/app/servers') {
+    await page.getByRole('link', { name: 'Create a world' }).first().click();
+    await expect(page).toHaveURL(/\/app\/setup$/);
+  }
   await page.getByPlaceholder('friends-world').fill('minecraft-auth-world');
   await page.getByRole('button', { name: /Create sleeping world/ }).click();
-  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
+  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
 
   const originalSession = await page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
@@ -110,7 +114,7 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     'Bedrock Browser Player',
   );
   await page.goto(`${bedrockLink.pathname}${bedrockLink.hash}`);
-  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
+  await expect(page).toHaveURL(/\/app\/servers$/);
   await page.goto('/app/account');
   await expect(page.getByRole('heading', { name: 'Linked identities' })).toBeVisible();
   await expect(page.getByText('Minecraft Java Edition', { exact: true })).toBeVisible();

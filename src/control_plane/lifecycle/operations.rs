@@ -1,11 +1,13 @@
-use anyhow::{Context, Result, bail};
-use serde_json::json;
+use anyhow::{Context, Result};
+use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    enqueue_delete, enqueue_operation, lock_placement, lock_server, release_placement_resources,
+    LifecycleFailure, bail, enqueue_delete, enqueue_operation, lock_placement, lock_server,
+    operation_payload, release_placement_resources,
 };
+use crate::contracts::worker::{OperationPayload, OperationProgress, OperationStage};
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationRecord, OperationStatus};
 
 pub async fn claim_operation(pool: &PgPool, worker_id: Uuid) -> Result<Option<OperationRecord>> {
@@ -14,7 +16,7 @@ pub async fn claim_operation(pool: &PgPool, worker_id: Uuid) -> Result<Option<Op
         .bind(worker_id)
         .fetch_optional(&mut *tx)
         .await?
-        .context("worker is not registered")?;
+        .ok_or_else(|| LifecycleFailure::NotFound("worker is not registered".to_owned()))?;
     let op = sqlx::query_as::<_, OperationRecord>(
         "SELECT o.id, o.server_id, o.worker_id, o.kind, o.status, o.generation, o.attempt,
                 o.payload, o.last_error, o.created_at, o.updated_at
@@ -71,7 +73,11 @@ pub async fn deactivate_placement_after_stop(
     lock_claim(&mut tx, op, None).await?;
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("placement deactivation lost its server placement")?;
+        .ok_or_else(|| {
+            LifecycleFailure::Conflict(
+                "placement deactivation lost its server placement".to_owned(),
+            )
+        })?;
     validate_placement(op, &placement)?;
     if placement.active {
         sqlx::query(
@@ -105,13 +111,11 @@ pub async fn recover_running_operations(pool: &PgPool, worker_id: Uuid) -> Resul
 pub async fn retry_operation(pool: &PgPool, op: &OperationRecord, error: &str) -> Result<bool> {
     const MAX_ATTEMPTS: i32 = 5;
     let resumable_snapshot: bool = if op.kind == OperationKind::Snapshot {
-        sqlx::query_scalar(
-            "SELECT COALESCE(payload->>'stage' = 'deferred', false)
-             FROM operations WHERE id = $1",
-        )
-        .bind(op.id)
-        .fetch_one(pool)
-        .await?
+        let payload: Value = sqlx::query_scalar("SELECT payload FROM operations WHERE id = $1")
+            .bind(op.id)
+            .fetch_one(pool)
+            .await?;
+        decode_operation_payload(payload, op.kind)?.stage == OperationStage::Deferred
     } else {
         false
     };
@@ -158,7 +162,7 @@ pub async fn begin_snapshot_retry(pool: &PgPool, op: &OperationRecord) -> Result
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("snapshot retry lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("snapshot retry lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
     if server.observed_state == ObservedState::Snapshotting && !placement.active {
         tx.commit().await?;
@@ -186,13 +190,19 @@ pub async fn begin_snapshot_retry(pool: &PgPool, op: &OperationRecord) -> Result
     .bind(op.generation)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE operations SET payload = payload || '{\"stage\":\"requested\"}'::jsonb,
-         updated_at = now() WHERE id = $1",
-    )
-    .bind(op.id)
-    .execute(&mut *tx)
-    .await?;
+    let stored_payload: Value = sqlx::query_scalar("SELECT payload FROM operations WHERE id = $1")
+        .bind(op.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut payload = decode_operation_payload(stored_payload, op.kind)?;
+    if !payload.reopen_deferred_snapshot() || !payload.valid_for(op.kind) {
+        bail!("snapshot operation is not in a reopenable deferred stage");
+    }
+    sqlx::query("UPDATE operations SET payload = $2, updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .bind(serde_json::to_value(payload)?)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -217,7 +227,7 @@ pub async fn defer_snapshot_operation(
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("snapshot deferral lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("snapshot deferral lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
     if server.observed_state == ObservedState::Online && placement.active {
         tx.commit().await?;
@@ -229,13 +239,19 @@ pub async fn defer_snapshot_operation(
     if placement.active {
         bail!("snapshot deferral requires the stopped placement fence");
     }
-    sqlx::query(
-        "UPDATE operations SET payload = payload || '{\"stage\":\"deferred\"}'::jsonb,
-         updated_at = now() WHERE id = $1",
-    )
-    .bind(op.id)
-    .execute(&mut *tx)
-    .await?;
+    let stored_payload: Value = sqlx::query_scalar("SELECT payload FROM operations WHERE id = $1")
+        .bind(op.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut payload = decode_operation_payload(stored_payload, op.kind)?;
+    if !payload.defer_snapshot_retry() || !payload.valid_for(op.kind) {
+        bail!("snapshot operation is not in a deferrable stage");
+    }
+    sqlx::query("UPDATE operations SET payload = $2, updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .bind(serde_json::to_value(payload)?)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE placements SET active = true, updated_at = now()
          WHERE server_id = $1 AND generation = $2",
@@ -322,7 +338,7 @@ pub async fn complete_start(pool: &PgPool, op: &OperationRecord, storage_bytes: 
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("started server lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("started server lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
     sqlx::query("UPDATE placements SET active = true, updated_at = now() WHERE server_id = $1 AND generation = $2")
         .bind(op.server_id)
@@ -360,7 +376,17 @@ pub async fn complete_start(pool: &PgPool, op: &OperationRecord, storage_bytes: 
             Some(placement.worker_id),
             OperationKind::Stop,
             op.generation,
-            json!({"reason": if server.desired_state == DesiredState::Deleted { "delete requested during start" } else { "stop requested during start" }}),
+            operation_payload(OperationPayload {
+                reason: Some(
+                    if server.desired_state == DesiredState::Deleted {
+                        "delete requested during start"
+                    } else {
+                        "stop requested during start"
+                    }
+                    .to_owned(),
+                ),
+                ..OperationPayload::default()
+            })?,
         )
         .await?;
         sqlx::query(
@@ -394,7 +420,7 @@ pub async fn complete_stop(
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("stopped server lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("stopped server lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
     // Only the snapshot publisher owns the recovery pointer. A worker report
     // cannot invent a generation, accept a partial upload, or rewind it.
@@ -442,19 +468,6 @@ pub async fn complete_stop(
     } else if server.desired_state == DesiredState::Deleted {
         enqueue_delete(&mut tx, op.server_id, op.generation).await?;
     }
-    if server.desired_state != DesiredState::Deleted {
-        sqlx::query(
-            "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
-             VALUES($1,$2,$3)
-             ON CONFLICT(worker_id, server_id) DO UPDATE
-               SET generation = EXCLUDED.generation, updated_at = now()",
-        )
-        .bind(placement.worker_id)
-        .bind(op.server_id)
-        .bind(snapshot_generation)
-        .execute(&mut *tx)
-        .await?;
-    }
     tx.commit().await?;
     Ok(())
 }
@@ -463,17 +476,28 @@ pub async fn complete_stop(
 pub async fn update_operation_payload(
     pool: &PgPool,
     op: &OperationRecord,
-    patch: serde_json::Value,
+    progress: OperationProgress,
 ) -> Result<()> {
+    if !progress.valid_for(op.kind) {
+        bail!("worker progress does not match the operation contract");
+    }
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
     if server.generation != op.generation {
         bail!("stale operation generation");
     }
     lock_claim(&mut tx, op, None).await?;
-    sqlx::query("UPDATE operations SET payload = payload || $2, updated_at = now() WHERE id = $1")
+    let stored_payload: Value = sqlx::query_scalar("SELECT payload FROM operations WHERE id = $1")
         .bind(op.id)
-        .bind(patch)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut payload = decode_operation_payload(stored_payload, op.kind)?;
+    if !payload.merge_progress(op.kind, progress) {
+        bail!("worker progress does not match the operation contract");
+    }
+    sqlx::query("UPDATE operations SET payload = $2, updated_at = now() WHERE id = $1")
+        .bind(op.id)
+        .bind(serde_json::to_value(payload)?)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -497,12 +521,10 @@ pub async fn complete_snapshot(pool: &PgPool, op: &OperationRecord, generation: 
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("snapshot lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("snapshot lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
-    let reason = op
-        .payload
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
+    let reason = decode_operation_payload(op.payload.clone(), op.kind)?
+        .reason
         .context("snapshot operation is missing its reason")?;
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM snapshots WHERE server_id = $1 AND generation = $2
@@ -511,7 +533,7 @@ pub async fn complete_snapshot(pool: &PgPool, op: &OperationRecord, generation: 
     )
     .bind(op.server_id)
     .bind(generation)
-    .bind(reason)
+    .bind(&reason)
     .bind(op.created_at)
     .fetch_one(&mut *tx)
     .await?;
@@ -562,6 +584,12 @@ pub async fn complete_restore(
     snapshot_generation: i64,
     storage_bytes: i64,
 ) -> Result<()> {
+    let requested_generation = decode_operation_payload(op.payload.clone(), op.kind)?
+        .target_generation
+        .context("restore operation is missing its requested generation")?;
+    if target_generation != requested_generation {
+        bail!("restore completion target does not match the assigned operation");
+    }
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
     if op.kind != OperationKind::Restore || server.generation != op.generation {
@@ -573,7 +601,7 @@ pub async fn complete_restore(
     }
     let placement = lock_placement(&mut tx, op.server_id)
         .await?
-        .context("restore lost placement")?;
+        .ok_or_else(|| LifecycleFailure::Conflict("restore lost placement".to_owned()))?;
     validate_placement(op, &placement)?;
     if placement.active {
         bail!("restore placement unexpectedly became active");
@@ -629,17 +657,6 @@ pub async fn complete_restore(
     .bind(next_state)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
-         VALUES($1,$2,$3)
-         ON CONFLICT(worker_id, server_id) DO UPDATE
-           SET generation = EXCLUDED.generation, updated_at = now()",
-    )
-    .bind(placement.worker_id)
-    .bind(op.server_id)
-    .bind(snapshot_generation)
-    .execute(&mut *tx)
-    .await?;
     match server.desired_state {
         DesiredState::Running => {
             sqlx::query(
@@ -667,6 +684,12 @@ pub async fn complete_reset(
     storage_bytes: i64,
     was_running: bool,
 ) -> Result<()> {
+    let expected_was_running = decode_operation_payload(op.payload.clone(), op.kind)?
+        .was_running
+        .context("reset operation is missing its original runtime state")?;
+    if was_running != expected_was_running {
+        bail!("reset completion runtime state does not match the assigned operation");
+    }
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
     if op.kind != OperationKind::Reset || server.generation != op.generation {
@@ -692,7 +715,9 @@ pub async fn complete_reset(
     }
     let placement = lock_placement(&mut tx, op.server_id).await?;
     if was_running {
-        let placement = placement.context("running reset lost its placement")?;
+        let placement = placement.ok_or_else(|| {
+            LifecycleFailure::Conflict("running reset lost its placement".to_owned())
+        })?;
         validate_placement(op, &placement)?;
         sqlx::query("UPDATE placements SET active = true, updated_at = now() WHERE server_id = $1")
             .bind(op.server_id)
@@ -717,23 +742,6 @@ pub async fn complete_reset(
         ObservedState::Sleeping
     })
     .bind(storage_bytes)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("DELETE FROM worker_snapshot_cache WHERE server_id = $1")
-        .bind(op.server_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO worker_snapshot_cache(worker_id, server_id, generation)
-         VALUES($1, $2, $3) ON CONFLICT(worker_id, server_id) DO UPDATE
-           SET generation = EXCLUDED.generation, updated_at = now()",
-    )
-    .bind(
-        op.worker_id
-            .context("reset operation has no worker claim")?,
-    )
-    .bind(op.server_id)
-    .bind(snapshot_generation)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -793,7 +801,7 @@ async fn lock_claim(
     .bind(claim.id)
     .fetch_optional(&mut **tx)
     .await?
-    .context("operation not found")?;
+    .ok_or_else(|| LifecycleFailure::NotFound("operation not found".to_owned()))?;
     if stored.server_id != claim.server_id
         || stored.worker_id != claim.worker_id
         || stored.generation != claim.generation
@@ -819,4 +827,13 @@ fn validate_placement(
         bail!("operation claim does not match placement");
     }
     Ok(())
+}
+
+fn decode_operation_payload(payload: Value, kind: OperationKind) -> Result<OperationPayload> {
+    let payload: OperationPayload = serde_json::from_value(payload)
+        .context("stored operation payload violates its contract")?;
+    if !payload.valid_for(kind) {
+        bail!("stored operation payload does not match its operation contract");
+    }
+    Ok(payload)
 }

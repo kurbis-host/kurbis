@@ -1,9 +1,12 @@
 pub mod config;
+pub mod contracts;
 pub mod control_plane;
 pub mod db;
 pub mod gateway;
 pub mod model;
 pub mod pumpkin_control;
+pub mod routing;
+pub mod snapshot;
 pub mod worker;
 
 pub fn init_tracing(default_filter: &str) {

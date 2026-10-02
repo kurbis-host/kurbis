@@ -6,9 +6,9 @@ import { RotateCcw, Save, Square, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
-import { apiRequest, apiVoid, errorMessage, jsonBody } from "../lib/api/client";
-import { fetchServer } from "../lib/api/queries";
-import { serverSchema, type Server } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
 import { lifecycle, lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
 import { settingsFormSchema, type SettingsFormValues } from "../lib/schemas";
@@ -22,6 +22,8 @@ import {
   Surface,
   SwitchField,
 } from "./ui";
+
+type Server = components["schemas"]["Server"];
 
 export function serverToSettingsValues(server: Server): SettingsFormValues {
   return {
@@ -42,7 +44,7 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
   const serverId = initialServer.id;
   const { data: server = initialServer } = useQuery({
     queryKey: queryKeys.server(serverId),
-    queryFn: () => fetchServer(serverId),
+    queryFn: () => browserApi.getServer(serverId),
     initialData: initialServer,
   });
   if (!server) throw new Error("Server disappeared while settings were open.");
@@ -74,20 +76,13 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
   }, [server, isDirty, resetForm]);
 
   const stop = useMutation({
-    mutationFn: () =>
-      apiVoid(`/api/v1/servers/${serverId}/actions`, {
-        method: "POST",
-        body: jsonBody({ action: "stop" }),
-      }),
+    mutationFn: () => browserApi.command(serverId, { command: "stop" }),
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const reset = useMutation({
-    mutationFn: (mode: "world" | "full") => apiVoid(`/api/v1/servers/${serverId}/reset`, {
-      method: "POST",
-      body: jsonBody({ mode }),
-    }),
+    mutationFn: (mode: "world" | "full") => browserApi.command(serverId, { command: "reset", mode }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
@@ -101,10 +96,7 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
     setRequestError(null);
     try {
       const { subdomain, ...settings } = values;
-      const updated = await apiRequest(`/api/v1/servers/${serverId}`, serverSchema, {
-        method: "PATCH",
-        body: jsonBody({ subdomain, settings }),
-      });
+      const updated = await browserApi.updateServer(serverId, { subdomain, settings });
       queryClient.setQueryData(queryKeys.server(serverId), updated);
       previousServerKey.current = JSON.stringify(
         serverToSettingsValues(updated),
@@ -118,9 +110,10 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
   const remove = async () => {
     setRequestError(null);
     try {
-      await apiVoid(`/api/v1/servers/${serverId}`, { method: "DELETE" });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.servers });
+      await browserApi.command(serverId, { command: "delete" });
       router.replace(afterDeleteHref);
+      queryClient.removeQueries({ queryKey: queryKeys.server(serverId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.servers });
     } catch (error) {
       setRequestError(errorMessage(error));
     }

@@ -47,7 +47,7 @@ async fn actual_host_process_survives_backend_drop_and_is_recovered_without_a_se
     drop(original);
     let recovered = runtime(root.path(), worker).await;
     assert_eq!(recovered.server_generation(server).await.unwrap(), Some(3));
-    recovered.abort_start(server).await.unwrap();
+    recovered.remove_runtime(server).await.unwrap();
     assert_eq!(recovered.server_generation(server).await.unwrap(), None);
     assert!(!recovered.record_path(server).exists());
     fs::remove_dir(recovered.sockets).await.unwrap();
@@ -68,7 +68,7 @@ async fn stale_pid_metadata_cannot_signal_an_unrelated_host_process() {
     .await
     .unwrap();
     assert_eq!(runtime.server_generation(server).await.unwrap(), None);
-    runtime.abort_start(server).await.unwrap();
+    runtime.remove_runtime(server).await.unwrap();
     assert!(child.try_wait().unwrap().is_none());
     child.kill().await.unwrap();
     fs::remove_dir(runtime.sockets).await.unwrap();

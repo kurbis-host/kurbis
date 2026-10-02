@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::{create_user, test_pool};
 use kurbis_hoster::control_plane::maintenance::WorkerMaintenance;
-use kurbis_hoster::worker::snapshot::physical_object_path;
+use kurbis_hoster::snapshot::physical_object_path;
 use object_store::{ObjectStore, local::LocalFileSystem};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -232,12 +232,11 @@ async fn make_worker(pool: &PgPool, label: &str, stale: bool) -> Uuid {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO worker_auth.credentials(worker_id, api_token_hash, database_role)
-         VALUES($1, $2, $3)",
+        "INSERT INTO worker_credentials(worker_id, api_token_hash)
+         VALUES($1, $2)",
     )
     .bind(worker_id)
     .bind(blake3::hash(worker_id.as_bytes()).as_bytes().to_vec())
-    .bind(format!("maintenance_role_{}", worker_id.simple()))
     .execute(pool)
     .await
     .unwrap();

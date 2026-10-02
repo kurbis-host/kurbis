@@ -2,7 +2,6 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -20,14 +19,15 @@ use storage::{ensure_storage_limit, persistent_size};
 
 use crate::{
     config::{RuntimeConfig, WorkerConfig},
+    contracts::worker::WorkerServerContext,
     model::{
-        OperationKind, OperationRecord, PlacementRecord, SERVER_STORAGE_BYTES, SnapshotReason,
+        DesiredState, ObservedState, OperationKind, OperationRecord, PlacementRecord,
+        SERVER_STORAGE_BYTES, SnapshotReason,
     },
     worker::{
         control_plane::WorkerControl,
         docker::DockerRuntime,
         idle::IdleTimer,
-        lease::WorkerLease,
         panel_state::{
             clear_players, sync_operators, sync_players, sync_whitelist, write_operator_file,
             write_whitelist_file,
@@ -41,9 +41,7 @@ use crate::{
 };
 
 pub struct WorkerRunner {
-    worker_lease: Option<WorkerLease>,
     config: WorkerConfig,
-    pool: PgPool,
     control_plane: WorkerControl,
     runtime: Box<dyn ServerRuntime>,
     server_access: ServerAccess,
@@ -57,38 +55,20 @@ pub struct WorkerRunner {
 }
 
 impl WorkerRunner {
-    pub async fn new(config: WorkerConfig, pool: PgPool) -> Result<Self> {
-        let database_worker_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT worker_auth.current_worker_id()")
-                .fetch_one(&pool)
-                .await?;
-        anyhow::ensure!(
-            database_worker_id == Some(config.id),
-            "WORKER_ID does not match the authenticated PostgreSQL principal"
-        );
-        let registered_signal_address: String = sqlx::query_scalar(
-            "SELECT signal_address FROM workers
-             WHERE id = worker_auth.current_worker_id() AND id = $1",
-        )
-        .bind(config.id)
-        .fetch_one(&pool)
-        .await?;
-        anyhow::ensure!(
-            crate::model::is_private_signal_address(&registered_signal_address)
-                && registered_signal_address.parse::<std::net::IpAddr>()? == config.signal_address,
-            "WORKER_SIGNAL_ADDRESS does not match the registered worker configuration"
-        );
+    pub async fn new(config: WorkerConfig) -> Result<Self> {
         let public_address: std::net::IpAddr = config
             .address
             .parse()
             .context("WORKER_ADDRESS must be an IP address for Bedrock ICE")?;
         let signal_address = config.signal_address;
-        let worker_lease = WorkerLease::acquire(&pool, config.id).await?;
         let control_plane = WorkerControl::new(
             &config.control_plane_url,
             &config.api_token,
             config.allow_insecure_local_control_plane_http,
         )?;
+        control_plane
+            .acquire_lease(config.id, signal_address)
+            .await?;
         let recovered = control_plane.recover().await?;
         if recovered.operations > 0 || recovered.exports > 0 {
             tracing::warn!(
@@ -99,12 +79,8 @@ impl WorkerRunner {
             );
         }
         tokio::fs::create_dir_all(config.root.join("servers")).await?;
-        let object_client = WorkerObjectClient::new(
-            &config.control_plane_url,
-            &config.api_token,
-            config.allow_insecure_local_control_plane_http,
-        )?;
-        let snapshots = SnapshotManager::new_worker(pool.clone(), object_client);
+        let object_client = WorkerObjectClient::from_control_plane(control_plane.clone());
+        let snapshots = SnapshotManager::new_worker(object_client);
         let runtime: Box<dyn ServerRuntime> = match &config.runtime {
             RuntimeConfig::Docker { image } => Box::new(DockerRuntime::new(
                 image.clone(),
@@ -125,12 +101,10 @@ impl WorkerRunner {
             ),
         };
         let storage = StorageManager::new(config.root.clone(), config.storage_mode);
-        let server_access = ServerAccess::new(&config)?;
+        let server_access = ServerAccess::new(&config, control_plane.clone())?;
         Ok(Self {
-            worker_lease: Some(worker_lease),
             control_plane,
             config,
-            pool,
             runtime,
             server_access,
             snapshots,
@@ -147,12 +121,7 @@ impl WorkerRunner {
         self.gc_stale_local_storage().await?;
         self.heartbeat().await?;
         let control_plane = self.control_plane.clone();
-        let lease = self
-            .worker_lease
-            .take()
-            .context("worker lease already consumed")?;
         tokio::select! {
-            result = lease.monitor() => result,
             result = maintain_heartbeat(control_plane) => result,
             result = self.run_operations() => result,
         }

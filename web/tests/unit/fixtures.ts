@@ -1,4 +1,8 @@
-import type { Server, Session, Snapshot } from "../../lib/contracts";
+import type { components } from "../../lib/api/generated";
+
+type Server = components["schemas"]["Server"];
+type Session = components["schemas"]["Session"];
+type Snapshot = components["schemas"]["Snapshot"];
 
 export const snapshot: Snapshot = {
   generation: 4,
@@ -28,6 +32,7 @@ export const server: Server = {
   storage_limit_bytes: 5 * 1024 * 1024 * 1024,
   memory_limit_bytes: 2 * 1024 * 1024 * 1024,
   player_count: 0,
+  generation: 0,
   created_at: "2026-09-29T18:00:00Z",
   updated_at: "2026-09-30T18:00:00Z",
   current_operation: null,

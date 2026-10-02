@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
-use crate::{model::SERVER_STORAGE_BYTES, worker::persistence::is_runtime_file};
+use crate::{model::SERVER_STORAGE_BYTES, snapshot::is_runtime_file};
 
 pub(super) fn persistent_size(root: &Path) -> Result<i64> {
     if !root.exists() {

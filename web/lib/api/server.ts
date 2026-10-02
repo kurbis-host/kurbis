@@ -1,41 +1,39 @@
 import { cookies } from "next/headers";
 import { cache } from "react";
-import type { ZodType } from "zod";
-import { accountSchema, activityListSchema, logPageSchema, playerListSchema, serverListSchema, serverSchema, sessionSchema, snapshotListSchema, whitelistListSchema } from "../contracts";
+import createClient from "openapi-fetch";
 import { controlPlaneOrigin } from "../control-plane";
-import { serverPath } from "./queries";
+import { ApiError } from "./client";
+import { apiOperations } from "./operations";
+import type { paths } from "./generated";
 
-export class ServerApiError extends Error {
-  constructor(message: string, public readonly status: number) {
-    super(message);
-    this.name = "ServerApiError";
-  }
+export { ApiError as ServerApiError };
+
+async function withServerApi<T>(run: (api: ReturnType<typeof apiOperations>) => Promise<T>): Promise<T> {
+  const cookie = (await cookies()).getAll().map(({ name, value }) => `${name}=${value}`).join("; ");
+  const client = createClient<paths>({
+    baseUrl: controlPlaneOrigin(),
+    credentials: "include",
+    headers: { accept: "application/json", ...(cookie ? { cookie } : {}) },
+    fetch: (request) => fetch(request, { cache: "no-store" }),
+  });
+  return run(apiOperations(client));
 }
 
-async function request<T>(path: string, schema: ZodType<T>): Promise<T> {
-  const cookieStore = await cookies();
-  const cookie = cookieStore.getAll().map(({ name, value }) => `${name}=${value}`).join("; ");
-  const response = await fetch(`${controlPlaneOrigin()}${path}`, { cache: "no-store", headers: { accept: "application/json", ...(cookie ? { cookie } : {}) } });
-  if (!response.ok) {
-    let message = `Control plane request failed (${response.status})`;
-    try {
-      const payload = (await response.json()) as { error?: string; message?: string };
-      message = payload.message ?? payload.error ?? message;
-    } catch {}
-    throw new ServerApiError(message, response.status);
-  }
-  return schema.parse(await response.json());
-}
-
-export const getSession = () => request("/api/v1/session", sessionSchema);
-export const getAccount = () => request("/api/v1/account", accountSchema);
-export const getServers = () => request("/api/v1/servers", serverListSchema);
+export const getSession = () => withServerApi((api) => api.getSession());
+export const getAccount = () => withServerApi((api) => api.getAccount());
+export const getServers = () => withServerApi((api) => api.getServers());
+export const getServerSessions = () => withServerApi((api) => api.getServerSessions());
 export async function getSessionOrNull() {
-  try { return await getSession(); } catch (error) { if (error instanceof ServerApiError && error.status === 401) return null; return null; }
+  try {
+    return await getSession();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) return null;
+    throw error;
+  }
 }
-export const getServer = cache((serverId: string) => request(serverPath(serverId), serverSchema));
-export const getActivity = (serverId: string) => request(serverPath(serverId, "/activity"), activityListSchema);
-export const getLogs = (serverId: string) => request(`${serverPath(serverId, "/logs")}?limit=240`, logPageSchema);
-export const getSnapshots = (serverId: string) => request(serverPath(serverId, "/snapshots"), snapshotListSchema);
-export const getPlayers = (serverId: string) => request(serverPath(serverId, "/players"), playerListSchema);
-export const getWhitelist = (serverId: string) => request(serverPath(serverId, "/whitelist"), whitelistListSchema);
+export const getServer = cache((serverId: string) => withServerApi((api) => api.getServer(serverId)));
+export const getActivity = (serverId: string) => withServerApi((api) => api.getActivity(serverId));
+export const getLogs = (serverId: string) => withServerApi((api) => api.getLogs(serverId));
+export const getSnapshots = (serverId: string) => withServerApi((api) => api.getSnapshots(serverId));
+export const getPlayers = (serverId: string) => withServerApi((api) => api.getPlayers(serverId));
+export const getWhitelist = (serverId: string) => withServerApi((api) => api.getWhitelist(serverId));

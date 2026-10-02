@@ -4,26 +4,23 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
+    contracts::worker::{OperationPayload, OperationProgress, OperationStage},
     control_plane::lifecycle::{
-        LifecycleActor, begin_snapshot_retry as lifecycle_begin_snapshot_retry, complete_delete,
-        complete_reset, complete_restore, complete_snapshot, complete_start, complete_stop,
+        begin_snapshot_retry as lifecycle_begin_snapshot_retry, complete_delete, complete_reset,
+        complete_restore, complete_snapshot, complete_start, complete_stop,
         deactivate_placement_after_stop, defer_snapshot_operation, mark_runtime_lost,
         retry_operation as retry_worker_operation, update_operation_payload, validate_delete,
     },
-    model::{
-        OperationKind, OperationRecord, OperationStatus, SERVER_STORAGE_BYTES, SnapshotReason,
-    },
+    model::{OperationKind, OperationRecord, OperationStatus},
 };
 
 use super::{ApiError, AppState, worker_auth};
 
 const MAX_WORKER_ERROR_BYTES: usize = 1_000;
-const MAX_OPERATION_PATCH_BYTES: usize = 4_096;
 #[derive(Debug, Serialize)]
 pub(super) struct RecoveryReport {
     operations: u64,
@@ -71,6 +68,16 @@ pub(super) async fn heartbeat(
 ) -> Result<StatusCode, ApiError> {
     let mut authorization = state.pool.begin().await?;
     let worker_id = worker_auth::lock_authenticated_worker_id(&mut authorization, &headers).await?;
+    let lease_updated = sqlx::query(
+        "UPDATE worker_credentials SET lease_expires_at = now() + interval '30 seconds'
+         WHERE worker_id = $1 AND lease_expires_at > now()",
+    )
+    .bind(worker_id)
+    .execute(&mut *authorization)
+    .await?;
+    if lease_updated.rows_affected() != 1 {
+        return Err(worker_auth::invalid_worker_token());
+    }
     let result = sqlx::query("UPDATE workers SET heartbeat_at = now() WHERE id = $1")
         .bind(worker_id)
         .execute(&mut *authorization)
@@ -213,7 +220,7 @@ pub(super) struct OperationFenceRequest {
 pub(super) struct OperationProgressRequest {
     generation: i64,
     attempt: i32,
-    patch: Value,
+    patch: OperationProgress,
 }
 
 pub(super) async fn operation_progress(
@@ -232,7 +239,9 @@ pub(super) async fn operation_progress(
         false,
     )
     .await?;
-    validate_progress_patch(operation.kind, &request.patch)?;
+    if !request.patch.valid_for(operation.kind) {
+        return Err(invalid_progress());
+    }
     update_operation_payload(&state.pool, &operation, request.patch)
         .await
         .map_err(super::lifecycle_error)?;
@@ -308,7 +317,7 @@ pub(super) async fn begin_snapshot_retry(
     )
     .await?;
     if operation.kind == OperationKind::Snapshot
-        && operation.payload.get("stage").and_then(Value::as_str) == Some("requested")
+        && decode_operation_payload(&operation)?.stage == OperationStage::Requested
         && snapshot_retry_state(
             &state.pool,
             &operation,
@@ -345,7 +354,7 @@ pub(super) async fn defer_snapshot(
     .await?;
     let error = bounded_worker_error(&request.error)?;
     if operation.kind == OperationKind::Snapshot
-        && operation.payload.get("stage").and_then(Value::as_str) == Some("deferred")
+        && decode_operation_payload(&operation)?.stage == OperationStage::Deferred
         && snapshot_retry_state(
             &state.pool,
             &operation,
@@ -434,6 +443,7 @@ pub(super) async fn complete_operation(
         true,
     )
     .await?;
+    let operation_payload = decode_operation_payload(&operation)?;
 
     let result = match (operation.kind, request.completion) {
         (OperationKind::Start, OperationCompletion::Start { storage_bytes }) => {
@@ -460,11 +470,7 @@ pub(super) async fn complete_operation(
                 storage_bytes,
             },
         ) => {
-            let trusted_target = operation
-                .payload
-                .get("target_generation")
-                .and_then(Value::as_i64);
-            if trusted_target != Some(target_generation) {
+            if operation_payload.target_generation != Some(target_generation) {
                 return Err(stale_operation());
             }
             complete_restore(
@@ -484,11 +490,7 @@ pub(super) async fn complete_operation(
                 was_running,
             },
         ) => {
-            let trusted_was_running = operation
-                .payload
-                .get("was_running")
-                .and_then(Value::as_bool);
-            if trusted_was_running != Some(was_running) {
+            if operation_payload.was_running != Some(was_running) {
                 return Err(stale_operation());
             }
             complete_reset(
@@ -594,74 +596,10 @@ pub(super) async fn runtime_lost(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ServerStopRequest {
-    generation: i64,
-    reason: String,
-}
-
-pub(super) async fn request_stop(
-    State(state): State<std::sync::Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(request): Json<ServerStopRequest>,
-) -> Result<Json<crate::model::ObservedState>, ApiError> {
-    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
-    if request.generation <= 0
-        || !matches!(request.reason.as_str(), "idle_timeout" | "storage_quota")
-    {
-        return Err(stale_operation());
-    }
-    let state = state
-        .lifecycle
-        .request_stop_for_actor(
-            LifecycleActor::AssignedWorker {
-                worker_id,
-                expected_generation: request.generation,
-            },
-            server_id,
-            &request.reason,
-        )
-        .await
-        .map_err(super::lifecycle_error)?;
-    Ok(Json(state))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ServerSnapshotRequest {
-    generation: i64,
-    reason: SnapshotReason,
-}
-
-pub(super) async fn request_snapshot(
-    State(state): State<std::sync::Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Json(request): Json<ServerSnapshotRequest>,
-) -> Result<Json<crate::model::ObservedState>, ApiError> {
-    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
-    if request.generation <= 0 || request.reason != SnapshotReason::Periodic {
-        return Err(stale_operation());
-    }
-    let state = state
-        .lifecycle
-        .request_snapshot_for_actor(
-            LifecycleActor::AssignedWorker {
-                worker_id,
-                expected_generation: request.generation,
-            },
-            server_id,
-            request.reason,
-        )
-        .await
-        .map_err(super::lifecycle_error)?;
-    Ok(Json(state))
-}
-
 mod storage;
-pub(super) use storage::{claim_export, complete_export, fail_export, publish_snapshot};
+pub(super) use storage::{
+    claim_export, complete_export, fail_export, publish_snapshot, verify_snapshot_manifest,
+};
 
 async fn current_operation(
     state: &AppState,
@@ -753,67 +691,14 @@ async fn lock_worker_operation(
     Ok(operation)
 }
 
-fn validate_progress_patch(kind: OperationKind, patch: &Value) -> Result<(), ApiError> {
-    if serde_json::to_vec(patch).is_ok_and(|bytes| bytes.len() > MAX_OPERATION_PATCH_BYTES) {
-        return Err(invalid_progress());
-    }
-    let Some(object) = patch.as_object() else {
-        return Err(invalid_progress());
-    };
-    if object.is_empty()
-        || object.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "stage" | "snapshot_generation" | "snapshot_size" | "pre_reset_generation"
-            )
-        })
-    {
-        return Err(invalid_progress());
-    }
-    let stage = object.get("stage").and_then(Value::as_str);
-    let stage_allowed = match kind {
-        OperationKind::Start => matches!(stage, Some("starting")),
-        OperationKind::Stop | OperationKind::Restart => {
-            matches!(
-                stage,
-                Some("saved" | "stopped" | "snapshotted" | "restarted")
-            )
-        }
-        OperationKind::Snapshot => matches!(stage, Some("saved" | "stopped" | "snapshotted")),
-        OperationKind::Restore => matches!(stage, Some("restored" | "snapshotted")),
-        OperationKind::Reset => matches!(
-            stage,
-            Some("saved" | "stopped" | "backed_up" | "cleared" | "initialized" | "snapshotted")
-        ),
-        OperationKind::Delete => false,
-    };
-    if !stage_allowed {
-        return Err(invalid_progress());
-    }
-    for key in ["snapshot_generation", "pre_reset_generation"] {
-        if object
-            .get(key)
-            .is_some_and(|value| value.as_i64().is_none_or(|value| value < 1))
-        {
-            return Err(invalid_progress());
-        }
-    }
-    if object.get("snapshot_size").is_some_and(|value| {
-        value
-            .as_i64()
-            .is_none_or(|size| !(0..=SERVER_STORAGE_BYTES).contains(&size))
-    }) {
-        return Err(invalid_progress());
-    }
-    if stage == Some("snapshotted")
-        && (!object.contains_key("snapshot_generation") || !object.contains_key("snapshot_size"))
-    {
-        return Err(invalid_progress());
-    }
-    if stage == Some("backed_up") && !object.contains_key("pre_reset_generation") {
-        return Err(invalid_progress());
-    }
-    Ok(())
+fn decode_operation_payload(operation: &OperationRecord) -> Result<OperationPayload, ApiError> {
+    serde_json::from_value(operation.payload.clone()).map_err(|_| {
+        ApiError::with_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_stored_operation_payload",
+            "operation state is unavailable",
+        )
+    })
 }
 
 fn bounded_worker_error(error: &str) -> Result<&str, ApiError> {

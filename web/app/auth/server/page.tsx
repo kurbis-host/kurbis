@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Gamepad2 } from "lucide-react";
+import { ApiError, errorMessage } from "../../../lib/api/client";
+import { browserApi } from "../../../lib/api/operations";
 
 type State = "reading" | "redeeming" | "error";
 
@@ -31,36 +33,16 @@ export default function ServerLoginPage() {
     setRetryable(false);
     setMessage("Opening the server panel…");
     try {
-      const response = await fetch("/auth/server/redeem", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({ token: value }),
-      });
-      if (!response.ok) {
-        let detail = "This link is invalid, expired, or has already been used.";
-        try {
-          const payload = (await response.json()) as { message?: string };
-          if (payload.message) detail = payload.message;
-        } catch {}
-        if (response.status === 400 || response.status === 401) {
-          setState("error");
-          setMessage(`${detail}. Join the server and run /kurbis login to request a fresh link.`);
-          return;
-        }
-        throw new Error(detail);
-      }
-      const result = (await response.json()) as { server_id?: string };
-      if (!result.server_id || !/^[0-9a-f-]{36}$/i.test(result.server_id)) {
-        setState("error");
-        setMessage("The server access response was invalid. Join the server and run /kurbis login to request a fresh link.");
-        return;
-      }
+      const result = await browserApi.redeemServer(value);
       window.location.replace(`/manage/${encodeURIComponent(result.server_id)}`);
     } catch (error) {
       setState("error");
-      setRetryable(true);
-      setMessage(error instanceof Error ? error.message : "Could not open the server panel. Check your connection and try again.");
+      if (error instanceof ApiError && [400, 401, 403, 422].includes(error.status)) {
+        setMessage("This server access link is invalid, expired, or already used. Join the server and run /kurbis login to request a fresh link.");
+      } else {
+        setRetryable(true);
+        setMessage(errorMessage(error));
+      }
     }
   }
 

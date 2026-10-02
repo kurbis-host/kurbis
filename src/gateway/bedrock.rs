@@ -24,7 +24,6 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -38,6 +37,7 @@ use uuid::Uuid;
 use crate::{
     config::GatewayConfig,
     model::{is_private_signal_address, subdomain_from_hostname},
+    routing::BedrockSignalTarget,
 };
 
 const MAX_SESSIONS: usize = 2048;
@@ -118,17 +118,6 @@ fn load_tls_acceptor(config: &GatewayConfig) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignalRoute {
-    server_id: Uuid,
-    generation: i64,
-    signal_address: String,
-    signal_port: u16,
-    worker_address: String,
-    bedrock_port: u16,
-}
-
 #[derive(Clone)]
 struct SignalProxy {
     config: GatewayConfig,
@@ -179,7 +168,7 @@ impl SignalProxy {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
             let body = read_bounded_response_body(response, MAX_SIGNAL_ROUTE_BYTES).await?;
-            let route: SignalRoute = serde_json::from_slice(&body).map_err(|error| {
+            let route: BedrockSignalTarget = serde_json::from_slice(&body).map_err(|error| {
                 tracing::warn!(%server_id, ?error, "invalid Bedrock signal assignment response");
                 StatusCode::BAD_GATEWAY
             })?;
@@ -200,7 +189,7 @@ impl SignalProxy {
 }
 
 fn validate_signal_route(
-    route: &SignalRoute,
+    route: &BedrockSignalTarget,
     expected_server_id: Uuid,
 ) -> Result<SocketAddr, StatusCode> {
     if route.server_id != expected_server_id || route.generation < 1 {
@@ -650,7 +639,12 @@ fn opens_session(packet: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use axum::Json;
+
     use super::*;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 
     fn open_request() -> Vec<u8> {
         let mut packet = vec![0x05];
@@ -658,6 +652,50 @@ mod tests {
         packet.push(11);
         packet.resize(1200, 0);
         packet
+    }
+
+    fn gateway_config(control_plane_url: String) -> GatewayConfig {
+        GatewayConfig {
+            common: crate::config::CommonConfig {
+                database_url: String::new(),
+            },
+            java_listen: "127.0.0.1:0".parse().unwrap(),
+            bedrock_listen: "127.0.0.1:0".parse().unwrap(),
+            bedrock_public_port: 19132,
+            bedrock_tls_certificate: PathBuf::new(),
+            bedrock_tls_private_key: PathBuf::new(),
+            waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_control_socket: PathBuf::new(),
+            waiting_control_token: "test".into(),
+            control_plane_url,
+            internal_token: "signal-test-token".into(),
+            root_domain: "mc.example.test".into(),
+            wake_timeout: Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        }
+    }
+
+    async fn signal_request_status(
+        proxy: Arc<SignalProxy>,
+        server_name: Option<String>,
+    ) -> StatusCode {
+        let hostname = "s-00000000-0000-0000-0000-000000000001.mc.example.test";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, format!("{hostname}:19132").parse().unwrap());
+        proxy_signal(
+            State(proxy),
+            ConnectInfo(SignalPeer {
+                address: "127.0.0.1:50000".parse().unwrap(),
+                server_name,
+            }),
+            headers,
+            Method::GET,
+            Uri::from_static("/v1/join"),
+            Body::empty(),
+        )
+        .await
+        .status()
     }
 
     #[test]
@@ -736,7 +774,7 @@ mod tests {
     #[test]
     fn signal_target_requires_a_current_private_and_distinct_endpoint() {
         let server_id = Uuid::new_v4();
-        let valid = SignalRoute {
+        let valid = BedrockSignalTarget {
             server_id,
             generation: 3,
             signal_address: "127.0.0.1".into(),
@@ -750,39 +788,39 @@ mod tests {
         );
 
         let invalid = [
-            SignalRoute {
+            BedrockSignalTarget {
                 generation: 0,
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 server_id: Uuid::new_v4(),
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 signal_address: "8.8.8.8".into(),
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 signal_address: "0.0.0.0".into(),
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 signal_port: 1024,
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 bedrock_port: 1024,
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 bedrock_port: valid.signal_port,
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 worker_address: "0.0.0.0".into(),
                 ..valid.clone()
             },
-            SignalRoute {
+            BedrockSignalTarget {
                 worker_address: "224.0.0.1".into(),
                 ..valid.clone()
             },
@@ -793,6 +831,109 @@ mod tests {
                 Err(StatusCode::BAD_GATEWAY)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signaling_rejects_missing_or_mismatched_sni_before_assignment_lookup() {
+        let proxy =
+            Arc::new(SignalProxy::new(gateway_config("http://127.0.0.1:0".into())).unwrap());
+        assert_eq!(
+            signal_request_status(proxy.clone(), Some("other.mc.example.test".into()),).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(
+            signal_request_status(proxy.clone(), None).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(
+            signal_request_status(
+                proxy,
+                Some("s-00000000-0000-0000-0000-000000000001.mc.example.test".into()),
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_assignment_decodes_the_shared_contract_and_validates_endpoint() {
+        use axum::{extract::Path, routing::get};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/internal/bedrock-signal/{server_id}",
+            get(|Path(server_id): Path<Uuid>| async move {
+                Json(BedrockSignalTarget {
+                    server_id,
+                    worker_address: "192.0.2.20".into(),
+                    bedrock_port: 46001,
+                    signal_address: "127.0.0.1".into(),
+                    signal_port: 46002,
+                    generation: 3,
+                })
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let proxy = SignalProxy::new(gateway_config(format!("http://{address}"))).unwrap();
+        let server_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let hostname = format!("s-{server_id}.mc.example.test");
+
+        assert_eq!(
+            proxy.target(&hostname).await.unwrap(),
+            "127.0.0.1:46002".parse::<SocketAddr>().unwrap()
+        );
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tls_listener_extracts_negotiated_sni_for_the_host_authority_gate() {
+        use std::io::BufReader;
+
+        use tokio_rustls::TlsConnector;
+
+        let mut config = gateway_config("http://127.0.0.1:0".into());
+        config.bedrock_tls_certificate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bedrock-gateway-test-cert.pem");
+        config.bedrock_tls_private_key = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bedrock-gateway-test-key.pem");
+        let tls_acceptor = load_tls_acceptor(&config).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let mut listener = TlsListener::new(tcp, tls_acceptor);
+        let accepted = tokio::spawn(async move {
+            let (_connection, peer) = listener.accept().await;
+            peer
+        });
+
+        let mut certificate_reader = BufReader::new(
+            include_bytes!("../../tests/fixtures/bedrock-gateway-test-cert.pem").as_slice(),
+        );
+        let certificate = rustls_pemfile::certs(&mut certificate_reader)
+            .next()
+            .expect("test certificate")
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let hostname = "s-00000000-0000-0000-0000-000000000001.mc.example.test";
+        let stream = TcpStream::connect(address).await.unwrap();
+        let _client = connector
+            .connect(ServerName::try_from(hostname.to_owned()).unwrap(), stream)
+            .await
+            .unwrap();
+
+        let peer = tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.server_name.as_deref(), Some(hostname));
     }
 
     #[tokio::test]

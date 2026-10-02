@@ -3,12 +3,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gamepad2, Link2, LogOut, MonitorSmartphone, ShieldCheck } from "lucide-react";
 import { useState } from "react";
-import { apiVoid, errorMessage } from "../lib/api/client";
-import { fetchAccount, fetchServers, fetchSession } from "../lib/api/queries";
-import type { AccountData, Server, Session } from "../lib/contracts";
+import { errorMessage } from "../lib/api/client";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
 import { formatBytes } from "../lib/format";
 import { queryKeys } from "../lib/query";
 import { Button, Notice, PageHeader, Surface } from "./ui";
+
+type AccountData = components["schemas"]["Account"];
+type Server = components["schemas"]["Server"];
+type Session = components["schemas"]["Session"];
 
 const limitCard = "rounded-[10px] bg-[#eee7d8] p-4";
 const secondaryLink =
@@ -28,21 +32,21 @@ export function Account({
   const [worldNotice, setWorldNotice] = useState<string | null>(null);
   const { data: session = initialSession } = useQuery({
     queryKey: queryKeys.session,
-    queryFn: fetchSession,
+    queryFn: browserApi.getSession,
     initialData: initialSession,
   });
   const { data: servers = initialServers } = useQuery({
     queryKey: queryKeys.servers,
-    queryFn: fetchServers,
+    queryFn: browserApi.getServers,
     initialData: initialServers,
   });
   const { data: account = initialAccount } = useQuery({
     queryKey: queryKeys.account,
-    queryFn: fetchAccount,
+    queryFn: browserApi.getAccount,
     initialData: initialAccount,
   });
   const revokeSession = useMutation({
-    mutationFn: (id: string) => apiVoid(`/api/v1/account/sessions/${id}`, { method: "DELETE" }),
+    mutationFn: (id: string) => browserApi.revokeAccountSession(id),
     onSuccess: async (_, id) => {
       const revoked = account.sessions.find((item) => item.id === id);
       if (revoked?.current) {
@@ -54,7 +58,7 @@ export function Account({
     onError: (error) => setActionError(errorMessage(error)),
   });
   const setDefaultWorld = useMutation({
-    mutationFn: (id: string) => apiVoid(`/api/v1/account/worlds/${id}/default`, { method: "PUT" }),
+    mutationFn: (id: string) => browserApi.setDefaultWorld(id),
     onSuccess: async (_, id) => {
       const selected = account.worlds.find((world) => world.id === id);
       setWorldNotice(selected ? `${selected.subdomain} is now the default world.` : "Default world updated.");
@@ -65,12 +69,14 @@ export function Account({
     },
     onError: (error) => setActionError(errorMessage(error)),
   });
-  const server = servers.find((item) => item.is_default) ?? servers[0] ?? null;
+  const ownedWorldIds = new Set(account.worlds.map((world) => world.id));
+  const ownedServers = servers.filter((item) => ownedWorldIds.has(item.id));
+  const server = ownedServers.find((item) => item.is_default) ?? ownedServers[0] ?? null;
 
   async function logout() {
     setActionError(null);
     try {
-      await apiVoid("/auth/logout", { method: "POST" });
+      await browserApi.logout();
       window.location.assign("/");
     } catch (error) {
       setActionError(errorMessage(error));
@@ -278,7 +284,7 @@ export function Account({
         {account.worlds.length === 0 ? (
           <p className="mt-4 mb-0 text-[13px] text-ink-soft">No active worlds are linked to this account.</p>
         ) : null}
-        {account.worlds.length > 0 ? <a className={`${secondaryLink} mt-4`} href="/app">Open default world</a> : null}
+        {account.worlds.length > 0 ? <a className={`${secondaryLink} mt-4`} href={`/manage/${server?.id ?? account.worlds[0].id}`}>Open default world</a> : null}
       </Surface>
     </>
   );

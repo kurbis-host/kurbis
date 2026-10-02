@@ -5,7 +5,7 @@ use object_store::ObjectStore;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::worker::snapshot::{GarbageCollection, SnapshotManager};
+use crate::control_plane::snapshots::{GarbageCollection, SnapshotStore};
 
 #[derive(Debug, Default)]
 pub struct MaintenanceReport {
@@ -33,7 +33,7 @@ impl WorkerMaintenance {
         let exports_assigned = self.assign_pending_exports().await?;
         let exports_expired = self.expire_exports().await?;
         let garbage_collection =
-            SnapshotManager::collect_garbage_with(&self.pool, self.object_store.clone()).await?;
+            SnapshotStore::collect_garbage_with(&self.pool, self.object_store.clone()).await?;
         Ok(MaintenanceReport {
             operations_assigned,
             exports_assigned,
@@ -83,8 +83,7 @@ impl WorkerMaintenance {
                 tx.commit().await?;
                 continue;
             }
-            let Some(worker_id) = eligible_worker(&mut tx, server_id, server_generation).await?
-            else {
+            let Some(worker_id) = eligible_worker(&mut tx).await? else {
                 tx.commit().await?;
                 continue;
             };
@@ -220,7 +219,7 @@ impl WorkerMaintenance {
                     None => None,
                 }
             } else if stage == "ready" && source_generation.is_some() {
-                eligible_worker(&mut tx, server_id, server_generation).await?
+                eligible_worker(&mut tx).await?
             } else {
                 None
             };
@@ -274,24 +273,16 @@ impl WorkerMaintenance {
     }
 }
 
-async fn eligible_worker(
-    tx: &mut Transaction<'_, Postgres>,
-    server_id: Uuid,
-    generation: i64,
-) -> Result<Option<Uuid>> {
+async fn eligible_worker(tx: &mut Transaction<'_, Postgres>) -> Result<Option<Uuid>> {
     Ok(sqlx::query_scalar(
         "SELECT w.id FROM workers w
-         JOIN worker_auth.credentials credential ON credential.worker_id = w.id
-         LEFT JOIN worker_snapshot_cache cache
-           ON cache.worker_id = w.id AND cache.server_id = $1 AND cache.generation = $2
+         JOIN worker_credentials credential ON credential.worker_id = w.id
          WHERE credential.revoked_at IS NULL AND NOT w.draining
            AND w.heartbeat_at > now() - interval '30 seconds'
            AND w.signal_address <> ''
-         ORDER BY (cache.worker_id IS NOT NULL) DESC, w.id
+         ORDER BY w.id
          FOR UPDATE OF w SKIP LOCKED LIMIT 1",
     )
-    .bind(server_id)
-    .bind(generation)
     .fetch_optional(&mut **tx)
     .await?)
 }
@@ -302,7 +293,7 @@ async fn lock_healthy_worker(
 ) -> Result<Option<Uuid>> {
     Ok(sqlx::query_scalar(
         "SELECT w.id FROM workers w
-         JOIN worker_auth.credentials credential ON credential.worker_id = w.id
+         JOIN worker_credentials credential ON credential.worker_id = w.id
          WHERE w.id = $1 AND credential.revoked_at IS NULL AND NOT w.draining
            AND w.heartbeat_at > now() - interval '30 seconds'
            AND w.signal_address <> ''

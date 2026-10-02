@@ -174,7 +174,7 @@ async fn manifest_upload_failure_preserves_current_and_releases_publication_lock
         .connect(&std::env::var("TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
-    let manager = SnapshotManager::new(
+    let manager = SnapshotStore::new(
         single_connection_pool,
         local_snapshot_store(objects.path()).await,
     );
@@ -266,7 +266,7 @@ async fn cancelled_publisher_does_not_leave_a_lock_in_the_pool() {
         .connect(&std::env::var("TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
-    let manager = SnapshotManager::new(limited_pool, local_snapshot_store(objects.path()).await);
+    let manager = SnapshotStore::new(limited_pool, local_snapshot_store(objects.path()).await);
     let mut guard = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(724514, hashtext($1))")
         .bind(server.to_string())
@@ -350,7 +350,7 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
             publish_test_snapshot(&pool, server, snapshot.generation, snapshot.size_bytes).await;
         }
         let gc_store = local_snapshot_store(objects.path()).await;
-        SnapshotManager::collect_garbage_with(&pool, gc_store)
+        SnapshotStore::collect_garbage_with(&pool, gc_store)
             .await
             .unwrap();
         assert!(
@@ -382,7 +382,7 @@ async fn restore_source_survives_retention_and_gc_until_operation_finishes() {
         .unwrap();
     publish_test_snapshot(&pool, server, latest.generation, latest.size_bytes).await;
     let gc_store = local_snapshot_store(objects.path()).await;
-    SnapshotManager::collect_garbage_with(&pool, gc_store)
+    SnapshotStore::collect_garbage_with(&pool, gc_store)
         .await
         .unwrap();
     assert!(

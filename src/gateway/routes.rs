@@ -8,15 +8,11 @@ use anyhow::Result;
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::RwLock;
 
-use crate::{
-    control_plane::api::resolve_subdomain,
-    model::{RouteTarget, subdomain_from_hostname},
-};
+use crate::{model::RouteTarget, routing::RouteRepository};
 
 #[derive(Clone)]
 pub struct RouteCache {
-    pool: PgPool,
-    root_domain: String,
+    repository: RouteRepository,
     cache: Arc<RwLock<CacheState>>,
     ttl: Duration,
 }
@@ -36,15 +32,14 @@ struct CachedRoute {
 impl RouteCache {
     pub fn new(pool: PgPool, root_domain: String) -> Self {
         Self {
-            pool,
-            root_domain: root_domain.trim_end_matches('.').to_ascii_lowercase(),
+            repository: RouteRepository::new(pool, root_domain),
             cache: Arc::new(RwLock::new(CacheState::default())),
             ttl: Duration::from_secs(10),
         }
     }
 
     pub async fn resolve(&self, hostname: &str) -> Result<Option<RouteTarget>> {
-        let Some(subdomain) = subdomain_for(hostname, &self.root_domain) else {
+        let Some(subdomain) = self.repository.subdomain_for_hostname(hostname) else {
             return Ok(None);
         };
         loop {
@@ -56,7 +51,7 @@ impl RouteCache {
             }
             let revision = cache.revision;
             drop(cache);
-            let target = resolve_subdomain(&self.pool, &subdomain).await?;
+            let target = self.repository.resolve_subdomain(&subdomain).await?;
             let mut cache = self.cache.write().await;
             if cache.revision != revision {
                 continue;
@@ -79,7 +74,7 @@ impl RouteCache {
     }
 
     pub fn accepts_server_address(&self, hostname: &str) -> bool {
-        subdomain_for(hostname, &self.root_domain).is_some()
+        self.repository.accepts_server_address(hostname)
     }
 
     pub async fn invalidate_all(&self) {
@@ -89,9 +84,7 @@ impl RouteCache {
     }
 
     pub async fn invalidation_listener(&self) -> Result<PgListener> {
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("route_changes").await?;
-        Ok(listener)
+        Ok(self.repository.invalidation_listener().await?)
     }
 
     pub async fn listen_for_invalidations(self, mut listener: PgListener) -> Result<()> {
@@ -105,40 +98,27 @@ impl RouteCache {
     }
 }
 
-fn subdomain_for(hostname: &str, root_domain: &str) -> Option<String> {
-    subdomain_from_hostname(hostname, root_domain)
-}
-
-pub fn normalize_requested_hostname(value: &str) -> Option<String> {
-    let value = value.split('\0').next()?.trim();
-    let hostname = match value.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
-        _ => value,
-    };
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-    (!hostname.is_empty()).then_some(hostname)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn hostname_parser_rejects_nested_and_foreign_names() {
+    #[tokio::test]
+    async fn hostname_parser_rejects_nested_and_foreign_names() {
+        let routes = RouteRepository::new(
+            PgPool::connect_lazy("postgres://localhost/test").unwrap(),
+            "play.example.com",
+        );
         assert_eq!(
-            subdomain_for("abc.play.example.com", "play.example.com"),
+            routes.subdomain_for_hostname("abc.play.example.com"),
             Some("abc".into())
         );
         assert_eq!(
-            subdomain_for("abc.def.play.example.com", "play.example.com"),
+            routes.subdomain_for_hostname("abc.def.play.example.com"),
             None
         );
+        assert_eq!(routes.subdomain_for_hostname("abc.other.example.com"), None);
         assert_eq!(
-            subdomain_for("abc.other.example.com", "play.example.com"),
-            None
-        );
-        assert_eq!(
-            subdomain_for("abc.play.example.com:19132", "play.example.com"),
+            routes.subdomain_for_hostname("abc.play.example.com:19132"),
             Some("abc".into())
         );
     }

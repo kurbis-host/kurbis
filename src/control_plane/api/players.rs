@@ -1,26 +1,24 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::actor::{ApiPath, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlayerEdition {
     Java,
     Bedrock,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct PlayerPresence {
     pub player_id: Uuid,
     pub name: String,
@@ -83,9 +81,10 @@ pub(super) async fn player_list(
 
 pub(super) async fn players(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Vec<PlayerPresence>>, ApiError> {
+    let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     Ok(Json(player_list(&state.pool, server.id).await?))
 }

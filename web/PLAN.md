@@ -13,16 +13,11 @@ The v1 product includes lifecycle management, connection details, live state, lo
 ## Product, UX, and Design
 
 - Build a focused / product site around the actual Kurbis mechanism: a voxel world visibly sleeping, waking when a player connects, restoring from snapshots, and releasing infrastructure when empty. Include free-tier limits, Java + Bedrock support, the five-minute idle flow, snapshot safety, FAQ, and a prominent sign-in/create CTA.
-- Replace the current login screen with the public product entry point. Authenticated visitors go directly into /app; unauthenticated CTAs enter OAuth.
+- Replace the current login screen with the public product entry point. Authenticated visitors go directly into /app/servers; unauthenticated CTAs enter OAuth.
 - Create /app/setup for first-run server creation: choose the address, select a sensible Survival/Creative preset and core settings, explain 2 GiB RAM / 5 GiB storage / wake-on-connect, create the server asleep, then guide the user to copy the address or start it.
-- Use a persistent /app shell with responsive navigation and these surfaces:
-    - /app — world overview: lifecycle state, start/stop/restart, Java/Bedrock addresses, connected players, storage, latest backup, current issue, and recent activity.
-    - /app/console — cursor-based live read-only logs with pause/resume, autoscroll, search/filter, copy, and download.
-    - /app/backups — retained snapshot timeline, reasons/sizes/timestamps, manual backup creation, and safe restore.
-    - /app/players — current online players plus persistent whitelist management.
-    - /app/settings — address and curated Pumpkin settings with explicit dirty state, validation, sleeping-state restrictions, and clear “stop to edit” affordances.
-    - /app/account — linked Google, Discord, Java, and Bedrock identities; explicit provider linking; browser-session listing/revocation; preserved-world/default-world selection; account state, service limits, and logout.
-- Support the in-game server-only entry point separately from account login. `/auth/server` reads the one-use token from the URL fragment, removes it from the address bar, and redeems it with a same-origin POST. `/manage/{serverId}` opens only the linked server panel with a distinct one-hour server session; this session does not sign into an account and cannot access account routes or another server.
+- Keep `/app/servers` as the account-level server list and selector. Use the `/app` account shell for setup and account navigation; all per-server surfaces live below `/manage/{serverId}`: overview, console, backups, players, and settings. Remove every `/app/servers/{serverId}` page without a redirect or alias.
+- Keep `/manage/{serverId}` as the only server-panel entry point. It accepts an account session authorized for that server or active scoped server-session proof. Retain multiple active scoped server-login grants; the selector shows the union of account-accessible servers and all servers covered by active scoped grants. Account cookies do not mask valid scoped access to another owner's server. Scoped access never authenticates account routes.
+- Support the in-game server-only entry point separately from account login. `/auth/server` reads the one-use token from the URL fragment, removes it from the address bar, and redeems it with a same-origin POST. The browser holds one opaque grant-collection cookie; each covered server grant remains active until that grant is explicitly revoked or its server is removed or suspended. The one-use login link still expires after 15 minutes.
 - Make every lifecycle state a first-class designed state: sleeping, queued, restoring, starting, online, stopping, snapshotting, failed, deleted. Show useful stage-specific language and actions rather than a generic spinner.
 - Failure states expose a stable user-facing error explanation, retry/recovery action where applicable, and expandable technical detail.
 - Preserve drafts across live server updates by keeping server state and form state separate.
@@ -41,7 +36,7 @@ The v1 product includes lifecycle management, connection details, live state, lo
 - Replace the monolithic web/app/page.tsx, global selector-heavy CSS, manual polling, and manually maintained API typings. Do not retain compatibility wrappers for the old frontend.
 - Keep Next.js 16 App Router and structure it around (marketing) and (app) route groups with shared layouts, route-level loading/error states, small Server Components, and narrow Client Component boundaries.
 - Make browser traffic same-origin:
-    - Add Next rewrites for /api/\* and /auth/\* to a server-only CONTROL_PLANE_INTERNAL_URL.
+    - Route /api/\* and the control-plane /auth/\* endpoints through the panel transport proxy to a server-only CONTROL_PLANE_INTERNAL_URL. The proxy must stream responses directly so SSE is never buffered by the application router.
     - Remove NEXT_PUBLIC_CONTROL_PLANE_URL and the browser’s direct cross-origin dependency on the control plane.
     - Point OAuth callbacks at the public Kurbis origin so session cookies belong to the frontend origin.
     - Remove public-panel CORS coupling from the control plane once all browser traffic uses the same-origin path.
@@ -54,19 +49,17 @@ The v1 product includes lifecycle management, connection details, live state, lo
 
 ## Backend/API Changes
 
-Replace the current ad-hoc panel endpoints with a versioned typed API and delete the old endpoint set when the frontend migrates.
+Replace the current ad-hoc panel endpoints with a versioned typed API and remove old endpoint paths without compatibility aliases.
 
 Public contracts:
 
 - GET /api/v1/session
-- GET /api/v1/servers; GET | PATCH | DELETE /api/v1/servers/{server_id}
-- POST /api/v1/servers/{server_id}/actions with start | stop | restart | snapshot
-- POST /api/v1/servers/{server_id}/reset
+- GET /api/v1/servers; GET | PATCH /api/v1/servers/{server_id}
+- POST /api/v1/servers/{server_id}/commands for typed start | stop | restart | snapshot | reset | restore | delete intents
 - GET /api/v1/servers/{server_id}/events for SSE
 - GET /api/v1/servers/{server_id}/logs?after_id=&limit=
 - GET /api/v1/servers/{server_id}/activity
 - GET /api/v1/servers/{server_id}/snapshots
-- POST /api/v1/servers/{server_id}/snapshots/{generation}/restore
 - GET /api/v1/servers/{server_id}/players
 - GET | POST | DELETE /api/v1/servers/{server_id}/whitelist
 - GET | POST /api/v1/servers/{server_id}/exports; GET /api/v1/servers/{server_id}/exports/{export_id}/download; DELETE /api/v1/servers/{server_id}/exports/{export_id}
@@ -74,11 +67,16 @@ Public contracts:
 - PUT /api/v1/account/worlds/{server_id}/default
 - DELETE /api/v1/account/sessions/{session_id}
 - POST /auth/minecraft/redeem (same-origin only; GET requests never mutate account state)
-- POST /auth/server/redeem (same-origin only; one-use token exchange for a one-hour session scoped to one server)
+- GET /api/v1/server/sessions; DELETE /api/v1/server/sessions/{session_id} (list and independently revoke this browser's scoped grants)
+- POST /auth/server/redeem (same-origin only; one-use 15-minute token exchange that adds a persistent grant scoped to one server)
 
 Create explicit serializable DTOs for Session, Server, ServerSettings, LifecycleStatus, Operation, Snapshot, PlayerPresence, WhitelistEntry, LogEntry, and discriminated ServerEvent variants. Stop returning raw settings JSON and unstructured lifecycle errors.
 
-Every per-server route and event stream checks that the caller may access the path's server ID. An account session must be active and own that server; a server-only session is limited to its one server and never authenticates account routes. Worker capabilities are service credentials, not browser sessions, and are valid only for the worker's current placement. API and PostgreSQL authorization both enforce the worker's assigned-server scope.
+Keep Axum/Tower and use typed actor authentication middleware/extractors; handlers dispatch into canonical domain operations rather than owning lifecycle rules. The single commands path serves account and assigned-worker lifecycle intents, with actor-specific authorization and placement fences. Remove `/actions`, separate reset/delete/restore lifecycle paths, and duplicate worker stop/snapshot paths without aliases.
+
+Use Rust route declarations and DTOs as the source of truth for the public JSON API. Produce OpenAPI with Aide and Schemars, generate TypeScript types with `openapi-typescript` and the fetch client with `openapi-fetch`, and use `garde`-derived request validation. Generated drift checks cover every public JSON endpoint. SSE and object transfer/download routes remain specialized streaming endpoints with explicit authorization.
+
+Every per-server route and event stream checks that the caller may access the path's server ID. An account session must be active and own that server; persistent scoped server grants authorize only their covered servers and never authenticate account routes. Multiple grants remain available to the selector and can be revoked independently. The account-accessible server list is the deduplicated union of owned servers and servers covered by this browser's scoped grants. Worker capabilities are service credentials, not browser sessions, and are valid only for the worker's current placement. Workers access the control plane only through its API and receive no database credentials, SQL pool, or bucket credentials.
 
 Extend the server response with timestamps, current operation/stage, latest snapshot metadata, player count, storage limits/usage, and structured error information.
 
@@ -94,16 +92,20 @@ Emit or trigger PostgreSQL notifications for server state, logs, operations, sna
 
 ## Test Plan and Acceptance Criteria
 
-- Add Rust/Postgres integration coverage for every new API, ownership isolation, suspended accounts, lifecycle action validation, manual snapshots, snapshot-history visibility, monotonic rollback restore, whitelist persistence/runtime synchronization, player presence, pagination, and SSE authorization/reconnect/catch-up behavior.
-- Verify per-server ownership isolation for every resource, action, export, and event stream.
+- Add Rust/Postgres integration coverage for every new API, ownership isolation, suspended accounts, lifecycle command validation, manual snapshots, snapshot-history visibility, monotonic rollback restore, whitelist persistence/runtime synchronization, player presence, pagination, and SSE authorization/reconnect/catch-up behavior.
+- Verify per-server ownership isolation for every resource, command, export, and event stream. Confirm `/app/servers/{serverId}` is absent with no redirect, and `/manage/{serverId}` covers account-authorized servers and the union of active scoped sessions.
+- Verify exactly one `/api/v1/servers/{server_id}/commands` route handles shared lifecycle intents, including owner/worker parity, and no old action/reset/restore/delete or worker stop/snapshot route remains as an alias.
+- Verify OpenAPI generation and TypeScript drift checks cover every public JSON route; test `garde`-derived validation against request DTO constraints.
+- Bootstrap the canonical schema from an empty database and verify workers have no DB credentials, SQL pool, or bucket credentials. Exercise worker assignment checks through the API and streamed object authorization.
 - Add frontend component tests for lifecycle rendering, optimistic mutations, settings draft isolation, validation, reconnect handling, destructive confirmations, backup restrictions, whitelist interactions, and error states.
 - Expand Playwright into complete user journeys: public landing → OAuth → onboarding → start/queue/restore/online → live logs → players/whitelist → settings → backup → restore → restart/stop → deletion → logout.
 - Preserve browser security assertions for OAuth state binding, explicit provider linking, secure renewable cookies, session revocation, replay rejection, user isolation, and address conflicts.
 - Cover Java and Bedrock Minecraft login redemption for signed-in and signed-out users, token expiry/reuse, cross-origin POST rejection, and rejection of unauthenticated or forged game identities.
-- Cover server-only login redemption, fragment removal before the same-origin POST, one-use and 15-minute token expiry, the distinct one-hour cookie, account-route denial, cross-server denial, and deleted-server recovery states.
-- Verify worker identity comes from its unique credential, not request fields; test cross-worker capability denial, placement reassignment, database permission boundaries, credential provisioning/rotation, and denial of placement or generation writes from worker database roles.
+- Cover server-only login redemption, fragment removal before the same-origin POST, one-use and 15-minute login-link expiry, persistent grant access after advancing the browser clock, independent per-server revocation and selector removal, account-cookie plus scoped-grant commands, account-route denial, cross-server denial, and deleted-server recovery states.
+- Verify worker identity comes from its unique API credential, not request fields; test cross-worker capability denial, placement reassignment, credential provisioning/rotation, and denial of placement or generation changes through worker API requests.
 - Verify identity merges retain every server and its backup/history data, carry suspension forward, and preserve the browser account's default world or choose the oldest surviving world.
 - Verify account owners can switch the default among their preserved worlds and cannot select a world owned by another account.
+- Verify that a BrowserGrant can reset or delete only its bound server, while a placement-scoped plugin capability and worker actor cannot issue reset/delete commands.
 - Add Playwright checks at desktop, tablet, and 390px mobile widths; verify navigation, dialogs, console, long server/log content, empty/error states, and absence of horizontal overflow.
 - Run automated accessibility checks with Axe plus keyboard-only Playwright flows and reduced-motion coverage.
 - Maintain visual-regression captures for the landing page, overview, console, backups, players, settings, setup, and representative queued/online/failed states at desktop and mobile.
@@ -113,5 +115,5 @@ Emit or trigger PostgreSQL notifications for server state, logs, operations, sna
 
 - New accounts receive one server; merged identities retain all existing worlds with one selected default. Kurbis remains one region, supports Google/Discord OAuth and verified Java/Bedrock identity login, 2 GiB RAM, 5 GiB persistent storage, five-minute idle flow, and no explicit player-count limit.
 - English-only is sufficient for v1, but UI strings should be centralized enough that localization is not structurally blocked.
-- The existing working tree is the implementation baseline; current uncommitted backend work must be preserved while replacing obsolete frontend/API code.
+- Existing implementation work is the behavioral baseline; preserve v1 product behavior while replacing obsolete frontend/API contracts and schema compatibility paths.
 - No backwards-compatibility layer is required. Legacy frontend components, polling logic, old API routes, cross-origin browser configuration, and obsolete CSS are removed once their replacements are covered by the new tests.

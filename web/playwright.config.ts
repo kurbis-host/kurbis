@@ -25,7 +25,7 @@ process.env.BROWSER_FIXTURE_DATA_DIR = fixtureDataRoot;
 process.env.BROWSER_OBJECT_STORE_ROOT = objectStoreRoot;
 const env = {
   ...process.env,
-  NEXT_DIST_DIR: `.next-e2e-${portBase}`,
+  NEXT_DIST_DIR: process.env.NEXT_DIST_DIR ?? `.next-e2e-${portBase}`,
   TEST_DATABASE_URL: database,
   DATABASE_URL: database,
   TEST_ARTIFACT_ROOT: fixtureDataRoot,

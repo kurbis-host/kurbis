@@ -5,6 +5,10 @@ use super::{
     create_test_worker, recover_running_operations, retry_operation, test_pool,
     update_operation_payload,
 };
+use kurbis_hoster::contracts::{
+    lifecycle::ResetMode,
+    worker::{OperationProgress, OperationStage},
+};
 use kurbis_hoster::control_plane::lifecycle::fail_operation;
 use kurbis_hoster::model::{DesiredState, OperationStatus, SERVER_MEMORY_BYTES};
 use serde_json::json;
@@ -278,26 +282,38 @@ async fn shutdown_stage_recovery_rejects_old_claim_and_completed_payload_writes(
     complete_start(&pool, &start, 0).await.unwrap();
     lifecycle.request_stop(server, "test").await.unwrap();
     let old = claim_operation(&pool, worker).await.unwrap().unwrap();
-    update_operation_payload(&pool, &old, serde_json::json!({"stage":"saved"}))
+    update_operation_payload(&pool, &old, OperationProgress::stage(OperationStage::Saved))
         .await
         .unwrap();
     recover_running_operations(&pool, worker).await.unwrap();
     let current = claim_operation(&pool, worker).await.unwrap().unwrap();
     assert_eq!(current.payload["stage"], "saved");
     assert!(
-        update_operation_payload(&pool, &old, serde_json::json!({"stage":"stopped"}))
-            .await
-            .is_err()
-    );
-    update_operation_payload(&pool, &current, serde_json::json!({"stage":"stopped"}))
+        update_operation_payload(
+            &pool,
+            &old,
+            OperationProgress::stage(OperationStage::Stopped),
+        )
         .await
-        .unwrap();
+        .is_err()
+    );
+    update_operation_payload(
+        &pool,
+        &current,
+        OperationProgress::stage(OperationStage::Stopped),
+    )
+    .await
+    .unwrap();
     publish_final_snapshot(&pool, &current, 1, 0).await;
     complete_stop(&pool, &current, 1, 0).await.unwrap();
     assert!(
-        update_operation_payload(&pool, &current, serde_json::json!({"stage":"saved"}))
-            .await
-            .is_err()
+        update_operation_payload(
+            &pool,
+            &current,
+            OperationProgress::stage(OperationStage::Saved),
+        )
+        .await
+        .is_err()
     );
     let stage: String =
         sqlx::query_scalar("SELECT payload->>'stage' FROM operations WHERE id = $1")
@@ -770,7 +786,7 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     let initial_generation = start.generation;
     assert_eq!(
         lifecycle
-            .request_reset(online_server, "world", json!({"unused":true}))
+            .request_reset(online_server, ResetMode::World, json!({"unused":true}))
             .await
             .unwrap(),
         ObservedState::Resetting
@@ -827,14 +843,18 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     );
     assert!(
         lifecycle
-            .request_reset(online_server, "world", json!({}))
+            .request_reset(online_server, ResetMode::World, json!({}))
             .await
             .is_err()
     );
 
-    update_operation_payload(&pool, &reset, json!({"stage":"backed_up"}))
-        .await
-        .unwrap();
+    update_operation_payload(
+        &pool,
+        &reset,
+        OperationProgress::backed_up(reset.generation - 1),
+    )
+    .await
+    .unwrap();
     recover_running_operations(&pool, worker).await.unwrap();
     let recovered = claim_operation(&pool, worker).await.unwrap().unwrap();
     assert_eq!(recovered.id, reset.id);
@@ -944,7 +964,7 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
         "whitelist":false
     });
     lifecycle
-        .request_reset(sleeping_server, "full", default_settings.clone())
+        .request_reset(sleeping_server, ResetMode::Full, default_settings.clone())
         .await
         .unwrap();
     let sleeping_reset = claim_operation(&pool, worker).await.unwrap().unwrap();

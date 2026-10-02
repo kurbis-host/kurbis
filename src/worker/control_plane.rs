@@ -2,35 +2,25 @@ use std::{borrow::Cow, net::IpAddr, str::FromStr};
 
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, Method, RequestBuilder, Url, header, redirect::Policy};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::model::{ObservedState, OperationRecord, SnapshotReason};
+mod api;
+
+use crate::contracts::worker::WorkerAssignment;
 
 const MAX_WORKER_ERROR_BYTES: usize = 1_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerExportTask {
-    pub id: Uuid,
-    pub server_id: Uuid,
-    pub source_generation: i64,
-    pub attempt: i32,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerRecoveryReport {
-    pub operations: u64,
-    pub exports: u64,
-}
+pub(super) struct EmptyRequest {}
 
 #[derive(Debug, Clone)]
 pub struct WorkerControl {
     base_url: Url,
     client: Client,
     authorization: header::HeaderValue,
+    lease_id: std::sync::Arc<std::sync::RwLock<Option<Uuid>>>,
 }
 
 impl WorkerControl {
@@ -54,7 +44,23 @@ impl WorkerControl {
             base_url,
             client: Client::builder().redirect(Policy::none()).build()?,
             authorization,
+            lease_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    pub fn new_with_lease(
+        control_plane_url: &str,
+        api_token: &str,
+        allow_insecure_local_http: bool,
+        lease_id: Uuid,
+    ) -> Result<Self> {
+        let control = Self::new(control_plane_url, api_token, allow_insecure_local_http)?;
+        control.set_lease_id(lease_id);
+        Ok(control)
+    }
+
+    pub fn set_lease_id(&self, lease_id: Uuid) {
+        *self.lease_id.write().expect("worker lease lock poisoned") = Some(lease_id);
     }
 
     pub fn base_url(&self) -> &Url {
@@ -71,308 +77,14 @@ impl WorkerControl {
             same_origin(&self.base_url, &url),
             "authenticated request target is outside the control-plane origin"
         );
-        Ok(self
+        let mut request = self
             .client
             .request(method, url)
-            .header(header::AUTHORIZATION, self.authorization.clone()))
-    }
-
-    pub async fn recover(&self) -> Result<WorkerRecoveryReport> {
-        self.post_json("/internal/worker/control/recover", &EmptyRequest {})
-            .await
-    }
-
-    pub async fn heartbeat(&self) -> Result<()> {
-        self.post_no_content("/internal/worker/control/heartbeat", &EmptyRequest {})
-            .await
-    }
-
-    pub async fn claim_operation(&self) -> Result<Option<OperationRecord>> {
-        self.post_json(
-            "/internal/worker/control/operations/claim",
-            &EmptyRequest {},
-        )
-        .await
-    }
-
-    pub async fn update_operation_payload(
-        &self,
-        operation: &OperationRecord,
-        patch: Value,
-    ) -> Result<()> {
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/progress",
-                operation.id
-            ),
-            &OperationFenceRequest::new(operation, Some(patch)),
-        )
-        .await
-    }
-
-    pub async fn retry_operation(&self, operation: &OperationRecord, error: &str) -> Result<bool> {
-        let error = bounded_worker_error(error);
-        let response: RetryOperationResponse = self
-            .post_json(
-                &format!("/internal/worker/control/operations/{}/retry", operation.id),
-                &OperationErrorFenceRequest::new(operation, error.as_ref()),
-            )
-            .await?;
-        Ok(response.retry_scheduled)
-    }
-
-    pub async fn begin_snapshot_retry(&self, operation: &OperationRecord) -> Result<()> {
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/begin-snapshot-retry",
-                operation.id
-            ),
-            &OperationFenceRequest::new(operation, None),
-        )
-        .await
-    }
-
-    pub async fn defer_snapshot_operation(
-        &self,
-        operation: &OperationRecord,
-        error: &str,
-    ) -> Result<()> {
-        let error = bounded_worker_error(error);
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/defer-snapshot",
-                operation.id
-            ),
-            &OperationErrorFenceRequest::new(operation, error.as_ref()),
-        )
-        .await
-    }
-
-    pub async fn complete_start(
-        &self,
-        operation: &OperationRecord,
-        storage_bytes: i64,
-    ) -> Result<()> {
-        self.complete_operation(operation, OperationCompletion::Start { storage_bytes })
-            .await
-    }
-
-    pub async fn complete_snapshot(
-        &self,
-        operation: &OperationRecord,
-        snapshot_generation: i64,
-    ) -> Result<()> {
-        self.complete_operation(
-            operation,
-            OperationCompletion::Snapshot {
-                snapshot_generation,
-            },
-        )
-        .await
-    }
-
-    pub async fn complete_stop(
-        &self,
-        operation: &OperationRecord,
-        snapshot_generation: i64,
-        storage_bytes: i64,
-    ) -> Result<()> {
-        self.complete_operation(
-            operation,
-            OperationCompletion::Stop {
-                snapshot_generation,
-                storage_bytes,
-            },
-        )
-        .await
-    }
-
-    pub async fn complete_restore(
-        &self,
-        operation: &OperationRecord,
-        target_generation: i64,
-        snapshot_generation: i64,
-        storage_bytes: i64,
-    ) -> Result<()> {
-        self.complete_operation(
-            operation,
-            OperationCompletion::Restore {
-                target_generation,
-                snapshot_generation,
-                storage_bytes,
-            },
-        )
-        .await
-    }
-
-    pub async fn complete_reset(
-        &self,
-        operation: &OperationRecord,
-        snapshot_generation: i64,
-        storage_bytes: i64,
-        was_running: bool,
-    ) -> Result<()> {
-        self.complete_operation(
-            operation,
-            OperationCompletion::Reset {
-                snapshot_generation,
-                storage_bytes,
-                was_running,
-            },
-        )
-        .await
-    }
-
-    pub async fn validate_delete(&self, operation: &OperationRecord) -> Result<()> {
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/validate-delete",
-                operation.id
-            ),
-            &OperationFenceRequest::new(operation, None),
-        )
-        .await
-    }
-
-    pub async fn deactivate_placement_after_stop(&self, operation: &OperationRecord) -> Result<()> {
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/deactivate-placement",
-                operation.id
-            ),
-            &OperationFenceRequest::new(operation, None),
-        )
-        .await
-    }
-
-    pub async fn complete_delete(&self, operation: &OperationRecord) -> Result<()> {
-        self.complete_operation(operation, OperationCompletion::Delete)
-            .await
-    }
-
-    pub async fn mark_runtime_lost(
-        &self,
-        server_id: Uuid,
-        generation: i64,
-        error: &str,
-    ) -> Result<()> {
-        let error = bounded_worker_error(error);
-        self.post_no_content(
-            "/internal/worker/control/runtime-lost",
-            &RuntimeLostRequest {
-                server_id,
-                generation,
-                error: error.as_ref(),
-            },
-        )
-        .await
-    }
-
-    pub async fn request_stop(
-        &self,
-        server_id: Uuid,
-        generation: i64,
-        reason: &str,
-    ) -> Result<ObservedState> {
-        self.post_json(
-            &format!("/internal/worker/control/servers/{server_id}/stop"),
-            &ServerGenerationRequest { generation, reason },
-        )
-        .await
-    }
-
-    pub async fn request_snapshot(
-        &self,
-        server_id: Uuid,
-        generation: i64,
-        reason: SnapshotReason,
-    ) -> Result<ObservedState> {
-        self.post_json(
-            &format!("/internal/worker/control/servers/{server_id}/snapshot"),
-            &ServerSnapshotRequest { generation, reason },
-        )
-        .await
-    }
-
-    pub async fn publish_snapshot(
-        &self,
-        server_id: Uuid,
-        operation: &OperationRecord,
-        snapshot_generation: i64,
-        size_bytes: i64,
-    ) -> Result<()> {
-        self.post_no_content(
-            &format!("/internal/worker/control/servers/{server_id}/snapshots/publish"),
-            &PublishSnapshotRequest {
-                operation_id: operation.id,
-                generation: operation.generation,
-                attempt: operation.attempt,
-                snapshot_generation,
-                size_bytes,
-            },
-        )
-        .await
-    }
-
-    pub async fn claim_export(&self) -> Result<Option<WorkerExportTask>> {
-        self.post_json("/internal/worker/control/exports/claim", &EmptyRequest {})
-            .await
-    }
-
-    pub async fn complete_export(
-        &self,
-        task: &WorkerExportTask,
-        archive_key: &str,
-        archive_size: i64,
-        archive_checksum: &str,
-    ) -> Result<()> {
-        self.post_no_content(
-            &format!("/internal/worker/control/exports/{}/complete", task.id),
-            &ExportFenceRequest {
-                source_generation: task.source_generation,
-                attempt: task.attempt,
-                archive_key: Some(archive_key),
-                archive_size: Some(archive_size),
-                archive_checksum: Some(archive_checksum),
-                error: None,
-            },
-        )
-        .await
-    }
-
-    pub async fn fail_export(&self, task: &WorkerExportTask, error: &str) -> Result<()> {
-        let error = bounded_worker_error(error);
-        self.post_no_content(
-            &format!("/internal/worker/control/exports/{}/fail", task.id),
-            &ExportFenceRequest {
-                source_generation: task.source_generation,
-                attempt: task.attempt,
-                archive_key: None,
-                archive_size: None,
-                archive_checksum: None,
-                error: Some(error.as_ref()),
-            },
-        )
-        .await
-    }
-
-    async fn complete_operation(
-        &self,
-        operation: &OperationRecord,
-        completion: OperationCompletion,
-    ) -> Result<()> {
-        self.post_no_content(
-            &format!(
-                "/internal/worker/control/operations/{}/complete",
-                operation.id
-            ),
-            &CompleteOperationRequest {
-                generation: operation.generation,
-                attempt: operation.attempt,
-                completion,
-            },
-        )
-        .await
+            .header(header::AUTHORIZATION, self.authorization.clone());
+        if let Some(lease_id) = *self.lease_id.read().expect("worker lease lock poisoned") {
+            request = request.header("x-worker-lease", lease_id.to_string());
+        }
+        Ok(request)
     }
 
     fn endpoint(&self, path: &str) -> Result<Url> {
@@ -413,6 +125,66 @@ impl WorkerControl {
             .context("send worker control-plane request")?;
         require_success(path, response).await?;
         Ok(())
+    }
+
+    async fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R> {
+        let response = self
+            .authorized_request(Method::GET, self.endpoint(path)?)?
+            .send()
+            .await
+            .context("send worker control-plane request")?;
+        require_success(path, response)
+            .await?
+            .json::<R>()
+            .await
+            .context("decode worker control-plane response")
+    }
+
+    async fn get_json_with_assignment<R: DeserializeOwned>(
+        &self,
+        path: &str,
+        assignment: WorkerAssignment,
+    ) -> Result<R> {
+        let mut url = self.endpoint(path)?;
+        {
+            let mut query = url.query_pairs_mut();
+            match assignment {
+                WorkerAssignment::Placement { generation } => {
+                    query.append_pair("assignment", "placement");
+                    query.append_pair("generation", &generation.to_string());
+                }
+                WorkerAssignment::Operation {
+                    operation_id,
+                    generation,
+                    attempt,
+                } => {
+                    query.append_pair("assignment", "operation");
+                    query.append_pair("operation_id", &operation_id.to_string());
+                    query.append_pair("generation", &generation.to_string());
+                    query.append_pair("attempt", &attempt.to_string());
+                }
+                WorkerAssignment::Export {
+                    export_id,
+                    generation,
+                    attempt,
+                } => {
+                    query.append_pair("assignment", "export");
+                    query.append_pair("export_id", &export_id.to_string());
+                    query.append_pair("generation", &generation.to_string());
+                    query.append_pair("attempt", &attempt.to_string());
+                }
+            }
+        }
+        let response = self
+            .authorized_request(Method::GET, url)?
+            .send()
+            .await
+            .context("send worker control-plane request")?;
+        require_success(path, response)
+            .await?
+            .json::<R>()
+            .await
+            .context("decode worker control-plane response")
     }
 }
 
@@ -482,134 +254,6 @@ async fn require_success(path: &str, response: reqwest::Response) -> Result<reqw
         );
     }
     Ok(response)
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyRequest {}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct OperationFenceRequest {
-    generation: i64,
-    attempt: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch: Option<Value>,
-}
-
-impl OperationFenceRequest {
-    fn new(operation: &OperationRecord, patch: Option<Value>) -> Self {
-        Self {
-            generation: operation.generation,
-            attempt: operation.attempt,
-            patch,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct OperationErrorFenceRequest<'a> {
-    generation: i64,
-    attempt: i32,
-    error: &'a str,
-}
-
-impl<'a> OperationErrorFenceRequest<'a> {
-    fn new(operation: &OperationRecord, error: &'a str) -> Self {
-        Self {
-            generation: operation.generation,
-            attempt: operation.attempt,
-            error,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetryOperationResponse {
-    retry_scheduled: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RuntimeLostRequest<'a> {
-    server_id: Uuid,
-    generation: i64,
-    error: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ServerGenerationRequest<'a> {
-    generation: i64,
-    reason: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ServerSnapshotRequest {
-    generation: i64,
-    reason: SnapshotReason,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PublishSnapshotRequest {
-    operation_id: Uuid,
-    generation: i64,
-    attempt: i32,
-    snapshot_generation: i64,
-    size_bytes: i64,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ExportFenceRequest<'a> {
-    source_generation: i64,
-    attempt: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archive_key: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archive_size: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archive_checksum: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CompleteOperationRequest {
-    generation: i64,
-    attempt: i32,
-    completion: OperationCompletion,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum OperationCompletion {
-    Start {
-        storage_bytes: i64,
-    },
-    Snapshot {
-        snapshot_generation: i64,
-    },
-    Stop {
-        snapshot_generation: i64,
-        storage_bytes: i64,
-    },
-    Restore {
-        target_generation: i64,
-        snapshot_generation: i64,
-        storage_bytes: i64,
-    },
-    Reset {
-        snapshot_generation: i64,
-        storage_bytes: i64,
-        was_running: bool,
-    },
-    Delete,
 }
 
 #[cfg(test)]

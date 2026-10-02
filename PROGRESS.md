@@ -1,38 +1,45 @@
 # Kurbis Implementation Progress
 
-Last reviewed: 2026-10-01
+Last reviewed: 2026-10-02
 
-## Status
+## Status: Architecture Overhaul Complete and Locally Verified
 
-Plan 1 authentication and account linking and Plan 2 server management, durable resets, and world export are implemented in the Rust/Postgres control plane, gateway, worker, and Next.js panel.
+The approved v1 architecture and product scope in [PLAN.md](PLAN.md) are implemented and verified locally. The public lifecycle surface is the canonical `POST /api/v1/servers/{server_id}/commands` endpoint; legacy `/actions` aliases and duplicate worker lifecycle routes are removed. Public authentication resolves through typed actor context, the OpenAPI contract is generated from the Rust router, and the TypeScript client is checked for drift.
 
-The built-in Pumpkin management plugin is implemented. OPs can open /kurbis for server status, players, logs, activity, settings, whitelist, snapshots, and lifecycle controls. /kurbis login creates a one-use link into the existing panel. The plugin calls the existing server API; a placement-scoped capability maps every request to one server. The worker keeps the capability source of truth outside the container, rotates it when placement changes, and stages only that server's credential for the plugin. Login tokens are stored hashed, expire after 15 minutes, and redeem once into a one-hour server-only browser session. These sessions cannot authenticate Kurbis accounts or access another server.
+The backend uses one fresh canonical schema in `migrations/0001_fresh_schema.sql`. Gateway routing reads through the shared repository boundary instead of control-plane API internals. Workers operate through the control-plane API and assignment-scoped object endpoints and do not receive database, bucket, or operator credentials. Worker API leases are fenced, and runtime cleanup removes the stopped runtime before the control plane releases capacity so published ports can be reused safely.
 
-## Worker Isolation Hardening (In Progress)
+The accepted account behavior is implemented: `/app/servers` is the account-level list/selector and `/manage/{serverId}` is the only server-panel route family. Multiple scoped browser grants persist independently until revoked. The selector exposes the union of account-accessible and grant-accessible servers. A scoped browser grant can reset or delete only its bound server; raw worker/plugin capabilities cannot perform those destructive actions. Plugin commands and menus resolve through one shared action registry.
 
-The prior verification below predates the requested worker-isolation changes. The current implementation provisions a unique worker API token and PostgreSQL login per worker, enforces assigned-server access in PostgreSQL, keeps placement and lifecycle ownership in the control plane, and mediates object access through request-time worker authorization. Workers do not retain a shared internal token, unrestricted database URL, or fleet-wide object-store credentials. Focused role, lifecycle, object, maintenance, API, and browser verification is now complete; local Linux runtime/quota evidence remains separate.
+## Verification Evidence
 
-Live Bedrock phone testing was canceled at the user's direction and is excluded from this task. Automated TLS/handoff and fresh browser verification passed; local Docker/Linux runtime and quota verification remain separate.
+All verification below ran against the completed implementation on 2026-10-02.
 
-The standalone worker launcher environment matrix passes **7/7** subprocess checks for native and Docker modes, per-worker bundle values, secret scrubbing, explicit local HTTP opt-in, and missing/malformed bundle failures. Fresh local PostgreSQL checks now pass the historical identity migration target (**1/1**), real-role/RLS worker isolation target (**1/1**), worker-control API target (**9/9**, including actor-aware owner/worker stop parity, stale-actor rejection, and bounded retry diagnostics), object-store isolation target (**1/1**), CP maintenance/expiry target (**1/1**), and lifecycle/placement target (**27/27**). `cargo check --locked --all-targets`, formatting, and clippy with `-D warnings` pass. Fresh rebuilt browser E2E passed **17/17**; production Linux/Docker evidence remains separate.
-
-Lifecycle HTTP adapters now share actor-aware command methods. Public owner/operator actions and assigned-worker stop/snapshot requests dispatch through one transactionally fenced `LifecycleActor` path; authentication derives actor identity and generation fences, while the canonical lifecycle service owns placement checks, locks, and state transitions. Retry, defer, completion, runtime-loss, and export routes already dispatch through shared lifecycle operations and resource-fenced helpers.
-
-Minecraft admission now uses the authenticated waiting runtime for both editions. The runtime exposes authenticated Java UUIDs and validated Bedrock XUIDs; only verified identities receive one-use browser login links. Signed-out redemption creates a persistent session; signed-in redemption merges identities and account data. Account creation and Minecraft admission serialize on the account row, preserving the one-server capacity rule and a single default server.
-
-World-only and full resets persist recoverable stages and generation fences. Export jobs pin immutable snapshots, stream ZIP64 world archives, validate source chunks and uploaded archive checksums, and expire after 24 hours.
-
-## Verification
-
-- With `TEST_DATABASE_URL` set to a disposable local PostgreSQL database, `cargo test --locked --all-targets -- --test-threads=1` passed **135 tests**. This includes server-capability rotation and scoping, same-generation worker relocation, login-token/session boundaries, identity migration and concurrent merges, suspension and world preservation, reset recovery, snapshots, worker leases, real worker roles/RLS, worker-control lifecycle fences, server-scoped streamed objects, CP maintenance/expiry, and ZIP64 archive contents/checksums.
-- `cargo test --locked --manifest-path plugins/kurbis-control/Cargo.toml` passed **6/6** plugin tests.
+- Fresh Rust/Postgres suite passed in full: 77 library tests; 10 API v1; 1 fresh-schema; 6 gateway-routing; 5 identity; 2 identity-preservation; 27 lifecycle; 5 server-access API; 13 snapshot-persistence; 2 worker-bundle; 13 worker-control API; 1 worker-maintenance; 2 worker-object isolation; 1 world-export; plus doc tests.
+- `cargo clippy --locked --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check` passed.
-- Frontend unit tests passed **18/18**; TypeScript typecheck and production build passed. The build includes /auth/server and /manage/{serverId}.
-- The fresh-database Playwright run passed **17/17** journeys, including server-scoped link redemption, account/cross-server denial, OAuth/session boundaries, resets, owner isolation, and security headers.
-- Native Pumpkin runtime verification passed with the built-in plugin staged. It covered OP-only command visibility, link issuance and one-use redemption, cross-origin/replay/expiry rejection, cross-server and account API denial, plugin/capability file placement, worker restart, snapshot upload recovery, worker fencing, cross-worker restore, and the real five-minute idle timer after a rejoin.
-- Local Docker readiness-only verification passed with the real nested Pumpkin runtime, short host-control socket path, plugin installation, and worker-to-control-plane transport. Full quota/lifecycle/GUI runtime verification remains unverified after subsequent harness/parser iterations; no green `result.json` is claimed.
-- Cargo formatting, shell syntax checks, Python compilation, and `git diff --check` passed.
+- Worker-focused Rust library tests passed **35/35** after the runtime teardown changes.
+- Plugin crate passed **7/7** tests, Clippy, and `wasm32-wasip2` checking.
+- Python runtime-verifier unit suite passed **20/20**.
+- Web API drift check (`pnpm --dir web run api:check`) passed.
+- Web TypeScript check passed.
+- Web unit suite passed **29/29** across 13 files.
+- Production Next.js build passed with `/app/servers` and `/manage/[serverId]` routes and no `/app/servers/[serverId]` route family.
+- Production Playwright suite passed **19/19**, including multi-grant persistence, independent revocation, account-cookie fallback, scoped reset/delete, and deterministic post-delete navigation.
+- `git diff --check` passed before the final progress-document update.
 
-## Release limits
+## Docker/Linux Runtime Acceptance
 
-Real Microsoft/Xbox Bedrock login and handoff remain unverified: the pinned Pumpkin runtime has a documented NetherNet signaling TLS incompatibility. Controlled fixtures cover verified Bedrock XUID admission. Live Google/Discord accounts and Linux container memory/disk quota behavior require external accounts or Docker/Linux. Docker image execution and hard 2 GiB/5 GiB quota verification were unavailable because Docker Desktop was stopped and the local Docker socket was absent. No production deployment was performed.
+The fresh local runtime harness completed with `passed: true` in `output/runtime/melon-local-verification-183e66584a1c48cf98983d5a2740d2ef/result.json`.
+
+It verified the generated API contract, worker credential isolation, live Pumpkin startup, the waiting runtime, the real gateway listener, trusted Bedrock TLS signaling, owner restart with generation fencing, operator plugin GUI behavior, world export, queued capacity and Java waiting login, clean capacity release, scoped stop/start/reset/delete, periodic snapshots, snapshot-upload outage recovery, worker heartbeat during object-store failure, expired-lease fencing, runtime-loss reconciliation, cross-worker snapshot restoration, clean shutdown/final snapshot, native Java wake/transfer, and player/world persistence across workers.
+
+The hard runtime limits also passed:
+
+- Per-server storage quota returned `ENOSPC` after **5,170,528,256 bytes** were written, proving the hard 5 GiB filesystem boundary.
+- Idle shutdown required a fresh continuous-empty interval after rejoin and completed after **308.45 seconds** continuously empty; the original empty interval reached **499.61 seconds** and was correctly reset by the rejoin.
+- Docker cgroup memory was limited to **2,147,483,648 bytes** with **0 bytes swap**. A 3 GiB allocation-pressure probe exited **137**, and `memory.events` changed from `oom=0, oom_kill=0` to `oom=1, oom_kill=1`.
+- Scoped stop followed immediately by scoped start succeeded after another grant was revoked, confirming the stopped Docker runtime is removed before the published port lease is reused.
+
+## Scope Note
+
+All implementation and acceptance work was local. Physical Bedrock client login/UI interaction was intentionally not performed per user instruction; automated Bedrock/TLS signaling coverage passed in the runtime harness.

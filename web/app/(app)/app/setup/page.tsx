@@ -1,10 +1,12 @@
 import { redirect } from "next/navigation";
 import { Setup } from "../../../../components/setup";
-import { getServers } from "../../../../lib/api/server";
+import { getAccount, getServers } from "../../../../lib/api/server";
 
 export default async function SetupPage() {
-  const servers = await getServers();
-  const selected = servers.find((server) => server.is_default) ?? servers[0];
-  if (selected) redirect(`/app/servers/${selected.id}`);
+  const [servers, account] = await Promise.all([getServers(), getAccount()]);
+  const ownedWorldIds = new Set(account.worlds.map((world) => world.id));
+  const ownedServers = servers.filter((server) => ownedWorldIds.has(server.id));
+  const selected = ownedServers.find((server) => server.is_default) ?? ownedServers[0];
+  if (selected) redirect(`/manage/${selected.id}`);
   return <Setup />;
 }

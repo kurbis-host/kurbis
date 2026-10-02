@@ -113,16 +113,28 @@ def transfer_port_allowed(port, exact_port, ranges):
 
 
 def skip_item_component(data, offset, component_id):
-    # The managed Kurbis menu uses custom_name and lore components. Decode
+    # The managed Kurbis menu uses custom_data, custom_name, and lore components. Decode
     # those network forms so GUI packets remain verifiable on modern clients;
     # unknown component payloads are rejected rather than guessed.
-    if component_id in (6, 11):  # custom_name/lore are Java NBT payloads
+    if component_id in (0, 6, 9):  # custom_data/custom_name/item_name are Java NBT payloads
         return skip_nbt(data, offset)
+    if component_id == 11:  # lore is a VarInt line count followed by NBT text components
+        if data[offset] == 9 and len(data) > offset + 1 and data[offset + 1] in (8, 10):
+            return skip_nbt(data, offset)
+        count, offset = read_vi(data, offset)
+        for _ in range(count):
+            offset = skip_nbt(data, offset)
+        return offset
     if component_id in (1, 2, 3, 12) or 88 <= component_id <= 121:
         # max-stack/damage/max-damage/rarity and registry-backed variants
         # are encoded as VarInts.
         _, offset = read_vi(data, offset)
         return offset
+    if component_id == 4:  # unbreakable is a unit component (0 payload bytes)
+        return offset
+    if component_id == 10:  # item_model is a VarInt-prefixed string
+        length, offset = read_vi(data, offset)
+        return offset + length
     raise ValueError(f"unsupported added item component id {component_id}")
 
 
@@ -146,7 +158,9 @@ def skip_nbt(data, offset):
             element = data[cursor]
             count = int.from_bytes(data[cursor + 1:cursor + 5], "big", signed=True)
             cursor += 5
-            for _ in range(max(count, 0)):
+            if element == 0 or count <= 0:
+                return cursor
+            for _ in range(count):
                 cursor = payload(element, cursor)
             return cursor
         if tag == 10:

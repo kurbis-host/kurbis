@@ -4,8 +4,8 @@ use std::{path::Path, sync::Arc};
 
 use common::{create_user, test_pool};
 use kurbis_hoster::{
+    control_plane::snapshots::SnapshotStore,
     model::{SNAPSHOT_RETENTION_GENERATIONS, SnapshotReason},
-    worker::snapshot::SnapshotManager,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-pub(crate) async fn local_snapshot_manager(pool: &PgPool, root: &Path) -> SnapshotManager {
-    SnapshotManager::new(pool.clone(), local_snapshot_store(root).await)
+pub(crate) async fn local_snapshot_manager(pool: &PgPool, root: &Path) -> SnapshotStore {
+    SnapshotStore::new(pool.clone(), local_snapshot_store(root).await)
 }
 
 pub(crate) async fn local_snapshot_store(root: &Path) -> Arc<dyn object_store::ObjectStore> {

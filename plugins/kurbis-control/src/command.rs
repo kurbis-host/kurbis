@@ -11,12 +11,12 @@ use pumpkin_plugin_api::{
 use serde_json::{Value, json};
 
 use crate::{
-    api,
+    actions, api,
     menu::{self, View},
 };
 
 pub(crate) fn command() -> Command {
-    Command::new(&["kurbis".into()], "Manage this Kurbis server.")
+    let mut command = Command::new(&["kurbis".into()], "Manage this Kurbis server.")
         .execute(Handler("menu"))
         .then(CommandNode::literal("login").execute(Handler("login")))
         .then(view("status"))
@@ -25,26 +25,19 @@ pub(crate) fn command() -> Command {
         .then(view("activity"))
         .then(view("settings"))
         .then(view("snapshots"))
-        .then(confirmed_lifecycle_action("start"))
-        .then(confirmed_lifecycle_action("stop"))
-        .then(confirmed_lifecycle_action("restart"))
-        .then(confirmed_lifecycle_action("snapshot"))
         .then(settings_command())
         .then(whitelist_command())
-        .then(restore_command())
+        .then(restore_command());
+    for action in actions::prompted_actions() {
+        command = command.then(confirmed_lifecycle_action(action));
+    }
+    command
 }
 
-fn confirmed_lifecycle_action(action: &'static str) -> CommandNode {
-    let confirm_handler = match action {
-        "start" => "start_confirm",
-        "stop" => "stop_confirm",
-        "restart" => "restart_confirm",
-        "snapshot" => "snapshot_confirm",
-        _ => unreachable!("only supported lifecycle actions are registered"),
-    };
-    CommandNode::literal(action)
-        .execute(Handler(action))
-        .then(CommandNode::literal("confirm").execute(Handler(confirm_handler)))
+fn confirmed_lifecycle_action(spec: &'static actions::ActionSpec) -> CommandNode {
+    CommandNode::literal(spec.command)
+        .execute(Handler(spec.command))
+        .then(CommandNode::literal("confirm").execute(Handler(spec.confirmation_handler)))
 }
 
 fn view(name: &'static str) -> CommandNode {
@@ -78,12 +71,13 @@ fn whitelist_command() -> CommandNode {
 }
 
 fn restore_command() -> CommandNode {
-    CommandNode::literal("restore")
+    CommandNode::literal(actions::spec(actions::LifecycleAction::Restore).command)
         .then(
-            CommandNode::literal("confirm")
-                .then(word("generation").execute(Handler("restore_confirm"))),
+            CommandNode::literal("confirm").then(word("generation").execute(Handler(
+                actions::spec(actions::LifecycleAction::Restore).confirmation_handler,
+            ))),
         )
-        .then(word("generation").execute(Handler("restore_prompt")))
+        .then(word("generation").execute(Handler(actions::RESTORE_PROMPT_HANDLER)))
 }
 
 fn arg(args: &ConsumedArgs, name: &str) -> Result<String> {
@@ -128,22 +122,28 @@ impl CommandHandler for Handler {
                 "settings" => page(&sender, View::Settings)?,
                 "whitelist" => page(&sender, View::Whitelist(0))?,
                 "snapshots" => page(&sender, View::Snapshots(0))?,
-                "start" | "stop" | "restart" | "snapshot" => {
-                    let action = self.0;
+                command if actions::by_command(command).is_some() => {
+                    let action = actions::by_command(command).expect("matched action");
+                    let spec = actions::spec(action);
                     say(
                         &sender,
                         &format!(
-                            "This will {action} this server. Confirm with /kurbis {action} confirm."
+                            "This will {} this server. Confirm with /kurbis {} confirm.",
+                            spec.command, spec.command,
                         ),
                     );
                 }
-                "start_confirm" | "stop_confirm" | "restart_confirm" | "snapshot_confirm" => {
-                    let action = self.0.strip_suffix("_confirm").unwrap_or(self.0);
-                    let result = api::server_action(action)?;
+                handler
+                    if actions::by_confirmation_handler(handler)
+                        .is_some_and(|action| action != actions::LifecycleAction::Restore) =>
+                {
+                    let action = actions::by_confirmation_handler(handler).expect("matched action");
+                    let command = actions::spec(action).command;
+                    let result = api::server_command(action, None)?;
                     say(
                         &sender,
                         &format!(
-                            "{action} requested; current state: {}.",
+                            "{command} requested; current state: {}.",
                             text(&result, "observed_state")
                         ),
                     );
@@ -166,7 +166,7 @@ impl CommandHandler for Handler {
                     ))?;
                     say(&sender, &format!("Removed {player_id} from the whitelist."));
                 }
-                "restore_prompt" => {
+                actions::RESTORE_PROMPT_HANDLER => {
                     let generation = positive_generation(&arg(&args, "generation")?)?;
                     say(
                         &sender,
@@ -175,9 +175,13 @@ impl CommandHandler for Handler {
                         ),
                     );
                 }
-                "restore_confirm" => {
+                handler
+                    if handler
+                        == actions::spec(actions::LifecycleAction::Restore)
+                            .confirmation_handler =>
+                {
                     let generation = positive_generation(&arg(&args, "generation")?)?;
-                    api::restore_snapshot(generation)?;
+                    api::server_command(actions::LifecycleAction::Restore, Some(generation))?;
                     say(
                         &sender,
                         &format!("Restore of snapshot {generation} requested."),

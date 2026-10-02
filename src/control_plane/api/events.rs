@@ -1,11 +1,12 @@
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures::{Stream, stream};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::time::sleep;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 use crate::model::{OperationRecord as DbOperation, SnapshotRecord as DbSnapshot};
 
 use super::activity::{EventRow, ServerEventKind};
+use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::{require_server_access, server_by_id};
 use super::logs::LogEntry;
 use super::players::player_list;
@@ -23,19 +25,19 @@ use super::whitelist::whitelist_state;
 use super::{ApiError, AppState};
 use super::{PlayerPresence, Whitelist};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct EventsQuery {
     pub(super) after_id: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct ServerEvent {
     pub id: i64,
     #[serde(flatten)]
     pub payload: ServerEventPayload,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEventPayload {
     Server {
@@ -180,10 +182,15 @@ pub(super) fn event_cursor(headers: &HeaderMap, query: &EventsQuery) -> Result<i
 
 pub(super) async fn server_events(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(server_id): Path<Uuid>,
-    Query(query): Query<EventsQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    headers: ApiServerHeaders,
+    ApiPath(path): ApiPath<ServerIdPath>,
+    ApiQuery(query): ApiQuery<EventsQuery>,
+) -> Result<
+    aide::UseApi<Sse<impl Stream<Item = Result<Event, Infallible>>>, axum::Json<ServerEvent>>,
+    ApiError,
+> {
+    let server_id = path.server_id;
+    let headers = headers.0;
     let server = require_server_access(&state, &headers, server_id).await?;
     let cursor = event_cursor(&headers, &query)?;
 
@@ -292,9 +299,11 @@ pub(super) async fn server_events(
         }
     });
 
-    Ok(Sse::new(output).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    Ok(Sse::new(output)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into())
 }

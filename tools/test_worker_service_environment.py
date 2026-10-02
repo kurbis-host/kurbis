@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Process-level checks for worker credential isolation in run-service.sh."""
+"""Process-level checks for the API-only worker environment in run-service.sh."""
 
 from __future__ import annotations
 
@@ -46,7 +46,6 @@ class WorkerLaunch:
             "CONTROL_PLANE_PORT": "18080",
             "DATABASE_URL": "postgres://operator:operator-database-secret@127.0.0.1/control_plane",
             "DATABASE_URL_NATIVE": "postgres://operator:operator-database-secret@127.0.0.1/control_plane",
-            "WORKER_DATABASE_URL": "operator-worker-database-fallback-sentinel",
             "WORKER_API_TOKEN": "operator-worker-api-fallback-sentinel",
             "PUMPKIN_HOST_CONTROL_TOKEN": "operator-host-control-fallback-sentinel",
             "WORKER_NAME": "operator-worker-name-sentinel",
@@ -81,7 +80,6 @@ class WorkerLaunch:
     def write_bundle(
         self,
         *,
-        include_database_url: bool = True,
         include_api_token: bool = True,
         allow_http: str | None = None,
     ) -> None:
@@ -111,10 +109,8 @@ class WorkerLaunch:
             values["KURBIS_CONTROL_PLUGIN_WASM"] = str(
                 self.root / "plugins/kurbis-control/target/wasm32-wasip2/release/kurbis_control.wasm"
             )
-        if include_database_url:
-            values["WORKER_DATABASE_URL"] = "postgres://worker:per-worker-db-secret@127.0.0.1/worker"
         if include_api_token:
-            values["WORKER_API_TOKEN"] = "per-worker-api-secret"
+            values["WORKER_API_TOKEN"] = "a" * 43
         if allow_http is not None:
             values["WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP"] = allow_http
         self.bundle.write_text(
@@ -134,6 +130,7 @@ class WorkerLaunch:
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", "/"),
             "INTERNAL_TOKEN": "ambient-internal-token-sentinel",
+            "PUMPKIN_HOST_CONTROL_TOKEN": "ambient-host-control-fallback-sentinel",
             "GOOGLE_OAUTH_CLIENT_SECRET": "ambient-google-oauth-sentinel",
             "DISCORD_OAUTH_CLIENT_SECRET": "ambient-discord-oauth-sentinel",
             "DATABASE_URL": "ambient-control-database-sentinel",
@@ -175,8 +172,7 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                 environment = launch.child_environment()
 
                 self.assertEqual(environment["WORKER_ID"], WORKER_ID)
-                self.assertEqual(environment["WORKER_DATABASE_URL"], "postgres://worker:per-worker-db-secret@127.0.0.1/worker")
-                self.assertEqual(environment["WORKER_API_TOKEN"], "per-worker-api-secret")
+                self.assertEqual(environment["WORKER_API_TOKEN"], "a" * 43)
                 self.assertEqual(environment["PUMPKIN_HOST_CONTROL_TOKEN"], "per-worker-host-control-secret")
                 self.assertEqual(environment["WORKER_NAME"], "browser-worker")
                 self.assertEqual(environment["WORKER_ADDRESS"], "198.51.100.20")
@@ -206,6 +202,8 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                 for name in (
                     "DATABASE_URL",
                     "DATABASE_URL_NATIVE",
+                    "WORKER_DATABASE_URL",
+                    "WORKER_PROVISIONING_DATABASE_URL",
                     "INTERNAL_TOKEN",
                     "PUMPKIN_GATEWAY_CONTROL_TOKEN",
                     "GOOGLE_OAUTH_CLIENT_SECRET",
@@ -228,6 +226,7 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                     "operator-database-secret",
                     "operator-internal-token-sentinel",
                     "operator-gateway-token-sentinel",
+                    "operator-host-control-fallback-sentinel",
                     "operator-google-oauth-sentinel",
                     "operator-discord-oauth-sentinel",
                     "operator-s3-access-sentinel",
@@ -236,6 +235,7 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                     "operator-aws-session-sentinel",
                     "operator-cloud-credentials-sentinel",
                     "ambient-internal-token-sentinel",
+                    "ambient-host-control-fallback-sentinel",
                     "ambient-google-oauth-sentinel",
                     "ambient-discord-oauth-sentinel",
                     "ambient-control-database-sentinel",
@@ -287,26 +287,28 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
         self.assertNotEqual(malformed_result.returncode, 0)
         self.assertFalse(malformed.capture_path.exists())
 
-    def test_incomplete_bundle_cannot_fall_back_to_operator_credentials(self) -> None:
+    def test_missing_api_credential_fails_before_worker_exec(self) -> None:
         launch = WorkerLaunch("docker")
         self.addCleanup(launch.close)
         launch.write_bundle(include_api_token=False)
         result = launch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        environment = launch.child_environment()
-        self.assertNotIn("WORKER_API_TOKEN", environment)
-        self.assertNotIn("INTERNAL_TOKEN", environment)
-        self.assertNotIn("DATABASE_URL", environment)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("worker credential bundle is missing WORKER_API_TOKEN", result.stderr)
+        self.assertFalse(launch.capture_path.exists())
 
-    def test_missing_bundle_database_url_cannot_fall_back_to_control_plane_url(self) -> None:
+    def test_malformed_api_credential_fails_before_worker_exec(self) -> None:
         launch = WorkerLaunch("docker")
         self.addCleanup(launch.close)
-        launch.write_bundle(include_database_url=False)
+        launch.write_bundle()
+        bundle = launch.bundle.read_text(encoding="utf-8").replace(
+            "export WORKER_API_TOKEN=a" + "a" * 42,
+            "export WORKER_API_TOKEN=short",
+        )
+        launch.bundle.write_text(bundle, encoding="utf-8")
         result = launch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        environment = launch.child_environment()
-        self.assertNotIn("WORKER_DATABASE_URL", environment)
-        self.assertNotIn("DATABASE_URL", environment)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("malformed WORKER_API_TOKEN", result.stderr)
+        self.assertFalse(launch.capture_path.exists())
 
     def test_launcher_rejects_missing_startup_arguments_before_exec(self) -> None:
         result = subprocess.run(

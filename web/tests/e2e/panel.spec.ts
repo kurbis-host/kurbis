@@ -102,7 +102,11 @@ async function login(page: Page, name = 'Browser Player', provider = 'Google') {
     const session = await browserApi(page, '/api/v1/session');
     return session.status === 200 ? JSON.parse(session.text).user.display_name : null;
   }).toBe(name);
-  await expect(page).toHaveURL(/\/app(?:\/setup)?$/);
+  await expect(page).toHaveURL(/\/app(?:\/setup|\/servers)$/);
+  if (new URL(page.url()).pathname === '/app/servers') {
+    await page.getByRole('link', { name: 'Create a world' }).first().click();
+    await expect(page).toHaveURL(/\/app\/setup$/);
+  }
   await expect(page.getByPlaceholder('friends-world')).toBeVisible();
 }
 async function state(page: Page, value: string) {
@@ -120,7 +124,7 @@ async function create(page: Page, name: string) {
   await page.getByPlaceholder('friends-world').fill(name);
   await page.getByRole('button', { name: /Create sleeping world/ }).click();
   await state(page, 'Sleeping');
-  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
+  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
 }
 async function browserApi(page: Page, path: string, method = 'GET', data?: unknown) {
   const cookie = (await page.context().cookies()).map(({ name, value }) => `${name}=${value}`).join('; ');
@@ -151,20 +155,22 @@ async function serverApiPath(page: Page, suffix = '') {
   return `/api/v1/servers/${await serverId(page)}${suffix}`;
 }
 async function serverRoute(page: Page, suffix = '') {
-  return `/app/servers/${await serverId(page)}${suffix}`;
+  return `/manage/${await serverId(page)}${suffix}`;
 }
 async function resetFromSettings(page: Page, request: APIRequestContext, id: string, mode: 'world' | 'full') {
-  await page.goto(`/app/servers/${id}/settings`);
+  await page.goto(`/manage/${id}/settings`);
   const trigger = mode === 'world' ? 'World reset' : 'Full server reset';
   const confirmation = mode === 'world' ? 'Reset world' : 'Reset full server';
   await page.getByRole('button', { name: trigger, exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
   const accepted = page.waitForResponse((response) =>
-    response.url().endsWith(`/api/v1/servers/${id}/reset`) && response.request().method() === 'POST',
+    response.url().endsWith(`/api/v1/servers/${id}/commands`) && response.request().method() === 'POST',
   );
   await dialog.getByRole('button', { name: confirmation, exact: true }).click();
-  expect((await accepted).status()).toBe(202);
+  const acceptedResponse = await accepted;
+  expect(acceptedResponse.status()).toBe(202);
+  expect(acceptedResponse.request().postDataJSON()).toEqual({ command: 'reset', mode });
   await expect.poll(async () => {
     const result = await pool.query('SELECT observed_state FROM servers WHERE id = $1', [id]);
     return result.rows[0]?.observed_state;
@@ -195,14 +201,40 @@ async function resetFromSettings(page: Page, request: APIRequestContext, id: str
     );
     return [state.rows[0]?.observed_state, operation.rows[0]?.status];
   }).toEqual(['sleeping', 'succeeded']);
-  await page.goto(`/app/servers/${id}`);
+  await page.goto(`/manage/${id}`);
   await state(page, 'Sleeping');
 }
 
 test.beforeEach(async ({ request }) => { await command(request, 'reset'); });
 test.afterAll(async () => { await pool.end(); });
 
-test('panel routes support AA accessibility, responsive widths and keyboard dialog control', async ({ page, request }, testInfo) => {
+test('account server list and selector open the shared server route without an owner alias', async ({ page }) => {
+  await login(page);
+  await create(page, 'account-world-one');
+  const firstId = await serverId(page);
+  const owner = await pool.query('SELECT owner_id FROM servers WHERE id = $1', [firstId]);
+  const secondId = randomUUID();
+  await pool.query(
+    'INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)',
+    [secondId, owner.rows[0].owner_id, 'account-world-two'],
+  );
+
+  await page.goto('/app/servers');
+  await expect(page.getByRole('link', { name: /account-world-one/ })).toBeVisible();
+  await expect(page.getByRole('link', { name: /account-world-two/ })).toBeVisible();
+  const selector = page.getByRole('combobox', { name: 'Select server' });
+  await expect(selector.locator('option')).toHaveCount(2);
+  await selector.selectOption(secondId);
+  await expect(page).toHaveURL(`${panel}/manage/${secondId}`);
+  await expect(page.getByRole('main').getByText('account-world-two.mc.example.test').first()).toBeVisible();
+
+  const legacyOwnerRoute = await page.request.get(`${panel}/app/servers/${secondId}`);
+  expect(legacyOwnerRoute.status()).toBe(404);
+  const legacyEventsRoute = await page.request.get(`${panel}/api/events?server_id=${secondId}`);
+  expect(legacyEventsRoute.status()).toBe(404);
+});
+
+test('panel routes support AA accessibility, responsive widths and keyboard dialog control', async ({ page, request, browser }, testInfo) => {
   test.setTimeout(120000);
   const axeResults: Record<string, unknown> = {};
   await page.emulateMedia({ reducedMotion: 'reduce' });
@@ -240,20 +272,6 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
   await expect(page.getByText('Live updates connected')).toBeVisible();
-  const eventsPath = `/api/events?server_id=${encodeURIComponent(await serverId(page))}`;
-  const rawEvent = await page.evaluate((path) => new Promise<string>((resolve, reject) => {
-    const source = new EventSource(path, { withCredentials: true });
-    const timeout = window.setTimeout(() => {
-      source.close();
-      reject(new Error('SSE did not replay a server event'));
-    }, 3000);
-    source.addEventListener('server', event => {
-      window.clearTimeout(timeout);
-      source.close();
-      resolve((event as MessageEvent<string>).data);
-    });
-  }), eventsPath);
-  expect(JSON.parse(rawEvent)).toMatchObject({ type: 'server', data: { id: expect.any(String) } });
   await page.goto(await serverRoute(page, '/settings'));
   const trigger = page.getByRole('button', { name: 'Delete server', exact: true });
   await trigger.focus();
@@ -274,32 +292,76 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await state(page, 'Queued');
   const queuedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
-  if (queuedAudit.violations.length) axeResults['/app?state=queued'] = queuedAudit.violations;
+  if (queuedAudit.violations.length) axeResults[`${await serverRoute(page)} (queued)`] = queuedAudit.violations;
   await captureResponsive(page, await serverRoute(page), 'states/queued', true);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await state(page, 'Sleeping');
   await command(request, 'capacity', { available: true });
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await state(page, 'Restoring');
-  await command(request, 'tick');
-  await command(request, 'tick');
-  await state(page, 'Online');
+  await tickUntil(page, request, 'Online');
   const onlineAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
-  if (onlineAudit.violations.length) axeResults['/app?state=online'] = onlineAudit.violations;
+  if (onlineAudit.violations.length) axeResults[`${await serverRoute(page)} (online)`] = onlineAudit.violations;
   await captureResponsive(page, await serverRoute(page), 'states/online', true);
   await pool.query(
     "UPDATE servers SET observed_state = 'failed', last_error = $1 WHERE subdomain = $2",
     ['Fixture visual state: readiness timed out', 'accessible-world'],
   );
+  await page.reload();
   await state(page, 'Needs attention');
   const failedAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
-  if (failedAudit.violations.length) axeResults['/app?state=failed'] = failedAudit.violations;
+  if (failedAudit.violations.length) axeResults[`${await serverRoute(page)} (failed)`] = failedAudit.violations;
   await captureResponsive(page, await serverRoute(page), 'states/failed', true);
   await testInfo.attach('axe-route-results.json', {
     body: Buffer.from(JSON.stringify(axeResults, null, 2)),
     contentType: 'application/json',
   });
   expect(axeResults).toEqual({});
+
+  const accountCookie = (await page.context().cookies()).find(cookie => cookie.name === 'kurbis_session');
+  expect(accountCookie).toBeTruthy();
+  const eventContext = await browser.newContext();
+  await eventContext.addCookies([{
+    name: accountCookie!.name,
+    value: accountCookie!.value,
+    url: panel,
+    httpOnly: accountCookie!.httpOnly,
+    secure: accountCookie!.secure,
+    sameSite: accountCookie!.sameSite,
+    expires: accountCookie!.expires,
+  }]);
+  const eventPage = await eventContext.newPage();
+  await eventPage.goto(`${panel}/login`);
+  expect((await eventContext.cookies(panel)).some(cookie => cookie.name === 'kurbis_session')).toBe(true);
+  const eventServerId = await serverId(page);
+  const eventsPath = `/api/v1/servers/${encodeURIComponent(eventServerId)}/events`;
+  const liveMotd = 'Live server event reached the browser';
+  const eventPromise = eventPage.evaluate((path) => new Promise<string>((resolve, reject) => {
+    const source = new EventSource(path, { withCredentials: true });
+    const timeout = window.setTimeout(() => {
+      source.close();
+      reject(new Error('SSE did not deliver the committed server update'));
+    }, 5000);
+    source.addEventListener('server', event => {
+      const data = (event as MessageEvent<string>).data;
+      if (JSON.parse(data).data?.settings?.motd === 'Live server event reached the browser') {
+        window.clearTimeout(timeout);
+        source.close();
+        resolve(data);
+      }
+    });
+    source.onopen = () => {
+      sessionStorage.setItem('server-event-source-open', 'true');
+    };
+  }), eventsPath);
+  await eventPage.waitForFunction(() => sessionStorage.getItem('server-event-source-open') === 'true');
+  await pool.query(
+    "UPDATE servers SET settings = jsonb_set(settings, '{motd}', to_jsonb($2::text), true) WHERE id = $1",
+    [eventServerId, liveMotd],
+  );
+  const rawEvent = await eventPromise;
+  await eventContext.close();
+  expect(JSON.parse(rawEvent)).toMatchObject({ type: 'server', data: { id: expect.any(String) } });
 });
 
 test('world and full reset preserve their distinct settings, whitelist, and recovery guarantees', async ({ page, request }) => {
@@ -439,14 +501,18 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await page.getByRole('button', { name: 'Delete server', exact: true }).click();
   const id = await serverId(page);
   const deleteResponse = page.waitForResponse(response =>
-    response.url().endsWith(`/api/v1/servers/${id}`) && response.request().method() === 'DELETE'
+    response.url().endsWith(`/api/v1/servers/${id}/commands`) && response.request().method() === 'POST'
   );
   await page.getByRole('dialog').getByRole('button', { name: 'Delete server', exact: true }).click();
-  expect((await deleteResponse).status()).toBe(202);
+  const acceptedDelete = await deleteResponse;
+  expect(acceptedDelete.status()).toBe(202);
+  expect(acceptedDelete.request().postDataJSON()).toEqual({ command: 'delete' });
+  await expect(page).toHaveURL(`${panel}/manage/server-removed`);
   const deletion = await command(request, 'tick');
   expect((await deletion.json()).operation).toBe('delete');
   await page.reload();
-  await expect(page.getByRole('button', { name: /Create sleeping world/ })).toBeVisible();
+  await expect(page).toHaveURL(`${panel}/manage/server-removed`);
+  await expect(page.getByRole('heading', { name: 'Server removal requested' })).toBeVisible();
   await expect.poll(async () => (await pool.query("SELECT count(*) FROM servers WHERE subdomain = 'renamed-world'")).rows[0].count).toBe('0');
   await page.goto('/app/account');
   await page.getByRole('button', { name: 'Sign out' }).click();
@@ -483,7 +549,8 @@ test('OAuth browser binding, state replay, ownership and invalid configuration a
   const duplicate = await browserApi(page, '/api/v1/servers', 'POST', { subdomain: 'another-world' });
   expect(duplicate.status).toBe(409);
   for (const input of [{ subdomain: '../bad' }, { settings: { difficulty: 'Impossible' } }, { settings: { view_distance: 33 } }, { settings: { plugins: ['unrestricted'] } }]) {
-    expect((await browserApi(page, await serverApiPath(page), 'PATCH', input)).status).toBe(422);
+    const response = await browserApi(page, await serverApiPath(page), 'PATCH', input);
+    expect(response.status, `invalid settings ${JSON.stringify(input)}: ${response.text}`).toBe(422);
   }
   expect((await current(page)).subdomain).toBe('validation-world');
   const anonymous = await browser.newContext();
@@ -535,7 +602,7 @@ test('Minecraft fragment links redeem once through the same-origin browser page'
   const redemption = page.waitForRequest(request =>
     new URL(request.url()).pathname === '/auth/minecraft/redeem' && request.method() === 'POST'
   );
-  const appLoaded = page.waitForURL(/\/app\/setup$/, { waitUntil: 'load' });
+  const appLoaded = page.waitForURL(/\/app\/servers$/, { waitUntil: 'load' });
   await page.goto(link);
   await redemption;
   await appLoaded;
@@ -568,7 +635,7 @@ test('signed-in Minecraft redemption attaches to the browser account without rep
   const identity = { kind: 'bedrock' as const, xuid: '2533274790395904' };
   const link = await issueMinecraftLink(request, identity);
   await page.goto(link);
-  await expect(page).toHaveURL(/\/app\/servers\/[0-9a-f-]+$/);
+  await expect(page).toHaveURL(/\/app\/servers$/);
   expect(new URL(page.url()).hash).toBe('');
   expect((await current(page)).subdomain).toBe('minecraft-owner-world');
 

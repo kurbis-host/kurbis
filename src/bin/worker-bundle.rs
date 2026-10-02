@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
 use rand::Rng;
 use sqlx::{
-    ConnectOptions, PgPool,
+    PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use uuid::Uuid;
@@ -62,46 +62,19 @@ async fn main() -> Result<()> {
     let admin_options = PgConnectOptions::from_str(&args.database_url)
         .context("invalid worker provisioning database URL")?;
     let worker_api_token = random_secret();
-    let worker_database_password = random_secret();
     let host_control_token = random_secret();
-    let database_role = format!(
-        "wkr_{}_{}",
-        worker.id.simple(),
-        Uuid::new_v4().simple().to_string()[..8].to_owned()
-    );
-    let worker_database_url = admin_options
-        .clone()
-        .username(&database_role)
-        .password(&worker_database_password)
-        .to_url_lossy()
-        .to_string();
-
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(admin_options)
         .await
         .context("connect to the worker provisioning database")?;
-    provision_worker(
-        &pool,
-        &worker,
-        &database_role,
-        &worker_database_password,
-        &worker_api_token,
-        args.rotate,
-    )
-    .await?;
+    provision_worker(&pool, &worker, &worker_api_token, args.rotate).await?;
 
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from(format!("data/worker-bundles/{}.env", worker.id)));
-    write_bundle(
-        &output,
-        &worker,
-        &worker_database_url,
-        &worker_api_token,
-        &host_control_token,
-    )?;
+    write_bundle(&output, &worker, &worker_api_token, &host_control_token)?;
     println!("Created worker bundle at {}", output.display());
     Ok(())
 }
@@ -184,8 +157,6 @@ fn worker_from_env(id: Uuid) -> Result<WorkerRecord> {
 async fn provision_worker(
     pool: &PgPool,
     worker: &WorkerRecord,
-    database_role: &str,
-    database_password: &str,
     api_token: &str,
     rotate: bool,
 ) -> Result<()> {
@@ -196,18 +167,17 @@ async fn provision_worker(
         .await?;
     // Existing-token operations lock credential -> assignment rows. Rotation
     // follows that order before taking the worker registration row.
-    let previous_role: Option<String> = sqlx::query_scalar(
-        "SELECT database_role::text FROM worker_auth.credentials
-         WHERE worker_id = $1 FOR UPDATE",
+    let previous_worker: Option<Uuid> = sqlx::query_scalar(
+        "SELECT worker_id FROM worker_credentials WHERE worker_id = $1 FOR UPDATE",
     )
     .bind(worker.id)
     .fetch_optional(&mut *tx)
     .await?;
-    match (&previous_role, rotate) {
-        (Some(_), false) => {
+    match (previous_worker.is_some(), rotate) {
+        (true, false) => {
             bail!("worker credentials already exist; pass --rotate to replace them")
         }
-        (None, true) => bail!("cannot rotate credentials for a worker that is not provisioned"),
+        (false, true) => bail!("cannot rotate credentials for a worker that is not provisioned"),
         _ => {}
     }
 
@@ -253,56 +223,20 @@ async fn provision_worker(
     .execute(&mut *tx)
     .await?;
 
-    let create_role = sqlx::query_scalar::<_, String>(
-        "SELECT format(
-             'CREATE ROLE %I LOGIN INHERIT PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
-             $1::text, $2::text
-         )",
-    )
-    .bind(database_role)
-    .bind(database_password)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::raw_sql(&create_role).execute(&mut *tx).await?;
-    let grant_runtime =
-        sqlx::query_scalar::<_, String>("SELECT format('GRANT worker_runtime TO %I', $1::text)")
-            .bind(database_role)
-            .fetch_one(&mut *tx)
-            .await?;
-    sqlx::raw_sql(&grant_runtime).execute(&mut *tx).await?;
-
     sqlx::query(
-        "INSERT INTO worker_auth.credentials(worker_id, api_token_hash, database_role)
-         VALUES($1, $2, $3)
+        "INSERT INTO worker_credentials(worker_id, api_token_hash)
+         VALUES($1, $2)
          ON CONFLICT(worker_id) DO UPDATE SET
              api_token_hash = EXCLUDED.api_token_hash,
-             database_role = EXCLUDED.database_role,
+             lease_id = NULL,
+             lease_expires_at = NULL,
              revoked_at = NULL,
              created_at = now()",
     )
     .bind(worker.id)
     .bind(blake3::hash(api_token.as_bytes()).as_bytes().to_vec())
-    .bind(database_role)
     .execute(&mut *tx)
     .await?;
-
-    if let Some(previous_role) = previous_role {
-        let disable_role =
-            sqlx::query_scalar::<_, String>("SELECT format('ALTER ROLE %I NOLOGIN', $1::text)")
-                .bind(&previous_role)
-                .fetch_one(&mut *tx)
-                .await?;
-        sqlx::raw_sql(&disable_role).execute(&mut *tx).await?;
-        let terminate_sessions: Vec<bool> = sqlx::query_scalar(
-            "SELECT pg_terminate_backend(pid)
-             FROM pg_stat_activity
-             WHERE usename = $1 AND pid <> pg_backend_pid()",
-        )
-        .bind(previous_role)
-        .fetch_all(&mut *tx)
-        .await?;
-        let _ = terminate_sessions;
-    }
     tx.commit().await?;
     Ok(())
 }
@@ -310,7 +244,6 @@ async fn provision_worker(
 fn write_bundle(
     path: &Path,
     worker: &WorkerRecord,
-    database_url: &str,
     api_token: &str,
     host_control_token: &str,
 ) -> Result<()> {
@@ -322,12 +255,11 @@ fn write_bundle(
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let temporary = parent.join(format!(".{}.{}.tmp", worker.id, Uuid::new_v4()));
     let mut contents = format!(
-        "export WORKER_ID={}\nexport WORKER_NAME={}\nexport WORKER_ADDRESS={}\nexport WORKER_SIGNAL_ADDRESS={}\nexport WORKER_DATABASE_URL={}\nexport WORKER_API_TOKEN={}\nexport PUMPKIN_HOST_CONTROL_TOKEN={}\nexport CONTROL_PLANE_URL={}\nexport PUBLIC_BASE_URL={}\nexport WORKER_RUNTIME={}\nexport WORKER_STORAGE_MODE={}\nexport WORKER_ROOT={}\nexport WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP={}\nexport WORKER_MEMORY_GIB={}\nexport WORKER_DISK_GIB={}\nexport WORKER_CPU_MILLIS={}\nexport WORKER_PORT_MIN={}\nexport WORKER_PORT_MAX={}\nexport SNAPSHOT_INTERVAL_SECONDS={}\nexport IDLE_TIMEOUT_SECONDS={}\n",
+        "export WORKER_ID={}\nexport WORKER_NAME={}\nexport WORKER_ADDRESS={}\nexport WORKER_SIGNAL_ADDRESS={}\nexport WORKER_API_TOKEN={}\nexport PUMPKIN_HOST_CONTROL_TOKEN={}\nexport CONTROL_PLANE_URL={}\nexport PUBLIC_BASE_URL={}\nexport WORKER_RUNTIME={}\nexport WORKER_STORAGE_MODE={}\nexport WORKER_ROOT={}\nexport WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP={}\nexport WORKER_MEMORY_GIB={}\nexport WORKER_DISK_GIB={}\nexport WORKER_CPU_MILLIS={}\nexport WORKER_PORT_MIN={}\nexport WORKER_PORT_MAX={}\nexport SNAPSHOT_INTERVAL_SECONDS={}\nexport IDLE_TIMEOUT_SECONDS={}\n",
         shell_quote(&worker.id.to_string()),
         shell_quote(&worker.name),
         shell_quote(&worker.address),
         shell_quote(&worker.signal_address),
-        shell_quote(database_url),
         shell_quote(api_token),
         shell_quote(host_control_token),
         shell_quote(&worker.control_plane_url),

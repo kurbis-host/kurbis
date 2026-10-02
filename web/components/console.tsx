@@ -3,10 +3,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { Clipboard, Download, Pause, Play, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchLogs } from "../lib/api/queries";
-import type { LogEntry, LogPage } from "../lib/contracts";
+import type { components } from "../lib/api/generated";
+import { browserApi } from "../lib/api/operations";
 import { queryKeys } from "../lib/query";
 import { Button, PageHeader } from "./ui";
+
+type LogEntry = components["schemas"]["LogEntry"];
+type LogPage = components["schemas"]["LogPage"];
 
 function toText(items: LogEntry[]) {
   return items
@@ -20,7 +23,7 @@ function toText(items: LogEntry[]) {
 export function Console({ serverId, initialLogs }: { serverId: string; initialLogs: LogPage }) {
   const { data = initialLogs } = useQuery({
     queryKey: queryKeys.logs(serverId),
-    queryFn: () => fetchLogs(serverId),
+    queryFn: () => browserApi.getLogs(serverId),
     initialData: initialLogs,
   });
   const [paused, setPaused] = useState(false);

@@ -30,7 +30,7 @@ pub trait ServerRuntime: Send + Sync {
     ) -> Result<()>;
     async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>>;
     async fn logs_since(&self, server_id: Uuid, since: &str) -> Result<Vec<String>>;
-    async fn abort_start(&self, server_id: Uuid) -> Result<()>;
+    async fn remove_runtime(&self, server_id: Uuid) -> Result<()>;
 
     async fn server_is_running(&self, server_id: Uuid) -> Result<bool> {
         Ok(self.server_generation(server_id).await?.is_some())
@@ -76,7 +76,8 @@ pub trait ServerRuntime: Send + Sync {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("Pumpkin did not exit within 60 seconds")?
+        .context("Pumpkin did not exit within 60 seconds")??;
+        self.remove_runtime(server_id).await
     }
 
     async fn wait_ready(

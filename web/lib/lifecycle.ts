@@ -1,4 +1,7 @@
-import type { ObservedState, Server } from "./contracts";
+import type { components } from "./api/generated";
+
+type ObservedState = components["schemas"]["ObservedState"];
+type Server = components["schemas"]["Server"];
 
 export type LifecyclePresentation = {
   label: string;

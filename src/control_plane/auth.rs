@@ -4,14 +4,16 @@ use anyhow::{Context, Result};
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Query, State},
+    extract::State,
     http::{HeaderMap, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use garde::Validate;
 use rand::random;
 use reqwest::Url;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::{config::OAuthProvider, pumpkin_control::VerifiedMinecraftIdentity};
 
 use super::{
-    api::{ApiError, AppState},
+    api::{ApiAccountHeaders, ApiError, ApiJson, ApiPath, ApiQuery, AppState, OAuthProviderPath},
     identity::{self, IdentityError},
 };
 
@@ -36,7 +38,7 @@ pub struct CurrentUser {
     pub account_status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OAuthCallback {
     code: Option<String>,
     state: String,
@@ -54,7 +56,7 @@ struct OAuthState {
     user_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MinecraftLinkRequest {
     identity: VerifiedMinecraftIdentity,
@@ -62,14 +64,16 @@ pub struct MinecraftLinkRequest {
     display_name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct MinecraftLinkResponse {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(super) struct MinecraftRedeemRequest {
+    #[garde(length(equal = 43))]
     token: String,
 }
 
@@ -82,17 +86,17 @@ struct MinecraftLoginToken {
 }
 
 pub async fn login(
-    Path(provider): Path<OAuthProvider>,
+    ApiPath(path): ApiPath<OAuthProviderPath>,
     State(state): State<Arc<AppState>>,
-) -> Result<Response, ApiError> {
-    begin_oauth(&state, provider, None).await
+) -> Result<aide::NoApi<Response>, ApiError> {
+    Ok(begin_oauth(&state, path.provider, None).await?.into())
 }
 
 pub async fn link_oauth(
-    Path(provider): Path<OAuthProvider>,
+    ApiPath(path): ApiPath<OAuthProviderPath>,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
+    headers: ApiAccountHeaders,
+) -> Result<aide::NoApi<Response>, ApiError> {
     let user = authenticate(&state.pool, &headers).await.map_err(|_| {
         ApiError::with_code(
             StatusCode::UNAUTHORIZED,
@@ -101,7 +105,9 @@ pub async fn link_oauth(
         )
     })?;
     require_active(&user)?;
-    begin_oauth(&state, provider, Some(user.id)).await
+    Ok(begin_oauth(&state, path.provider, Some(user.id))
+        .await?
+        .into())
 }
 
 async fn begin_oauth(
@@ -147,11 +153,12 @@ async fn begin_oauth(
 }
 
 pub async fn callback(
-    Path(provider): Path<OAuthProvider>,
+    ApiPath(path): ApiPath<OAuthProviderPath>,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<OAuthCallback>,
+    ApiQuery(params): ApiQuery<OAuthCallback>,
     headers: HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<aide::NoApi<Response>, ApiError> {
+    let provider = path.provider;
     let oauth_cookie = oauth_cookie_name(provider);
     if cookie_value(&headers, &oauth_cookie) != Some(params.state.as_str()) {
         return Err(ApiError::new(
@@ -313,7 +320,7 @@ pub async fn callback(
             .parse()
             .expect("static cookie is valid"),
     );
-    Ok(response)
+    Ok(response.into())
 }
 
 pub async fn create_minecraft_link(
@@ -364,8 +371,8 @@ pub async fn create_minecraft_link(
 pub(super) async fn redeem_minecraft(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<MinecraftRedeemRequest>,
-) -> Result<Response, ApiError> {
+    ApiJson(request): ApiJson<MinecraftRedeemRequest>,
+) -> Result<aide::NoApi<Response>, ApiError> {
     if !same_origin(&headers, &state.config.public_base_url) {
         return Err(ApiError::with_code(
             StatusCode::FORBIDDEN,
@@ -429,13 +436,13 @@ pub(super) async fn redeem_minecraft(
         let session = create_session(&state.pool, user_id).await?;
         set_session_cookie(&mut response, &session);
     }
-    Ok(response)
+    Ok(response.into())
 }
 
 pub async fn logout(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
+    headers: ApiAccountHeaders,
+) -> Result<aide::NoApi<Response>, ApiError> {
     if let Some(token) = session_token(&headers) {
         sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(token_hash(token))
@@ -449,7 +456,7 @@ pub async fn logout(
             .parse()
             .expect("static cookie is valid"),
     );
-    Ok(response)
+    Ok(response.into())
 }
 
 pub async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<CurrentUser> {
