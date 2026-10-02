@@ -271,15 +271,18 @@ create_dashboard() {
   local -a panes=()
 
   panes+=("$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n services -c "$ROOT")")
-  for service in "${services[@]:1}"; do
-    last=${panes[${#panes[@]}-1]}
-    panes+=("$(tmux split-window -d -P -F '#{pane_id}' -t "$last" -c "$ROOT")")
-  done
   tmux set-option -t "$SESSION" mouse on
   tmux set-option -t "$SESSION" remain-on-exit on
   tmux set-window-option -t "$SESSION:services" pane-border-status top
   tmux set-window-option -t "$SESSION:services" pane-border-format '#{pane_title}'
-  tmux select-layout -t "$SESSION:services" tiled >/dev/null
+  for service in "${services[@]:1}"; do
+    last=${panes[${#panes[@]}-1]}
+    panes+=("$(tmux split-window -d -P -F '#{pane_id}' -t "$last" -c "$ROOT")")
+    # Rebalance after every split. Splitting the last pane repeatedly creates
+    # a single shrinking column and can exhaust a normal terminal's height
+    # before the final tiled layout is applied.
+    tmux select-layout -t "$SESSION:services" tiled >/dev/null
+  done
 
   for (( index=0; index<${#services[@]}; index++ )); do
     service=${services[index]}
