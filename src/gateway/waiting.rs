@@ -461,6 +461,7 @@ mod tests {
             bedrock_tls_private_key: "/unused/test-key.pem".into(),
             waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
             waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
             waiting_control_socket: "/unused/control.sock".into(),
             waiting_control_token: "test".into(),
             control_plane_url: "http://127.0.0.1:8080".into(),

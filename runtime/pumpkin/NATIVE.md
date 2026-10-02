@@ -68,6 +68,7 @@ export CONTROL_PLANE_URL=http://127.0.0.1:8080
 export JAVA_LISTEN=127.0.0.1:25565
 export BEDROCK_LISTEN=127.0.0.1:19132
 export BEDROCK_PUBLIC_PORT=19132
+export WAITING_SIGNAL_ADDRESS=127.0.0.1:19134
 export BEDROCK_TLS_CERT_FILE=/absolute/path/to/mc.example.test.crt
 export BEDROCK_TLS_KEY_FILE=/absolute/path/to/mc.example.test.key
 export PUMPKIN_NETHERNET_EXTERNAL_IP=127.0.0.1

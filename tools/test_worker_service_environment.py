@@ -162,7 +162,7 @@ class WorkerLaunch:
 
 class WorkerServiceEnvironmentTests(unittest.TestCase):
     def test_worker_exec_gets_worker_credentials_and_mode_runtime_paths(self) -> None:
-        for mode in ("docker", "native-release"):
+        for mode in ("docker", "native-debug", "native-release"):
             with self.subTest(mode=mode):
                 launch = WorkerLaunch(mode, root_http_opt_in="false")
                 self.addCleanup(launch.close)
@@ -190,13 +190,14 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                     self.assertNotIn("PUMPKIN_BINARY", environment)
                     self.assertNotIn("KURBIS_CONTROL_PLUGIN_WASM", environment)
                 else:
+                    profile = "debug" if mode == "native-debug" else "release"
                     self.assertEqual(
                         environment["PUMPKIN_BINARY"],
-                        str(launch.root / "output/native-pumpkin/target/release/pumpkin"),
+                        str(launch.root / f"output/native-pumpkin/target/{profile}/pumpkin"),
                     )
                     self.assertEqual(
                         environment["KURBIS_CONTROL_PLUGIN_WASM"],
-                        str(launch.root / "plugins/kurbis-control/target/wasm32-wasip2/release/kurbis_control.wasm"),
+                        str(launch.root / f"plugins/kurbis-control/target/wasm32-wasip2/{profile}/kurbis_control.wasm"),
                     )
 
                 for name in (

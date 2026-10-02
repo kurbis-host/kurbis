@@ -81,8 +81,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       JAVA_LISTEN: 0.0.0.0:25565
       BEDROCK_LISTEN: 0.0.0.0:19132
+      BEDROCK_PUBLIC_PORT: ${BEDROCK_PORT}
       WAITING_JAVA_ADDRESS: ${WAITING_IP}:25566
       WAITING_BEDROCK_ADDRESS: ${WAITING_IP}:19133
+      WAITING_SIGNAL_ADDRESS: ${WAITING_IP}:19132
       WAITING_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_GATEWAY_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
       CONTROL_PLANE_URL: http://control-plane:8080
@@ -90,6 +92,7 @@ services:
       ROOT_DOMAIN: ${ROOT_DOMAIN}
     ports:
       - ${JAVA_PORT}:25565/tcp
+      - ${BEDROCK_PORT}:19132/tcp
       - ${BEDROCK_PORT}:19132/udp
     volumes:
       - waiting-control:/run/kurbis-gateway:ro

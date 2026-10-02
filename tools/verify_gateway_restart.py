@@ -154,6 +154,7 @@ class RestartVerification:
             "BEDROCK_LISTEN": f"127.0.0.1:{self.bedrock_gateway}",
             "WAITING_JAVA_ADDRESS": f"127.0.0.1:{self.waiting_java}",
             "WAITING_BEDROCK_ADDRESS": f"127.0.0.1:{self.waiting_bedrock}",
+            "WAITING_SIGNAL_ADDRESS": f"127.0.0.1:{self.waiting_bedrock}",
             "WAITING_CONTROL_SOCKET": str(self.control_sockets["waiting"]),
             "PUMPKIN_GATEWAY_CONTROL_TOKEN": self.token,
             "CONTROL_PLANE_URL": f"http://127.0.0.1:{self.api_port}",

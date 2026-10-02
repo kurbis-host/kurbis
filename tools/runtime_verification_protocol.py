@@ -288,6 +288,7 @@ enabled = false
         "BEDROCK_TLS_CERT_FILE": str(bedrock_certificate),
         "BEDROCK_TLS_KEY_FILE": str(bedrock_private_key),
         "WAITING_JAVA_ADDRESS": f"127.0.0.1:{waiting_java_port}", "WAITING_BEDROCK_ADDRESS": f"127.0.0.1:{waiting_bedrock_port}",
+        "WAITING_SIGNAL_ADDRESS": f"127.0.0.1:{waiting_bedrock_port}",
         "WAITING_CONTROL_SOCKET": str(waiting_root / "run/host-control.sock"), "PUMPKIN_GATEWAY_CONTROL_TOKEN": secret,
         "CONTROL_PLANE_URL": f"http://127.0.0.1:{api_port}", "INTERNAL_TOKEN": secret,
         "RUST_LOG": "info",

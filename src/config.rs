@@ -287,6 +287,7 @@ pub struct GatewayConfig {
     pub bedrock_tls_private_key: PathBuf,
     pub waiting_java_address: SocketAddr,
     pub waiting_bedrock_address: SocketAddr,
+    pub waiting_signal_address: SocketAddr,
     pub waiting_control_socket: PathBuf,
     pub waiting_control_token: String,
     pub control_plane_url: String,
@@ -314,6 +315,7 @@ impl GatewayConfig {
             bedrock_tls_private_key: PathBuf::from(required("BEDROCK_TLS_KEY_FILE")?),
             waiting_java_address: value("WAITING_JAVA_ADDRESS", "127.0.0.1:25566").parse()?,
             waiting_bedrock_address: value("WAITING_BEDROCK_ADDRESS", "127.0.0.1:19133").parse()?,
+            waiting_signal_address: value("WAITING_SIGNAL_ADDRESS", "127.0.0.1:19134").parse()?,
             waiting_control_socket: PathBuf::from(value(
                 "WAITING_CONTROL_SOCKET",
                 "/run/kurbis-gateway/host-control.sock",

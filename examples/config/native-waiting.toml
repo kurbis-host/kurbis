@@ -22,6 +22,7 @@ enabled = true
 [networking.bedrock.nethernet]
 enabled = true
 address = "127.0.0.1:19133"
+signal_address = "127.0.0.1:19134"
 external_ip = ""
 identity_key = "nethernet-key.der"
 stun_servers = []

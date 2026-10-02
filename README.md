@@ -139,9 +139,16 @@ host Docker engine and worker storage mounts. Docker mode needs Linux, Docker
 Engine with Compose v2, Rust/Cargo, and tmux; use native mode on macOS. The
 first Pumpkin image build takes substantially longer than later starts.
 
+For native debug with `ROOT_DOMAIN=localhost`, the launcher creates a local
+self-signed Bedrock TLS certificate when certificate paths are not configured.
+Clients will need to trust that certificate to validate the local server. For
+other hostnames, configure `BEDROCK_TLS_CERT_FILE` and
+`BEDROCK_TLS_KEY_FILE` with a certificate trusted for the root domain and its
+server subdomains.
+
 The Docker Compose deployment publishes the panel on `PANEL_PORT`, Java on
-`JAVA_PORT`, and Bedrock UDP on `BEDROCK_PORT`. Put an HTTPS reverse proxy in
-front of the panel port and point `PUBLIC_BASE_URL` at that HTTPS origin. Open
+`JAVA_PORT`, and Bedrock TCP and UDP on `BEDROCK_PORT`. Put an HTTPS reverse
+proxy in front of the panel port and point `PUBLIC_BASE_URL` at that HTTPS origin. Open
 the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
 `WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
 quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the

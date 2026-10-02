@@ -89,6 +89,7 @@ fn gateway_config(control_plane_url: String, internal_token: String) -> GatewayC
         bedrock_tls_private_key: PathBuf::new(),
         waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
         waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+        waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
         waiting_control_socket: PathBuf::new(),
         waiting_control_token: "test".into(),
         control_plane_url,

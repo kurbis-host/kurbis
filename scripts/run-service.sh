@@ -48,6 +48,18 @@ if [[ $service == worker ]]; then
     echo "worker credential bundle contains a malformed WORKER_API_TOKEN" >&2
     exit 2
   fi
+  if [[ $WORKER_RUNTIME == native ]]; then
+    case ${PUMPKIN_BINARY:-} in
+      "$root/output/native-pumpkin/target/debug/pumpkin"|"$root/output/native-pumpkin/target/release/pumpkin")
+        PUMPKIN_BINARY="$root/output/native-pumpkin/target/$profile/pumpkin"
+        ;;
+    esac
+    case ${KURBIS_CONTROL_PLUGIN_WASM:-} in
+      "$root/plugins/kurbis-control/target/wasm32-wasip2/debug/kurbis_control.wasm"|"$root/plugins/kurbis-control/target/wasm32-wasip2/release/kurbis_control.wasm")
+        KURBIS_CONTROL_PLUGIN_WASM="$root/plugins/kurbis-control/target/wasm32-wasip2/$profile/kurbis_control.wasm"
+        ;;
+    esac
+  fi
   worker_env=(env -i "PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}" "HOME=${HOME:-/}")
   for variable_name in \
     LANG LC_ALL TMPDIR SSL_CERT_FILE SSL_CERT_DIR RUST_LOG DOCKER_HOST DOCKER_CONFIG \
@@ -113,6 +125,36 @@ case "$service" in
     export CONTROL_PLANE_URL=http://127.0.0.1:8080
     export JAVA_LISTEN=0.0.0.0:25565
     export BEDROCK_LISTEN=0.0.0.0:19132
+    export BEDROCK_PUBLIC_PORT=${BEDROCK_PUBLIC_PORT:-${BEDROCK_PORT:-19132}}
+    export WAITING_SIGNAL_ADDRESS=${WAITING_SIGNAL_ADDRESS:-127.0.0.1:19134}
+    if [[ -z ${BEDROCK_TLS_CERT_FILE:-} && -z ${BEDROCK_TLS_KEY_FILE:-} ]]; then
+      if [[ $mode != native-debug || $ROOT_DOMAIN != localhost ]]; then
+        echo "BEDROCK_TLS_CERT_FILE and BEDROCK_TLS_KEY_FILE are required outside localhost native debug" >&2
+        exit 2
+      fi
+      require_openssl=$(command -v openssl) || {
+        echo "openssl is required to create the localhost Bedrock development certificate" >&2
+        exit 2
+      }
+      cert_dir="$root/data/native-gateway"
+      export BEDROCK_TLS_CERT_FILE="$cert_dir/localhost.crt"
+      export BEDROCK_TLS_KEY_FILE="$cert_dir/localhost.key"
+      if [[ ! -f $BEDROCK_TLS_CERT_FILE || ! -f $BEDROCK_TLS_KEY_FILE ]]; then
+        mkdir -p "$cert_dir"
+        "$require_openssl" req -x509 -newkey rsa:2048 -sha256 -nodes -days 825 \
+          -keyout "$BEDROCK_TLS_KEY_FILE" -out "$BEDROCK_TLS_CERT_FILE" \
+          -subj /CN=localhost \
+          -addext 'subjectAltName=DNS:localhost,DNS:*.localhost,IP:127.0.0.1'
+        chmod 600 "$BEDROCK_TLS_KEY_FILE"
+      fi
+    elif [[ -z ${BEDROCK_TLS_CERT_FILE:-} || -z ${BEDROCK_TLS_KEY_FILE:-} ]]; then
+      echo "set both BEDROCK_TLS_CERT_FILE and BEDROCK_TLS_KEY_FILE" >&2
+      exit 2
+    fi
+    if [[ ! -r $BEDROCK_TLS_CERT_FILE || ! -r $BEDROCK_TLS_KEY_FILE ]]; then
+      echo "Bedrock TLS certificate or private key is not readable" >&2
+      exit 2
+    fi
     exec "$binary_dir/gateway"
     ;;
   waiting-pumpkin)
@@ -126,9 +168,9 @@ case "$service" in
     export CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080
     cd "$root/web"
     if [[ $mode == native-debug ]]; then
-      exec pnpm run dev -- --hostname 0.0.0.0
+      exec pnpm run dev --hostname 0.0.0.0
     fi
-    exec pnpm run start -- --hostname 0.0.0.0
+    exec pnpm run start --hostname 0.0.0.0
     ;;
   postgres|control-plane-log|waiting-pumpkin-log|gateway-log|panel-log)
     compose_service=${service%-log}

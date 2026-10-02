@@ -64,6 +64,12 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
     {
         bail!("waiting Bedrock address must identify a separate reachable RakNet listener");
     }
+    if config.waiting_signal_address.ip().is_unspecified()
+        || config.waiting_signal_address.port() == 0
+        || !is_private_signal_address(&config.waiting_signal_address.ip().to_string())
+    {
+        bail!("waiting signal address must identify a reachable private HTTP listener");
+    }
     let socket = Arc::new(UdpSocket::bind(config.bedrock_listen).await?);
     let tcp = TcpListener::bind(config.bedrock_listen).await?;
     let tls = load_tls_acceptor(&config)?;
@@ -77,7 +83,9 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
         app.into_make_service_with_connect_info::<SignalPeer>(),
     );
 
-    tracing::info!(listen = %config.bedrock_listen, waiting = %config.waiting_bedrock_address,
+    tracing::info!(listen = %config.bedrock_listen,
+        waiting_bedrock = %config.waiting_bedrock_address,
+        waiting_signal = %config.waiting_signal_address,
         tls_certificate = %config.bedrock_tls_certificate.display(),
         "Bedrock RakNet and TLS signaling gateway listening");
     tokio::try_join!(relay(socket, config.waiting_bedrock_address), async {
@@ -181,7 +189,7 @@ impl SignalProxy {
         }
 
         if subdomain_from_hostname(hostname, &self.config.root_domain).is_some() {
-            return Ok(self.config.waiting_bedrock_address);
+            return Ok(self.config.waiting_signal_address);
         }
 
         Err(StatusCode::NOT_FOUND)
@@ -666,6 +674,7 @@ mod tests {
             bedrock_tls_private_key: PathBuf::new(),
             waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
             waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
             waiting_control_socket: PathBuf::new(),
             waiting_control_token: "test".into(),
             control_plane_url,
@@ -852,6 +861,16 @@ mod tests {
             )
             .await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_host_signal_uses_its_separate_backend_listener() {
+        let proxy = SignalProxy::new(gateway_config("http://127.0.0.1:8080".into())).unwrap();
+
+        assert_eq!(
+            proxy.target("waiting.mc.example.test").await.unwrap(),
+            "127.0.0.1:19134".parse::<SocketAddr>().unwrap()
         );
     }
 
