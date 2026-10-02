@@ -175,7 +175,7 @@ impl Lifecycle {
         .fetch_optional(&mut *tx)
         .await?;
         let worker = if queue_head.is_none_or(|head| head == server_id) {
-            select_worker(&mut tx).await?
+            select_worker(&mut tx, server.id, server.current_snapshot_generation).await?
         } else {
             None
         };
@@ -485,11 +485,13 @@ impl Lifecycle {
         {
             bail!("server still has an active fenced placement");
         }
-        let worker = select_worker(&mut tx).await?.ok_or_else(|| {
-            LifecycleFailure::Unavailable(
-                "no worker capacity available for snapshot restore".to_owned(),
-            )
-        })?;
+        let worker = select_worker(&mut tx, server_id, Some(target_generation))
+            .await?
+            .ok_or_else(|| {
+                LifecycleFailure::Unavailable(
+                    "no worker capacity available for snapshot restore".to_owned(),
+                )
+            })?;
         place_and_enqueue_worker_operation(
             &mut tx,
             &server,

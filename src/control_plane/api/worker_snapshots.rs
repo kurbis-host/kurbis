@@ -8,7 +8,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    contracts::worker::{WorkerAssignment, WorkerSnapshotReservation},
+    contracts::worker::{WorkerAssignment, WorkerSnapshotCacheHint, WorkerSnapshotReservation},
     model::{OperationKind, OperationRecord, OperationStatus, SnapshotReason, SnapshotRecord},
     snapshot::{ObjectKind, WorkerObjectKey, physical_object_path},
 };
@@ -16,7 +16,7 @@ use crate::{
 use super::{
     ApiError, AppState, worker_auth,
     worker_control::verify_snapshot_manifest,
-    worker_state::{ContextQuery, validate_assignment},
+    worker_state::{ContextQuery, lock_assignment, validate_assignment},
 };
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +45,51 @@ pub(super) struct DeleteManifestsRequest {
     operation_id: Uuid,
     generation: i64,
     attempt: i32,
+}
+
+pub(super) async fn report_snapshot_cache_hint(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(server_id): Path<Uuid>,
+    Json(request): Json<WorkerSnapshotCacheHint>,
+) -> Result<StatusCode, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    if request.snapshot_generation <= 0
+        || matches!(request.assignment, WorkerAssignment::Export { .. })
+    {
+        return Err(invalid_snapshot_assignment());
+    }
+    lock_assignment(&mut tx, worker_id, server_id, request.assignment).await?;
+    let complete: Option<i64> = sqlx::query_scalar(
+        "SELECT generation FROM snapshots
+         WHERE server_id = $1 AND generation = $2 AND complete
+           AND manifest_key <> '' AND checksum <> ''
+         FOR SHARE",
+    )
+    .bind(server_id)
+    .bind(request.snapshot_generation)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if complete.is_none() {
+        return Err(invalid_snapshot_assignment());
+    }
+    if worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await? != worker_id {
+        return Err(worker_auth::invalid_worker_token());
+    }
+    sqlx::query(
+        "INSERT INTO worker_snapshot_hints(worker_id, server_id, snapshot_generation)
+         VALUES($1, $2, $3)
+         ON CONFLICT(worker_id, server_id)
+         DO UPDATE SET snapshot_generation = EXCLUDED.snapshot_generation, reported_at = now()",
+    )
+    .bind(worker_id)
+    .bind(server_id)
+    .bind(request.snapshot_generation)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn reserve_snapshot(

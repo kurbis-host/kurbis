@@ -420,19 +420,80 @@ pub(super) async fn validate_assignment(
     server_id: Uuid,
     assignment: WorkerAssignment,
 ) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    lock_assignment(&mut tx, worker_id, server_id, assignment).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(super) async fn lock_assignment(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    worker_id: Uuid,
+    server_id: Uuid,
+    assignment: WorkerAssignment,
+) -> Result<(), ApiError> {
+    let server_generation: Option<i64> =
+        sqlx::query_scalar("SELECT generation FROM servers WHERE id = $1 FOR SHARE")
+            .bind(server_id)
+            .fetch_optional(&mut **tx)
+            .await?;
     let allowed: bool = match assignment {
-        WorkerAssignment::Placement { generation } => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM placements p JOIN servers s ON s.id = p.server_id WHERE p.server_id=$1 AND p.worker_id=$2 AND p.generation=$3 AND s.generation=$3)")
-                .bind(server_id).bind(worker_id).bind(generation).fetch_one(pool).await?
+        WorkerAssignment::Placement { generation }
+            if generation > 0 && server_generation == Some(generation) =>
+        {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT server_id FROM placements
+                 WHERE server_id = $1 AND worker_id = $2 AND generation = $3
+                 FOR SHARE",
+            )
+            .bind(server_id)
+            .bind(worker_id)
+            .bind(generation)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
         }
-        WorkerAssignment::Operation { operation_id, generation, attempt } => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operations o JOIN servers s ON s.id=o.server_id WHERE o.id=$1 AND o.server_id=$2 AND o.worker_id=$3 AND o.generation=$4 AND o.attempt=$5 AND o.status='running' AND s.generation=$4)")
-                .bind(operation_id).bind(server_id).bind(worker_id).bind(generation).bind(attempt).fetch_one(pool).await?
+        WorkerAssignment::Operation {
+            operation_id,
+            generation,
+            attempt,
+        } if generation > 0 && attempt > 0 && server_generation == Some(generation) => {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM operations
+                 WHERE id = $1 AND server_id = $2 AND worker_id = $3
+                   AND generation = $4 AND attempt = $5 AND status = 'running'
+                 FOR SHARE",
+            )
+            .bind(operation_id)
+            .bind(server_id)
+            .bind(worker_id)
+            .bind(generation)
+            .bind(attempt)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
         }
-        WorkerAssignment::Export { export_id, generation, attempt } => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM world_exports e WHERE e.id=$1 AND e.server_id=$2 AND e.worker_id=$3 AND e.source_generation=$4 AND e.attempt=$5 AND e.status='running')")
-                .bind(export_id).bind(server_id).bind(worker_id).bind(generation).bind(attempt).fetch_one(pool).await?
+        WorkerAssignment::Export {
+            export_id,
+            generation,
+            attempt,
+        } if generation > 0 && attempt > 0 && server_generation.is_some() => {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM world_exports
+                 WHERE id = $1 AND server_id = $2 AND worker_id = $3
+                   AND source_generation = $4 AND attempt = $5 AND status = 'running'
+                 FOR SHARE",
+            )
+            .bind(export_id)
+            .bind(server_id)
+            .bind(worker_id)
+            .bind(generation)
+            .bind(attempt)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
         }
+        _ => false,
     };
     if !allowed {
         return Err(invalid_assignment());

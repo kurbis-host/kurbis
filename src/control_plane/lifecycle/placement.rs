@@ -49,6 +49,8 @@ pub(super) async fn lock_placement(
 
 pub(super) async fn select_worker(
     tx: &mut Transaction<'_, Postgres>,
+    server_id: Uuid,
+    snapshot_generation: Option<i64>,
 ) -> Result<Option<WorkerRecord>> {
     Ok(sqlx::query_as::<_, WorkerRecord>(
         "SELECT w.id, w.name, w.address, w.signal_address, w.total_memory_bytes, w.total_disk_bytes,
@@ -70,7 +72,14 @@ pub(super) async fn select_worker(
                )
            )
            AND w.signal_address <> ''
-         ORDER BY (w.total_memory_bytes - w.reserved_memory_bytes - $1) ASC,
+         ORDER BY CASE WHEN EXISTS (
+                      SELECT 1 FROM worker_snapshot_hints h
+                      JOIN snapshots s ON s.server_id = h.server_id
+                          AND s.generation = h.snapshot_generation AND s.complete
+                      WHERE h.worker_id = w.id AND h.server_id = $4
+                        AND h.snapshot_generation = $5
+                  ) THEN 0 ELSE 1 END,
+                  (w.total_memory_bytes - w.reserved_memory_bytes - $1) ASC,
                   (w.total_disk_bytes - w.reserved_disk_bytes - $2) ASC,
                   w.id
          FOR UPDATE OF w SKIP LOCKED
@@ -79,6 +88,8 @@ pub(super) async fn select_worker(
     .bind(SERVER_MEMORY_BYTES)
     .bind(SERVER_STORAGE_BYTES)
     .bind(SERVER_CPU_MILLIS)
+    .bind(server_id)
+    .bind(snapshot_generation)
     .fetch_optional(&mut **tx)
     .await?)
 }

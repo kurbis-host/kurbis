@@ -59,6 +59,17 @@ impl WorkerObjectClient {
             .await
     }
 
+    pub async fn report_snapshot_cache_hint(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        snapshot_generation: i64,
+    ) -> Result<()> {
+        self.control
+            .report_snapshot_cache_hint(server_id, assignment, snapshot_generation)
+            .await
+    }
+
     pub async fn snapshot(
         &self,
         server_id: Uuid,

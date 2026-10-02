@@ -161,7 +161,9 @@ export function ServerPanelShell({
           })}
         </nav>
 
-        <div className="mt-auto border-t border-white/8 px-2 pt-4 max-[860px]:hidden">
+        <div className={`mt-auto border-t border-white/8 px-2 pt-4 ${scoped
+          ? "max-[860px]:mx-0 max-[860px]:mt-0 max-[860px]:border-0 max-[860px]:px-0 max-[860px]:pt-0 max-[860px]:pb-3"
+          : "max-[860px]:hidden"}`}>
           {!scoped && server ? <div className="flex items-center gap-2 text-xs text-[#bcb4a5]"><i className={`size-[7px] rounded-full ${eventStatus === "live" ? "bg-[#8eb866]" : eventStatus === "reconnecting" ? "animate-[pulse-status_1.2s_infinite] bg-[#d8964e]" : "bg-[#8d8a82]"}`} /><span>{eventStatus === "live" ? "Live updates connected" : eventStatus === "reconnecting" ? "Reconnecting live updates" : "Connecting live updates"}</span></div> : null}
           {scoped ? <p className="m-0 text-xs leading-relaxed text-[#bcb4a5]">Server-only access</p> : null}
           {scopedGrant ? (

@@ -139,6 +139,13 @@ pub mod worker {
         },
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct WorkerSnapshotCacheHint {
+        pub snapshot_generation: i64,
+        pub assignment: WorkerAssignment,
+    }
+
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(rename_all = "snake_case")]
     pub enum OperationStage {

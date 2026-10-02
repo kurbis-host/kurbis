@@ -64,6 +64,17 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         "legacy worker DB credential/cache tables must be absent"
     );
 
+    let local_snapshot_hints: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'worker_snapshot_hints')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        local_snapshot_hints,
+        "the control plane owns generation-scoped worker cache hints"
+    );
+
     let worker_auth_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname='worker_auth')")
             .fetch_one(&pool)

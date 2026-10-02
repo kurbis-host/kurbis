@@ -91,6 +91,26 @@ impl SnapshotManager {
         Ok(WorkerObjectKey::parse(key)?.path().clone())
     }
 
+    async fn report_cache_hint(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        snapshot_generation: i64,
+    ) {
+        if let Err(error) = self
+            .worker_client
+            .report_snapshot_cache_hint(server_id, assignment, snapshot_generation)
+            .await
+        {
+            tracing::debug!(
+                %server_id,
+                snapshot_generation,
+                ?error,
+                "could not report worker-local snapshot hint"
+            );
+        }
+    }
+
     pub async fn create(
         &self,
         server_id: Uuid,
@@ -163,6 +183,8 @@ impl SnapshotManager {
                 &checksum,
             )
             .await?;
+        self.report_cache_hint(server_id, assignment, reservation.generation)
+            .await;
         Ok(SnapshotRecord {
             id: reservation.id,
             server_id,
@@ -253,6 +275,8 @@ impl SnapshotManager {
         };
         let manifest = self.read_manifest(&snapshot).await?;
         self.restore_manifest(root, manifest).await?;
+        self.report_cache_hint(server_id, assignment, snapshot.generation)
+            .await;
         Ok(Some(snapshot.generation))
     }
 
@@ -269,6 +293,8 @@ impl SnapshotManager {
             .await?;
         let manifest = self.read_manifest(&snapshot).await?;
         self.restore_manifest(root, manifest).await?;
+        self.report_cache_hint(server_id, assignment, snapshot.generation)
+            .await;
         Ok(snapshot.generation)
     }
 
@@ -378,7 +404,7 @@ impl SnapshotManager {
         };
         let manifest = self.read_manifest(&snapshot).await?;
         let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let matches = tokio::task::spawn_blocking(move || -> Result<bool> {
             let local = collect_files(&root)?;
             if local.len() != manifest.files.len() {
                 return Ok(false);
@@ -405,7 +431,12 @@ impl SnapshotManager {
             Ok(true)
         })
         .await
-        .context("local snapshot validation task failed")?
+        .context("local snapshot validation task failed")??;
+        if matches {
+            self.report_cache_hint(server_id, assignment, snapshot.generation)
+                .await;
+        }
+        Ok(matches)
     }
 
     pub async fn delete_server_manifests(&self, operation: &OperationRecord) -> Result<()> {

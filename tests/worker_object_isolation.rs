@@ -266,11 +266,30 @@ async fn restart_operation_can_publish_and_restore_snapshot_objects_through_work
         .create(server_id, source.path(), SnapshotReason::Shutdown)
         .await
         .unwrap();
+    let hint_after_publish: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM worker_snapshot_hints
+         WHERE worker_id = $1 AND server_id = $2 AND snapshot_generation = $3)",
+    )
+    .bind(worker_id)
+    .bind(server_id)
+    .bind(snapshot.generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        hint_after_publish,
+        "published snapshot is reported as local"
+    );
     publish_test_snapshot(&pool, server_id, snapshot.generation, snapshot.size_bytes).await;
     let manifest_path = physical_object_path(server_id, &snapshot.manifest_key).unwrap();
     assert!(object_store.head(&manifest_path).await.is_ok());
 
     let restored = tempfile::tempdir().unwrap();
+    sqlx::query("DELETE FROM worker_snapshot_hints WHERE server_id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         snapshots
             .restore_latest(server_id, restored.path())
@@ -283,6 +302,75 @@ async fn restart_operation_can_publish_and_restore_snapshot_objects_through_work
             .await
             .unwrap(),
         b"restart snapshot world"
+    );
+    let hint_after_restore: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM worker_snapshot_hints
+         WHERE worker_id = $1 AND server_id = $2 AND snapshot_generation = $3)",
+    )
+    .bind(worker_id)
+    .bind(server_id)
+    .bind(snapshot.generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(hint_after_restore, "restored snapshot is reported as local");
+    sqlx::query("DELETE FROM worker_snapshot_hints WHERE server_id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        snapshots
+            .local_matches_current(server_id, restored.path())
+            .await
+            .unwrap()
+    );
+    let hint_after_validation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM worker_snapshot_hints
+         WHERE worker_id = $1 AND server_id = $2 AND snapshot_generation = $3)",
+    )
+    .bind(worker_id)
+    .bind(server_id)
+    .bind(snapshot.generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        hint_after_validation,
+        "a locally validated matching snapshot is reported"
+    );
+    sqlx::query("DELETE FROM worker_snapshot_hints WHERE server_id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let explicit_restore = tempfile::tempdir().unwrap();
+    assert_eq!(
+        snapshots
+            .restore_generation(server_id, snapshot.generation, explicit_restore.path())
+            .await
+            .unwrap(),
+        snapshot.generation
+    );
+    assert_eq!(
+        tokio::fs::read(explicit_restore.path().join("world/level.dat"))
+            .await
+            .unwrap(),
+        b"restart snapshot world"
+    );
+    let hint_after_explicit_restore: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM worker_snapshot_hints
+         WHERE worker_id = $1 AND server_id = $2 AND snapshot_generation = $3)",
+    )
+    .bind(worker_id)
+    .bind(server_id)
+    .bind(snapshot.generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        hint_after_explicit_restore,
+        "an explicit generation restore is reported as local"
     );
 
     sqlx::query("DELETE FROM users WHERE id = $1")

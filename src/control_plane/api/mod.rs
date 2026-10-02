@@ -504,6 +504,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/worker/control/servers/{server_id}/whitelist-applied", post(worker_state::mark_whitelist_applied))
         .route("/internal/worker/control/servers/{server_id}/operators-applied", post(worker_state::mark_operators_applied))
         .route("/internal/worker/control/servers/{server_id}/snapshots/reserve", post(worker_snapshots::reserve_snapshot))
+        .route("/internal/worker/control/servers/{server_id}/snapshots/cache-hint", post(worker_snapshots::report_snapshot_cache_hint))
         .route("/internal/worker/control/servers/{server_id}/snapshots/current", get(worker_snapshots::current_snapshot))
         .route("/internal/worker/control/servers/{server_id}/snapshots/{snapshot_generation}/metadata", post(worker_snapshots::publish_snapshot_metadata))
         .route("/internal/worker/control/servers/{server_id}/snapshots/{snapshot_generation}", get(worker_snapshots::snapshot))

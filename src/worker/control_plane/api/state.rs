@@ -9,7 +9,7 @@ use crate::{
         lifecycle::{CommandResponse, ServerCommandRequest},
         worker::{
             WorkerAssignment, WorkerRecoveryReport, WorkerServerContext, WorkerServerState,
-            WorkerSnapshotReservation,
+            WorkerSnapshotCacheHint, WorkerSnapshotReservation,
         },
     },
     model::{ObservedState, SnapshotReason, SnapshotRecord},
@@ -180,6 +180,22 @@ impl WorkerControl {
         self.get_json_with_assignment(
             &format!("/internal/worker/control/servers/{server_id}/snapshots/current"),
             assignment,
+        )
+        .await
+    }
+
+    pub async fn report_snapshot_cache_hint(
+        &self,
+        server_id: Uuid,
+        assignment: WorkerAssignment,
+        snapshot_generation: i64,
+    ) -> Result<()> {
+        self.post_no_content(
+            &format!("/internal/worker/control/servers/{server_id}/snapshots/cache-hint"),
+            &WorkerSnapshotCacheHint {
+                snapshot_generation,
+                assignment,
+            },
         )
         .await
     }

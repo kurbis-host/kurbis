@@ -75,6 +75,30 @@ async fn create_test_worker(pool: &PgPool, prefix: &str, port_min: i32) -> Uuid 
     worker_id
 }
 
+async fn add_inactive_placement(
+    pool: &PgPool,
+    server_id: Uuid,
+    worker_id: Uuid,
+    generation: i64,
+    port_min: i32,
+) {
+    sqlx::query(
+        "INSERT INTO placements(server_id, worker_id, generation, lease_token,
+                                java_port, bedrock_port, signal_port, active)
+         VALUES($1, $2, $3, $4, $5, $6, $7, false)",
+    )
+    .bind(server_id)
+    .bind(worker_id)
+    .bind(generation)
+    .bind(Uuid::new_v4())
+    .bind(port_min)
+    .bind(port_min + 1)
+    .bind(port_min + 2)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn publish_final_snapshot(
     pool: &PgPool,
     op: &kurbis_hoster::model::OperationRecord,
@@ -92,6 +116,26 @@ async fn publish_final_snapshot(
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn seed_current_snapshot(pool: &PgPool, server_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes,
+                               checksum, reason, complete)
+         VALUES($1, $2, 1, $3, 12, $4, 'shutdown', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server_id)
+    .bind(format!("snapshots/1-{}.json", "a".repeat(64)))
+    .bind("a".repeat(64))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET current_snapshot_generation = 1 WHERE id = $1")
+        .bind(server_id)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn cleanup_test_entities(pool: &PgPool, user_id: Uuid, worker_ids: &[Uuid]) {
@@ -835,6 +879,183 @@ async fn stopped_server_ports_are_reused_without_losing_its_cached_placement() {
     );
     cleanup_test_entities(&pool, owner_a, &[]).await;
     cleanup_test_entities(&pool, owner_b, &[worker]).await;
+}
+
+#[tokio::test]
+async fn snapshot_cache_hints_prefer_matching_eligible_workers_then_fall_back() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let cached_worker = create_test_worker(&pool, "worker-cache-preferred", 29200).await;
+    let binpack_worker = create_test_worker(&pool, "worker-cache-binpack", 29300).await;
+    sqlx::query(
+        "UPDATE workers SET total_memory_bytes = 68719476736,
+                             total_disk_bytes = 107374182400
+         WHERE id = $1",
+    )
+    .bind(cached_worker)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (owner_a, server_a) = create_test_server(&pool, "cache-a").await;
+    sqlx::query(
+        "UPDATE servers SET generation = 1, desired_state = 'stopped',
+                             observed_state = 'sleeping' WHERE id = $1",
+    )
+    .bind(server_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_current_snapshot(&pool, server_a).await;
+    add_inactive_placement(&pool, server_a, cached_worker, 1, 29200).await;
+    sqlx::query(
+        "INSERT INTO worker_snapshot_hints(worker_id, server_id, snapshot_generation)
+         VALUES($1, $2, 1)",
+    )
+    .bind(cached_worker)
+    .bind(server_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lifecycle = Lifecycle::new(pool.clone());
+    assert_eq!(
+        lifecycle
+            .request_start(server_a, "cache-preference")
+            .await
+            .unwrap(),
+        ObservedState::Restoring
+    );
+    let selected: Uuid =
+        sqlx::query_scalar("SELECT worker_id FROM placements WHERE server_id = $1")
+            .bind(server_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        selected, cached_worker,
+        "a matching snapshot hint outranks the tighter bin-packing candidate"
+    );
+
+    let (owner_b, server_b) = create_test_server(&pool, "cache-b").await;
+    sqlx::query(
+        "UPDATE servers SET generation = 1, desired_state = 'stopped',
+                             observed_state = 'sleeping' WHERE id = $1",
+    )
+    .bind(server_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_current_snapshot(&pool, server_b).await;
+    add_inactive_placement(&pool, server_b, cached_worker, 1, 29200).await;
+    sqlx::query(
+        "INSERT INTO worker_snapshot_hints(worker_id, server_id, snapshot_generation)
+         VALUES($1, $2, 1)",
+    )
+    .bind(cached_worker)
+    .bind(server_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workers SET draining = true WHERE id = $1")
+        .bind(cached_worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lifecycle
+            .request_start(server_b, "cache-ineligible")
+            .await
+            .unwrap(),
+        ObservedState::Restoring
+    );
+    let selected: Uuid =
+        sqlx::query_scalar("SELECT worker_id FROM placements WHERE server_id = $1")
+            .bind(server_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        selected, binpack_worker,
+        "cache hints never make a draining worker eligible"
+    );
+
+    cleanup_test_entities(&pool, owner_a, &[]).await;
+    cleanup_test_entities(&pool, owner_b, &[cached_worker, binpack_worker]).await;
+}
+
+#[tokio::test]
+async fn restore_prefers_the_hint_for_its_selected_snapshot_generation() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let selected_snapshot_worker =
+        create_test_worker(&pool, "worker-restore-cache-selected", 29400).await;
+    let latest_snapshot_worker =
+        create_test_worker(&pool, "worker-restore-cache-latest", 29500).await;
+    let (owner, server_id) = create_test_server(&pool, "restore-cache").await;
+    sqlx::query(
+        "UPDATE servers SET generation = 1, desired_state = 'stopped',
+                             observed_state = 'sleeping' WHERE id = $1",
+    )
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_current_snapshot(&pool, server_id).await;
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes,
+                               checksum, reason, complete)
+         VALUES($1, $2, 2, $3, 16, $4, 'shutdown', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server_id)
+    .bind(format!("snapshots/2-{}.json", "b".repeat(64)))
+    .bind("b".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET current_snapshot_generation = 2 WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    add_inactive_placement(&pool, server_id, latest_snapshot_worker, 1, 29500).await;
+    sqlx::query(
+        "INSERT INTO worker_snapshot_hints(worker_id, server_id, snapshot_generation)
+         VALUES($1, $3, 1), ($2, $3, 2)",
+    )
+    .bind(selected_snapshot_worker)
+    .bind(latest_snapshot_worker)
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lifecycle = Lifecycle::new(pool.clone());
+    assert_eq!(
+        lifecycle.request_restore(server_id, 1).await.unwrap(),
+        ObservedState::Restoring
+    );
+    let selected: Uuid =
+        sqlx::query_scalar("SELECT worker_id FROM placements WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        selected, selected_snapshot_worker,
+        "restore placement follows the selected generation rather than the latest pointer"
+    );
+
+    cleanup_test_entities(
+        &pool,
+        owner,
+        &[selected_snapshot_worker, latest_snapshot_worker],
+    )
+    .await;
 }
 
 #[tokio::test]

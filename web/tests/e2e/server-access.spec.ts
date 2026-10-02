@@ -322,6 +322,41 @@ test("account and multiple scoped grants share the selector with independent rev
   expect(await page.evaluate(async () => (await fetch("/api/v1/account")).status)).toBe(401);
 });
 
+test("scoped-only users can revoke individual grants from a mobile server panel", async ({ page, request }) => {
+  await loginAndCreateServer(page);
+  const capacity = await request.post(`${fixture}/fixture/capacity`, { data: { available: true } });
+  expect(capacity.ok(), await capacity.text()).toBeTruthy();
+  const first = await createScopedWorldLink(request, "mobile-revoke-one", 40);
+  const second = await createScopedWorldLink(request, "mobile-revoke-two", 50);
+  await pool.query("DELETE FROM sessions");
+  await page.context().clearCookies();
+
+  for (const grant of [first, second]) {
+    await page.goto(`${grant.link.pathname}${grant.link.hash}`);
+    await expect(page).toHaveURL(`${panel}/manage/${grant.serverId}`);
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${panel}/manage/${first.serverId}`);
+  await expect(page.getByText("Server only • no Kurbis account")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Revoke access" })).toBeVisible();
+  await page.getByRole("button", { name: "Revoke access" }).click();
+
+  await expect(page).toHaveURL(`${panel}/manage/${second.serverId}`);
+  await expect(page.getByRole("button", { name: "Revoke access" })).toBeVisible();
+  const accessibleIds = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/servers");
+    return (await response.json()).map((server: { id: string }) => server.id).sort();
+  });
+  expect(accessibleIds).toEqual([second.serverId]);
+
+  await page.goto(`${panel}/manage/${first.serverId}`);
+  await expect(page).toHaveURL(`${panel}/manage/access-unavailable`);
+  await page.goto(`${panel}/manage/${second.serverId}`);
+  await page.getByRole("button", { name: "Revoke access" }).click();
+  await expect(page).toHaveURL(`${panel}/manage/access-unavailable`);
+});
+
 test("server login link opens a scoped panel and keeps account routes private", async ({ page, request, browser }) => {
   test.setTimeout(60000);
   const serverId = await loginAndCreateServer(page);

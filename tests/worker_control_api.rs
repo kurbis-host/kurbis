@@ -322,6 +322,207 @@ async fn workers_cannot_reset_or_delete_through_the_shared_command_route() {
     );
 }
 
+#[tokio::test]
+async fn snapshot_cache_hints_require_the_worker_lease_assignment_and_complete_generation() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "snapshot-hint").await;
+    let foreign = create_worker(&pool, "snapshot-hint-foreign").await;
+    let server_id = create_server(&pool, "snapshot-hint").await;
+    set_server_state(&pool, server_id, 1, "stopped", "sleeping").await;
+    add_placement(&pool, server_id, worker.id, 1, false).await;
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes,
+                               checksum, reason, complete)
+         VALUES($1, $2, 1, 'snapshots/1-complete.json', 12, 'complete-checksum', 'shutdown', true),
+               ($3, $2, 2, 'snapshots/2-complete.json', 16, 'newer-checksum', 'shutdown', true),
+               ($4, $2, 3, 'snapshots/3-incomplete.json', 20, 'incomplete-checksum', 'periodic', false)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET current_snapshot_generation = 2 WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let endpoint = format!("/internal/worker/control/servers/{server_id}/snapshots/cache-hint");
+    let placement_hint = |snapshot_generation, generation| {
+        json!({
+            "snapshot_generation": snapshot_generation,
+            "assignment": {"placement": {"generation": generation}}
+        })
+    };
+
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &worker.token,
+            None,
+            placement_hint(1, 1),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            placement_hint(1, 1),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &foreign.token,
+            Some(foreign.lease_id),
+            placement_hint(1, 1),
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            placement_hint(1, 99),
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            placement_hint(3, 1),
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            placement_hint(2, 1),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let replaced_generation: i64 = sqlx::query_scalar(
+        "SELECT snapshot_generation FROM worker_snapshot_hints
+         WHERE worker_id = $1 AND server_id = $2",
+    )
+    .bind(worker.id)
+    .bind(server_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(replaced_generation, 2);
+
+    let operation_id = add_operation(
+        &pool,
+        server_id,
+        worker.id,
+        1,
+        "snapshot",
+        "running",
+        json!({"reason":"manual"}),
+    )
+    .await;
+    assert_eq!(
+        worker_api_request(
+            service,
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            json!({
+                "snapshot_generation": 2,
+                "assignment": {"operation": {
+                    "operation_id": operation_id,
+                    "generation": 1,
+                    "attempt": 1
+                }}
+            }),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let export_id = Uuid::new_v4();
+    let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO world_exports(id, server_id, requested_by, status, stage,
+                                   source_generation, worker_id, attempt)
+         VALUES($1, $2, $3, 'running', 'archiving', 2, $4, 1)",
+    )
+    .bind(export_id)
+    .bind(server_id)
+    .bind(owner_id)
+    .bind(worker.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        worker_api_request(
+            app(pool.clone(), Arc::new(InMemory::new())),
+            &endpoint,
+            &worker.token,
+            Some(worker.lease_id),
+            json!({
+                "snapshot_generation": 2,
+                "assignment": {"export": {
+                    "export_id": export_id,
+                    "generation": 2,
+                    "attempt": 1
+                }}
+            }),
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+
+    let hints: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+        "SELECT worker_id, server_id, snapshot_generation FROM worker_snapshot_hints
+         WHERE server_id = $1 ORDER BY worker_id",
+    )
+    .bind(server_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hints, vec![(worker.id, server_id, 2)]);
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workers WHERE id = ANY($1::uuid[])")
+        .bind(vec![worker.id, foreign.id])
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 async fn set_server_state(
     pool: &PgPool,
     server_id: Uuid,
