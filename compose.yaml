@@ -43,6 +43,8 @@ services:
     build:
       context: .
       dockerfile: runtime/Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     entrypoint: [/usr/local/bin/control-plane]
     environment: *control-plane-environment
     volumes:
@@ -63,6 +65,12 @@ services:
 
   waiting-pumpkin:
     image: melon-pumpkin:waiting
+    build:
+      context: .
+      dockerfile: runtime/pumpkin/Dockerfile
+      target: waiting
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     environment:
       PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
@@ -111,8 +119,10 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     ports:
-      - ${PANEL_PORT}:3000
+      - ${PANEL_BIND_ADDRESS:-127.0.0.1}:${PANEL_PORT}:3000
     environment:
       CONTROL_PLANE_INTERNAL_URL: http://control-plane:8080
     depends_on:

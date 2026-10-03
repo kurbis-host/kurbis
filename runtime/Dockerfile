@@ -1,4 +1,6 @@
 FROM rust:1.98-bookworm AS builder
+ARG BUILD_REVISION=development
+ENV KURBIS_BUILD_REVISION=${BUILD_REVISION}
 ENV CARGO_BUILD_JOBS=2
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
@@ -7,6 +9,8 @@ COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle /artifacts/
 
 FROM debian:bookworm-slim
+ARG BUILD_REVISION=development
+LABEL org.opencontainers.image.revision=${BUILD_REVISION}
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/lib/kurbis/object-store && chown 65532:65532 /var/lib/kurbis/object-store
 COPY --from=builder /artifacts/control-plane /usr/local/bin/control-plane
