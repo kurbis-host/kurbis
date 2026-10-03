@@ -4,7 +4,7 @@ WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target cargo build --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle /artifacts/
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle /artifacts/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
