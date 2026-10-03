@@ -36,6 +36,12 @@ pub fn minecraft_identity_key(
     Ok(MinecraftIdentityKey { provider, subject })
 }
 
+/// Whether an in-game name may be stored as an identity display name.
+pub fn valid_minecraft_display_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
+}
+
 pub async fn resolve_minecraft_owner(
     tx: &mut Transaction<'_, Postgres>,
     key: &MinecraftIdentityKey,
@@ -416,4 +422,19 @@ async fn lock_identity_writes(tx: &mut Transaction<'_, Postgres>) -> Result<(), 
 
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_minecraft_display_name;
+
+    #[test]
+    fn minecraft_display_names_are_bounded_and_safe() {
+        assert!(valid_minecraft_display_name("Steve"));
+        assert!(valid_minecraft_display_name(&"a".repeat(64)));
+        assert!(!valid_minecraft_display_name(""));
+        assert!(!valid_minecraft_display_name(" \t "));
+        assert!(!valid_minecraft_display_name(&"a".repeat(65)));
+        assert!(!valid_minecraft_display_name("player\nname"));
+    }
 }

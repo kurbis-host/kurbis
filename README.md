@@ -16,7 +16,8 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 
 ## Features
 
-- One new hosted Minecraft server per account; account merges preserve all existing worlds.
+- Verified online Minecraft Java and Bedrock identities automatically register or resume an account on join.
+- The first valid address creates that account’s server; each account has one server, and account merges preserve all existing worlds.
 - Java 26.3 hostname routing, sleeping-server wake, waiting sessions, and native backend transfer, exercised with a real protocol client.
 - Wake-on-join for sleeping servers.
 - Automatic sleep after inactivity.

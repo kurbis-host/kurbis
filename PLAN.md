@@ -53,7 +53,7 @@ Use transactions, row locks, advisory locks where useful, and explicit generatio
 Public API/panel supports:
 
 - Google/Discord OAuth login and explicit provider linking.
-- Verified Minecraft Java/Bedrock sign-in and linking through one-use browser redemption links.
+- Automatic account registration and first-server creation from verified online Minecraft Java/Bedrock identities; one-use browser redemption links remain available for linking a Minecraft identity to an existing browser account.
 - Account identity listing, browser-session listing/revocation, preserved-world/default-world selection, and logout.
 - Create/delete one server for a new account; preserve all worlds when identities merge.
 - Select/change an available subdomain while stopped.
@@ -160,7 +160,7 @@ The native development runtime shares worker leases, lifecycle operations, stora
 
 Use a provider-neutral identities table rather than provider columns on users. Link Google and Discord identities automatically only when both providers confirm the same email; normalize verified email by trimming whitespace and lowercasing. Do not treat an email as verified unless the current provider response confirms it.
 
-Minecraft login links are issued only for identities proven by successful online Java authentication or validated Bedrock Xbox authentication. Bind links to the authenticated game connection, store only a hash of a random single-use token, and expire it after 15 minutes. Show the link privately in the waiting session. Redeem it through a same-origin POST; a GET never changes account state. Signed-out redemption creates or resumes the Minecraft account. Signed-in redemption merges the Minecraft account into the browser account.
+A verified online Java identity or validated Bedrock Xbox identity automatically registers or resumes its provider-neutral account during server admission. The first valid server address creates one default server for that account. Unverified or offline identities cannot register accounts. Browser OAuth identities continue to link only when verified email ownership matches; explicit account merges preserve every linked Minecraft identity and world.
 
 An account merge moves identities, sessions, and server ownership transactionally. Preserve snapshots, operations, logs, events, player history, whitelist data, and all other records attached to the existing server IDs. A suspended source or destination leaves the merged account suspended. Keep the browser account's selected default world; if it has none, choose the oldest surviving world. There remains one default world after each merge.
 
@@ -184,7 +184,7 @@ Test the complete lifecycle rather than isolated smoke tests:
 - 2 GiB memory and 5 GiB storage quotas are enforced under real container load.
 - Unknown/invalid subdomains, failed restores, corrupt snapshots, object-store outage, full workers, and Pumpkin startup failure produce deterministic states and recoverable retries.
 - Browser E2E tests cover OAuth, server creation, address selection, lifecycle controls, queue state, logs, and deletion.
-- Identity tests cover normalized verified-email linking under concurrency, suspended-account merges, preservation of all server-linked history, and default-world selection. Schema tests bootstrap a fresh database and do not require historical migration compatibility.
+- Identity tests cover automatic Minecraft account registration and first-server creation from verified online identities, concurrent first admissions, normalized verified-email linking, suspended-account merges, preservation of all server-linked history, and default-world selection. Schema tests bootstrap a fresh database and do not require historical migration compatibility.
 - Browser security tests cover OAuth provider linking, signed-in and signed-out Minecraft redemption, one-use/15-minute tokens, cross-origin rejection, forged or offline identity rejection, persistent sessions, revocation, and logout.
 - Per-server API tests verify every server route checks active account ownership, including events, logs, exports, players, whitelist, snapshots, and lifecycle mutations.
 - Server-access tests cover current-placement capability rotation, malformed and stale credentials, one-use 15-minute login links, permanent server-bound browser grants, independent revocation, OP-grant reset/delete authorization, runtime-capability destructive-action denial, and denial of cross-server and account-wide APIs.

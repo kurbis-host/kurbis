@@ -1,7 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -9,7 +8,7 @@ use crate::{
     config::GatewayConfig,
     gateway::{routes::RouteCache, wake::request_wake},
     model::{ObservedState, RouteTarget},
-    pumpkin_control::{PlayerEdition, PumpkinControl, VerifiedMinecraftIdentity, WaitingPlayer},
+    pumpkin_control::{PlayerEdition, PumpkinControl, WaitingPlayer},
     routing::{AdmissionRequest, AdmissionResponse},
 };
 
@@ -18,7 +17,6 @@ struct WaitingState {
     last_notice: Option<String>,
     last_wake: Option<Instant>,
     transfer_sent: bool,
-    login_link_sent: bool,
     admission_target: Option<RouteTarget>,
     admission_hostname: Option<String>,
     admission_complete: bool,
@@ -31,7 +29,6 @@ impl WaitingState {
             last_notice: None,
             last_wake: None,
             transfer_sent: false,
-            login_link_sent: false,
             admission_target: None,
             admission_hostname: None,
             admission_complete: false,
@@ -130,21 +127,6 @@ async fn handle_player(
             )
             .await?;
         return Ok(());
-    }
-
-    if !state.login_link_sent
-        && let Some(identity) = player.verified_identity.as_ref()
-    {
-        let url =
-            create_minecraft_login_link(config, http, identity, player.id, &player.name).await?;
-        control
-            .message(
-                &config.waiting_control_socket,
-                player.id,
-                &format!("Sign in to kurbis: {url}"),
-            )
-            .await?;
-        state.login_link_sent = true;
     }
 
     if !state.admission_complete {
@@ -286,13 +268,6 @@ async fn handle_player(
     Ok(())
 }
 
-#[derive(Serialize)]
-struct MinecraftLinkRequest<'a> {
-    identity: &'a VerifiedMinecraftIdentity,
-    minecraft_player_id: Uuid,
-    display_name: &'a str,
-}
-
 async fn request_admission(
     config: &GatewayConfig,
     http: &reqwest::Client,
@@ -307,6 +282,10 @@ async fn request_admission(
         hostname: player.server_address.clone(),
         identity: player.verified_identity.clone(),
         minecraft_player_id: player.verified_identity.as_ref().map(|_| player.id),
+        display_name: player
+            .verified_identity
+            .as_ref()
+            .map(|_| player.name.clone()),
     })
     .send()
     .await?
@@ -319,43 +298,12 @@ fn admission_error_message(status: reqwest::StatusCode) -> &'static str {
     match status {
         reqwest::StatusCode::FORBIDDEN => "This account is suspended or cannot create a server.",
         reqwest::StatusCode::NOT_FOUND => {
-            "Unknown server address. Link this Minecraft account before creating a server."
+            "Unknown server address. Join with online Minecraft authentication enabled to create it."
         }
         reqwest::StatusCode::CONFLICT => "Server admission is changing. Please reconnect shortly.",
         reqwest::StatusCode::UNPROCESSABLE_ENTITY => "Minecraft identity could not be verified.",
         _ => "Server admission was rejected. Please reconnect shortly.",
     }
-}
-
-#[derive(Deserialize)]
-struct MinecraftLinkResponse {
-    url: String,
-}
-
-async fn create_minecraft_login_link(
-    config: &GatewayConfig,
-    http: &reqwest::Client,
-    identity: &VerifiedMinecraftIdentity,
-    minecraft_player_id: Uuid,
-    display_name: &str,
-) -> Result<String> {
-    let response = http
-        .post(format!(
-            "{}/internal/minecraft-login-links",
-            config.control_plane_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&config.internal_token)
-        .json(&MinecraftLinkRequest {
-            identity,
-            minecraft_player_id,
-            display_name,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<MinecraftLinkResponse>()
-        .await?;
-    Ok(response.url)
 }
 
 async fn transfer(
@@ -414,6 +362,89 @@ fn transfer_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_join_admission_carries_verified_identity_and_display_name() {
+        use axum::{Json, routing::post};
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let captured = std::sync::Arc::new(Mutex::new(None));
+        let app = axum::Router::new().route(
+            "/internal/admission",
+            post({
+                let captured = captured.clone();
+                move |Json(request): Json<AdmissionRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().await = Some(request);
+                        Json(AdmissionResponse {
+                            target: RouteTarget {
+                                server_id: Uuid::new_v4(),
+                                subdomain: "steve".into(),
+                                state: ObservedState::Sleeping,
+                                account_suspended: false,
+                                worker_healthy: None,
+                                worker_valid_until: None,
+                                worker_address: None,
+                                java_port: None,
+                                bedrock_port: None,
+                            },
+                            private_message: None,
+                            created: true,
+                        })
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let player_id = Uuid::new_v4();
+        let identity = crate::pumpkin_control::VerifiedMinecraftIdentity::Java { uuid: player_id };
+        let player = WaitingPlayer {
+            connection_id: Uuid::new_v4(),
+            id: player_id,
+            name: "Steve".into(),
+            edition: PlayerEdition::Java,
+            server_address: "steve.mc.example.test".into(),
+            ready_for_transfer: true,
+            verified_identity: Some(identity.clone()),
+        };
+        let config = GatewayConfig {
+            common: crate::config::CommonConfig {
+                database_url: String::new(),
+            },
+            java_listen: "127.0.0.1:0".parse().unwrap(),
+            bedrock_listen: "127.0.0.1:0".parse().unwrap(),
+            bedrock_public_port: 19132,
+            bedrock_tls_certificate: "/unused/test-cert.pem".into(),
+            bedrock_tls_private_key: "/unused/test-key.pem".into(),
+            waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
+            waiting_control_socket: "/unused/control.sock".into(),
+            waiting_control_token: "test".into(),
+            control_plane_url: format!("http://{address}"),
+            internal_token: "test".into(),
+            root_domain: "mc.example.test".into(),
+            wake_timeout: Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        };
+
+        let admission = request_admission(&config, &reqwest::Client::new(), &player)
+            .await
+            .unwrap();
+        assert!(admission.created);
+        let request = captured.lock().await.take().unwrap();
+        assert_eq!(request.hostname, "steve.mc.example.test");
+        assert_eq!(request.identity, Some(identity));
+        assert_eq!(request.minecraft_player_id, Some(player_id));
+        assert_eq!(request.display_name.as_deref(), Some("Steve"));
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn capacity_queue_does_not_consume_the_restore_start_timeout() {

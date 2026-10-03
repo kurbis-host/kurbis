@@ -334,10 +334,7 @@ pub async fn create_minecraft_link(
     } = request;
     let key = identity::minecraft_identity_key(&identity, minecraft_player_id)
         .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
-    if display_name.trim().is_empty()
-        || display_name.len() > 64
-        || display_name.chars().any(char::is_control)
-    {
+    if !identity::valid_minecraft_display_name(&display_name) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "verified Minecraft profile is invalid",

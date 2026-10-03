@@ -151,6 +151,7 @@ pub(crate) fn internal_admission_request(
     identity: Option<Value>,
     minecraft_player_id: Option<Uuid>,
 ) -> Request<Body> {
+    let display_name = identity.as_ref().map(|_| "Admission Player");
     Request::builder()
         .method(Method::POST)
         .uri("/internal/admission")
@@ -161,6 +162,7 @@ pub(crate) fn internal_admission_request(
                 "hostname": hostname,
                 "identity": identity,
                 "minecraft_player_id": minecraft_player_id,
+                "display_name": display_name,
             })
             .to_string(),
         ))

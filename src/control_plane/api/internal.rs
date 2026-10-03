@@ -96,6 +96,58 @@ pub(super) async fn admit(
                 "unknown server address",
             )
         })?;
+    let minecraft_account = if let Some(identity) = request.identity.as_ref() {
+        let profile_id = request.minecraft_player_id.ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_identity",
+                "verified Minecraft profile is missing",
+            )
+        })?;
+        let key = identity::minecraft_identity_key(identity, profile_id).map_err(|message| {
+            ApiError::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_identity",
+                message,
+            )
+        })?;
+        let display_name = request
+            .display_name
+            .as_deref()
+            .filter(|name| identity::valid_minecraft_display_name(name))
+            .ok_or_else(|| {
+                ApiError::with_code(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_identity",
+                    "verified Minecraft profile name is invalid",
+                )
+            })?;
+        // Online authenticated Minecraft identity is the registration
+        // credential; first joins create an account and later joins resume it.
+        identity::attach_minecraft_identity(
+            &state.pool,
+            key.provider,
+            &key.subject,
+            profile_id,
+            display_name.trim(),
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            identity::IdentityError::Database(error) => error.into(),
+            identity::IdentityError::AlreadyLinked | identity::IdentityError::AccountMissing => {
+                ApiError::with_code(
+                    StatusCode::CONFLICT,
+                    "identity_changed",
+                    "Minecraft account linking changed during admission",
+                )
+            }
+        })?;
+        Some((key, profile_id))
+    } else {
+        None
+    };
+
     if let Some(target) = routes.resolve_subdomain(&subdomain).await? {
         return Ok(Json(AdmissionResponse {
             target,
@@ -104,35 +156,22 @@ pub(super) async fn admit(
         }));
     }
 
-    let identity = request.identity.as_ref().ok_or_else(|| {
-        ApiError::with_code(
+    let Some((key, profile_id)) = minecraft_account else {
+        return Err(ApiError::with_code(
             StatusCode::NOT_FOUND,
             "unknown_hostname",
             "unknown server address",
-        )
-    })?;
-    let profile_id = request.minecraft_player_id.ok_or_else(|| {
-        ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_identity",
-            "verified Minecraft profile is missing",
-        )
-    })?;
-    let key = identity::minecraft_identity_key(identity, profile_id).map_err(|message| {
-        ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_identity",
-            message,
-        )
-    })?;
+        ));
+    };
+
     let mut tx = state.pool.begin().await?;
     let owner_id = identity::resolve_minecraft_owner(&mut tx, &key, profile_id).await?;
     let Some(owner_id) = owner_id else {
         tx.rollback().await?;
         return Err(ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "identity_not_linked",
-            "link this Minecraft account from the account page before creating a server",
+            StatusCode::CONFLICT,
+            "identity_changed",
+            "Minecraft account linking changed during admission",
         ));
     };
     let account_status: Option<String> =

@@ -23,6 +23,8 @@ pub struct AdmissionRequest {
     pub hostname: String,
     pub identity: Option<VerifiedMinecraftIdentity>,
     pub minecraft_player_id: Option<Uuid>,
+    /// In-game name used when this verified identity first creates an account.
+    pub display_name: Option<String>,
 }
 
 /// Typed admission result shared by the gateway client and control-plane API.
@@ -180,6 +182,7 @@ mod tests {
                 xuid: "2533274790395904".into(),
             }),
             minecraft_player_id: Some(Uuid::new_v4()),
+            display_name: Some("Admission Player".into()),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
@@ -209,6 +212,7 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(AdmissionRequest)).unwrap();
         assert!(admission_schema["properties"]["hostname"].is_object());
         assert!(admission_schema["properties"]["identity"].is_object());
+        assert!(admission_schema["properties"]["display_name"].is_object());
         let signal_schema =
             serde_json::to_value(schemars::schema_for!(BedrockSignalTarget)).unwrap();
         assert!(signal_schema["properties"]["signal_address"].is_object());
