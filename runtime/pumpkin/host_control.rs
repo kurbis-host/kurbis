@@ -1,19 +1,19 @@
 use std::{
     io,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
 
-use pumpkin_config::whitelist::WhitelistEntry;
 use pumpkin_config::op::Op;
+use pumpkin_config::whitelist::WhitelistEntry;
 use pumpkin_protocol::{
     bedrock::client::transfer::CTransfer as BedrockTransfer, codec::var_int::VarInt,
     java::client::play::CTransfer as JavaTransfer,
 };
-use pumpkin_util::text::TextComponent;
 use pumpkin_util::PermissionLvl;
-use serde::Deserialize;
+use pumpkin_util::text::TextComponent;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     fs,
@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     STOP_INTERRUPT,
+    command::CommandSender,
     data::SaveJSONConfiguration,
     net::{ClientPlatform, DisconnectReason},
     server::Server,
@@ -33,6 +34,17 @@ use crate::{
 
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 const MIN_TOKEN_BYTES: usize = 32;
+const MAX_COMMAND_BYTES: usize = 512;
+const MAX_COMMAND_OUTPUT_LINES: usize = 100;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOperatorState {
+    player_ids: Vec<uuid::Uuid>,
+    #[serde(default)]
+    unrelated_ops: Vec<Op>,
+}
 
 #[derive(Deserialize)]
 struct Request {
@@ -45,6 +57,7 @@ struct Request {
     enabled: Option<bool>,
     whitelist_entries: Option<Vec<WhitelistEntry>>,
     operators: Option<Vec<WhitelistEntry>>,
+    command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +72,7 @@ enum Action {
     Shutdown,
     WhitelistReplace,
     OperatorsReplace,
+    ExecuteCommand,
 }
 
 pub fn spawn(server: &Arc<Server>) {
@@ -359,36 +373,130 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                 )
                 .await;
             };
+            let state_path = std::env::current_dir()
+                .map(|root| root.join("plugins/data/kurbis-control/operator-config.json"));
+            let mut managed_state = match state_path.as_ref() {
+                Ok(path) => match read_managed_operator_state(path) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        warn!("Managed operator metadata is invalid: {error}");
+                        return write_response(
+                            &mut write_half,
+                            json!({"ok": false, "error": "invalid_operator_state"}),
+                        )
+                        .await;
+                    }
+                },
+                Err(error) => {
+                    warn!("Managed operator storage path is unavailable: {error}");
+                    return write_response(
+                        &mut write_half,
+                        json!({"ok": false, "error": "invalid_operator_state"}),
+                    )
+                    .await;
+                }
+            };
+            let desired_ids = owners.iter().map(|owner| owner.uuid).collect::<Vec<_>>();
+            let desired_set = desired_ids.iter().copied().collect::<std::collections::HashSet<_>>();
             {
                 let mut config = server
                     .data
                     .operator_config
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for owner in owners {
-                    if let Some(existing) = config.ops.iter_mut().find(|op| op.uuid == owner.uuid) {
-                        existing.name = owner.name.clone();
+                let previously_managed = managed_state
+                    .player_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                config.ops.retain(|op| !previously_managed.contains(&op.uuid));
+                for operator in &owners {
+                    if let Some(existing) = config.ops.iter_mut().find(|op| op.uuid == operator.uuid) {
+                        existing.name = operator.name.clone();
                         existing.level = PermissionLvl::Four;
                         existing.bypasses_player_limit = true;
                     } else {
                         config.ops.push(Op::new(
-                            owner.uuid,
-                            owner.name.clone(),
+                            operator.uuid,
+                            operator.name.clone(),
                             PermissionLvl::Four,
                             true,
                         ));
                     }
-                    if let Some(player) = server.get_player_by_uuid(owner.uuid) {
-                        player.set_permission_lvl(
-                            server,
-                            PermissionLvl::Four,
-                            &server.command_dispatcher.load(),
-                        );
-                    }
                 }
                 config.save();
+                managed_state.unrelated_ops = config
+                    .ops
+                    .iter()
+                    .filter(|op| !desired_set.contains(&op.uuid))
+                    .cloned()
+                    .collect();
+                for player in server.get_all_players() {
+                    let level = config
+                        .ops
+                        .iter()
+                        .find(|operator| operator.uuid == player.gameprofile.id)
+                        .map(|operator| operator.level)
+                        .unwrap_or(PermissionLvl::Zero);
+                    player.set_permission_lvl(server, level, &server.command_dispatcher.load());
+                }
+            }
+            managed_state.player_ids = desired_ids;
+            let persisted = state_path
+                .map_err(|error| error.to_string())
+                .and_then(|path| {
+                    write_managed_operator_state(&path, &managed_state)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = persisted {
+                warn!("Could not persist managed operator metadata: {error}");
+                return write_response(
+                    &mut write_half,
+                    json!({"ok": false, "error": "operator_state_persist_failed"}),
+                )
+                .await;
             }
             write_response(&mut write_half, json!({"ok": true})).await
+        }
+        Action::ExecuteCommand => {
+            let Some(command) = request.command.filter(|command| {
+                !command.trim().is_empty()
+                    && command.len() <= MAX_COMMAND_BYTES
+                    && !command.chars().any(char::is_control)
+            }) else {
+                return write_response(
+                    &mut write_half,
+                    json!({"ok": false, "error": "invalid_command"}),
+                )
+                .await;
+            };
+            let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sender = CommandSender::Rcon(output.clone());
+            let source = sender.into_source(server);
+            server
+                .command_dispatcher
+                .load()
+                .handle_command(&source, command.trim());
+            let mut output = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            output.truncate(MAX_COMMAND_OUTPUT_LINES);
+            let mut bytes = 0;
+            output.retain(|line| {
+                if line.len() > 4_096
+                    || line.len() > MAX_COMMAND_OUTPUT_BYTES.saturating_sub(bytes)
+                {
+                    return false;
+                }
+                bytes += line.len();
+                true
+            });
+            write_response(
+                &mut write_half,
+                json!({"ok": true, "output": output}),
+            )
+            .await
         }
         Action::Save => match server.save_all().await {
             Ok(()) => write_response(&mut write_half, json!({"ok": true})).await,
@@ -418,6 +526,32 @@ fn requested_player(
         .get_all_players()
         .into_iter()
         .find(|player| player.gameprofile.id == id)
+}
+
+fn read_managed_operator_state(path: &Path) -> io::Result<ManagedOperatorState> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(ManagedOperatorState::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_managed_operator_state(path: &Path, state: &ManagedOperatorState) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operator state path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.pumpkin-tmp");
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(temporary, path)
 }
 
 async fn write_response(

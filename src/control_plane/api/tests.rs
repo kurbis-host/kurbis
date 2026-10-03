@@ -74,7 +74,7 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
                 }
             }
             for status in [
-                "400", "401", "403", "404", "409", "415", "422", "500", "503",
+                "400", "401", "403", "404", "409", "415", "422", "429", "500", "503",
             ] {
                 if let Some(response) = operation["responses"].get(status) {
                     assert_eq!(
@@ -88,6 +88,51 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
     }
 
     assert!(paths.contains_key("/api/v1/servers/{server_id}/commands"));
+    assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands"));
+    assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands/{command_id}"));
+    assert!(schemas.contains_key("ConsoleCommandRequest"));
+    assert!(schemas.contains_key("ConsoleCommandResponse"));
+    assert!(paths.contains_key("/api/v1/servers/{server_id}/operators"));
+    for method in ["get", "post", "delete"] {
+        let security = paths["/api/v1/servers/{server_id}/operators"][method]["security"]
+            .as_array()
+            .expect("browser security requirements are documented");
+        for requirement in security {
+            assert!(
+                !requirement
+                    .as_object()
+                    .unwrap()
+                    .contains_key("serverCapabilityBearer"),
+                "operator {method} must not be available to runtime capabilities"
+            );
+        }
+    }
+    for (path, operation) in [
+        (
+            "/api/v1/servers/{server_id}/operators",
+            &paths["/api/v1/servers/{server_id}/operators"]["post"],
+        ),
+        (
+            "/api/v1/servers/{server_id}/whitelist",
+            &paths["/api/v1/servers/{server_id}/whitelist"]["post"],
+        ),
+    ] {
+        let schema = operation["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap();
+        let schema_name = schema.strip_prefix("#/components/schemas/").unwrap();
+        assert_eq!(
+            schemas[schema_name]["required"],
+            serde_json::json!(["name"]),
+            "name-only mutation schema for {path}"
+        );
+        assert!(
+            schemas[schema_name]["properties"]
+                .get("player_id")
+                .is_none(),
+            "player mutation must not trust caller UUIDs for {path}"
+        );
+    }
     for removed in [
         "/api/v1/servers/{server_id}/actions",
         "/api/v1/servers/{server_id}/reset",

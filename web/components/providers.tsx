@@ -49,7 +49,7 @@ function EventsBridge({ scopedServerId }: { scopedServerId?: string }) {
     };
     source.onopen = () => queryClient.setQueryData(eventStatusKey, "live");
     source.onerror = () => queryClient.setQueryData(eventStatusKey, "reconnecting");
-    for (const name of ["server", "operation", "snapshot", "players", "whitelist", "log"] as const) {
+    for (const name of ["server", "operation", "snapshot", "players", "whitelist", "operators", "log"] as const) {
       source.addEventListener(name, (event) => consume(event as MessageEvent<string>));
     }
     return () => source.close();

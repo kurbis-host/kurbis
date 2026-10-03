@@ -16,11 +16,11 @@ import time
 import uuid
 
 
-def rpc(socket_path, token, action):
+def rpc(socket_path, token, action, **fields):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(30)
         connection.connect(str(socket_path))
-        connection.sendall(json.dumps({"token": token, "action": action}).encode() + b"\n")
+        connection.sendall(json.dumps({"token": token, "action": action, **fields}).encode() + b"\n")
         response = b""
         while not response.endswith(b"\n"):
             part = connection.recv(8192)
@@ -69,15 +69,35 @@ max_players = 0
 view_distance = 2
 simulation_distance = 2
 [networking.bedrock]
-enabled = true
+enabled = false
 online_mode = false
-address = "127.0.0.1:{bedrock_port}"
 view_distance = 2
 simulation_distance = 2
 [telemetry]
 enabled = false
 ''')
-        evidence = {"binary": str(binary), "java_port": port, "checks": []}
+        unmanaged_operator_id = str(uuid.uuid4())
+        owner_operator_id = str(uuid.uuid4())
+        managed_operator_id = str(uuid.uuid4())
+        # Seed a legitimate operator as if it came from ops.json/in-game admin
+        # setup before Kurbis applies its server-owned operator roster.
+        ops_path = root / "data" / "ops.json"
+        ops_path.parent.mkdir(parents=True, exist_ok=True)
+        seeded_unmanaged_operator = {
+            "uuid": unmanaged_operator_id,
+            "name": "FixtureVanillaOp",
+            "level": 2,
+            "bypasses_player_limit": False,
+        }
+        ops_path.write_text(json.dumps([seeded_unmanaged_operator], indent=2) + "\n")
+        evidence = {
+            "binary": str(binary),
+            "java_port": port,
+            "unmanaged_operator_id": unmanaged_operator_id,
+            "owner_operator_id": owner_operator_id,
+            "managed_operator_id": managed_operator_id,
+            "checks": [],
+        }
         with (output / "pumpkin.log").open("wb") as log:
             child = subprocess.Popen([str(binary)], cwd=root, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT,
@@ -106,6 +126,82 @@ enabled = false
                 players = rpc(rpc_path, token, "players")
                 assert players["ok"] and players["waiting_players"] == [], players
                 evidence["checks"].append({"players": players})
+                initial_ops = json.loads(ops_path.read_text())
+                seeded = next(entry for entry in initial_ops if entry["uuid"] == unmanaged_operator_id)
+                assert seeded["level"] == 2 and seeded["name"] == "FixtureVanillaOp", initial_ops
+                evidence["checks"].append({"unmanaged_operator_seeded": seeded})
+
+                managed_roster = [
+                    {"uuid": owner_operator_id, "name": "FixtureOwner"},
+                    {"uuid": managed_operator_id, "name": "FixtureManagedOp"},
+                ]
+                managed = rpc(
+                    rpc_path,
+                    token,
+                    "operators_replace",
+                    operators=managed_roster,
+                )
+                assert managed["ok"], managed
+                ops = json.loads(ops_path.read_text())
+                unmanaged = next(entry for entry in ops if entry["uuid"] == unmanaged_operator_id)
+                owner = next(entry for entry in ops if entry["uuid"] == owner_operator_id)
+                panel_operator = next(entry for entry in ops if entry["uuid"] == managed_operator_id)
+                assert unmanaged["level"] == 2 and unmanaged["name"] == "FixtureVanillaOp", ops
+                assert owner["level"] == 4 and owner["name"] == "FixtureOwner", owner
+                assert panel_operator["level"] == 4 and panel_operator["name"] == "FixtureManagedOp", panel_operator
+                sidecar_path = root / "plugins" / "data" / "kurbis-control" / "operator-config.json"
+                sidecar = json.loads(sidecar_path.read_text())
+                assert set(sidecar["player_ids"]) == {owner_operator_id, managed_operator_id}, sidecar
+                assert any(entry["uuid"] == unmanaged_operator_id for entry in sidecar["unrelated_ops"]), sidecar
+                evidence["checks"].append({
+                    "managed_operator_roster_applied": {
+                        "owner": owner,
+                        "managed": panel_operator,
+                        "preserved_unmanaged": unmanaged,
+                    }
+                })
+
+                # Revoke one managed roster entry while retaining the actual
+                # server owner. The unrelated preexisting ops.json entry must
+                # survive both the grant and revoke transitions unchanged.
+                revoked = rpc(
+                    rpc_path,
+                    token,
+                    "operators_replace",
+                    operators=[{"uuid": owner_operator_id, "name": "FixtureOwner"}],
+                )
+                assert revoked["ok"], revoked
+                ops = json.loads(ops_path.read_text())
+                assert all(entry["uuid"] != managed_operator_id for entry in ops), ops
+                owner = next(entry for entry in ops if entry["uuid"] == owner_operator_id)
+                unmanaged = next(entry for entry in ops if entry["uuid"] == unmanaged_operator_id)
+                assert owner["level"] == 4 and owner["name"] == "FixtureOwner", ops
+                assert unmanaged["level"] == 2 and unmanaged["name"] == "FixtureVanillaOp", ops
+                sidecar = json.loads(sidecar_path.read_text())
+                assert sidecar["player_ids"] == [owner_operator_id], sidecar
+                assert [entry["uuid"] for entry in sidecar["unrelated_ops"]] == [unmanaged_operator_id], sidecar
+                evidence["checks"].append({
+                    "managed_operator_revoked_owner_and_unmanaged_preserved": {
+                        "owner": owner,
+                        "unmanaged": unmanaged,
+                        "sidecar": sidecar,
+                    }
+                })
+                command = rpc(rpc_path, token, "execute_command", command="list")
+                assert command["ok"] and command["output"], command
+                evidence["checks"].append({"console_command": command})
+                rejected_by_dispatcher = rpc(
+                    rpc_path,
+                    token,
+                    "execute_command",
+                    command="kurbis_fixture_unknown_command",
+                )
+                assert rejected_by_dispatcher["ok"] is True, rejected_by_dispatcher
+                assert any("unknown command" in line.lower() for line in rejected_by_dispatcher["output"]), rejected_by_dispatcher
+                evidence["checks"].append({"dispatcher_rejection_output": rejected_by_dispatcher})
+                invalid_command = rpc(rpc_path, token, "execute_command", command="   ")
+                assert invalid_command["ok"] is False, invalid_command
+                evidence["checks"].append({"invalid_console_command": invalid_command})
                 invalid = rpc(rpc_path, token, "unknown_action")
                 assert invalid["ok"] is False, invalid
                 evidence["checks"].append({"invalid_request": invalid})

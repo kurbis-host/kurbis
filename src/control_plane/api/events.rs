@@ -18,6 +18,7 @@ use super::activity::{EventRow, ServerEventKind};
 use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::{require_server_access, server_by_id};
 use super::logs::LogEntry;
+use super::operators::{Operators, operators_state};
 use super::players::player_list;
 use super::server::server_view;
 use super::types::{Operation, Server, Snapshot};
@@ -60,6 +61,9 @@ pub enum ServerEventPayload {
     },
     Whitelist {
         data: Whitelist,
+    },
+    Operators {
+        data: Operators,
     },
 }
 
@@ -121,6 +125,9 @@ pub(super) async fn server_event_payload(
         },
         ServerEventKind::Whitelist => ServerEventPayload::Whitelist {
             data: whitelist_state(&state.pool, server_id).await?,
+        },
+        ServerEventKind::Operators => ServerEventPayload::Operators {
+            data: operators_state(&state.pool, server_id).await?,
         },
     };
     Ok(ServerEvent {

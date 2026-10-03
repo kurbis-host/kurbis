@@ -85,6 +85,19 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
     );
     assert_eq!(created["storage_limit_bytes"], 5_i64 * 1024 * 1024 * 1024);
 
+    let owner_profile_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'WorldOwner', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind(owner_profile_id.to_string())
+    .bind(owner_profile_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let isolated = app
         .clone()
         .oneshot(request(
@@ -113,7 +126,63 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         "Changed through v1"
     );
 
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'online', desired_state = 'running' WHERE id = $1",
+    )
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     let settings_uri = format!("/api/v1/servers/{server_id}");
+    let online_settings = app
+        .clone()
+        .oneshot(request(
+            Method::PATCH,
+            &settings_uri,
+            Some(&token),
+            Some(json!({"settings":{"difficulty":"Hard"}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(online_settings.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(online_settings).await["code"],
+        "server_not_sleeping"
+    );
+
+    let online_subdomain = app
+        .clone()
+        .oneshot(request(
+            Method::PATCH,
+            &settings_uri,
+            Some(&token),
+            Some(json!({"subdomain":"new-address"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(online_subdomain.status(), StatusCode::CONFLICT);
+    sqlx::query(
+        "UPDATE servers SET observed_state = 'sleeping', desired_state = 'stopped' WHERE id = $1",
+    )
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sleeping_settings = app
+        .clone()
+        .oneshot(request(
+            Method::PATCH,
+            &settings_uri,
+            Some(&token),
+            Some(json!({"settings":{"difficulty":"Hard"}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sleeping_settings.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(sleeping_settings).await["settings"]["difficulty"],
+        "Hard"
+    );
     let invalid_settings = app
         .clone()
         .oneshot(
@@ -214,7 +283,16 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
     let player_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO server_players(server_id, player_id, name, edition)
-         VALUES($1,$2,'Alex','java')",
+         VALUES($1,$2,'Alex','bedrock')",
+    )
+    .bind(server_id)
+    .bind(player_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO server_known_players(server_id, player_id, name, edition)
+         VALUES($1, $2, 'Alex', 'bedrock')",
     )
     .bind(server_id)
     .bind(player_id)
@@ -233,7 +311,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     let players = json_body(players).await;
     assert_eq!(players[0]["player_id"], player_id.to_string());
-    assert_eq!(players[0]["edition"], "java");
+    assert_eq!(players[0]["edition"], "bedrock");
 
     let whitelist = app
         .clone()
@@ -247,9 +325,9 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     let whitelist = json_body(whitelist).await;
     assert_eq!(whitelist["enabled"], true);
-    assert_eq!(whitelist["revision"], 0);
+    assert_eq!(whitelist["revision"], 1);
     assert_eq!(whitelist["applied_revision"], 0);
-    assert_eq!(whitelist["synchronized"], true);
+    assert_eq!(whitelist["synchronized"], false);
 
     let added = app
         .clone()
@@ -257,16 +335,195 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
             Method::POST,
             &format!("/api/v1/servers/{server_id}/whitelist"),
             Some(&token),
-            Some(json!({"player_id":player_id,"name":"Alex"})),
+            Some(json!({"name":"Alex"})),
         ))
         .await
         .unwrap();
     assert_eq!(added.status(), StatusCode::CREATED);
     let added = json_body(added).await;
-    assert_eq!(added["revision"], 1);
+    assert_eq!(added["revision"], 2);
     assert_eq!(added["applied_revision"], 0);
     assert_eq!(added["synchronized"], false);
     assert_eq!(added["entries"][0]["player_id"], player_id.to_string());
+
+    let operators_uri = format!("/api/v1/servers/{server_id}/operators");
+    let initial_operators = app
+        .clone()
+        .oneshot(request(Method::GET, &operators_uri, Some(&token), None))
+        .await
+        .unwrap();
+    let initial_operators = json_body(initial_operators).await;
+    assert_eq!(initial_operators["revision"], 2);
+    assert_eq!(initial_operators["applied_revision"], 0);
+    assert_eq!(initial_operators["synchronized"], false);
+    assert_eq!(
+        initial_operators["entries"][0]["player_id"],
+        owner_profile_id.to_string()
+    );
+    assert_eq!(initial_operators["entries"][0]["name"], "WorldOwner");
+    assert_eq!(initial_operators["entries"][0]["is_owner"], true);
+
+    let owner_mutation = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"WorldOwner"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_mutation.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(owner_mutation).await["code"],
+        "owner_operator_always_enabled"
+    );
+    let owner_roster_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operator_entries WHERE server_id = $1 AND player_id = $2",
+    )
+    .bind(server_id)
+    .bind(owner_profile_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner_roster_rows, 0,
+        "locked owner is represented only by identity"
+    );
+
+    let added_operator = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"Alex"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added_operator.status(), StatusCode::CREATED);
+    let added_operator = json_body(added_operator).await;
+    assert_eq!(added_operator["revision"], 3);
+    assert_eq!(added_operator["applied_revision"], 0);
+    assert_eq!(added_operator["synchronized"], false);
+    assert_eq!(
+        added_operator["entries"][0]["player_id"],
+        player_id.to_string()
+    );
+
+    sqlx::query("DELETE FROM server_players WHERE server_id = $1 AND player_id = $2")
+        .bind(server_id)
+        .bind(player_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let readded_offline_bedrock = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"Alex"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(readded_offline_bedrock.status(), StatusCode::CREATED);
+    assert_eq!(
+        json_body(readded_offline_bedrock).await["entries"][0]["player_id"],
+        player_id.to_string()
+    );
+
+    let removed_operator = app
+        .clone()
+        .oneshot(request(
+            Method::DELETE,
+            &format!("{operators_uri}?player_id={player_id}"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(removed_operator.status(), StatusCode::OK);
+    let removed_operator = json_body(removed_operator).await;
+    assert_eq!(removed_operator["revision"], 4);
+    assert_eq!(removed_operator["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(removed_operator["entries"][0]["is_owner"], true);
+
+    let offline_bedrock_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO server_known_players(server_id, player_id, name, edition)
+         VALUES($1, $2, 'OfflineBedrock', 'bedrock')",
+    )
+    .bind(server_id)
+    .bind(offline_bedrock_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let known_bedrock = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"OfflineBedrock"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(known_bedrock.status(), StatusCode::CREATED);
+    let known_bedrock = json_body(known_bedrock).await;
+    assert!(
+        known_bedrock["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["player_id"] == offline_bedrock_id.to_string()
+                    && entry["name"] == "OfflineBedrock"
+            })
+    );
+
+    let ambiguous_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    for id in ambiguous_ids {
+        sqlx::query(
+            "INSERT INTO server_players(server_id, player_id, name, edition)
+             VALUES($1, $2, 'Twin', 'bedrock')",
+        )
+        .bind(server_id)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let ambiguous = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"Twin"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_body(ambiguous).await["code"], "ambiguous_player_name");
+    let unsupported_bedrock = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &operators_uri,
+            Some(&token),
+            Some(json!({"name":"Gamertag With Spaces"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        unsupported_bedrock.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        json_body(unsupported_bedrock).await["code"],
+        "bedrock_player_lookup_unavailable"
+    );
 
     let activity = app
         .clone()

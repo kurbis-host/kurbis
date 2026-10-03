@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::actor::{ApiJson, ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
+use super::player_resolution::{resolve_player_name, validate_player_name};
 use super::{ApiError, AppState, mutation_error};
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, JsonSchema)]
@@ -84,22 +85,10 @@ pub(super) async fn whitelist(
 #[serde(deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(super) struct WhitelistMutation {
-    #[garde(skip)]
-    player_id: Uuid,
+    /// The Minecraft name to resolve. Java names are looked up through Mojang;
+    /// Bedrock names resolve only from this server's live players or stored roster.
     #[garde(length(min = 1, max = 64))]
     name: String,
-}
-
-fn validate_player_name(name: &str) -> Result<&str, ApiError> {
-    let name = name.trim();
-    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_player_name",
-            "player name must contain 1 to 64 printable characters",
-        ));
-    }
-    Ok(name)
 }
 
 pub(super) async fn add_whitelist_entry(
@@ -110,7 +99,8 @@ pub(super) async fn add_whitelist_entry(
 ) -> Result<(StatusCode, Json<Whitelist>), ApiError> {
     let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
-    let name = validate_player_name(&input.name)?;
+    let resolved = resolve_player_name(&state, server.id, &input.name).await?;
+    let name = validate_player_name(&resolved.name)?;
     let result = sqlx::query(
         "INSERT INTO whitelist_entries(server_id, player_id, name)
          VALUES($1, $2, $3)
@@ -118,7 +108,7 @@ pub(super) async fn add_whitelist_entry(
            SET name = EXCLUDED.name, updated_at = now()",
     )
     .bind(server.id)
-    .bind(input.player_id)
+    .bind(resolved.player_id)
     .bind(name)
     .execute(&state.pool)
     .await;
@@ -130,6 +120,7 @@ pub(super) async fn add_whitelist_entry(
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct WhitelistDeleteQuery {
     player_id: Uuid,
 }
@@ -150,6 +141,7 @@ pub(super) async fn remove_whitelist_entry(
     .bind(query.player_id)
     .execute(&state.pool)
     .await?;
+
     if result.rows_affected() == 0 {
         return Err(ApiError::with_code(
             StatusCode::NOT_FOUND,

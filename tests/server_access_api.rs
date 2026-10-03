@@ -418,9 +418,24 @@ fn server_route_matrix(server_id: Uuid, data: &ServerData) -> Vec<RouteCase> {
             body: None,
         },
         RouteCase {
+            method: Method::GET,
+            path: format!("{prefix}/operators"),
+            body: None,
+        },
+        RouteCase {
+            method: Method::POST,
+            path: format!("{prefix}/operators"),
+            body: Some(json!({"name":"Unauthorized"})),
+        },
+        RouteCase {
+            method: Method::DELETE,
+            path: format!("{prefix}/operators?player_id={}", data.whitelist_player_id),
+            body: None,
+        },
+        RouteCase {
             method: Method::POST,
             path: format!("{prefix}/whitelist"),
-            body: Some(json!({"player_id":Uuid::new_v4(),"name":"Unauthorized"})),
+            body: Some(json!({"name":"Unauthorized"})),
         },
         RouteCase {
             method: Method::DELETE,
@@ -634,6 +649,58 @@ async fn server_sessions_and_plugin_capabilities_are_confined_to_one_server() {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
     }
+
+    let session_operators = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::GET,
+            &format!("/api/v1/servers/{}/operators", fixture.server_id),
+            ServerCredential::Session(&session_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_operators.status(), StatusCode::OK);
+    let plugin_operators = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::GET,
+            &format!("/api/v1/servers/{}/operators", fixture.server_id),
+            ServerCredential::Plugin(&fixture.capability),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(plugin_operators.status(), StatusCode::NOT_FOUND);
+    let plugin_add_operator = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::POST,
+            &format!("/api/v1/servers/{}/operators", fixture.server_id),
+            ServerCredential::Plugin(&fixture.capability),
+            Some(json!({"name":"PrivatePlayer"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(plugin_add_operator.status(), StatusCode::NOT_FOUND);
+    let plugin_remove_operator = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::DELETE,
+            &format!(
+                "/api/v1/servers/{}/operators?player_id={}",
+                fixture.server_id, source_data.whitelist_player_id
+            ),
+            ServerCredential::Plugin(&fixture.capability),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(plugin_remove_operator.status(), StatusCode::NOT_FOUND);
 
     for credential in [
         ServerCredential::Session(&session_token),

@@ -22,8 +22,17 @@ export type SetupValues = z.infer<typeof setupSchema>;
 export const settingsFormSchema = setupSchema.omit({ preset: true });
 export type SettingsFormValues = z.infer<typeof settingsFormSchema>;
 
-export const whitelistFormSchema = z.object({
-  player_id: z.string().uuid("Enter a valid Minecraft player UUID."),
-  name: z.string().trim().min(1, "Enter a player name.").max(64, "Player names are limited to 64 characters."),
-});
-export type WhitelistFormValues = z.infer<typeof whitelistFormSchema>;
+const playerNameSchema = z
+  .string()
+  .trim()
+  .min(1, "Enter a player name.")
+  .max(64, "Player names are limited to 64 characters.")
+  .refine((name) => [...name].every((character) => !/\p{Cc}/u.test(character)), "Player names cannot contain control characters.");
+
+/** Names are the source of truth for panel mutations; the API resolves the
+ * verified game profile or reports when a Bedrock player must reconnect first. */
+export const playerMutationSchema = z.object({ name: playerNameSchema });
+export type PlayerMutationValues = z.infer<typeof playerMutationSchema>;
+
+export const whitelistFormSchema = playerMutationSchema;
+export type WhitelistFormValues = PlayerMutationValues;

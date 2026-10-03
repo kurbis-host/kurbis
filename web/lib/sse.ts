@@ -3,13 +3,13 @@ import type { components } from "./api/generated";
 import { queryKeys } from "./query";
 
 type ServerEvent = components["schemas"]["ServerEvent"];
-
 export function applyServerEvent(queryClient: QueryClient, serverId: string, event: ServerEvent) {
   const serverKey = queryKeys.server(serverId);
   const activityKey = queryKeys.activity(serverId);
   const snapshotsKey = queryKeys.snapshots(serverId);
   const playersKey = queryKeys.players(serverId);
   const whitelistKey = queryKeys.whitelist(serverId);
+  const operatorsKey = queryKeys.operators(serverId);
   const logsKey = queryKeys.logs(serverId);
   // Every durable event also adds a row to the activity feed.
   void queryClient.invalidateQueries({ queryKey: activityKey });
@@ -47,6 +47,14 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
         void queryClient.invalidateQueries({ queryKey: whitelistKey });
       }
       break;
+    case "operators":
+      if (event.data) {
+        void queryClient.cancelQueries({ queryKey: operatorsKey, exact: true });
+        queryClient.setQueryData(operatorsKey, event.data);
+      } else {
+        void queryClient.invalidateQueries({ queryKey: operatorsKey });
+      }
+      break;
     case "log":
       if (event.data) {
         const entry = event.data;
@@ -64,7 +72,7 @@ export function parseServerEvent(raw: string) {
   try {
     const value = JSON.parse(raw) as Partial<ServerEvent>;
     if (typeof value.id !== "number" || !Number.isInteger(value.id)
-      || !["server", "operation", "snapshot", "players", "whitelist", "log"].includes(value.type ?? "")) {
+      || !["server", "operation", "snapshot", "players", "whitelist", "operators", "log"].includes(value.type ?? "")) {
       return { success: false as const, error: new Error("Invalid server event") };
     }
     return { success: true as const, data: value as ServerEvent };

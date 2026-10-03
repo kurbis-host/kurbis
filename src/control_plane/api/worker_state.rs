@@ -226,6 +226,13 @@ pub(super) async fn server_context(
     .bind(server_id)
     .fetch_all(&state.pool)
     .await?;
+    let operator_entries: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT player_id, name FROM operator_entries
+         WHERE server_id = $1 ORDER BY lower(name), player_id",
+    )
+    .bind(server_id)
+    .fetch_all(&state.pool)
+    .await?;
     let placement = serde_json::from_value(row.0).map_err(|_| invalid_assignment())?;
     Ok(Json(WorkerServerContext {
         placement,
@@ -243,6 +250,10 @@ pub(super) async fn server_context(
             .map(|(id, name)| WhitelistEntry { id, name })
             .collect(),
         owners: owners
+            .into_iter()
+            .map(|(id, name)| WhitelistEntry { id, name })
+            .collect(),
+        operator_entries: operator_entries
             .into_iter()
             .map(|(id, name)| WhitelistEntry { id, name })
             .collect(),
@@ -285,7 +296,18 @@ pub(super) async fn sync_players(
         )
         .bind(server_id)
         .bind(player.id)
-        .bind(player.name)
+        .bind(&player.name)
+        .bind(edition)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO server_known_players(server_id, player_id, name, edition)
+             VALUES($1,$2,$3,$4) ON CONFLICT(server_id, player_id) DO UPDATE
+             SET name = EXCLUDED.name, edition = EXCLUDED.edition, last_seen_at = now()",
+        )
+        .bind(server_id)
+        .bind(player.id)
+        .bind(&player.name)
         .bind(edition)
         .execute(&mut *tx)
         .await?;

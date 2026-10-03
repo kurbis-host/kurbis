@@ -384,6 +384,26 @@ pub(super) async fn require_server_access(
     headers: &HeaderMap,
     server_id: Uuid,
 ) -> Result<ServerRecord, ApiError> {
+    require_server_access_inner(state, headers, server_id, true).await
+}
+
+/// Restrict panel-management endpoints to browser sessions, not runtime
+/// capabilities. Runtime capabilities can read operational data but must not
+/// grant privilege-changing player or command controls.
+pub(super) async fn require_browser_server_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+) -> Result<ServerRecord, ApiError> {
+    require_server_access_inner(state, headers, server_id, false).await
+}
+
+async fn require_server_access_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+    allow_instance_capability: bool,
+) -> Result<ServerRecord, ApiError> {
     let owner_error = match require_active_user(state, headers).await {
         Ok(user) => {
             if let Some(server) = server_by_id(&state.pool, server_id)
@@ -415,7 +435,7 @@ pub(super) async fn require_server_access(
 
     let capability_server_id =
         super::server_access::instance_capability_server_id(&state.pool, headers).await?;
-    if capability_server_id == Some(server_id) {
+    if allow_instance_capability && capability_server_id == Some(server_id) {
         return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
             ApiError::with_code(
                 StatusCode::NOT_FOUND,

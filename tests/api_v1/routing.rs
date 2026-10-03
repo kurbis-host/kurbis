@@ -68,10 +68,21 @@ async fn every_server_route_requires_ownership_and_legacy_singular_routes_are_go
         ),
         (Method::GET, format!("{prefix}/players"), None),
         (Method::GET, format!("{prefix}/whitelist"), None),
+        (Method::GET, format!("{prefix}/operators"), None),
+        (
+            Method::POST,
+            format!("{prefix}/operators"),
+            Some(json!({"name":"Foreign"})),
+        ),
+        (
+            Method::DELETE,
+            format!("{prefix}/operators?player_id={player_id}"),
+            None,
+        ),
         (
             Method::POST,
             format!("{prefix}/whitelist"),
-            Some(json!({"player_id":player_id,"name":"Foreign"})),
+            Some(json!({"name":"Foreign"})),
         ),
         (
             Method::DELETE,

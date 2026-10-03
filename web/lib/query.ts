@@ -9,6 +9,7 @@ export const queryKeys = {
   snapshots: (serverId: string) => ["servers", serverId, "snapshots"] as const,
   players: (serverId: string) => ["servers", serverId, "players"] as const,
   whitelist: (serverId: string) => ["servers", serverId, "whitelist"] as const,
+  operators: (serverId: string) => ["servers", serverId, "operators"] as const,
   exports: (serverId: string) => ["servers", serverId, "exports"] as const,
   eventStatus: (serverId: string) => ["servers", serverId, "event-status"] as const,
 };

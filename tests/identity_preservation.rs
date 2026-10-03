@@ -15,7 +15,11 @@ async fn world_history_counts(pool: &PgPool, server_ids: &[Uuid]) -> Vec<(String
         "server_players",
         "whitelist_entries",
     ] {
-        let query = format!("SELECT count(*) FROM {table} WHERE server_id = ANY($1)");
+        let query = if table == "server_events" {
+            "SELECT count(*) FROM server_events WHERE server_id = ANY($1) AND event_type <> 'operators'".to_owned()
+        } else {
+            format!("SELECT count(*) FROM {table} WHERE server_id = ANY($1)")
+        };
         let count: i64 = sqlx::query_scalar(&query)
             .bind(server_ids)
             .fetch_one(pool)

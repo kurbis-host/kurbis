@@ -82,6 +82,10 @@ macro_rules! api_headers {
 
 api_headers!(ApiAccountHeaders, ["accountSessionCookie"]);
 api_headers!(
+    ApiBrowserServerHeaders,
+    ["accountSessionCookie", "serverGrantCookie"]
+);
+api_headers!(
     ApiServerHeaders,
     [
         "accountSessionCookie",

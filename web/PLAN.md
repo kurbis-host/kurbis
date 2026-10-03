@@ -8,7 +8,7 @@ The new visual direction is an **original voxel-world interface**: unmistakably 
 
 The target audience is mixed: effortless for casual friend groups, with progressively disclosed controls for experienced server owners.
 
-The v1 product includes lifecycle management, connection details, live state, logs, configuration, player/whitelist management, backup history/manual backups/restore, operational activity, resource usage, account UX, onboarding, and failure recovery. Keep payments, plugin/mod uploads, unrestricted file management, arbitrary binaries, and admin tooling out of scope.
+The v1 product includes lifecycle management, connection details, live state, a runtime-online console command surface, safely formatted logs, configuration, player presence, independent whitelist and managed-operator rosters, backup history/manual backups/restore, operational activity, resource usage, account UX, onboarding, and failure recovery. Keep payments, plugin/mod uploads, unrestricted file management, arbitrary binaries, and administrative tooling beyond these scoped player controls out of scope.
 
 ## Product, UX, and Design
 
@@ -45,7 +45,7 @@ The v1 product includes lifecycle management, connection details, live state, lo
 - Use Tailwind CSS 4 utilities with a small global design-token layer instead of component-spanning global selectors. Keep shared visual patterns in reusable primitives and split the app shell, domain components, feature components, hooks, API code, and schemas into focused modules.
 - Replace browser polling with authenticated **Server-Sent Events**. REST remains authoritative for mutations; SSE updates the client cache for lifecycle, player presence, logs, operations, and snapshots.
 - SSE must support reconnect/catch-up with event IDs. Back it with PostgreSQL notification/event sources rather than process-local broadcasts so multiple control-plane replicas remain consistent.
-- Keep the console read-only in v1. Do not add arbitrary Minecraft command execution as part of this frontend project.
+- Keep logs safe and readable in the console: render ANSI/Minecraft formatting, filter visible text, and export plain text. Allow authorized browser users to queue a Minecraft command only while the runtime is online; submission feedback confirms queue acceptance while command output continues through the normal live log stream.
 
 ## Backend/API Changes
 
@@ -57,11 +57,13 @@ Public contracts:
 - GET /api/v1/servers; GET | PATCH /api/v1/servers/{server_id}
 - POST /api/v1/servers/{server_id}/commands for typed start | stop | restart | snapshot | reset | restore | delete intents
 - GET /api/v1/servers/{server_id}/events for SSE
+- POST /api/v1/servers/{server_id}/console/commands with a validated `{ request_id, command }` body to idempotently queue an authorized console command only while the runtime is online; return `202` and do not wait for execution
 - GET /api/v1/servers/{server_id}/logs?after_id=&limit=
 - GET /api/v1/servers/{server_id}/activity
 - GET /api/v1/servers/{server_id}/snapshots
 - GET /api/v1/servers/{server_id}/players
 - GET | POST | DELETE /api/v1/servers/{server_id}/whitelist
+- GET | POST | DELETE /api/v1/servers/{server_id}/operators
 - GET | POST /api/v1/servers/{server_id}/exports; GET /api/v1/servers/{server_id}/exports/{export_id}/download; DELETE /api/v1/servers/{server_id}/exports/{export_id}
 - GET /api/v1/account
 - PUT /api/v1/account/worlds/{server_id}/default
@@ -84,7 +86,7 @@ For backup restore, never move current_snapshot_generation backwards. Restoring 
 
 Expose retained completed snapshots only. Manual backup creation uses the existing snapshot operation machinery and is available while the runtime is online; restore requires the server to be sleeping.
 
-Make whitelist entries first-class persisted server data. Apply them when Pumpkin starts and synchronize mutations into the live runtime when online. Extend host control as necessary so online player presence and whitelist changes have an acknowledged runtime boundary instead of frontend-only state.
+Make whitelist entries and managed operator entries first-class, independent persisted server data. Resolve names server-side, keep player IDs internal, lock owner operators, fix managed operators at permission level 4, and preserve unrelated in-game operators. Apply both rosters when Pumpkin starts and synchronize mutations into the live runtime when online. World reset retains managed operators; full reset clears them. Extend host control as necessary so online player presence and whitelist/operator changes have an acknowledged runtime boundary instead of frontend-only state.
 
 Persist enough player presence/activity data for the control plane to serve the panel without the browser reaching worker-local sockets.
 
@@ -92,13 +94,13 @@ Emit or trigger PostgreSQL notifications for server state, logs, operations, sna
 
 ## Test Plan and Acceptance Criteria
 
-- Add Rust/Postgres integration coverage for every new API, ownership isolation, suspended accounts, lifecycle command validation, manual snapshots, snapshot-history visibility, monotonic rollback restore, whitelist persistence/runtime synchronization, player presence, pagination, and SSE authorization/reconnect/catch-up behavior.
+- Add Rust/Postgres integration coverage for every new API, ownership isolation, suspended accounts, lifecycle command validation, durable console command request deduplication, generation fencing, no automatic replay, manual snapshots, snapshot-history visibility, monotonic rollback restore, whitelist/operator persistence and runtime synchronization, player identity resolution, player presence, pagination, and SSE authorization/reconnect/catch-up behavior.
 - Verify per-server ownership isolation for every resource, command, export, and event stream. Confirm `/app/servers/{serverId}` is absent with no redirect, and `/manage/{serverId}` covers account-authorized servers and the union of active scoped sessions.
 - Verify exactly one `/api/v1/servers/{server_id}/commands` route handles shared lifecycle intents, including owner/worker parity, and no old action/reset/restore/delete or worker stop/snapshot route remains as an alias.
 - Verify OpenAPI generation and TypeScript drift checks cover every public JSON route; test `garde`-derived validation against request DTO constraints.
 - Bootstrap the canonical schema from an empty database and verify workers have no DB credentials, SQL pool, or bucket credentials. Exercise worker assignment checks through the API and streamed object authorization.
-- Add frontend component tests for lifecycle rendering, optimistic mutations, settings draft isolation, validation, reconnect handling, destructive confirmations, backup restrictions, whitelist interactions, and error states.
-- Expand Playwright into complete user journeys: public landing → OAuth → onboarding → start/queue/restore/online → live logs → players/whitelist → settings → backup → restore → restart/stop → deletion → logout.
+- Add frontend component tests for lifecycle rendering, optimistic mutations, settings draft isolation, validation, reconnect handling, console command online-state gating/dispatch feedback, ANSI and Minecraft formatting, readable filtering/exports, destructive confirmations, backup restrictions, whitelist interactions, and error states.
+- Expand Playwright into complete user journeys: public landing → OAuth → onboarding → start/queue/restore/online → run and complete a console command with live output → manage whitelist and operators → settings → backup → restore → restart/stop → deletion → logout.
 - Preserve browser security assertions for OAuth state binding, explicit provider linking, secure renewable cookies, session revocation, replay rejection, user isolation, and address conflicts.
 - Cover Java and Bedrock Minecraft login redemption for signed-in and signed-out users, token expiry/reuse, cross-origin POST rejection, and rejection of unauthenticated or forged game identities.
 - Cover server-only login redemption, fragment removal before the same-origin POST, one-use and 15-minute login-link expiry, persistent grant access after advancing the browser clock, independent per-server revocation and selector removal, account-cookie plus scoped-grant commands, account-route denial, cross-server denial, and deleted-server recovery states.

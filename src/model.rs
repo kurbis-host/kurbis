@@ -13,6 +13,19 @@ pub const DEFAULT_SERVER_MOTD: &str = "Hosted by Kurbis";
 pub const DEFAULT_IDLE_SECONDS: i64 = 5 * 60;
 pub const SNAPSHOT_RETENTION_GENERATIONS: i64 = 5;
 
+pub fn is_gateway_source_address(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            !address.is_unspecified() && !address.is_broadcast() && !address.is_multicast()
+        }
+        Ok(IpAddr::V6(address)) => !address.is_unspecified() && !address.is_multicast(),
+        Err(_) => false,
+    }
+}
+
 pub fn is_private_signal_address(value: &str) -> bool {
     if value.trim() != value {
         return false;
@@ -94,6 +107,17 @@ pub enum SnapshotReason {
     Export,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, JsonSchema)]
+#[sqlx(type_name = "console_command_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleCommandStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ServerRecord {
     pub id: Uuid,
@@ -168,6 +192,24 @@ pub struct OperationRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ConsoleCommandRecord {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub request_id: Uuid,
+    pub worker_id: Option<Uuid>,
+    pub generation: i64,
+    pub attempt: i32,
+    pub command: String,
+    pub status: ConsoleCommandStatus,
+    pub output: Vec<String>,
+    pub error: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SnapshotRecord {
     pub id: Uuid,
     pub server_id: Uuid,
@@ -232,6 +274,16 @@ pub fn subdomain_from_hostname(value: &str, root_domain: &str) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_source_address_accepts_public_unicast_but_rejects_non_hosts() {
+        assert!(is_gateway_source_address("198.51.100.23"));
+        assert!(is_gateway_source_address("fd00::2"));
+        assert!(!is_gateway_source_address("0.0.0.0"));
+        assert!(!is_gateway_source_address("224.0.0.1"));
+        assert!(!is_gateway_source_address("255.255.255.255"));
+        assert!(!is_gateway_source_address("gateway.example.test"));
+    }
 
     #[test]
     fn subdomain_validation_is_strict_and_dns_safe() {

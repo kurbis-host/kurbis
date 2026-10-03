@@ -105,6 +105,45 @@ describe("event reconnect state", () => {
     await waitFor(() => expect(screen.getByText("reconnecting")).toBeVisible());
   });
 
+  it("subscribes to operator events and updates the managed roster cache", async () => {
+    vi.stubGlobal("EventSource", EventSourceStub);
+    function OperatorCount() {
+      const { data } = useQuery({
+        queryKey: queryKeys.operators(server.id),
+        queryFn: async () => ({ revision: 1, applied_revision: 1, synchronized: true, entries: [] }),
+        staleTime: Infinity,
+      });
+      return <span>{data?.entries.length ?? 0} operators</span>;
+    }
+    render(
+      <AppProviders session={session} servers={[server]}>
+        <OperatorCount />
+      </AppProviders>,
+    );
+    await waitFor(() => expect(screen.getByText("0 operators")).toBeVisible());
+
+    const roster = {
+      revision: 2,
+      applied_revision: 2,
+      synchronized: true,
+      entries: [{
+        player_id: "00000000-0000-0000-0000-000000000004",
+        name: "Operator",
+        created_at: "2026-10-03T12:00:00Z",
+        updated_at: "2026-10-03T12:00:00Z",
+        is_owner: false,
+      }],
+    };
+    act(() => EventSourceStub.instance?.emit(
+      "operators",
+      new MessageEvent("operators", {
+        data: JSON.stringify({ id: 22, type: "operators", data: roster }),
+        lastEventId: "22",
+      }),
+    ));
+    await waitFor(() => expect(screen.getByText("1 operators")).toBeVisible());
+  });
+
   it("applies a named server event's complete envelope to the shared cache", async () => {
     vi.stubGlobal("EventSource", EventSourceStub);
     render(

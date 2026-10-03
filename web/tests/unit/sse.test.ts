@@ -1,7 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import type { components } from "../../lib/api/generated";
-import { applyServerEvent } from "../../lib/sse";
+import { applyServerEvent, parseServerEvent } from "../../lib/sse";
 import { queryKeys } from "../../lib/query";
 import { server } from "./fixtures";
 
@@ -76,6 +76,28 @@ describe("server event integration", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.server(server.id) });
   });
 
+  it("patches the operator roster from live operator events and parses the new event kind", () => {
+    const client = new QueryClient();
+    const roster = {
+      revision: 2,
+      applied_revision: 2,
+      synchronized: true,
+      entries: [{
+        player_id: "00000000-0000-0000-0000-000000000001",
+        name: "Alex",
+        created_at: "2026-09-30T18:20:00Z",
+        updated_at: "2026-09-30T18:20:00Z",
+        is_owner: true,
+      }],
+    };
+    const rawEvent = JSON.stringify({ id: 21, type: "operators", data: roster });
+    const parsed = parseServerEvent(rawEvent);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    applyServerEvent(client, server.id, parsed.data);
+    expect(client.getQueryData(queryKeys.operators(server.id))).toEqual(roster);
+  });
+
   it("refreshes activity for every durable event type", () => {
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, "invalidateQueries");
@@ -85,7 +107,8 @@ describe("server event integration", () => {
       { id: 3, type: "snapshot" },
       { id: 4, type: "players", data: [] },
       { id: 5, type: "whitelist", data: { enabled: false, revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
-      { id: 6, type: "log" },
+      { id: 6, type: "operators", data: { revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
+      { id: 7, type: "log" },
     ];
 
     for (const event of events) {

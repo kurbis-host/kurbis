@@ -52,6 +52,17 @@ pub(super) async fn recover(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    // Console commands are not retried after a worker interruption: the
+    // command may have executed before its acknowledgement was lost.
+    sqlx::query(
+        "UPDATE console_commands SET status = 'failed',
+             error = 'execution_outcome_unknown_after_worker_recovery',
+             completed_at = now(), updated_at = now()
+         WHERE status = 'running' AND worker_id = $1",
+    )
+    .bind(worker_id)
+    .execute(&mut *tx)
+    .await?;
     if worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await? != worker_id {
         return Err(worker_auth::invalid_worker_token());
     }

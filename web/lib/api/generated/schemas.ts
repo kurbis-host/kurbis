@@ -58,6 +58,38 @@ export interface components {
         CommandResponse: {
             observed_state: components["schemas"]["ObservedState"];
         };
+        /** @description A single server-console command submitted by an authorized browser actor. */
+        ConsoleCommandRequest: {
+            command: string;
+            /** Format: uuid */
+            request_id: string;
+        };
+        ConsoleCommandResponse: {
+            /** Format: int32 */
+            attempt: number;
+            /** Format: date-time */
+            claimed_at?: string | null;
+            command: string;
+            /** Format: date-time */
+            completed_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            error?: string | null;
+            /** Format: int64 */
+            generation: number;
+            /** Format: uuid */
+            id: string;
+            output: string[];
+            /** Format: uuid */
+            request_id: string;
+            /** Format: uuid */
+            server_id: string;
+            status: components["schemas"]["ConsoleCommandStatus"];
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** @enum {string} */
+        ConsoleCommandStatus: "queued" | "running" | "succeeded" | "failed" | "cancelled";
         CreateServerRequest: {
             /** @default {
              *       "difficulty": "Normal",
@@ -144,6 +176,33 @@ export interface components {
         OperationKind: "start" | "stop" | "restart" | "snapshot" | "restore" | "reset" | "delete";
         /** @enum {string} */
         OperationStatus: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+        OperatorDeleteQuery: {
+            /** Format: uuid */
+            player_id: string;
+        };
+        OperatorEntry: {
+            /** Format: date-time */
+            created_at: string;
+            is_owner: boolean;
+            name: string;
+            /** Format: uuid */
+            player_id: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        OperatorMutation: {
+            /** @description Java names are resolved with Mojang. Bedrock names resolve only while
+             *      the player is online on this server or already has a stored roster entry. */
+            name: string;
+        };
+        Operators: {
+            /** Format: int64 */
+            applied_revision: number;
+            entries: components["schemas"]["OperatorEntry"][];
+            /** Format: int64 */
+            revision: number;
+            synchronized: boolean;
+        };
         /** @enum {string} */
         PlayerEdition: "java" | "bedrock";
         PlayerPresence: {
@@ -229,6 +288,12 @@ export interface components {
             /** Format: int64 */
             generation: number;
         };
+        ServerConsoleCommandPath: {
+            /** Format: uuid */
+            command_id: string;
+            /** Format: uuid */
+            server_id: string;
+        };
         ServerEvent: {
             /** Format: int64 */
             id: number;
@@ -256,9 +321,13 @@ export interface components {
             /** @constant */
             type: "whitelist";
             data: components["schemas"]["Whitelist"];
+        } | {
+            /** @constant */
+            type: "operators";
+            data: components["schemas"]["Operators"];
         });
         /** @enum {string} */
-        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist";
+        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist" | "operators";
         ServerExportPath: {
             /** Format: uuid */
             export_id: string;
@@ -395,9 +464,9 @@ export interface components {
             updated_at: string;
         };
         WhitelistMutation: {
+            /** @description The Minecraft name to resolve. Java names are looked up through Mojang;
+             *      Bedrock names resolve only from this server's live players or stored roster. */
             name: string;
-            /** Format: uuid */
-            player_id: string;
         };
         WorldExport: {
             archive_checksum?: string | null;

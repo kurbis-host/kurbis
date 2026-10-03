@@ -43,6 +43,8 @@ mod tests {
             "advanced_config.toml",
             "nethernet-key.der",
             "whitelist.json",
+            "ops.json",
+            "data/whitelist.json",
             "logs/latest.log",
             "run/host-control.sock",
             "plugins/kurbis-control.wasm",
@@ -58,6 +60,7 @@ mod tests {
         ] {
             assert!(!is_runtime_file(Path::new(path)));
         }
+        assert!(!is_runtime_file(Path::new("data/ops.json")));
         assert!(!is_runtime_file(Path::new("world/level.dat")));
     }
 }

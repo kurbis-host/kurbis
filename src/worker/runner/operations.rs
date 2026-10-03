@@ -26,6 +26,11 @@ impl WorkerRunner {
                     }
                 }
             }
+            if let Some(command) = self.control_plane.claim_console_command().await?
+                && let Err(error) = self.execute_console_command(&command).await
+            {
+                tracing::warn!(console_command_id = %command.id, ?error, "console command completion failed");
+            }
             if let Err(error) = self.maintain_online_servers().await {
                 tracing::warn!(?error, "failed to maintain online servers");
             }
@@ -60,6 +65,80 @@ impl WorkerRunner {
             OperationKind::Restore => self.restore(op, &payload, &snapshots).await,
             OperationKind::Reset => self.reset(op, &payload, &snapshots).await,
             OperationKind::Delete => self.delete(op, &payload, &snapshots).await,
+        }
+    }
+
+    async fn execute_console_command(
+        &self,
+        command: &crate::contracts::worker::WorkerConsoleCommand,
+    ) -> Result<()> {
+        let execution = async {
+            let context = self
+                .control_plane
+                .server_context(
+                    command.server_id,
+                    crate::contracts::worker::WorkerAssignment::Placement {
+                        generation: command.generation,
+                    },
+                )
+                .await?;
+            if context.placement.worker_id != self.config.id
+                || context.placement.generation != command.generation
+                || !context.placement.active
+                || context.observed_state != ObservedState::Online
+                || context.desired_state != DesiredState::Running
+            {
+                bail!("console command assignment is stale or no longer online");
+            }
+            if self.runtime.server_generation(command.server_id).await? != Some(command.generation)
+            {
+                bail!("console command runtime generation does not match its assignment");
+            }
+            self.runtime
+                .execute_command(&self.server_dir(command.server_id), &command.command)
+                .await
+        }
+        .await;
+
+        match execution {
+            Ok(output) => {
+                let mut transcript = Vec::with_capacity(output.len() + 1);
+                transcript.push(format!("> /{}", command.command));
+                transcript.extend(output.iter().cloned());
+                if let Err(error) = self
+                    .control_plane
+                    .append_logs(command.server_id, command.generation, &transcript)
+                    .await
+                {
+                    tracing::warn!(
+                        console_command_id = %command.id,
+                        ?error,
+                        "console command completed but transcript could not be published to live logs"
+                    );
+                }
+                self.control_plane
+                    .complete_console_command(command, true, output, None)
+                    .await
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let failure_line = format!("! /{} failed: {message}", command.command);
+                if let Err(log_error) = self
+                    .control_plane
+                    .append_logs(command.server_id, command.generation, &[failure_line])
+                    .await
+                {
+                    tracing::debug!(
+                        console_command_id = %command.id,
+                        ?log_error,
+                        "failed console command transcript could not be published"
+                    );
+                }
+                self.control_plane
+                    .complete_console_command(command, false, Vec::new(), Some(&message))
+                    .await?;
+                Err(error)
+            }
         }
     }
 

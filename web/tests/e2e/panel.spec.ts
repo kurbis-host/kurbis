@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { blake3 } from '@noble/hashes/blake3';
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 import { Pool } from 'pg';
 import AxeBuilder from '@axe-core/playwright';
@@ -119,6 +120,32 @@ async function tickUntil(page: Page, request: APIRequestContext, value: string, 
     if (await page.getByRole('heading', { name: value, exact: true }).isVisible()) return;
   }
   await state(page, value);
+}
+function workerLeaseId(token: string) {
+  const hex = Buffer.from(blake3(Buffer.from(token)).slice(0, 16)).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+async function startWorldOnline(page: Page, request: APIRequestContext, worldName: string) {
+  await login(page);
+  await create(page, worldName);
+  const id = await serverId(page);
+  const capacity = await command(request, 'capacity', { available: true });
+  expect(capacity.status()).toBe(204);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await state(page, 'Restoring');
+  await tickUntil(page, request, 'Online');
+  await command(request, 'capacity', { available: true });
+  const placement = await pool.query('SELECT worker_id FROM placements WHERE server_id = $1 AND active', [id]);
+  expect(placement.rowCount).toBe(1);
+  const workerToken = randomBytes(32).toString('base64url');
+  await pool.query(
+    `INSERT INTO worker_credentials(worker_id, api_token_hash, lease_id, lease_expires_at, revoked_at)
+     VALUES($1, $2, $3, now() + interval '1 hour', NULL)
+     ON CONFLICT(worker_id) DO UPDATE SET api_token_hash = EXCLUDED.api_token_hash,
+       lease_id = EXCLUDED.lease_id, lease_expires_at = EXCLUDED.lease_expires_at, revoked_at = NULL`,
+    [placement.rows[0].worker_id, Buffer.from(blake3(Buffer.from(workerToken))), workerLeaseId(workerToken)],
+  );
+  return id;
 }
 async function create(page: Page, name: string) {
   await page.getByPlaceholder('friends-world').fill(name);
@@ -375,8 +402,12 @@ test('world and full reset preserve their distinct settings, whitelist, and reco
   });
   expect(updated.status).toBe(200);
   const playerId = randomUUID();
+  await pool.query(
+    `INSERT INTO server_known_players(server_id, player_id, name, edition)
+     VALUES($1, $2, 'PersistentPlayer', 'java')`,
+    [id, playerId],
+  );
   const added = await browserApi(page, `${settingsPath}/whitelist`, 'POST', {
-    player_id: playerId,
     name: 'PersistentPlayer',
   });
   expect(added.status).toBe(201);
@@ -706,4 +737,177 @@ test('expired OAuth state and a replayed successful callback cannot create sessi
   expect(replay?.status()).toBe(400);
   expect(await replay?.text()).toContain('invalid or expired OAuth state');
   expect((await pool.query('SELECT count(*) FROM sessions')).rows[0].count).toBe(before);
+});
+
+
+test('online console commands are deduplicated, fenced to a runtime generation, and stream output or failures', async ({ page, request }) => {
+  test.setTimeout(120000);
+  const id = await startWorldOnline(page, request, 'console-command-world');
+  await page.goto(`/manage/${id}/console`);
+  await expect(page.getByText('Runtime online')).toBeVisible();
+  await expect(page.getByText('Live updates connected')).toBeVisible();
+
+  const commandText = 'say Browser command works';
+  const commandInput = page.getByRole('textbox', { name: 'Minecraft command' });
+  await commandInput.fill(`/${commandText}`);
+  const acceptedResponse = page.waitForResponse((response) =>
+    response.url().endsWith(`/api/v1/servers/${id}/console/commands`) && response.request().method() === 'POST',
+  );
+  await page.getByRole('button', { name: 'Send command' }).click();
+  const accepted = await acceptedResponse;
+  expect(accepted.status()).toBe(202);
+  const queued = await accepted.json() as {
+    id: string;
+    server_id: string;
+    request_id: string;
+    generation: number;
+    attempt: number;
+    command: string;
+    status: string;
+  };
+  expect(queued).toMatchObject({
+    server_id: id,
+    generation: 1,
+    attempt: 0,
+    command: commandText,
+    status: 'queued',
+  });
+  expect(queued.request_id).toMatch(/^[0-9a-f-]{36}$/i);
+  await expect(page.getByRole('status')).toContainText('Command queued');
+
+  const replay = await page.evaluate(async ({ requestId, command: submitted }) => {
+    const response = await fetch(`/api/v1/servers/${window.location.pathname.split('/')[2]}/console/commands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId, command: submitted }),
+    });
+    return { status: response.status, body: await response.json() };
+  }, { requestId: queued.request_id, command: commandText });
+  expect(replay.status).toBe(202);
+  expect(replay.body.id).toBe(queued.id);
+  const conflictingReplay = await page.evaluate(async ({ requestId, command: submitted }) => {
+    const response = await fetch(`/api/v1/servers/${window.location.pathname.split('/')[2]}/console/commands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId, command: submitted }),
+    });
+    return { status: response.status, body: await response.json() };
+  }, { requestId: queued.request_id, command: 'say this is a different command' });
+  expect(conflictingReplay.status).toBe(409);
+  expect(conflictingReplay.body.code).toBe('console_request_id_conflict');
+
+  const execution = await request.post(`${fixture}/fixture/console/execute`, {
+    data: {
+      server_id: id,
+      command_id: queued.id,
+      output: ['\u001b[32mBrowser command returned OK\u001b[0m'],
+    },
+  });
+  expect(execution.status(), await execution.text()).toBe(200);
+  expect(await execution.json()).toMatchObject({ id: queued.id, status: 'succeeded', attempt: 1 });
+  await expect(page.getByRole('log').getByText('Browser command returned OK')).toBeVisible();
+  await expect(page.getByRole('log').getByText('Browser command returned OK')).toHaveCSS('color', 'rgb(0, 170, 0)');
+  const succeeded = await page.evaluate(async (commandId) => {
+    const serverId = window.location.pathname.split('/')[2];
+    const response = await fetch(`/api/v1/servers/${serverId}/console/commands/${commandId}`);
+    return { status: response.status, body: await response.json() };
+  }, queued.id);
+  expect(succeeded).toMatchObject({ status: 200, body: { status: 'succeeded', attempt: 1 } });
+
+  await commandInput.fill('say failing command');
+  const failedResponsePromise = page.waitForResponse((response) =>
+    response.url().endsWith(`/api/v1/servers/${id}/console/commands`) && response.request().method() === 'POST',
+  );
+  await page.getByRole('button', { name: 'Send command' }).click();
+  const failedResponse = await failedResponsePromise;
+  expect(failedResponse.status()).toBe(202);
+  const failedQueued = await failedResponse.json() as { id: string; status: string };
+  expect(failedQueued.status).toBe('queued');
+  const failure = await request.post(`${fixture}/fixture/console/execute`, {
+    data: { server_id: id, command_id: failedQueued.id, succeeded: false, error: 'fixture runtime rejected the command' },
+  });
+  expect(failure.status(), await failure.text()).toBe(200);
+  await expect(page.getByRole('log').getByText('! /say failing command failed: fixture runtime rejected the command')).toBeVisible();
+  const failedStatus = await page.evaluate(async (commandId) => {
+    const serverId = window.location.pathname.split('/')[2];
+    const response = await fetch(`/api/v1/servers/${serverId}/console/commands/${commandId}`);
+    return { status: response.status, body: await response.json() };
+  }, failedQueued.id);
+  expect(failedStatus).toMatchObject({ status: 200, body: { status: 'failed', attempt: 1, error: 'fixture runtime rejected the command' } });
+
+  for (const width of [1440, 820, 390]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    const audit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
+    expect(audit.violations, `console command route at ${width}px`).toEqual([]);
+    if (width === 1440 || width === 390) {
+      await capture(page, `console-command-${width}.png`);
+    }
+  }
+});
+
+test('Players page manages independent whitelist and protected operator rosters without exposing IDs', async ({ page, request }) => {
+  test.setTimeout(120000);
+  const id = await startWorldOnline(page, request, 'managed-player-world');
+  const owner = await pool.query('SELECT owner_id FROM servers WHERE id = $1', [id]);
+  const ownerProfileId = randomUUID();
+  const playerId = '8667ba71-b85a-4004-af54-457a9734eed7';
+  await pool.query(
+    `INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+     VALUES($1, $2, 'minecraft_java', $3, 'BrowserOwner', $4)`,
+    [randomUUID(), owner.rows[0].owner_id, ownerProfileId, ownerProfileId],
+  );
+  await pool.query(
+    `INSERT INTO server_players(server_id, player_id, name, edition)
+     VALUES($1, $2, 'BrowserHelper', 'java')
+     ON CONFLICT(server_id, player_id) DO UPDATE SET name = EXCLUDED.name, edition = EXCLUDED.edition,
+       connected_at = now(), last_seen_at = now()`,
+    [id, playerId],
+  );
+  await page.goto(`/manage/${id}/players`);
+  await expect(page.getByText('BrowserHelper', { exact: true })).toBeVisible();
+  await expect(page.getByText('BrowserOwner', { exact: true })).toBeVisible();
+  await expect(page.getByText('Locked', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Remove BrowserOwner as operator' })).toHaveCount(0);
+  await expect(page.getByPlaceholder('00000000-0000-0000-0000-000000000000')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(page.getByText('Allowed', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Grant OP', exact: true }).click();
+  await expect(page.getByText('Operator', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Remove BrowserHelper as operator' })).toBeVisible();
+
+  const whitelistStored = await pool.query(
+    'SELECT player_id, name FROM whitelist_entries WHERE server_id = $1', [id],
+  );
+  const operatorStored = await pool.query(
+    'SELECT player_id, name FROM operator_entries WHERE server_id = $1', [id],
+  );
+  expect(whitelistStored.rows).toEqual([{ player_id: playerId, name: 'BrowserHelper' }]);
+  expect(operatorStored.rows).toEqual([{ player_id: playerId, name: 'BrowserHelper' }]);
+
+  await page.reload();
+  await expect(page.getByText('BrowserOwner', { exact: true })).toBeVisible();
+  await expect(page.getByText('BrowserHelper', { exact: true })).toHaveCount(3);
+  await page.getByRole('button', { name: 'Remove BrowserHelper from whitelist' }).click();
+  await expect(page.getByText('Whitelist is empty')).toBeVisible();
+  await page.getByRole('button', { name: 'Remove BrowserHelper as operator' }).click();
+  await expect(page.getByText('No extra operators')).toBeVisible();
+  await expect.poll(async () => {
+    const [whitelist, operators] = await Promise.all([
+      pool.query('SELECT count(*) FROM whitelist_entries WHERE server_id = $1', [id]),
+      pool.query('SELECT count(*) FROM operator_entries WHERE server_id = $1', [id]),
+    ]);
+    return [whitelist.rows[0].count, operators.rows[0].count];
+  }).toEqual(['0', '0']);
+
+  for (const width of [1440, 820, 390]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    const audit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
+    expect(audit.violations, `Players route at ${width}px`).toEqual([]);
+    if (width === 1440 || width === 390) {
+      await capture(page, `managed-players-${width}.png`);
+    }
+  }
 });

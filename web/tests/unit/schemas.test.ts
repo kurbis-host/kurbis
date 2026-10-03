@@ -25,3 +25,17 @@ describe("server forms", () => {
     expect(settingsFormSchema.safeParse(settings).success).toBe(true);
   });
 });
+
+describe("player mutation form", () => {
+  it("normalizes Minecraft names and needs no UUID for an offline entry", async () => {
+    const { playerMutationSchema } = await import("../../lib/schemas");
+    expect(playerMutationSchema.parse({ name: "  OfflinePlayer  " })).toEqual({ name: "OfflinePlayer" });
+  });
+
+  it("rejects blank, oversized, and control-character names", async () => {
+    const { playerMutationSchema } = await import("../../lib/schemas");
+    expect(playerMutationSchema.safeParse({ name: "   " }).success).toBe(false);
+    expect(playerMutationSchema.safeParse({ name: "x".repeat(65) }).success).toBe(false);
+    expect(playerMutationSchema.safeParse({ name: "Bad\nName" }).success).toBe(false);
+  });
+});

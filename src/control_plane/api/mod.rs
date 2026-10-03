@@ -38,11 +38,15 @@ mod account;
 mod activity;
 mod actor;
 mod commands;
+mod console;
+mod console_commands;
 mod events;
 mod exports;
 mod internal;
 mod logs;
 mod openapi;
+mod operators;
+mod player_resolution;
 mod players;
 mod server;
 mod server_access;
@@ -68,6 +72,7 @@ pub use actor::{
 };
 pub use events::{ServerEvent, ServerEventPayload};
 pub use logs::{LogEntry, LogPage};
+pub use operators::{OperatorEntry, Operators};
 pub use players::{PlayerEdition, PlayerPresence};
 pub use session::{AccountStatus, ServiceLimits, Session, SessionUser};
 pub use types::{
@@ -123,7 +128,7 @@ impl aide::operation::OperationOutput for ApiError {
         let Some(response) = Self::operation_response(context, operation) else {
             return Vec::new();
         };
-        [400, 401, 403, 404, 409, 415, 422, 500, 503]
+        [400, 401, 403, 404, 409, 415, 422, 429, 500, 503]
             .into_iter()
             .map(|status| (Some(status), response.clone()))
             .collect()
@@ -386,6 +391,21 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             api_get(server::get_server).patch(server::update_server),
         )
         .api_route(
+            "/api/v1/servers/{server_id}/console/commands",
+            api_post_with(console::enqueue_console_command, |operation| {
+                operation
+                    .id("enqueueConsoleCommand")
+                    .description("Queue one server console command for the current online placement and return its durable execution record.")
+                    .security_requirement("accountSessionCookie")
+                    .security_requirement("serverGrantCookie")
+                    .response::<202, Json<crate::contracts::console::ConsoleCommandResponse>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/console/commands/{command_id}",
+            api_get(console::get_console_command),
+        )
+        .api_route(
             commands::COMMAND_ROUTE,
             api_post_with(commands::dispatch_command, |operation| {
                 operation
@@ -463,6 +483,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             api_get(players::players),
         )
         .api_route(
+            "/api/v1/servers/{server_id}/operators",
+            api_get(operators::operators)
+                .post_with(operators::add_operator, |operation| {
+                    operation.response::<201, Json<Operators>>()
+                })
+                .delete(operators::remove_operator),
+        )
+        .api_route(
             "/api/v1/servers/{server_id}/whitelist",
             api_get(whitelist::whitelist)
                 .post_with(whitelist::add_whitelist_entry, |operation| {
@@ -514,6 +542,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/worker/control/servers/{server_id}/snapshots/{snapshot_generation}", get(worker_snapshots::snapshot))
         .route("/internal/worker/control/servers/{server_id}/snapshots/delete-manifests", post(worker_snapshots::delete_manifests))
         .route("/internal/worker/control/exports/{export_id}/running", get(worker_snapshots::export_running))
+        .route(
+            "/internal/worker/control/console/commands/claim",
+            post(console_commands::claim_console_command),
+        )
+        .route(
+            "/internal/worker/control/console/commands/{command_id}/complete",
+            post(console_commands::complete_console_command),
+        )
         .route(
             "/internal/worker/control/operations/claim",
             post(worker_control::claim_operation),

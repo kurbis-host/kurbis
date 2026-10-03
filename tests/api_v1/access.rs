@@ -658,7 +658,28 @@ async fn current_placement_capability_and_redeemed_session_share_server_scope() 
         .await
         .unwrap();
     assert_eq!(cross_server.status(), StatusCode::NOT_FOUND);
-
+    let cross_server_operators = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{other_server_id}/operators"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_server_operators.status(), StatusCode::NOT_FOUND);
+    let capability_operators = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}/operators"),
+            &capability,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(capability_operators.status(), StatusCode::NOT_FOUND);
     // The handler does not extract a body: a forged identifier may be sent but
     // cannot override scope, which must remain derived from the bearer token.
     let minted = app
@@ -798,6 +819,17 @@ async fn current_placement_capability_and_redeemed_session_share_server_scope() 
         .await
         .unwrap();
     assert_eq!(session_access.status(), StatusCode::OK);
+    let session_operator_access = app
+        .clone()
+        .oneshot(server_session_request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}/operators"),
+            &server_session,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_operator_access.status(), StatusCode::OK);
     let session_cross_server = app
         .clone()
         .oneshot(server_session_request(

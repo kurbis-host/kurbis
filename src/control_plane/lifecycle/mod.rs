@@ -777,6 +777,10 @@ impl Lifecycle {
                 .bind(server_id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("DELETE FROM operator_entries WHERE server_id = $1")
+                .bind(server_id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(
                 "INSERT INTO server_whitelist_state(server_id, revision, applied_revision)
                  VALUES($1, 1, 0) ON CONFLICT(server_id) DO UPDATE

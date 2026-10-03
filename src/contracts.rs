@@ -1,5 +1,58 @@
 //! Shared JSON contracts used by the control plane, gateway, and worker clients.
 
+pub mod console {
+    use chrono::{DateTime, Utc};
+    use garde::Validate;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    use crate::model::ConsoleCommandStatus;
+
+    /// A single server-console command submitted by an authorized browser actor.
+    #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Validate)]
+    #[serde(deny_unknown_fields)]
+    pub struct ConsoleCommandRequest {
+        #[garde(skip)]
+        pub request_id: Uuid,
+        #[garde(length(min = 1, max = 512))]
+        pub command: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ConsoleCommandResponse {
+        pub id: Uuid,
+        pub server_id: Uuid,
+        pub request_id: Uuid,
+        pub generation: i64,
+        pub attempt: i32,
+        pub command: String,
+        pub status: ConsoleCommandStatus,
+        pub output: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub claimed_at: Option<DateTime<Utc>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub completed_at: Option<DateTime<Utc>>,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ConsoleCommandCompletion {
+        pub generation: i64,
+        pub attempt: i32,
+        pub succeeded: bool,
+        #[serde(default)]
+        pub output: Vec<String>,
+        #[serde(default)]
+        pub error: Option<String>,
+    }
+}
+
 pub mod lifecycle {
     use garde::Validate;
     use schemars::JsonSchema;
@@ -79,6 +132,16 @@ pub mod worker {
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
+    pub struct WorkerConsoleCommand {
+        pub id: Uuid,
+        pub server_id: Uuid,
+        pub generation: i64,
+        pub attempt: i32,
+        pub command: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct WorkerSnapshotReservation {
         pub id: Uuid,
         pub server_id: Uuid,
@@ -117,6 +180,7 @@ pub mod worker {
         pub whitelist_applied_revision: i64,
         pub whitelist_entries: Vec<WhitelistEntry>,
         pub owners: Vec<WhitelistEntry>,
+        pub operator_entries: Vec<WhitelistEntry>,
         pub operator_revision: i64,
         pub operator_applied_revision: i64,
     }

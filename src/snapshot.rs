@@ -36,6 +36,8 @@ pub(crate) fn is_runtime_file(relative: &Path) -> bool {
                 | "advanced_config.toml"
                 | "nethernet-key.der"
                 | "whitelist.json"
+                | "ops.json"
+                | "data/whitelist.json"
                 | "plugins/kurbis-control.wasm"
                 | "plugins/data/kurbis-control/config.json"
         )

@@ -107,3 +107,75 @@ async fn sse_streams_server_changes_committed_after_the_connection_opens() {
     assert!(frame.contains("event: server") || frame.contains("event:server"));
     assert!(frame.contains("live SSE update"));
 }
+
+#[tokio::test]
+async fn owner_identity_revision_streams_the_derived_owner_operator_entry() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner_id, token) = user_session(&pool, "active").await;
+    let server_id = create_test_server(&pool, owner_id, "sse-owner-operator").await;
+    let baseline: i64 =
+        sqlx::query_scalar("SELECT COALESCE(max(id), 0) FROM server_events WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let player_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'WorldOwner', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind(player_id.to_string())
+    .bind(player_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let event_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM server_events
+         WHERE server_id = $1 AND event_type = 'operators' AND id > $2
+         ORDER BY id LIMIT 1",
+    )
+    .bind(server_id)
+    .bind(baseline)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let response = router(state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/servers/{server_id}/events"))
+                .header(header::COOKIE, format!("kurbis_session={token}"))
+                .header("last-event-id", baseline.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        response.into_body().into_data_stream().next(),
+    )
+    .await
+    .expect("owner operator event should arrive")
+    .expect("SSE stream should remain open")
+    .expect("SSE frame should be readable");
+    let frame = String::from_utf8(frame.to_vec()).unwrap();
+    assert!(
+        frame.contains(&format!("id:{event_id}")) || frame.contains(&format!("id: {event_id}"))
+    );
+    assert!(frame.contains("event:operators") || frame.contains("event: operators"));
+    assert!(frame.contains(&player_id.to_string()));
+    assert!(frame.contains("WorldOwner"));
+    assert!(frame.contains("\"is_owner\":true"));
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

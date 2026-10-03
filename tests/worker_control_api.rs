@@ -826,6 +826,38 @@ async fn worker_state_reads_and_runtime_sync_are_assignment_scoped() {
             .await
             .unwrap();
     assert_eq!(players, (1, Some("CurrentPlayer".to_owned())));
+    let known_player: Option<(String, String)> = sqlx::query_as(
+        "SELECT name, edition FROM server_known_players
+         WHERE server_id = $1 AND player_id = $2",
+    )
+    .bind(server)
+    .bind(player_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        known_player,
+        Some(("CurrentPlayer".to_owned(), "java".to_owned()))
+    );
+
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        &players_uri,
+        Some(&worker.token),
+        json!({"generation":3,"players":[]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (current_count, known_count): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM server_players WHERE server_id = $1),
+                (SELECT count(*) FROM server_known_players WHERE server_id = $1)",
+    )
+    .bind(server)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((current_count, known_count), (0, 1));
 
     let logs_uri = format!("/internal/worker/control/servers/{server}/logs");
     let (status, _) = send_json(
@@ -1361,4 +1393,471 @@ async fn retry_stores_bounded_worker_error_but_rejects_oversized_direct_error() 
             .unwrap();
     assert_eq!(state.0, "pending");
     assert_eq!(state.1.as_deref(), Some(bounded.as_str()));
+}
+
+#[tokio::test]
+async fn console_commands_are_durable_claimed_once_and_completed_under_generation_fence() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "console-command").await;
+    let foreign_worker = create_worker(&pool, "console-command-foreign").await;
+    let server_id = create_server(&pool, "console-command").await;
+    set_server_state(&pool, server_id, 1, "running", "online").await;
+    add_placement(&pool, server_id, worker.id, 1, true).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let session_token = format!("console-owner-session-{server_id}");
+    sqlx::query("INSERT INTO sessions(id, token_hash, user_id) VALUES($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(blake3::hash(session_token.as_bytes()).as_bytes().to_vec())
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET heartbeat_at = now() WHERE id = $1")
+        .bind(worker.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let command_uri = format!("/api/v1/servers/{server_id}/console/commands");
+    let worker_denied = send_json(
+        service.clone(),
+        Method::POST,
+        &command_uri,
+        Some(&worker.token),
+        json!({"request_id":Uuid::new_v4(),"command":"say worker must not run this"}),
+    )
+    .await;
+    assert_eq!(worker_denied.0, StatusCode::FORBIDDEN);
+    let gateway_denied = send_json(
+        service.clone(),
+        Method::POST,
+        &command_uri,
+        Some("shared-internal-test-token"),
+        json!({"request_id":Uuid::new_v4(),"command":"say gateway must not run this"}),
+    )
+    .await;
+    assert_eq!(gateway_denied.0, StatusCode::FORBIDDEN);
+    let invalid = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&command_uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":Uuid::new_v4(),"command":"say\nno"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let request_id = Uuid::new_v4();
+    let response = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&command_uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":request_id,"command":"say hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let response_status = response.status();
+    let response_body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+    assert_eq!(
+        response_status,
+        StatusCode::ACCEPTED,
+        "console enqueue failed: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    let response: Value = serde_json::from_slice(&response_body).unwrap();
+    let command_id = Uuid::parse_str(response["id"].as_str().unwrap()).unwrap();
+    assert_eq!(response["status"], "queued");
+    assert_eq!(response["generation"], 1);
+    assert_eq!(response["request_id"], request_id.to_string());
+    let replay = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&command_uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":request_id,"command":"say hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(replay.into_body(), 32 * 1024).await.unwrap()).unwrap();
+    assert_eq!(replay["id"], command_id.to_string());
+    let reused_id = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&command_uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":request_id,"command":"say different"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused_id.status(), StatusCode::CONFLICT);
+
+    let foreign_claim = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&foreign_worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(foreign_claim.0, StatusCode::OK);
+    assert_eq!(foreign_claim.1, Value::Null);
+    let claimed = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(claimed.0, StatusCode::OK);
+    assert_eq!(claimed.1["id"], command_id.to_string());
+    assert_eq!(claimed.1["attempt"], 1);
+    let duplicate_claim = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(duplicate_claim.0, StatusCode::OK);
+    assert_eq!(duplicate_claim.1, Value::Null);
+
+    let status = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{command_uri}/{command_id}"))
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(response_json(status).await["status"], "running");
+
+    let complete = send_json(
+        service.clone(),
+        Method::POST,
+        &format!("/internal/worker/control/console/commands/{command_id}/complete"),
+        Some(&worker.token),
+        json!({
+            "generation": 1,
+            "attempt": 1,
+            "succeeded": true,
+            "output": ["[Server: hello"]
+        }),
+    )
+    .await;
+    assert_eq!(complete.0, StatusCode::NO_CONTENT);
+
+    let completed = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{command_uri}/{command_id}"))
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let completed = response_json(completed).await;
+    assert_eq!(completed["status"], "succeeded");
+    assert_eq!(completed["output"][0], "[Server: hello");
+}
+
+#[tokio::test]
+async fn console_commands_are_cancelled_and_stale_completion_is_rejected_after_generation_change() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "console-fence").await;
+    let server_id = create_server(&pool, "console-fence").await;
+    set_server_state(&pool, server_id, 1, "running", "online").await;
+    add_placement(&pool, server_id, worker.id, 1, true).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let session_token = format!("console-fence-session-{server_id}");
+    sqlx::query("INSERT INTO sessions(id, token_hash, user_id) VALUES($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(blake3::hash(session_token.as_bytes()).as_bytes().to_vec())
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET heartbeat_at = now() WHERE id = $1")
+        .bind(worker.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let uri = format!("/api/v1/servers/{server_id}/console/commands");
+    let submitted = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":Uuid::new_v4(),"command":"time query daytime"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let submitted_status = submitted.status();
+    let submitted_body = to_bytes(submitted.into_body(), 32 * 1024).await.unwrap();
+    assert_eq!(
+        submitted_status,
+        StatusCode::ACCEPTED,
+        "console enqueue failed: {}",
+        String::from_utf8_lossy(&submitted_body)
+    );
+    let submitted: Value = serde_json::from_slice(&submitted_body).unwrap();
+    let command_id = Uuid::parse_str(submitted["id"].as_str().unwrap()).unwrap();
+    let claimed = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(claimed.0, StatusCode::OK);
+    assert_eq!(claimed.1["id"], command_id.to_string());
+
+    // A stop request fences a command that has been claimed but not yet
+    // completed. This is the stop-vs-runtime-dispatch boundary.
+    set_server_state(&pool, server_id, 1, "running", "stopping").await;
+    let stop_race_completion = send_json(
+        service.clone(),
+        Method::POST,
+        &format!("/internal/worker/control/console/commands/{command_id}/complete"),
+        Some(&worker.token),
+        json!({
+            "generation": 1,
+            "attempt": 1,
+            "succeeded": true,
+            "output": []
+        }),
+    )
+    .await;
+    assert_eq!(stop_race_completion.0, StatusCode::CONFLICT);
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM console_commands WHERE id = $1")
+            .bind(command_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "cancelled");
+
+    // Re-online the unchanged assignment and prove that generation advance
+    // also cancels an in-flight claim before accepting completion.
+    set_server_state(&pool, server_id, 1, "running", "online").await;
+    let second_request_id = Uuid::new_v4();
+    let submitted = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":second_request_id,"command":"say generation fenced"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted: Value = response_json(submitted).await;
+    let second_command_id = Uuid::parse_str(submitted["id"].as_str().unwrap()).unwrap();
+    let claimed = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(claimed.0, StatusCode::OK);
+    assert_eq!(claimed.1["id"], second_command_id.to_string());
+
+    set_server_state(&pool, server_id, 2, "running", "restoring").await;
+    let stale = send_json(
+        service,
+        Method::POST,
+        &format!("/internal/worker/control/console/commands/{second_command_id}/complete"),
+        Some(&worker.token),
+        json!({
+            "generation": 1,
+            "attempt": 1,
+            "succeeded": true,
+            "output": []
+        }),
+    )
+    .await;
+    assert_eq!(stale.0, StatusCode::CONFLICT);
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM console_commands WHERE id = $1")
+            .bind(second_command_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "cancelled");
+}
+
+#[tokio::test]
+async fn worker_recovery_marks_claimed_console_commands_unknown_and_never_requeues_them() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "console-recovery").await;
+    let server_id = create_server(&pool, "console-recovery").await;
+    set_server_state(&pool, server_id, 1, "running", "online").await;
+    add_placement(&pool, server_id, worker.id, 1, true).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let session_token = format!("console-recovery-session-{server_id}");
+    sqlx::query("INSERT INTO sessions(id, token_hash, user_id) VALUES($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(blake3::hash(session_token.as_bytes()).as_bytes().to_vec())
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET heartbeat_at = now() WHERE id = $1")
+        .bind(worker.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = app(pool.clone(), Arc::new(InMemory::new()));
+    let uri = format!("/api/v1/servers/{server_id}/console/commands");
+    let submitted = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"request_id":Uuid::new_v4(),"command":"say may have run"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted: Value = response_json(submitted).await;
+    let command_id = Uuid::parse_str(submitted["id"].as_str().unwrap()).unwrap();
+    let claimed = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(claimed.0, StatusCode::OK);
+    assert_eq!(claimed.1["id"], command_id.to_string());
+
+    let recovery = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/recover",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(recovery.0, StatusCode::OK);
+    let failed = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{uri}/{command_id}"))
+                .header(header::COOKIE, format!("kurbis_session={session_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let failed = response_json(failed).await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(
+        failed["error"],
+        "execution_outcome_unknown_after_worker_recovery"
+    );
+    assert!(failed["completed_at"].is_string());
+
+    let claimed_again = send_json(
+        service.clone(),
+        Method::POST,
+        "/internal/worker/control/console/commands/claim",
+        Some(&worker.token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(claimed_again.0, StatusCode::OK);
+    assert_eq!(claimed_again.1, Value::Null);
+    let stale_completion = send_json(
+        service,
+        Method::POST,
+        &format!("/internal/worker/control/console/commands/{command_id}/complete"),
+        Some(&worker.token),
+        json!({
+            "generation": 1,
+            "attempt": 1,
+            "succeeded": true,
+            "output": []
+        }),
+    )
+    .await;
+    assert_eq!(stale_completion.0, StatusCode::CONFLICT);
+}
+
+async fn response_json(response: axum::response::Response) -> Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await.unwrap()).unwrap()
 }

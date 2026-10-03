@@ -61,6 +61,12 @@ pub trait ServerRuntime: Send + Sync {
             .await
     }
 
+    async fn execute_command(&self, server_dir: &Path, command: &str) -> Result<Vec<String>> {
+        self.control()
+            .execute_command(&self.socket_path(server_dir)?, command)
+            .await
+    }
+
     async fn save(&self, server_dir: &Path) -> Result<()> {
         self.control().save(&self.socket_path(server_dir)?).await
     }

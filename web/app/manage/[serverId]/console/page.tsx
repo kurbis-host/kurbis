@@ -5,6 +5,6 @@ import { serverAccessPage } from "../server-access";
 export default async function ServerAccessConsole({ params }: { params: Promise<{ serverId: string }> }) {
   return serverAccessPage({ params }, async (serverId) => {
     const [server, logs] = await Promise.all([getServer(serverId), getLogs(serverId)]);
-    return <Console serverId={server.id} initialLogs={logs} />;
+    return <Console serverId={server.id} initialServer={server} initialLogs={logs} />;
   });
 }

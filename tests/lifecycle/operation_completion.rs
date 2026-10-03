@@ -776,6 +776,15 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     .await
     .unwrap();
 
+    sqlx::query(
+        "INSERT INTO operator_entries(server_id, player_id, name) VALUES($1, $2, 'KeepOperator')",
+    )
+    .bind(online_server)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let lifecycle = Lifecycle::new(pool.clone());
     lifecycle
         .request_start(online_server, "reset test")
@@ -907,15 +916,16 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
         )
     );
     assert_eq!(settings, custom_settings);
-    let (whitelist_count, snapshot_count): (i64, i64) = sqlx::query_as(
+    let (whitelist_count, operator_count, snapshot_count): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM whitelist_entries WHERE server_id = $1),
+                (SELECT count(*) FROM operator_entries WHERE server_id = $1),
                 (SELECT count(*) FROM snapshots WHERE server_id = $1)",
     )
     .bind(online_server)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((whitelist_count, snapshot_count), (1, 2));
+    assert_eq!((whitelist_count, operator_count, snapshot_count), (1, 1, 2));
 
     let (sleeping_owner, sleeping_server) = create_test_server(&pool, "reset-full-sleeping").await;
     let sleeping_subdomain: String =
@@ -954,6 +964,14 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO operator_entries(server_id, player_id, name) VALUES($1, $2, 'RemoveOperator')",
+    )
+    .bind(sleeping_server)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
     let default_settings = json!({
         "motd":"A Pumpkin Server",
         "difficulty":"Normal",
@@ -970,15 +988,17 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     let sleeping_reset = claim_operation(&pool, worker).await.unwrap().unwrap();
     assert_eq!(sleeping_reset.payload["was_running"], false);
     assert_eq!(sleeping_reset.generation, 1);
-    let (state, desired, settings, whitelist_count, default_server): (
+    let (state, desired, settings, whitelist_count, operator_count, default_server): (
         ObservedState,
         DesiredState,
         serde_json::Value,
         i64,
+        i64,
         bool,
     ) = sqlx::query_as(
         "SELECT s.observed_state, s.desired_state, s.settings,
-                (SELECT count(*) FROM whitelist_entries WHERE server_id = s.id), s.is_default
+                (SELECT count(*) FROM whitelist_entries WHERE server_id = s.id),
+                (SELECT count(*) FROM operator_entries WHERE server_id = s.id), s.is_default
          FROM servers s WHERE s.id = $1",
     )
     .bind(sleeping_server)
@@ -989,6 +1009,7 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     assert_eq!(desired, DesiredState::Stopped);
     assert_eq!(settings, default_settings);
     assert_eq!(whitelist_count, 0);
+    assert_eq!(operator_count, 0);
     assert!(default_server);
 
     sqlx::query(

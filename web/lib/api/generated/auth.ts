@@ -84,6 +84,14 @@ export interface paths {
                         "application/json": components["schemas"]["ApiErrorResponse"];
                     };
                 };
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -185,6 +193,14 @@ export interface paths {
                     };
                 };
                 422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
+                429: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -304,6 +320,14 @@ export interface paths {
                         "application/json": components["schemas"]["ApiErrorResponse"];
                     };
                 };
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -409,6 +433,14 @@ export interface paths {
                     };
                 };
                 422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
+                429: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -527,6 +559,14 @@ export interface paths {
                         "application/json": components["schemas"]["ApiErrorResponse"];
                     };
                 };
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -625,6 +665,14 @@ export interface paths {
                     };
                 };
                 422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiErrorResponse"];
+                    };
+                };
+                429: {
                     headers: {
                         [name: string]: unknown;
                     };

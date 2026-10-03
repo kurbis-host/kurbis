@@ -70,6 +70,21 @@ struct Pause {
 struct EmailVerification {
     verified: bool,
 }
+#[derive(Deserialize)]
+struct ConsoleExecution {
+    server_id: Uuid,
+    command_id: Uuid,
+    #[serde(default = "default_console_success")]
+    succeeded: bool,
+    #[serde(default)]
+    output: Vec<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn default_console_success() -> bool {
+    true
+}
 
 async fn authorize(
     State(f): State<Fixture>,
@@ -259,6 +274,112 @@ async fn capacity(State(f): State<Fixture>, Json(q): Json<Capacity>) -> Result<S
     f.lifecycle.drain_queue_once().await.map_err(err)?;
     Ok(StatusCode::NO_CONTENT)
 }
+async fn execute_console_command(
+    State(f): State<Fixture>,
+    Json(request): Json<ConsoleExecution>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if request.output.len() > 100
+        || request.output.iter().any(|line| line.len() > 4096)
+        || request.output.iter().map(String::len).sum::<usize>() > 16 * 1024
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "console fixture output is too large".into(),
+        ));
+    }
+    if !request.succeeded && request.error.as_deref().unwrap_or_default().is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "failed fixture execution requires an error".into(),
+        ));
+    }
+
+    let mut tx = f.pool.begin().await.map_err(fixture_error)?;
+    let claimed = sqlx::query_as::<_, (i64, i32, String)>(
+        "UPDATE console_commands c
+         SET status = 'running', attempt = attempt + 1,
+             claimed_at = now(), updated_at = now()
+         FROM servers s, placements p
+         WHERE c.id = $1 AND c.server_id = $2 AND c.status = 'queued'
+           AND s.id = c.server_id AND s.generation = c.generation
+           AND s.desired_state = 'running' AND s.observed_state = 'online'
+           AND p.server_id = s.id AND p.generation = s.generation
+           AND p.worker_id = c.worker_id AND p.active
+         RETURNING c.generation, c.attempt, c.command",
+    )
+    .bind(request.command_id)
+    .bind(request.server_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(fixture_error)?;
+    let Some((generation, attempt, command_text)) = claimed else {
+        return Err((
+            StatusCode::CONFLICT,
+            "no eligible queued console command".into(),
+        ));
+    };
+
+    let error = if request.succeeded {
+        None
+    } else {
+        request.error.as_deref()
+    };
+    let completion = sqlx::query(
+        "UPDATE console_commands
+         SET status = $4::console_command_status, output = $5, error = $6,
+             completed_at = now(), updated_at = now()
+         WHERE id = $1 AND server_id = $2 AND generation = $3 AND status = 'running'",
+    )
+    .bind(request.command_id)
+    .bind(request.server_id)
+    .bind(generation)
+    .bind(if request.succeeded {
+        "succeeded"
+    } else {
+        "failed"
+    })
+    .bind(&request.output)
+    .bind(error)
+    .execute(&mut *tx)
+    .await
+    .map_err(fixture_error)?;
+    if completion.rows_affected() != 1 {
+        return Err((
+            StatusCode::CONFLICT,
+            "console command completion was fenced".into(),
+        ));
+    }
+
+    let log_lines = if request.succeeded {
+        request.output
+    } else {
+        vec![format!(
+            "! /{command_text} failed: {}",
+            error.unwrap_or("runtime failure")
+        )]
+    };
+    for line in &log_lines {
+        sqlx::query("INSERT INTO server_logs(server_id, line) VALUES ($1, $2)")
+            .bind(request.server_id)
+            .bind(line)
+            .execute(&mut *tx)
+            .await
+            .map_err(fixture_error)?;
+    }
+    tx.commit().await.map_err(fixture_error)?;
+    Ok(Json(json!({
+        "id": request.command_id,
+        "status": if request.succeeded { "succeeded" } else { "failed" },
+        "generation": generation,
+        "attempt": attempt,
+        "output": log_lines,
+    })))
+}
+
+fn fixture_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
 async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
     let Some(op) = claim_operation(&f.pool, f.worker).await.map_err(err)? else {
         return Ok(Json(json!({"operation":null})));
@@ -481,6 +602,7 @@ async fn main() -> Result<()> {
         .route("/fixture/pause", post(pause))
         .route("/fixture/email-verification", post(email_verification))
         .route("/fixture/tick", post(tick))
+        .route("/fixture/console/execute", post(execute_console_command))
         .with_state(fixture);
     let listen =
         std::env::var("BROWSER_FIXTURE_LISTEN").unwrap_or_else(|_| "127.0.0.1:18081".to_owned());

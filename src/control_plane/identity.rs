@@ -412,7 +412,9 @@ async fn update_oauth_identity(
     Ok(())
 }
 
-async fn lock_identity_writes(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+pub(crate) async fn lock_identity_writes(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(IDENTITY_WRITE_LOCK)
         .execute(&mut **tx)

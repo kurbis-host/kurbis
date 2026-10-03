@@ -9,7 +9,7 @@ use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
 use super::internal::require_server_access;
 use super::{ApiError, AppState};
 
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerEventKind {
     Server,
@@ -18,6 +18,7 @@ pub enum ServerEventKind {
     Log,
     Players,
     Whitelist,
+    Operators,
 }
 
 impl TryFrom<&str> for ServerEventKind {
@@ -31,6 +32,7 @@ impl TryFrom<&str> for ServerEventKind {
             "log" => Ok(Self::Log),
             "players" => Ok(Self::Players),
             "whitelist" => Ok(Self::Whitelist),
+            "operators" => Ok(Self::Operators),
             _ => Err(ApiError::with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid_server_event",
@@ -49,6 +51,7 @@ impl ServerEventKind {
             Self::Log => "log",
             Self::Players => "players",
             Self::Whitelist => "whitelist",
+            Self::Operators => "operators",
         }
     }
 }
@@ -106,6 +109,7 @@ pub(super) async fn activity(
                 ServerEventKind::Log => "Server log updated",
                 ServerEventKind::Players => "Player presence changed",
                 ServerEventKind::Whitelist => "Whitelist changed",
+                ServerEventKind::Operators => "Operator roster changed",
             }
             .to_owned();
             Ok(ActivityEntry {

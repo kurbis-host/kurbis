@@ -66,6 +66,7 @@ struct Response {
     activity_revision: Option<u64>,
     online_authentication: Option<OnlineAuthentication>,
     waiting_players: Option<Vec<WaitingPlayer>>,
+    output: Option<Vec<String>>,
     error: Option<String>,
 }
 
@@ -168,6 +169,18 @@ impl PumpkinControl {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn execute_command(&self, socket: &Path, command: &str) -> Result<Vec<String>> {
+        let response = self
+            .request(
+                socket,
+                json!({"action":"execute_command", "command":command}),
+            )
+            .await?;
+        response
+            .output
+            .context("console command response omitted output")
     }
 
     pub async fn save(&self, socket: &Path) -> Result<()> {

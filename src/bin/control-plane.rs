@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         object_store,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
