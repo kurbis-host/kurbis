@@ -184,6 +184,10 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                 self.assertEqual(environment["WORKER_STORAGE_MODE"], "directory")
                 self.assertIn("PATH", environment)
                 self.assertIn("HOME", environment)
+                if mode == "native-debug":
+                    self.assertEqual(environment["KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV"], "true")
+                else:
+                    self.assertNotIn("KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV", environment)
 
                 if mode == "docker":
                     self.assertEqual(environment["PUMPKIN_IMAGE"], "melon-pumpkin:host-control")

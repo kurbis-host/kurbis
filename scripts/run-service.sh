@@ -61,6 +61,13 @@ if [[ $service == worker ]]; then
     esac
   fi
   worker_env=(env -i "PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}" "HOME=${HOME:-/}")
+  # Selecting native debug is the explicit operator opt-in for the unsandboxed
+  # host-process fixture. Keep the opt-in scoped to this worker launch and
+  # never carry it into release or Docker workers, even if a stale bundle or
+  # ambient shell exports it.
+  if [[ $mode == native-debug ]]; then
+    worker_env+=("KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV=true")
+  fi
   for variable_name in \
     LANG LC_ALL TMPDIR SSL_CERT_FILE SSL_CERT_DIR RUST_LOG DOCKER_HOST DOCKER_CONFIG \
     DOCKER_TLS_VERIFY DOCKER_CERT_PATH WORKER_ID WORKER_NAME WORKER_ADDRESS \
