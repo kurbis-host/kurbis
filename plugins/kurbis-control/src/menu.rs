@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::{
     PERMISSION,
     actions::{self, LifecycleAction},
-    api, book,
+    api, book, chat,
 };
 
 const PAGE_SIZE: usize = 18;
@@ -748,7 +748,7 @@ fn activate(player: &Player, action: Action) -> Result<()> {
         Action::Open(view) => open(player, view)?,
         Action::Login => {
             let url = api::create_login_link()?;
-            tell(player, &format!("One-use login link (15 minutes): {url}"));
+            player.send_system_message(chat::server_login_link(&url), false);
         }
         Action::Execute(lifecycle_action) => {
             let action = actions::spec(lifecycle_action).command;

@@ -11,7 +11,7 @@ use pumpkin_plugin_api::{
 use serde_json::{Value, json};
 
 use crate::{
-    actions, api,
+    actions, api, chat,
     menu::{self, View},
 };
 
@@ -110,10 +110,7 @@ impl CommandHandler for Handler {
                 }
                 "login" => {
                     let url = api::create_login_link()?;
-                    say(
-                        &sender,
-                        &format!("One-use server login link (valid for 15 minutes): {url}"),
-                    );
+                    sender.send_message(chat::server_login_link(&url));
                 }
                 "status" => page(&sender, View::Status)?,
                 "players" => page(&sender, View::Players(0))?,

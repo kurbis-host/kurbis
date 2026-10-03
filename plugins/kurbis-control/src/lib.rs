@@ -1,6 +1,7 @@
 mod actions;
 mod book;
 mod api;
+mod chat;
 mod command;
 mod menu;
 

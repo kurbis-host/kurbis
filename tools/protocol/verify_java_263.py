@@ -181,6 +181,83 @@ def skip_nbt(data, offset):
     return payload(tag, offset)
 
 
+def read_nbt_string(data, offset):
+    length = int.from_bytes(data[offset:offset + 2], "big")
+    offset += 2
+    return data[offset:offset + length].decode("utf-8"), offset + length
+
+
+def read_nbt_payload(data, offset, tag):
+    if tag == 1:
+        return int.from_bytes(data[offset:offset + 1], "big", signed=True), offset + 1
+    if tag == 2:
+        return int.from_bytes(data[offset:offset + 2], "big", signed=True), offset + 2
+    if tag in (3, 4):
+        width = 4 if tag == 3 else 8
+        return int.from_bytes(data[offset:offset + width], "big", signed=True), offset + width
+    if tag in (5, 6):
+        width = 4 if tag == 5 else 8
+        value = struct.unpack_from(">f" if tag == 5 else ">d", data, offset)[0]
+        return value, offset + width
+    if tag in (7, 11, 12):
+        length = int.from_bytes(data[offset:offset + 4], "big", signed=True)
+        offset += 4
+        width = {7: 1, 11: 4, 12: 8}[tag]
+        values = []
+        for _ in range(max(length, 0)):
+            values.append(int.from_bytes(data[offset:offset + width], "big", signed=(tag == 7)))
+            offset += width
+        return values, offset
+    if tag == 8:
+        return read_nbt_string(data, offset)
+    if tag == 9:
+        element = data[offset]
+        length = int.from_bytes(data[offset + 1:offset + 5], "big", signed=True)
+        offset += 5
+        values = []
+        for _ in range(max(length, 0)):
+            value, offset = read_nbt_payload(data, offset, element)
+            values.append(value)
+        return values, offset
+    if tag == 10:
+        values = {}
+        while data[offset] != 0:
+            child = data[offset]
+            name, offset = read_nbt_string(data, offset + 1)
+            values[name], offset = read_nbt_payload(data, offset, child)
+        return values, offset + 1
+    raise ValueError(f"unsupported NBT tag {tag}")
+
+
+def read_nbt(data, offset=0):
+    tag = data[offset]
+    if tag == 0:
+        return None, offset + 1
+    # Minecraft network NBT omits the root name; named child tags still carry
+    # their regular NBT names inside compound payloads.
+    return read_nbt_payload(data, offset + 1, tag)
+
+
+def find_clickable_url(component, url):
+    if isinstance(component, dict):
+        for key in ("click_event", "clickEvent"):
+            click = component.get(key)
+            if (component.get("text") == url and isinstance(click, dict)
+                    and click.get("action") == "open_url"
+                    and click.get("url", click.get("value")) == url):
+                return key
+        for value in component.values():
+            key = find_clickable_url(value, url)
+            if key:
+                return key
+    elif isinstance(component, list):
+        for value in component:
+            key = find_clickable_url(value, url)
+            if key:
+                return key
+    return None
+
+
 def unpack_item(body, offset):
     count, offset = read_vi(body, offset)
     if count == 0:
@@ -359,6 +436,18 @@ class ProtocolClient:
                             text,
                         )
                         if link:
+                            component, _ = read_nbt(body)
+                            click_key = find_clickable_url(component, link.group(0))
+                            if click_key is None:
+                                raise AssertionError(
+                                    "Kurbis login URL was not sent with a matching visible-text open_url click event"
+                                )
+                            self.record(
+                                "login_link_clickable",
+                                click_key=click_key,
+                                action="open_url",
+                                target_matches_visible_url=True,
+                            )
                             print(f"KURBIS_LOGIN_LINK={link.group(0)}", flush=True)
                     self.record("server_message", text=text)
                     continue
