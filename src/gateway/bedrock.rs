@@ -27,7 +27,7 @@ use futures::StreamExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     task::{AbortHandle, JoinSet},
     time::{Instant, interval, sleep, timeout},
 };
@@ -45,16 +45,167 @@ const MAX_SIGNAL_BODY: usize = 1 << 20;
 const MAX_SIGNAL_ROUTE_BYTES: usize = 8 << 10;
 const MAX_TLS_HANDSHAKES: usize = 128;
 const SESSION_IDLE: Duration = Duration::from_secs(60);
+const SIGNAL_ROUTE_IDLE: Duration = Duration::from_secs(60);
+const MAX_SIGNAL_ROUTE_LEASES: usize = 4096;
+const MAX_ICE_UFRAG_BYTES: usize = 256;
+const STUN_MAGIC: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFLINE_MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignalRoute {
+    server_id: Option<Uuid>,
+    generation: Option<i64>,
+    hostname: Option<String>,
+    signal: SocketAddr,
+    bedrock: SocketAddr,
+}
+
+impl SignalRoute {
+    fn waiting(config: &GatewayConfig) -> Self {
+        Self {
+            server_id: None,
+            generation: None,
+            hostname: None,
+            signal: config.waiting_signal_address,
+            bedrock: config.waiting_bedrock_address,
+        }
+    }
+}
+
 struct Session {
     id: u64,
     socket: Arc<UdpSocket>,
+    route: SignalRoute,
     last_input: Instant,
     replies: AbortHandle,
+}
+
+#[derive(Clone)]
+struct RouteRegistry {
+    state: Arc<Mutex<RouteRegistryState>>,
+}
+
+struct RouteRegistryState {
+    next_id: u64,
+    by_ufrag: HashMap<String, SignalRouteLease>,
+    generations: HashMap<Uuid, i64>,
+}
+
+#[derive(Clone)]
+struct SignalRouteLease {
+    id: u64,
+    source_ip: IpAddr,
+    route: SignalRoute,
+    expires: Instant,
+}
+
+impl RouteRegistry {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RouteRegistryState {
+                next_id: 0,
+                by_ufrag: HashMap::new(),
+                generations: HashMap::new(),
+            })),
+        }
+    }
+
+    async fn register(&self, source_ip: IpAddr, route: SignalRoute, ufrags: Vec<String>) -> bool {
+        if ufrags.is_empty() || ufrags.iter().any(|ufrag| !valid_ice_ufrag(ufrag)) {
+            return false;
+        }
+        let mut state = self.state.lock().await;
+        purge_expired_routes(&mut state);
+        if let (Some(server_id), Some(generation)) = (route.server_id, route.generation) {
+            if state
+                .generations
+                .get(&server_id)
+                .is_some_and(|current| *current > generation)
+            {
+                return false;
+            }
+            if state
+                .generations
+                .insert(server_id, generation)
+                .is_some_and(|current| current < generation)
+            {
+                state.by_ufrag.retain(|_, lease| {
+                    !(lease.route.server_id == Some(server_id)
+                        && lease
+                            .route
+                            .generation
+                            .is_some_and(|value| value < generation))
+                });
+            }
+        }
+        let mut unique = ufrags;
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() > MAX_SIGNAL_ROUTE_LEASES.saturating_sub(state.by_ufrag.len()) {
+            return false;
+        }
+        state.next_id = state.next_id.wrapping_add(1);
+        let id = state.next_id;
+        let expires = Instant::now() + SIGNAL_ROUTE_IDLE;
+        for ufrag in unique {
+            state.by_ufrag.insert(
+                ufrag,
+                SignalRouteLease {
+                    id,
+                    source_ip,
+                    route: route.clone(),
+                    expires,
+                },
+            );
+        }
+        true
+    }
+
+    async fn route_for_packet(&self, peer: SocketAddr, packet: &[u8]) -> Option<SignalRoute> {
+        let mut state = self.state.lock().await;
+        purge_expired_routes(&mut state);
+        let mut candidates = stun_username_tokens(packet)
+            .into_iter()
+            .filter_map(|ufrag| state.by_ufrag.get(&ufrag).cloned());
+        let lease = candidates.next()?;
+        if lease.source_ip == peer.ip()
+            && candidates.all(|other| other.id == lease.id && other.source_ip == peer.ip())
+            && route_generation_is_current(&state, &lease.route)
+        {
+            Some(lease.route)
+        } else {
+            None
+        }
+    }
+
+    async fn is_current(&self, route: &SignalRoute) -> bool {
+        let mut state = self.state.lock().await;
+        purge_expired_routes(&mut state);
+        if !route_generation_is_current(&state, route) {
+            return false;
+        }
+        route.server_id.is_none() || state.by_ufrag.values().any(|lease| lease.route == *route)
+    }
+}
+
+fn purge_expired_routes(state: &mut RouteRegistryState) {
+    let now = Instant::now();
+    state.by_ufrag.retain(|_, lease| lease.expires > now);
+}
+
+fn route_generation_is_current(state: &RouteRegistryState, route: &SignalRoute) -> bool {
+    route
+        .server_id
+        .zip(route.generation)
+        .is_none_or(|(server_id, generation)| {
+            state
+                .generations
+                .get(&server_id)
+                .is_none_or(|current| *current == generation)
+        })
 }
 
 pub async fn run(config: GatewayConfig) -> Result<()> {
@@ -74,7 +225,8 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
     let tcp = TcpListener::bind(config.bedrock_listen).await?;
     let tls = load_tls_acceptor(&config)?;
     let listener = TlsListener::new(tcp, tls);
-    let signal_state = Arc::new(SignalProxy::new(config.clone())?);
+    let routes = RouteRegistry::new();
+    let signal_state = Arc::new(SignalProxy::new(config.clone(), routes.clone())?);
     let app = Router::new()
         .fallback(proxy_signal)
         .with_state(signal_state);
@@ -88,11 +240,14 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
         waiting_signal = %config.waiting_signal_address,
         tls_certificate = %config.bedrock_tls_certificate.display(),
         "Bedrock RakNet and TLS signaling gateway listening");
-    tokio::try_join!(relay(socket, config.waiting_bedrock_address), async {
-        server
-            .await
-            .context("Bedrock TLS signaling listener stopped")
-    },)?;
+    tokio::try_join!(
+        relay(socket, SignalRoute::waiting(&config), routes),
+        async {
+            server
+                .await
+                .context("Bedrock TLS signaling listener stopped")
+        },
+    )?;
     Ok(())
 }
 
@@ -130,6 +285,7 @@ fn load_tls_acceptor(config: &GatewayConfig) -> Result<TlsAcceptor> {
 struct SignalProxy {
     config: GatewayConfig,
     http: reqwest::Client,
+    routes: RouteRegistry,
 }
 
 #[derive(Clone, Debug)]
@@ -145,16 +301,20 @@ impl<'a> Connected<axum::serve::IncomingStream<'a, TlsListener>> for SignalPeer 
 }
 
 impl SignalProxy {
-    fn new(config: GatewayConfig) -> Result<Self> {
+    fn new(config: GatewayConfig, routes: RouteRegistry) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            routes,
+        })
     }
 
-    async fn target(&self, hostname: &str) -> Result<SocketAddr, StatusCode> {
+    async fn route(&self, hostname: &str) -> Result<SignalRoute, StatusCode> {
         if let Some(server_id) = server_id_from_signal_hostname(hostname, &self.config.root_domain)
         {
             let url = format!(
@@ -180,26 +340,32 @@ impl SignalProxy {
                 tracing::warn!(%server_id, ?error, "invalid Bedrock signal assignment response");
                 StatusCode::BAD_GATEWAY
             })?;
-            let target = validate_signal_route(&route, server_id)?;
+            let mut target = validate_signal_target(&route, server_id)?;
+            target.hostname = Some(hostname.to_owned());
             tracing::debug!(%server_id, generation = route.generation,
                 worker = %route.worker_address, bedrock_port = route.bedrock_port,
-                signal = %target,
+                signal = %target.signal, bedrock = %target.bedrock,
                 "resolved current Bedrock signal assignment");
             return Ok(target);
         }
 
         if subdomain_from_hostname(hostname, &self.config.root_domain).is_some() {
-            return Ok(self.config.waiting_signal_address);
+            return Ok(SignalRoute::waiting(&self.config));
         }
 
         Err(StatusCode::NOT_FOUND)
     }
+
+    #[cfg(test)]
+    async fn target(&self, hostname: &str) -> Result<SocketAddr, StatusCode> {
+        Ok(self.route(hostname).await?.signal)
+    }
 }
 
-fn validate_signal_route(
+fn validate_signal_target(
     route: &BedrockSignalTarget,
     expected_server_id: Uuid,
-) -> Result<SocketAddr, StatusCode> {
+) -> Result<SignalRoute, StatusCode> {
     if route.server_id != expected_server_id || route.generation < 1 {
         return Err(StatusCode::BAD_GATEWAY);
     }
@@ -225,7 +391,21 @@ fn validate_signal_route(
     {
         return Err(StatusCode::BAD_GATEWAY);
     }
-    Ok(SocketAddr::new(signal_ip, route.signal_port))
+    Ok(SignalRoute {
+        server_id: Some(expected_server_id),
+        generation: Some(route.generation),
+        hostname: None,
+        signal: SocketAddr::new(signal_ip, route.signal_port),
+        bedrock: SocketAddr::new(worker_ip, route.bedrock_port),
+    })
+}
+
+#[cfg(test)]
+fn validate_signal_route(
+    route: &BedrockSignalTarget,
+    expected_server_id: Uuid,
+) -> Result<SocketAddr, StatusCode> {
+    Ok(validate_signal_target(route, expected_server_id)?.signal)
 }
 
 async fn proxy_signal(
@@ -286,25 +466,25 @@ async fn proxy_signal(
             "Bedrock TLS authority did not match the requested host");
         return StatusCode::MISDIRECTED_REQUEST.into_response();
     }
-    let target = match proxy.target(&hostname).await {
-        Ok(target) => target,
+    let route = match proxy.route(&hostname).await {
+        Ok(route) => route,
         Err(status) => return status.into_response(),
     };
-    let backend_url = format!("http://{target}{path}");
+    let backend_url = format!("http://{}{path}", route.signal);
     let mut request = proxy
         .http
-        .request(method, backend_url)
+        .request(method.clone(), backend_url)
         .header(header::ACCEPT, "application/json, application/sdp")
         .header(header::CACHE_CONTROL, "no-store");
     if !body.is_empty() {
         request = request
             .header(header::CONTENT_TYPE, "application/sdp")
-            .body(body);
+            .body(body.clone());
     }
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(%target, ?error, "Bedrock signal backend request failed");
+            tracing::warn!(signal = %route.signal, ?error, "Bedrock signal backend request failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -312,6 +492,20 @@ async fn proxy_signal(
         Ok(response) => response,
         Err(status) => return status.into_response(),
     };
+
+    if method == Method::POST && status.is_success() {
+        if let Some(network_id) = path.strip_prefix("/v1/join/") {
+            let mut ufrags = extract_ice_ufrags(&body);
+            ufrags.extend(extract_ice_ufrags(&response_body));
+            if !proxy
+                .routes
+                .register(peer.address.ip(), route, ufrags)
+                .await
+            {
+                tracing::debug!(peer = %peer.address, network_id, "Bedrock signal route was not registered");
+            }
+        }
+    }
 
     let mut output = Response::builder().status(status);
     if let Some(value) = content_type.filter(|value| {
@@ -359,6 +553,62 @@ async fn read_bounded_response_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+fn extract_ice_ufrags(sdp: &[u8]) -> Vec<String> {
+    let Ok(sdp) = std::str::from_utf8(sdp) else {
+        return Vec::new();
+    };
+    sdp.lines()
+        .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .map(str::trim)
+        .filter(|value| valid_ice_ufrag(value))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn valid_ice_ufrag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ICE_UFRAG_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b':' && byte != b'/' && byte != b'\\')
+}
+
+fn stun_username_tokens(packet: &[u8]) -> Vec<String> {
+    if packet.len() < 20 || packet[0] & 0xc0 != 0 || packet.get(4..8) != Some(&STUN_MAGIC) {
+        return Vec::new();
+    }
+    let message_length = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let message_end = 20usize.saturating_add(message_length);
+    if message_end > packet.len() {
+        return Vec::new();
+    }
+    let mut offset = 20;
+    let mut tokens = Vec::new();
+    while offset + 4 <= message_end {
+        let attribute_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let attribute_length =
+            u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
+        let value_start = offset + 4;
+        let value_end = value_start.saturating_add(attribute_length);
+        if value_end > message_end {
+            return Vec::new();
+        }
+        if attribute_type == 0x0006 {
+            if let Ok(username) = std::str::from_utf8(&packet[value_start..value_end]) {
+                tokens.extend(
+                    username
+                        .split(':')
+                        .map(str::trim)
+                        .filter(|value| valid_ice_ufrag(value))
+                        .map(str::to_owned),
+                );
+            }
+        }
+        offset = value_start.saturating_add((attribute_length + 3) & !3);
+    }
+    tokens
 }
 
 fn valid_network_id(value: &str) -> bool {
@@ -556,7 +806,7 @@ impl Listener for TlsListener {
     }
 }
 
-async fn relay(public: Arc<UdpSocket>, waiting: SocketAddr) -> Result<()> {
+async fn relay(public: Arc<UdpSocket>, waiting: SignalRoute, routes: RouteRegistry) -> Result<()> {
     let mut sessions = HashMap::<SocketAddr, Session>::new();
     // Dropping the gateway aborts all reply loops instead of leaking sockets.
     let mut replies = JoinSet::new();
@@ -567,15 +817,23 @@ async fn relay(public: Arc<UdpSocket>, waiting: SocketAddr) -> Result<()> {
         tokio::select! {
             received = public.recv_from(&mut packet) => {
                 let (length, peer) = received?;
+                let packet = &packet[..length];
                 if !sessions.contains_key(&peer) {
-                    // Only valid offline discovery/open requests may allocate a
-                    // transport session. Pumpkin validates the remaining protocol.
-                    if sessions.len() >= MAX_SESSIONS || !opens_session(&packet[..length]) {
+                    let Some(route) = routes.route_for_packet(peer, packet).await.or_else(|| {
+                        opens_session(packet).then_some(waiting.clone())
+                    }) else {
+                        // NetherNet must present an ICE username bound by the
+                        // authenticated TLS signaling exchange. Unknown STUN,
+                        // DTLS, and arbitrary UDP packets fail closed rather
+                        // than being sent to another server's runtime.
+                        continue;
+                    };
+                    if sessions.len() >= MAX_SESSIONS || !routes.is_current(&route).await {
                         continue;
                     }
-                    let bind = if waiting.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                    let bind = if route.bedrock.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                     let backend = Arc::new(UdpSocket::bind(bind).await?);
-                    backend.connect(waiting).await?;
+                    backend.connect(route.bedrock).await?;
                     next_id = next_id.wrapping_add(1);
                     let id = next_id;
                     let incoming = backend.clone();
@@ -584,20 +842,36 @@ async fn relay(public: Arc<UdpSocket>, waiting: SocketAddr) -> Result<()> {
                         (peer, id, forward_replies(incoming, outgoing, peer).await)
                     });
                     sessions.insert(peer, Session {
-                        id, socket: backend, last_input: Instant::now(), replies: handle,
+                        id,
+                        socket: backend,
+                        route,
+                        last_input: Instant::now(),
+                        replies: handle,
                     });
+                }
+                let stale = if let Some(session) = sessions.get(&peer) {
+                    !routes.is_current(&session.route).await
+                } else {
+                    true
+                };
+                if stale {
+                    if let Some(session) = sessions.remove(&peer) {
+                        session.replies.abort();
+                    }
+                    continue;
                 }
                 let session = sessions.get_mut(&peer).expect("session allocated");
                 session.last_input = Instant::now();
-                if let Err(error) = session.socket.send(&packet[..length]).await {
-                    tracing::debug!(%peer, ?error, "Bedrock waiting transport unavailable");
+                if let Err(error) = session.socket.send(packet).await {
+                    tracing::debug!(%peer, target = %session.route.bedrock, ?error,
+                        "Bedrock backend transport unavailable");
                     if let Some(session) = sessions.remove(&peer) { session.replies.abort(); }
                 }
             }
             completed = replies.join_next(), if !replies.is_empty() => {
                 if let Some(Ok((peer, id, result))) = completed {
                     if let Err(error) = result {
-                        tracing::debug!(%peer, ?error, "Bedrock reply transport closed");
+                        tracing::debug!(%peer, ?error, "Bedrock backend reply transport closed");
                     }
                     // A delayed completion from an expired socket cannot remove
                     // its replacement session for the same client endpoint.
@@ -659,6 +933,38 @@ mod tests {
         packet.extend(OFFLINE_MAGIC);
         packet.push(11);
         packet.resize(1200, 0);
+        packet
+    }
+
+    fn direct_route(server_id: Uuid, generation: i64, bedrock: SocketAddr) -> SignalRoute {
+        SignalRoute {
+            server_id: Some(server_id),
+            generation: Some(generation),
+            hostname: None,
+            signal: "127.0.0.1:46002".parse().unwrap(),
+            bedrock,
+        }
+    }
+
+    fn stun_request(username: &str) -> Vec<u8> {
+        let username = username.as_bytes();
+        let padded = (username.len() + 3) & !3;
+        let mut packet = vec![
+            0x00,
+            0x01,
+            0,
+            0,
+            STUN_MAGIC[0],
+            STUN_MAGIC[1],
+            STUN_MAGIC[2],
+            STUN_MAGIC[3],
+        ];
+        packet.extend([0x11; 12]);
+        packet[2..4].copy_from_slice(&(u16::try_from(4 + padded).unwrap()).to_be_bytes());
+        packet.extend(0x0006_u16.to_be_bytes());
+        packet.extend(u16::try_from(username.len()).unwrap().to_be_bytes());
+        packet.extend(username);
+        packet.resize(packet.len() + padded - username.len(), 0);
         packet
     }
 
@@ -844,8 +1150,13 @@ mod tests {
 
     #[tokio::test]
     async fn signaling_rejects_missing_or_mismatched_sni_before_assignment_lookup() {
-        let proxy =
-            Arc::new(SignalProxy::new(gateway_config("http://127.0.0.1:0".into())).unwrap());
+        let proxy = Arc::new(
+            SignalProxy::new(
+                gateway_config("http://127.0.0.1:0".into()),
+                RouteRegistry::new(),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             signal_request_status(proxy.clone(), Some("other.mc.example.test".into()),).await,
             StatusCode::MISDIRECTED_REQUEST
@@ -866,7 +1177,11 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_host_signal_uses_its_separate_backend_listener() {
-        let proxy = SignalProxy::new(gateway_config("http://127.0.0.1:8080".into())).unwrap();
+        let proxy = SignalProxy::new(
+            gateway_config("http://127.0.0.1:8080".into()),
+            RouteRegistry::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             proxy.target("waiting.mc.example.test").await.unwrap(),
@@ -895,7 +1210,11 @@ mod tests {
             }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let proxy = SignalProxy::new(gateway_config(format!("http://{address}"))).unwrap();
+        let proxy = SignalProxy::new(
+            gateway_config(format!("http://{address}")),
+            RouteRegistry::new(),
+        )
+        .unwrap();
         let server_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let hostname = format!("s-{server_id}.mc.example.test");
 
@@ -1025,7 +1344,14 @@ mod tests {
         let waiting = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let address = public.local_addr().unwrap();
-        let task = tokio::spawn(relay(public, waiting.local_addr().unwrap()));
+        let waiting_route = SignalRoute {
+            server_id: None,
+            generation: None,
+            hostname: None,
+            signal: waiting.local_addr().unwrap(),
+            bedrock: waiting.local_addr().unwrap(),
+        };
+        let task = tokio::spawn(relay(public, waiting_route, RouteRegistry::new()));
         let clients = [
             UdpSocket::bind("127.0.0.1:0").await.unwrap(),
             UdpSocket::bind("127.0.0.1:0").await.unwrap(),
@@ -1101,6 +1427,160 @@ mod tests {
                     .unwrap();
             assert_eq!(&buffer[..length], &[0x80, index as u8]);
         }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn signal_route_registry_uses_ice_credentials_and_fences_generations() {
+        let registry = RouteRegistry::new();
+        let server_id = Uuid::new_v4();
+        let old_route = direct_route(server_id, 2, "127.0.0.1:46001".parse().unwrap());
+        let current_route = direct_route(server_id, 3, "127.0.0.1:46003".parse().unwrap());
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    old_route.clone(),
+                    vec!["old-client".into(), "old-server".into()]
+                )
+                .await
+        );
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    current_route.clone(),
+                    vec!["new-client".into(), "new-server".into()]
+                )
+                .await
+        );
+        assert_eq!(
+            registry
+                .route_for_packet(
+                    "127.0.0.1:50000".parse().unwrap(),
+                    &stun_request("old-server:old-client")
+                )
+                .await,
+            None
+        );
+        assert_eq!(
+            registry
+                .route_for_packet(
+                    "127.0.0.1:50000".parse().unwrap(),
+                    &stun_request("new-server:new-client")
+                )
+                .await,
+            Some(current_route.clone())
+        );
+        assert_eq!(
+            registry
+                .route_for_packet(
+                    "127.0.0.2:50000".parse().unwrap(),
+                    &stun_request("new-server:new-client")
+                )
+                .await,
+            None
+        );
+        assert!(
+            !registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    old_route,
+                    vec!["stale-client".into()]
+                )
+                .await
+        );
+        assert_eq!(
+            registry
+                .route_for_packet(
+                    "127.0.0.1:50000".parse().unwrap(),
+                    &stun_request("stale-client")
+                )
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_route_registry_expires_unmatched_ice_credentials() {
+        let registry = RouteRegistry::new();
+        let route = direct_route(Uuid::new_v4(), 1, "127.0.0.1:46001".parse().unwrap());
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    route.clone(),
+                    vec!["expiring".into()]
+                )
+                .await
+        );
+        {
+            let mut state = registry.state.lock().await;
+            state.by_ufrag.get_mut("expiring").unwrap().expires =
+                Instant::now() - Duration::from_secs(1);
+        }
+        assert_eq!(
+            registry
+                .route_for_packet(
+                    "127.0.0.1:50000".parse().unwrap(),
+                    &stun_request("expiring")
+                )
+                .await,
+            None
+        );
+        assert!(!registry.is_current(&route).await);
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_a_signaled_route_to_the_assigned_worker() {
+        let worker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let waiting = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let registry = RouteRegistry::new();
+        let route = SignalRoute {
+            server_id: Some(Uuid::new_v4()),
+            generation: Some(1),
+            hostname: None,
+            signal: "127.0.0.1:46002".parse().unwrap(),
+            bedrock: worker.local_addr().unwrap(),
+        };
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    route.clone(),
+                    vec!["worker".into()]
+                )
+                .await
+        );
+        let waiting_route = SignalRoute {
+            server_id: None,
+            generation: None,
+            hostname: None,
+            signal: waiting.local_addr().unwrap(),
+            bedrock: waiting.local_addr().unwrap(),
+        };
+        let public_address = public.local_addr().unwrap();
+        let task = tokio::spawn(relay(public, waiting_route, registry));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = stun_request("server:worker");
+        client.send_to(&request, public_address).await.unwrap();
+        let mut buffer = [0_u8; 1500];
+        let (length, worker_peer) =
+            tokio::time::timeout(Duration::from_secs(2), worker.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], request);
+        let response = [0x80, 0x01, 0x00, 0x00];
+        worker.send_to(&response, worker_peer).await.unwrap();
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], response);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }
