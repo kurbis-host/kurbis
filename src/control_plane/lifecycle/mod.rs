@@ -460,9 +460,6 @@ impl Lifecycle {
         {
             bail!(not_found: "server is deleted");
         }
-        if server.observed_state != ObservedState::Sleeping {
-            bail!("snapshot restore requires a sleeping server");
-        }
         if target_generation < 1 {
             bail!(invalid: "invalid snapshot generation");
         }
@@ -480,33 +477,86 @@ impl Lifecycle {
         if !retained {
             bail!(not_found: "snapshot not found");
         }
-        if let Some(placement) = lock_placement(&mut tx, server_id).await?
-            && placement.active
-        {
-            bail!("server still has an active fenced placement");
-        }
-        let worker = select_worker(&mut tx, server_id, Some(target_generation))
-            .await?
-            .ok_or_else(|| {
-                LifecycleFailure::Unavailable(
-                    "no worker capacity available for snapshot restore".to_owned(),
+
+        match server.observed_state {
+            ObservedState::Sleeping => {
+                if let Some(placement) = lock_placement(&mut tx, server_id).await?
+                    && placement.active
+                {
+                    bail!("server still has an active fenced placement");
+                }
+                let worker = select_worker(&mut tx, server_id, Some(target_generation))
+                    .await?
+                    .ok_or_else(|| {
+                        LifecycleFailure::Unavailable(
+                            "no worker capacity available for snapshot restore".to_owned(),
+                        )
+                    })?;
+                place_and_enqueue_worker_operation(
+                    &mut tx,
+                    &server,
+                    &worker,
+                    DesiredState::Stopped,
+                    ObservedState::Restoring,
+                    OperationKind::Restore,
+                    operation_payload(OperationPayload {
+                        target_generation: Some(target_generation),
+                        ..OperationPayload::default()
+                    })?,
                 )
-            })?;
-        place_and_enqueue_worker_operation(
-            &mut tx,
-            &server,
-            &worker,
-            DesiredState::Stopped,
-            ObservedState::Restoring,
-            OperationKind::Restore,
-            operation_payload(OperationPayload {
-                target_generation: Some(target_generation),
-                ..OperationPayload::default()
-            })?,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(ObservedState::Restoring)
+                .await?;
+                tx.commit().await?;
+                Ok(ObservedState::Restoring)
+            }
+            ObservedState::Online if server.desired_state == DesiredState::Running => {
+                if has_live_snapshot(&mut tx, server_id).await? {
+                    bail!("server snapshot is in progress");
+                }
+                let live_operation: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM operations
+                        WHERE server_id = $1 AND status IN ('pending', 'running')
+                    )",
+                )
+                .bind(server_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if live_operation {
+                    bail!("another server operation is in progress");
+                }
+                let placement = lock_placement(&mut tx, server_id).await?.ok_or_else(|| {
+                    LifecycleFailure::Conflict("online server has no placement".to_owned())
+                })?;
+                if !placement.active || placement.generation != server.generation {
+                    bail!("online server placement is not active for the current generation");
+                }
+                sqlx::query(
+                    "UPDATE servers
+                     SET desired_state = 'stopped', observed_state = 'stopping',
+                         last_error = NULL, updated_at = now()
+                     WHERE id = $1",
+                )
+                .bind(server_id)
+                .execute(&mut *tx)
+                .await?;
+                enqueue_operation(
+                    &mut tx,
+                    server_id,
+                    Some(placement.worker_id),
+                    OperationKind::Stop,
+                    server.generation,
+                    operation_payload(OperationPayload {
+                        reason: Some("restore".to_owned()),
+                        restore_after_stop_generation: Some(target_generation),
+                        ..OperationPayload::default()
+                    })?,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(ObservedState::Stopping)
+            }
+            _ => bail!("snapshot restore requires a sleeping or online server"),
+        }
     }
 
     pub async fn request_delete(&self, server_id: Uuid) -> Result<ObservedState> {

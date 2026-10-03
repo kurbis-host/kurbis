@@ -171,6 +171,7 @@ pub mod worker {
         pub mode: Option<ResetMode>,
         pub was_running: Option<bool>,
         pub target_generation: Option<i64>,
+        pub restore_after_stop_generation: Option<i64>,
         pub snapshot_generation: Option<i64>,
         pub snapshot_size: Option<i64>,
         pub pre_reset_generation: Option<i64>,
@@ -321,6 +322,9 @@ pub mod worker {
             };
             if !stage_allowed
                 || self.target_generation.is_some_and(|value| value < 1)
+                || self
+                    .restore_after_stop_generation
+                    .is_some_and(|value| value < 1)
                 || self.snapshot_generation.is_some_and(|value| value < 1)
                 || self
                     .snapshot_size
@@ -332,8 +336,13 @@ pub mod worker {
             }
 
             let restore_values_match_kind = match kind {
-                crate::model::OperationKind::Restore => self.target_generation.is_some(),
-                _ => self.target_generation.is_none(),
+                crate::model::OperationKind::Restore => {
+                    self.target_generation.is_some() && self.restore_after_stop_generation.is_none()
+                }
+                crate::model::OperationKind::Stop => self.target_generation.is_none(),
+                _ => {
+                    self.target_generation.is_none() && self.restore_after_stop_generation.is_none()
+                }
             };
             let reset_values_match_kind = match kind {
                 crate::model::OperationKind::Reset => {

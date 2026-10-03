@@ -1045,3 +1045,58 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     cleanup_test_entities(&pool, online_owner, &[worker]).await;
     cleanup_test_entities(&pool, sleeping_owner, &[]).await;
 }
+
+#[tokio::test]
+async fn online_restore_stops_cleanly_then_enqueues_the_restore_operation() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+    let worker = create_test_worker(&pool, "worker-online-restore", 33200).await;
+    let (owner, server) = create_test_server(&pool, "online-restore").await;
+    sqlx::query(
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
+         VALUES($1, $2, 1, 'restore-source', 10, 'restore-source-checksum', 'shutdown', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(server)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET current_snapshot_generation = 1 WHERE id = $1")
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let lifecycle = Lifecycle::new(pool.clone());
+    assert_eq!(
+        lifecycle.request_start(server, "test").await.unwrap(),
+        ObservedState::Restoring
+    );
+    let start = claim_operation(&pool, worker).await.unwrap().unwrap();
+    complete_start(&pool, &start, 10).await.unwrap();
+
+    assert_eq!(
+        lifecycle.request_restore(server, 1).await.unwrap(),
+        ObservedState::Stopping
+    );
+    let stop = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(stop.kind, kurbis_hoster::model::OperationKind::Stop);
+    publish_final_snapshot(&pool, &stop, 2, 11).await;
+    complete_stop(&pool, &stop, 2, 11).await.unwrap();
+
+    let (state, desired): (ObservedState, DesiredState) =
+        sqlx::query_as("SELECT observed_state, desired_state FROM servers WHERE id = $1")
+            .bind(server)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state, desired),
+        (ObservedState::Restoring, DesiredState::Stopped)
+    );
+    let restore = claim_operation(&pool, worker).await.unwrap().unwrap();
+    assert_eq!(restore.kind, kurbis_hoster::model::OperationKind::Restore);
+    assert_eq!(restore.generation, 2);
+    cleanup_test_entities(&pool, owner, &[worker]).await;
+}

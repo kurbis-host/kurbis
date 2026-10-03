@@ -228,9 +228,7 @@ fn update_setting(sender: &CommandSender, args: &ConsumedArgs) -> Result<()> {
         "hardcore" | "whitelist" => Value::Bool(raw.parse::<bool>()?),
         _ => bail!("invalid settings key or value"),
     };
-    let mut settings = serde_json::Map::new();
-    settings.insert(key.clone(), value);
-    api::patch(&api::server_path("")?, &json!({"settings": settings}))?;
+    api::update_setting(&key, value)?;
     say(
         sender,
         &format!(

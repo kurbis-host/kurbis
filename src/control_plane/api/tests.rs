@@ -335,6 +335,7 @@ fn test_profile_id(identity: &Value) -> Uuid {
 
 fn minecraft_token(link: &Value) -> String {
     let url = reqwest::Url::parse(link["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.scheme(), "https");
     assert_eq!(url.path(), "/auth/minecraft");
     url.fragment()
         .unwrap()

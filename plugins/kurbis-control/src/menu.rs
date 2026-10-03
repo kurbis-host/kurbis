@@ -8,6 +8,7 @@ use pumpkin_plugin_api::{
     ItemStack, Player, Screen, Server,
     events::{
         EventData, EventHandler, InventoryClickEvent, InventoryCloseEvent, InventoryDragEvent,
+        PlayerEditBookEvent,
     },
     gui::Gui,
     text::TextComponent,
@@ -17,7 +18,7 @@ use serde_json::Value;
 use crate::{
     PERMISSION,
     actions::{self, LifecycleAction},
-    api,
+    api, book,
 };
 
 const PAGE_SIZE: usize = 18;
@@ -54,12 +55,16 @@ enum Action {
     Execute(LifecycleAction),
     Login,
     Restore { generation: i64, page: usize },
+    AdjustSetting { key: &'static str, direction: i8 },
+    ToggleSetting { key: &'static str },
+    EditMotd,
 }
 
 #[derive(Default)]
 struct State {
     menus: HashMap<String, HashMap<i16, Action>>,
     opening: HashSet<String>,
+    text_inputs: HashMap<String, (pumpkin_plugin_api::common::Hand, Option<ItemStack>)>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -105,19 +110,11 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
         player.has_permission(PERMISSION),
         "Operator access required"
     );
-    let title = match &view {
-        View::Home => "Kurbis • Server management",
-        View::Status => "Kurbis • Status",
-        View::Players(_) => "Kurbis • Players",
-        View::Logs => "Kurbis • Logs",
-        View::Activity => "Kurbis • Activity",
-        View::Settings => "Kurbis • Settings",
-        View::Whitelist(_) => "Kurbis • Whitelist",
-        View::Snapshots(_) => "Kurbis • Snapshots",
-        View::Controls => "Kurbis • Controls",
-        View::LifecycleConfirm(_) => "Kurbis • Confirm action",
-        View::RestoreConfirm { .. } => "Kurbis • Confirm restore",
-    };
+    let title = view_title(&view);
+    if matches!(view, View::Logs | View::Activity) {
+        let data = page_data(&view)?;
+        return book::open_pages(player, title, &book_pages(&view, &data));
+    }
     let gui = Gui::new(Screen::Generic9x6, TextComponent::text(title));
     gui.set_allow_grab_items(false);
     gui.set_allow_put_items(false);
@@ -179,7 +176,7 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
                 29,
                 "redstone",
                 "Settings",
-                "View settings; edit from /kurbis set",
+                "Edit server settings with buttons and a writable book",
                 Some(Action::Open(View::Settings)),
             );
             button(
@@ -364,31 +361,7 @@ fn render_page(
                 None,
             );
         }
-        View::Settings => {
-            let settings = &data["settings"];
-            for (slot, field, label) in [
-                (19, "motd", "MOTD"),
-                (20, "difficulty", "Difficulty"),
-                (21, "gamemode", "Game mode"),
-                (22, "view_distance", "View distance"),
-                (23, "simulation_distance", "Simulation distance"),
-                (24, "hardcore", "Hardcore"),
-                (25, "whitelist", "Whitelist enabled"),
-            ] {
-                button(
-                    gui,
-                    actions,
-                    slot,
-                    "writable_book",
-                    label,
-                    &format!(
-                        "{}\nEdit while sleeping: /kurbis set {field} <value>",
-                        value(settings, &[field])
-                    ),
-                    None,
-                );
-            }
-        }
+        View::Settings => render_settings(gui, actions, &data["settings"]),
         View::Players(requested_page) => {
             let entries = data.as_array().context("players response was not a list")?;
             let page = current_page(entries.len(), *requested_page);
@@ -401,29 +374,6 @@ fn render_page(
             });
             page_controls(gui, actions, view, page, entries.len());
         }
-        View::Logs => render_list(
-            gui,
-            data["items"]
-                .as_array()
-                .context("logs response omitted items")?,
-            "paper",
-            0,
-            |entry| clip(&value(entry, &["line"]), 140),
-        ),
-        View::Activity => render_list(
-            gui,
-            data.as_array()
-                .context("activity response was not a list")?,
-            "clock",
-            0,
-            |entry| {
-                format!(
-                    "{} • {}",
-                    value(entry, &["type"]),
-                    clip(&value(entry, &["summary"]), 80)
-                )
-            },
-        ),
         View::Whitelist(requested_page) => {
             let entries = data["entries"]
                 .as_array()
@@ -481,6 +431,151 @@ fn render_page(
         _ => {}
     }
     Ok(())
+}
+
+fn view_title(view: &View) -> &'static str {
+    match view {
+        View::Home => "Kurbis • Server management",
+        View::Status => "Kurbis • Status",
+        View::Players(_) => "Kurbis • Players",
+        View::Logs => "Kurbis • Logs",
+        View::Activity => "Kurbis • Activity",
+        View::Settings => "Kurbis • Settings",
+        View::Whitelist(_) => "Kurbis • Whitelist",
+        View::Snapshots(_) => "Kurbis • Snapshots",
+        View::Controls => "Kurbis • Controls",
+        View::LifecycleConfirm(_) => "Kurbis • Confirm action",
+        View::RestoreConfirm { .. } => "Kurbis • Confirm restore",
+    }
+}
+
+fn book_pages(view: &View, data: &Value) -> Vec<String> {
+    match view {
+        View::Logs => data["items"]
+            .as_array()
+            .map(|items| items.iter().map(|entry| value(entry, &["line"])).collect())
+            .unwrap_or_else(|| vec!["Logs response omitted items.".to_owned()]),
+        View::Activity => data
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{}\n{}\n{}",
+                            value(entry, &["type"]),
+                            value(entry, &["created_at"]),
+                            value(entry, &["summary"]),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["Activity response was not a list.".to_owned()]),
+        _ => vec!["No entries.".to_owned()],
+    }
+}
+
+fn render_settings(gui: &Gui, actions: &mut HashMap<i16, Action>, settings: &Value) {
+    button(
+        gui,
+        actions,
+        10,
+        "writable_book",
+        "MOTD",
+        &value(settings, &["motd"]),
+        Some(Action::EditMotd),
+    );
+    setting_button(gui, actions, SettingControl {
+        slot: 19,
+        material: "compass",
+        label: "Difficulty",
+        current: value(settings, &["difficulty"]),
+        previous: Some(Action::AdjustSetting { key: "difficulty", direction: -1 }),
+        next: Some(Action::AdjustSetting { key: "difficulty", direction: 1 }),
+    });
+    setting_button(gui, actions, SettingControl {
+        slot: 28,
+        material: "grass_block",
+        label: "Game mode",
+        current: value(settings, &["gamemode"]),
+        previous: Some(Action::AdjustSetting { key: "gamemode", direction: -1 }),
+        next: Some(Action::AdjustSetting { key: "gamemode", direction: 1 }),
+    });
+    setting_button(gui, actions, SettingControl {
+        slot: 37,
+        material: "spyglass",
+        label: "View distance",
+        current: value(settings, &["view_distance"]),
+        previous: Some(Action::AdjustSetting { key: "view_distance", direction: -1 }),
+        next: Some(Action::AdjustSetting { key: "view_distance", direction: 1 }),
+    });
+    setting_button(gui, actions, SettingControl {
+        slot: 41,
+        material: "clock",
+        label: "Simulation distance",
+        current: value(settings, &["simulation_distance"]),
+        previous: Some(Action::AdjustSetting { key: "simulation_distance", direction: -1 }),
+        next: Some(Action::AdjustSetting { key: "simulation_distance", direction: 1 }),
+    });
+    setting_button(gui, actions, SettingControl {
+        slot: 47,
+        material: "redstone_torch",
+        label: "Hardcore",
+        current: value(settings, &["hardcore"]),
+        previous: None,
+        next: Some(Action::ToggleSetting { key: "hardcore" }),
+    });
+    setting_button(gui, actions, SettingControl {
+        slot: 51,
+        material: "iron_bars",
+        label: "Whitelist",
+        current: value(settings, &["whitelist"]),
+        previous: None,
+        next: Some(Action::ToggleSetting { key: "whitelist" }),
+    });
+}
+
+struct SettingControl {
+    slot: u32,
+    material: &'static str,
+    label: &'static str,
+    current: String,
+    previous: Option<Action>,
+    next: Option<Action>,
+}
+
+fn setting_button(gui: &Gui, actions: &mut HashMap<i16, Action>, control: SettingControl) {
+    button(
+        gui,
+        actions,
+        control.slot,
+        control.material,
+        control.label,
+        &control.current,
+        None,
+    );
+    if let Some(action) = control.previous {
+        button(
+            gui,
+            actions,
+            control.slot - 1,
+            "arrow",
+            "Previous",
+            "Choose the previous value",
+            Some(action),
+        );
+    }
+    if let Some(action) = control.next {
+        button(
+            gui,
+            actions,
+            control.slot + 1,
+            "arrow",
+            "Next",
+            "Choose the next value",
+            Some(action),
+        );
+    }
 }
 
 fn render_list<F>(gui: &Gui, entries: &[Value], material: &str, page: usize, mut title: F)
@@ -674,8 +769,58 @@ fn activate(player: &Player, action: Action) -> Result<()> {
             );
             open(player, View::Snapshots(page))?;
         }
+        Action::AdjustSetting { key, direction } => {
+            api::adjust_setting(key, direction)?;
+            open(player, View::Settings)?;
+        }
+        Action::ToggleSetting { key } => {
+            api::adjust_setting(key, 1)?;
+            open(player, View::Settings)?;
+        }
+        Action::EditMotd => {
+            let data = page_data(&View::Settings)?;
+            let current = value(&data, &["settings", "motd"]);
+            let input = book::open_text_input(player, &current)?;
+            lock_state().text_inputs.insert(player_key(player), input);
+        }
     }
     Ok(())
+}
+
+pub(crate) struct EditBook;
+impl EventHandler<PlayerEditBookEvent> for EditBook {
+    fn handle(
+        &self,
+        _server: Server,
+        mut event: EventData<PlayerEditBookEvent>,
+    ) -> EventData<PlayerEditBookEvent> {
+        let key = player_key(&event.player);
+        let input = lock_state().text_inputs.remove(&key);
+        let Some((hand, original)) = input else {
+            return event;
+        };
+
+        event.cancelled = true;
+        let text = event
+            .pages
+            .first()
+            .map_or_else(String::new, |page| page.trim().to_owned());
+        let updated = match api::update_setting("motd", Value::String(text)) {
+            Ok(()) => {
+                tell(&event.player, "Updated server setting motd.");
+                true
+            }
+            Err(error) => {
+                tell(&event.player, &format!("Kurbis: {error:#}"));
+                false
+            }
+        };
+        event.player.set_item_in_hand(hand, original);
+        if updated {
+            let _ = open(&event.player, View::Settings);
+        }
+        event
+    }
 }
 
 pub(crate) struct Close;

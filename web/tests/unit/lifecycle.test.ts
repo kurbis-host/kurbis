@@ -15,7 +15,7 @@ describe("lifecycle presentation", () => {
 
   it("enforces sleeping edits, online snapshots, and state-safe actions", () => {
     expect(lifecycleActions(server)).toMatchObject({ canStart: true, canEdit: true, canSnapshot: false, canRestore: true });
-    expect(lifecycleActions({ ...server, observed_state: "online", desired_state: "running" })).toMatchObject({ canStart: false, canStop: true, canRestart: true, canEdit: false, canSnapshot: true, canRestore: false });
+    expect(lifecycleActions({ ...server, observed_state: "online", desired_state: "running" })).toMatchObject({ canStart: false, canStop: true, canRestart: true, canEdit: false, canSnapshot: true, canRestore: true });
     expect(lifecycleActions({ ...server, observed_state: "restoring", desired_state: "running" })).toMatchObject({ canStart: false, canStop: true, canRestart: false, canEdit: false });
     expect(lifecycleActions({ ...server, observed_state: "resetting", desired_state: "running" })).toMatchObject({ canStart: false, canStop: false, canEdit: false, canReset: false });
   });

@@ -133,7 +133,7 @@ export function Backups({
                     <ConfirmDialog
                       disabled={!allowed.canRestore}
                       title={`Restore generation ${snapshot.generation}?`}
-                      description="Restoring an older completed snapshot creates a new authoritative generation derived from it. The server must stay sleeping while the restore is requested."
+                      description="Restoring an older completed snapshot creates a new authoritative generation derived from it. Online servers are stopped cleanly before the restore is queued; sleeping servers restore immediately."
                       confirmLabel="Restore snapshot"
                       onConfirm={() => restore(snapshot)}
                       trigger={

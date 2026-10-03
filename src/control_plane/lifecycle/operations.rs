@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use super::{
     LifecycleFailure, bail, enqueue_delete, enqueue_operation, lock_placement, lock_server,
-    operation_payload, release_placement_resources,
+    operation_payload, place_and_enqueue_worker_operation, release_placement_resources,
+    select_worker,
 };
 use crate::contracts::worker::{OperationPayload, OperationProgress, OperationStage};
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationRecord, OperationStatus};
@@ -406,6 +407,8 @@ pub async fn complete_stop(
     snapshot_generation: i64,
     storage_bytes: i64,
 ) -> Result<()> {
+    let restore_after_stop_generation =
+        decode_operation_payload(op.payload.clone(), op.kind)?.restore_after_stop_generation;
     let mut tx = pool.begin().await?;
     let server = lock_server(&mut tx, op.server_id).await?;
     if server.generation != op.generation {
@@ -424,18 +427,35 @@ pub async fn complete_stop(
     validate_placement(op, &placement)?;
     // Only the snapshot publisher owns the recovery pointer. A worker report
     // cannot invent a generation, accept a partial upload, or rewind it.
-    let valid_final_snapshot: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM snapshots
-         WHERE server_id = $1 AND generation = $2 AND complete
-           AND reason = 'shutdown' AND size_bytes = $3
-           AND manifest_key <> '' AND checksum <> '' AND created_at >= $4)",
+    let final_snapshot = sqlx::query_as::<
+        _,
+        (
+            bool,
+            i64,
+            String,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT complete, size_bytes, reason::text, manifest_key, checksum, created_at
+         FROM snapshots
+         WHERE server_id = $1 AND generation = $2",
     )
     .bind(op.server_id)
     .bind(snapshot_generation)
-    .bind(storage_bytes)
-    .bind(op.created_at)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+    let valid_final_snapshot = final_snapshot.is_some_and(
+        |(complete, size, reason, manifest_key, checksum, created_at)| {
+            complete
+                && size == storage_bytes
+                && reason == "shutdown"
+                && !manifest_key.is_empty()
+                && !checksum.is_empty()
+                && created_at >= op.created_at
+        },
+    );
     if server.current_snapshot_generation != Some(snapshot_generation) || !valid_final_snapshot {
         bail!("stop completion requires the current complete final snapshot for this shutdown");
     }
@@ -457,7 +477,33 @@ pub async fn complete_stop(
     .bind(next_state)
     .execute(&mut *tx)
     .await?;
-    if server.desired_state == DesiredState::Running {
+
+    if let Some(target_generation) = restore_after_stop_generation {
+        if let Some(worker) = select_worker(&mut tx, op.server_id, Some(target_generation)).await? {
+            place_and_enqueue_worker_operation(
+                &mut tx,
+                &server,
+                &worker,
+                DesiredState::Stopped,
+                ObservedState::Restoring,
+                OperationKind::Restore,
+                operation_payload(OperationPayload {
+                    target_generation: Some(target_generation),
+                    ..OperationPayload::default()
+                })?,
+            )
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE servers
+                 SET last_error = 'restore is waiting for worker capacity', updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(op.server_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else if server.desired_state == DesiredState::Running {
         sqlx::query(
             "INSERT INTO start_requests(server_id, reason) VALUES($1, 'restart')
              ON CONFLICT(server_id) DO UPDATE SET reason = EXCLUDED.reason, requested_at = now()",

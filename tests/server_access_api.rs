@@ -982,13 +982,9 @@ async fn concurrent_plugin_login_link_mints_enforce_the_per_server_limit() {
         match response.status() {
             StatusCode::OK => {
                 let body = json_body(response).await;
-                let token = body["url"]
-                    .as_str()
-                    .unwrap()
-                    .split_once("#token=")
-                    .unwrap()
-                    .1
-                    .to_owned();
+                let login_url = body["url"].as_str().unwrap();
+                assert!(login_url.starts_with("https://"));
+                let token = login_url.split_once("#token=").unwrap().1.to_owned();
                 assert_eq!(body["expires_in_seconds"], 900);
                 created_tokens.push(token);
             }

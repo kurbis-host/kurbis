@@ -124,13 +124,84 @@ fn server_path_for(server_id: uuid::Uuid, suffix: &str) -> Result<String> {
     Ok(format!("/api/v1/servers/{}{}", server_id, suffix))
 }
 
+pub(crate) fn update_setting(key: &str, value: Value) -> Result<()> {
+    validate_setting_value(key, &value)?;
+    let mut settings = serde_json::Map::new();
+    settings.insert(key.to_owned(), value);
+    patch(&server_path("")?, &serde_json::json!({"settings": settings}))?;
+    Ok(())
+}
+
+pub(crate) fn adjust_setting(key: &str, direction: i8) -> Result<()> {
+    anyhow::ensure!(direction != 0, "setting adjustment cannot be zero");
+    let server = get(&server_path("")?)?;
+    let settings = server
+        .get("settings")
+        .context("server response omitted settings")?;
+    let value = match key {
+        "difficulty" => cycle_string(
+            settings.get(key).and_then(Value::as_str),
+            &["Peaceful", "Easy", "Normal", "Hard"],
+            direction,
+        )?,
+        "gamemode" => cycle_string(
+            settings.get(key).and_then(Value::as_str),
+            &["Survival", "Creative", "Adventure", "Spectator"],
+            direction,
+        )?,
+        "view_distance" | "simulation_distance" => {
+            let current = settings
+                .get(key)
+                .and_then(Value::as_u64)
+                .context("distance setting was not numeric")? as i16;
+            Value::Number(current.saturating_add(direction as i16).clamp(2, 32).into())
+        }
+        "hardcore" | "whitelist" => {
+            Value::Bool(!settings.get(key).and_then(Value::as_bool).unwrap_or(false))
+        }
+        _ => anyhow::bail!("invalid settings key"),
+    };
+    update_setting(key, value)
+}
+
+fn cycle_string(current: Option<&str>, options: &[&str], direction: i8) -> Result<Value> {
+    let current = current.context("setting was not a string")?;
+    let index = options
+        .iter()
+        .position(|option| *option == current)
+        .context("setting contains an unsupported value")?;
+    let next = (index as i8 + direction).rem_euclid(options.len() as i8) as usize;
+    Ok(Value::String(options[next].to_owned()))
+}
+
+fn validate_setting_value(key: &str, value: &Value) -> Result<()> {
+    match key {
+        "motd" if value.as_str().is_some_and(|text| text.len() <= 120) => Ok(()),
+        "difficulty" if value
+            .as_str()
+            .is_some_and(|value| matches!(value, "Peaceful" | "Easy" | "Normal" | "Hard")) => Ok(()),
+        "gamemode" if value.as_str().is_some_and(|value| {
+            matches!(value, "Survival" | "Creative" | "Adventure" | "Spectator")
+        }) => Ok(()),
+        "view_distance" | "simulation_distance"
+            if value.as_u64().is_some_and(|value| (2..=32).contains(&value)) => Ok(()),
+        "hardcore" | "whitelist" if value.as_bool().is_some() => Ok(()),
+        _ => anyhow::bail!("invalid settings key or value"),
+    }
+}
+
 pub(crate) fn create_login_link() -> Result<String> {
     let response = post_empty("/api/v1/server/login-links")?;
-    response
+    let url = response
         .get("url")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .context("login link response omitted its URL")
+        .context("login link response omitted its URL")?;
+    Ok(force_https_url(url))
+}
+
+fn force_https_url(url: &str) -> String {
+    url.strip_prefix("http://")
+        .map_or_else(|| url.to_owned(), |rest| format!("https://{rest}"))
 }
 
 pub(crate) fn server_command(
@@ -356,6 +427,12 @@ mod tests {
         assert!(valid_token(&"a".repeat(43)));
         assert!(!valid_token(&"a".repeat(42)));
         assert!(!valid_token(&format!("{}.", "a".repeat(42))));
+    }
+
+    #[test]
+    fn login_links_are_upgraded_to_https_before_they_reach_chat() {
+        assert_eq!(force_https_url("http://panel.example/auth/server#token=x"), "https://panel.example/auth/server#token=x");
+        assert_eq!(force_https_url("https://panel.example/auth/server#token=x"), "https://panel.example/auth/server#token=x");
     }
 
     #[test]

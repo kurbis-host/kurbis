@@ -31,7 +31,7 @@ export function lifecycleActions(server: Server) {
     canRestart: state === "online",
     canEdit: state === "sleeping",
     canSnapshot: state === "online",
-    canRestore: state === "sleeping",
+    canRestore: state === "sleeping" || state === "online",
     canDelete: state === "sleeping",
     canReset: state === "sleeping" || state === "online",
   };

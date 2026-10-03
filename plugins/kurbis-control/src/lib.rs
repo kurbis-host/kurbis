@@ -1,4 +1,5 @@
 mod actions;
+mod book;
 mod api;
 mod command;
 mod menu;
@@ -106,6 +107,11 @@ impl Plugin for KurbisControl {
         )?;
         context.register_event_handler::<InventoryDragEvent, _>(
             menu::Drag,
+            EventPriority::High,
+            true,
+        )?;
+        context.register_event_handler::<pumpkin_plugin_api::events::PlayerEditBookEvent, _>(
+            menu::EditBook,
             EventPriority::High,
             true,
         )?;
