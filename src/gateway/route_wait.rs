@@ -44,6 +44,9 @@ impl RouteLease {
             return None;
         }
         let worker_address = target.worker_address.as_deref()?.parse().ok()?;
+        if !is_routable_backend_address(worker_address) {
+            return None;
+        }
         let port = match protocol {
             RouteProtocol::Java => target.java_port?,
             RouteProtocol::Bedrock => target.bedrock_port?,
@@ -64,6 +67,15 @@ impl RouteLease {
     /// Check that a freshly resolved route still denotes this exact placement.
     pub fn matches(&self, target: &RouteTarget) -> bool {
         Self::from_target(target, self.protocol).is_some_and(|current| current == *self)
+    }
+}
+
+fn is_routable_backend_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified() && !address.is_broadcast() && !address.is_multicast()
+        }
+        IpAddr::V6(address) => !address.is_unspecified() && !address.is_multicast(),
     }
 }
 
@@ -183,6 +195,12 @@ mod tests {
         unassigned.generation = 0;
         unassigned.worker_address = None;
         assert!(!is_direct_ready(&unassigned));
+
+        let mut malformed_worker = target(ObservedState::Online);
+        malformed_worker.worker_address = Some("0.0.0.0".into());
+        assert!(RouteLease::from_target(&malformed_worker, RouteProtocol::Java).is_none());
+        malformed_worker.worker_address = Some("224.0.0.1".into());
+        assert!(RouteLease::from_target(&malformed_worker, RouteProtocol::Java).is_none());
     }
 
     #[test]

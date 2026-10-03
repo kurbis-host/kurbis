@@ -474,6 +474,10 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/bedrock-signal/{server_id}",
             get(internal::bedrock_signal_target),
         )
+        .route(
+            "/internal/bedrock-signal/by-subdomain/{subdomain}",
+            get(internal::bedrock_signal_target_by_subdomain),
+        )
         .route("/internal/admission", post(internal::admit))
         .route(
             "/internal/minecraft-login-links",

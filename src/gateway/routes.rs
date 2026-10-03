@@ -73,6 +73,17 @@ impl RouteCache {
         }
     }
 
+    /// Resolve directly from the repository when a generation-sensitive
+    /// connection is about to be opened. The cache remains useful for status
+    /// and startup polling, but a direct backend must not rely on a stale
+    /// placement snapshot.
+    pub async fn resolve_current(&self, hostname: &str) -> Result<Option<RouteTarget>> {
+        let Some(subdomain) = self.repository.subdomain_for_hostname(hostname) else {
+            return Ok(None);
+        };
+        Ok(self.repository.resolve_subdomain(&subdomain).await?)
+    }
+
     pub fn accepts_server_address(&self, hostname: &str) -> bool {
         self.repository.accepts_server_address(hostname)
     }

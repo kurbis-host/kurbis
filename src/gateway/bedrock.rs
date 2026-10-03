@@ -144,7 +144,11 @@ impl RouteRegistry {
         let mut unique = ufrags;
         unique.sort_unstable();
         unique.dedup();
-        if unique.len() > MAX_SIGNAL_ROUTE_LEASES.saturating_sub(state.by_ufrag.len()) {
+        let additional = unique
+            .iter()
+            .filter(|ufrag| !state.by_ufrag.contains_key(*ufrag))
+            .count();
+        if additional > MAX_SIGNAL_ROUTE_LEASES.saturating_sub(state.by_ufrag.len()) {
             return false;
         }
         state.next_id = state.next_id.wrapping_add(1);
@@ -183,11 +187,25 @@ impl RouteRegistry {
 
     async fn is_current(&self, route: &SignalRoute) -> bool {
         let mut state = self.state.lock().await;
-        purge_expired_routes(&mut state);
         if !route_generation_is_current(&state, route) {
             return false;
         }
-        route.server_id.is_none() || state.by_ufrag.values().any(|lease| lease.route == *route)
+        if route.server_id.is_none() {
+            return true;
+        }
+        let current = state.by_ufrag.values().any(|lease| lease.route == *route);
+        if current {
+            // Route leases are idle leases, not absolute session lifetimes. A
+            // live UDP session refreshes its credentials on every packet;
+            // inactive sessions are still removed by the relay sweep.
+            let expires = Instant::now() + SIGNAL_ROUTE_IDLE;
+            for lease in state.by_ufrag.values_mut() {
+                if lease.route == *route {
+                    lease.expires = expires;
+                }
+            }
+        }
+        current
     }
 }
 
@@ -315,45 +333,70 @@ impl SignalProxy {
     }
 
     async fn route(&self, hostname: &str) -> Result<SignalRoute, StatusCode> {
-        if let Some(server_id) = server_id_from_signal_hostname(hostname, &self.config.root_domain)
+        let (url, expected_server_id, fallback_to_waiting) = if let Some(server_id) =
+            server_id_from_signal_hostname(hostname, &self.config.root_domain)
         {
-            let url = format!(
-                "{}/internal/bedrock-signal/{server_id}",
-                self.config.control_plane_url.trim_end_matches('/')
-            );
-            let response = self
-                .http
-                .get(url)
-                .bearer_auth(&self.config.internal_token)
-                .send()
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%server_id, ?error, "Bedrock signal assignment lookup failed");
-                    StatusCode::SERVICE_UNAVAILABLE
-                })?;
-            if !response.status().is_success() {
-                tracing::debug!(%server_id, status = %response.status(), "Bedrock signal assignment is unavailable");
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            (
+                format!(
+                    "{}/internal/bedrock-signal/{server_id}",
+                    self.config.control_plane_url.trim_end_matches('/')
+                ),
+                Some(server_id),
+                false,
+            )
+        } else if let Some(subdomain) = subdomain_from_hostname(hostname, &self.config.root_domain)
+        {
+            (
+                format!(
+                    "{}/internal/bedrock-signal/by-subdomain/{subdomain}",
+                    self.config.control_plane_url.trim_end_matches('/')
+                ),
+                None,
+                true,
+            )
+        } else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+
+        let response = match self
+            .http
+            .get(url)
+            .bearer_auth(&self.config.internal_token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%hostname, ?error, "Bedrock signal assignment lookup failed");
+                return if fallback_to_waiting {
+                    Ok(SignalRoute::waiting(&self.config))
+                } else {
+                    Err(StatusCode::SERVICE_UNAVAILABLE)
+                };
             }
-            let body = read_bounded_response_body(response, MAX_SIGNAL_ROUTE_BYTES).await?;
-            let route: BedrockSignalTarget = serde_json::from_slice(&body).map_err(|error| {
-                tracing::warn!(%server_id, ?error, "invalid Bedrock signal assignment response");
-                StatusCode::BAD_GATEWAY
-            })?;
-            let mut target = validate_signal_target(&route, server_id)?;
-            target.hostname = Some(hostname.to_owned());
-            tracing::debug!(%server_id, generation = route.generation,
-                worker = %route.worker_address, bedrock_port = route.bedrock_port,
-                signal = %target.signal, bedrock = %target.bedrock,
-                "resolved current Bedrock signal assignment");
-            return Ok(target);
+        };
+        if !response.status().is_success() {
+            tracing::debug!(%hostname, status = %response.status(),
+                fallback_to_waiting, "Bedrock signal assignment is unavailable");
+            return if fallback_to_waiting {
+                Ok(SignalRoute::waiting(&self.config))
+            } else {
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            };
         }
-
-        if subdomain_from_hostname(hostname, &self.config.root_domain).is_some() {
-            return Ok(SignalRoute::waiting(&self.config));
-        }
-
-        Err(StatusCode::NOT_FOUND)
+        let body = read_bounded_response_body(response, MAX_SIGNAL_ROUTE_BYTES).await?;
+        let route: BedrockSignalTarget = serde_json::from_slice(&body).map_err(|error| {
+            tracing::warn!(%hostname, ?error, "invalid Bedrock signal assignment response");
+            StatusCode::BAD_GATEWAY
+        })?;
+        let expected_server_id = expected_server_id.unwrap_or(route.server_id);
+        let mut target = validate_signal_target(&route, expected_server_id)?;
+        target.hostname = Some(hostname.to_owned());
+        tracing::debug!(%expected_server_id, generation = route.generation,
+            worker = %route.worker_address, bedrock_port = route.bedrock_port,
+            signal = %target.signal, bedrock = %target.bedrock,
+            "resolved current Bedrock signal assignment");
+        Ok(target)
     }
 
     #[cfg(test)]
@@ -493,17 +536,18 @@ async fn proxy_signal(
         Err(status) => return status.into_response(),
     };
 
-    if method == Method::POST && status.is_success() {
-        if let Some(network_id) = path.strip_prefix("/v1/join/") {
-            let mut ufrags = extract_ice_ufrags(&body);
-            ufrags.extend(extract_ice_ufrags(&response_body));
-            if !proxy
-                .routes
-                .register(peer.address.ip(), route, ufrags)
-                .await
-            {
-                tracing::debug!(peer = %peer.address, network_id, "Bedrock signal route was not registered");
-            }
+    if method == Method::POST
+        && status.is_success()
+        && let Some(network_id) = path.strip_prefix("/v1/join/")
+    {
+        let mut ufrags = extract_ice_ufrags(&body);
+        ufrags.extend(extract_ice_ufrags(&response_body));
+        if !proxy
+            .routes
+            .register(peer.address.ip(), route, ufrags)
+            .await
+        {
+            tracing::debug!(peer = %peer.address, network_id, "Bedrock signal route was not registered");
         }
     }
 
@@ -595,16 +639,16 @@ fn stun_username_tokens(packet: &[u8]) -> Vec<String> {
         if value_end > message_end {
             return Vec::new();
         }
-        if attribute_type == 0x0006 {
-            if let Ok(username) = std::str::from_utf8(&packet[value_start..value_end]) {
-                tokens.extend(
-                    username
-                        .split(':')
-                        .map(str::trim)
-                        .filter(|value| valid_ice_ufrag(value))
-                        .map(str::to_owned),
-                );
-            }
+        if attribute_type == 0x0006
+            && let Ok(username) = std::str::from_utf8(&packet[value_start..value_end])
+        {
+            tokens.extend(
+                username
+                    .split(':')
+                    .map(str::trim)
+                    .filter(|value| valid_ice_ufrag(value))
+                    .map(str::to_owned),
+            );
         }
         offset = value_start.saturating_add((attribute_length + 3) & !3);
     }
@@ -1228,6 +1272,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_server_hostname_resolves_direct_signal_assignment() {
+        use axum::{extract::Path, routing::get};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_id = Uuid::new_v4();
+        let app = Router::new().route(
+            "/internal/bedrock-signal/by-subdomain/{subdomain}",
+            get(move |Path(subdomain): Path<String>| {
+                let server_id = server_id;
+                async move {
+                    assert_eq!(subdomain, "friends");
+                    Json(BedrockSignalTarget {
+                        server_id,
+                        worker_address: "192.0.2.20".into(),
+                        bedrock_port: 46001,
+                        signal_address: "127.0.0.1".into(),
+                        signal_port: 46002,
+                        generation: 3,
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let proxy = SignalProxy::new(
+            gateway_config(format!("http://{address}")),
+            RouteRegistry::new(),
+        )
+        .unwrap();
+
+        let route = proxy
+            .route("friends.mc.example.test")
+            .await
+            .expect("normal server hostname should resolve directly");
+        assert_eq!(route.server_id, Some(server_id));
+        assert_eq!(route.generation, Some(3));
+        assert_eq!(route.signal, "127.0.0.1:46002".parse().unwrap());
+        assert_eq!(route.bedrock, "192.0.2.20:46001".parse().unwrap());
+        assert_eq!(route.hostname.as_deref(), Some("friends.mc.example.test"));
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn tls_listener_extracts_negotiated_sni_for_the_host_authority_gate() {
         use std::io::BufReader;
 
@@ -1500,6 +1590,29 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn active_route_refreshes_its_idle_lease() {
+        let registry = RouteRegistry::new();
+        let route = direct_route(Uuid::new_v4(), 1, "127.0.0.1:46001".parse().unwrap());
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    route.clone(),
+                    vec!["active".into()]
+                )
+                .await
+        );
+        {
+            let mut state = registry.state.lock().await;
+            state.by_ufrag.get_mut("active").unwrap().expires =
+                Instant::now() - Duration::from_secs(1);
+        }
+        assert!(registry.is_current(&route).await);
+        let state = registry.state.lock().await;
+        assert!(state.by_ufrag["active"].expires > Instant::now());
     }
 
     #[tokio::test]

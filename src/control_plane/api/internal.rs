@@ -19,40 +19,69 @@ use super::auth::CurrentUser;
 use super::types::ServerSettings;
 use super::{ApiError, AppState};
 
+type BedrockSignalRow = (Uuid, String, i32, String, i32, i64);
+
+const BEDROCK_SIGNAL_SELECT: &str = "SELECT p.server_id, w.address, p.bedrock_port,
+                w.signal_address, p.signal_port, p.generation
+         FROM placements p
+         JOIN servers s ON s.id = p.server_id
+         JOIN workers w ON w.id = p.worker_id
+         JOIN users u ON u.id = s.owner_id
+         WHERE p.active
+           AND p.generation = s.generation
+           AND s.desired_state = 'running' AND s.observed_state = 'online'
+           AND u.account_status = 'active'
+           AND w.signal_address <> ''
+           AND w.heartbeat_at > now() - interval '30 seconds'";
+
 pub(super) async fn bedrock_signal_target(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<BedrockSignalTarget>, ApiError> {
     require_internal(&state, &headers)?;
-    let target = sqlx::query_as::<_, (Uuid, String, i32, String, i32, i64)>(
-        "SELECT p.server_id, w.address, p.bedrock_port,
-                w.signal_address, p.signal_port, p.generation
-         FROM placements p
-         JOIN servers s ON s.id = p.server_id
-         JOIN workers w ON w.id = p.worker_id
-         JOIN users u ON u.id = s.owner_id
-         WHERE p.server_id = $1 AND p.active
-           AND p.generation = s.generation
-           AND s.desired_state = 'running' AND s.observed_state = 'online'
-           AND u.account_status = 'active'
-           AND w.signal_address <> ''
-           AND w.heartbeat_at > now() - interval '30 seconds'",
-    )
+    let target = sqlx::query_as::<_, BedrockSignalRow>(&format!(
+        "{BEDROCK_SIGNAL_SELECT} AND p.server_id = $1"
+    ))
     .bind(server_id)
     .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| {
-        ApiError::with_code(
+    .await?;
+    finish_bedrock_signal_target(target)
+}
+
+pub(super) async fn bedrock_signal_target_by_subdomain(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(subdomain): Path<String>,
+) -> Result<Json<BedrockSignalTarget>, ApiError> {
+    require_internal(&state, &headers)?;
+    if !crate::model::validate_subdomain(&subdomain) {
+        return Err(signal_target_unavailable(
+            StatusCode::NOT_FOUND,
+            "unknown server address",
+        ));
+    }
+    let target = sqlx::query_as::<_, BedrockSignalRow>(&format!(
+        "{BEDROCK_SIGNAL_SELECT} AND s.subdomain = $1"
+    ))
+    .bind(subdomain)
+    .fetch_optional(&state.pool)
+    .await?;
+    finish_bedrock_signal_target(target)
+}
+
+fn finish_bedrock_signal_target(
+    target: Option<BedrockSignalRow>,
+) -> Result<Json<BedrockSignalTarget>, ApiError> {
+    let target = target.ok_or_else(|| {
+        signal_target_unavailable(
             StatusCode::SERVICE_UNAVAILABLE,
-            "signal_target_unavailable",
             "server signaling target is unavailable",
         )
     })?;
     if !crate::model::is_private_signal_address(&target.3) {
-        return Err(ApiError::with_code(
+        return Err(signal_target_unavailable(
             StatusCode::SERVICE_UNAVAILABLE,
-            "signal_target_unavailable",
             "server signaling target is unavailable",
         ));
     }
@@ -78,6 +107,10 @@ pub(super) async fn bedrock_signal_target(
         signal_port,
         generation: target.5,
     }))
+}
+
+fn signal_target_unavailable(status: StatusCode, message: &'static str) -> ApiError {
+    ApiError::with_code(status, "signal_target_unavailable", message)
 }
 
 pub(super) async fn admit(

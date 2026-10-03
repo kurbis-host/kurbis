@@ -98,8 +98,16 @@ async fn handle_login(
         .await;
     }
 
-    if let Some(lease) = java_lease(&target) {
-        return proxy_to_backend(client, handshake, lease).await;
+    if java_lease(&target).is_some() {
+        let current = routes.resolve_current(&handshake.hostname).await?;
+        let Some(current) = current else {
+            let mut client = client;
+            return send_login_disconnect(&mut client, "Unknown or deleted server address.").await;
+        };
+        if let Some(lease) = java_lease(&current) {
+            return proxy_to_backend(client, handshake, lease).await;
+        }
+        return wait_for_backend(client, config, routes, handshake, current).await;
     }
 
     if target.state == ObservedState::Failed {
@@ -191,6 +199,18 @@ async fn wait_for_backend(
                 "Server failed to start. Retry it from the panel.",
             )
             .await;
+        }
+        if java_lease(&target).is_some() {
+            target = match routes.resolve_current(&handshake.hostname).await? {
+                Some(current) => current,
+                None => {
+                    return send_login_disconnect(
+                        &mut client,
+                        "Unknown or deleted server address.",
+                    )
+                    .await;
+                }
+            };
         }
         if let Some(lease) = java_lease(&target) {
             return proxy_to_backend(client, handshake, lease).await;
