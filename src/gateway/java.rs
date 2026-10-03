@@ -49,8 +49,15 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
     };
     match handshake.next_state {
         1 => {
+            let accepted_server_address = routes.accepts_server_address(&handshake.hostname);
             let target = routes.resolve(&handshake.hostname).await?;
-            handle_status(&mut client, &handshake, target.as_ref()).await
+            handle_status(
+                &mut client,
+                &handshake,
+                accepted_server_address,
+                target.as_ref(),
+            )
+            .await
         }
         2 => {
             if !routes.accepts_server_address(&handshake.hostname) {
@@ -92,18 +99,12 @@ async fn connect_backend(address: impl tokio::net::ToSocketAddrs) -> Result<TcpS
     .context("backend connection timed out")??)
 }
 
-async fn handle_status(
-    client: &mut TcpStream,
-    handshake: &Handshake,
+fn status_info(
+    accepted_server_address: bool,
     target: Option<&RouteTarget>,
-) -> Result<()> {
-    let request = read_frame(client, 1024).await?;
-    let mut cursor = 0;
-    let packet_id = read_varint(&request, &mut cursor)?;
-    if packet_id != 0 {
-        bail!("unexpected status request packet id {packet_id}");
-    }
-    let (state, description) = match target {
+) -> (&'static str, String) {
+    match target {
+        None if accepted_server_address => ("ready", "Join to create your server".to_owned()),
         None => ("unknown", "Unknown server address".to_owned()),
         Some(target) if target.account_suspended => ("suspended", "Server suspended".to_owned()),
         Some(target) => match target.state {
@@ -124,7 +125,22 @@ async fn handle_status(
             ObservedState::Resetting => ("starting", "Resetting server".to_owned()),
             state => ("sleeping", format!("{state:?}")),
         },
-    };
+    }
+}
+
+async fn handle_status(
+    client: &mut TcpStream,
+    handshake: &Handshake,
+    accepted_server_address: bool,
+    target: Option<&RouteTarget>,
+) -> Result<()> {
+    let request = read_frame(client, 1024).await?;
+    let mut cursor = 0;
+    let packet_id = read_varint(&request, &mut cursor)?;
+    if packet_id != 0 {
+        bail!("unexpected status request packet id {packet_id}");
+    }
+    let (state, description) = status_info(accepted_server_address, target);
     let status = json!({
         "version": {"name": format!("kurbis ({state})"), "protocol": handshake.protocol},
         "players": {"max": 0, "online": 0, "sample": []},
@@ -261,6 +277,20 @@ fn write_string(value: &str, output: &mut Vec<u8>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_unregistered_address_has_creation_motd() {
+        let (state, description) = status_info(true, None);
+        assert_eq!(state, "ready");
+        assert_eq!(description, "Join to create your server");
+    }
+
+    #[test]
+    fn invalid_address_keeps_unknown_motd() {
+        let (state, description) = status_info(false, None);
+        assert_eq!(state, "unknown");
+        assert_eq!(description, "Unknown server address");
+    }
 
     #[tokio::test]
     async fn login_is_authenticated_by_the_waiting_runtime_before_transfer() {
