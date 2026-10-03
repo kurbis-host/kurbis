@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -105,7 +105,11 @@ async fn handle_login(
             return send_login_disconnect(&mut client, "Unknown or deleted server address.").await;
         };
         if let Some(lease) = java_lease(&current) {
-            return proxy_to_backend(client, handshake, lease).await;
+            let hostname = handshake.hostname.clone();
+            return proxy_to_backend(client, handshake, lease, || {
+                routes.resolve_current(&hostname)
+            })
+            .await;
         }
         return wait_for_backend(client, config, routes, handshake, current).await;
     }
@@ -152,13 +156,18 @@ async fn proxy_to_waiting(
     Ok(())
 }
 
-async fn proxy_to_backend(
+async fn proxy_to_backend<F, Fut>(
     mut client: TcpStream,
     handshake: Handshake,
     lease: RouteLease,
-) -> Result<()> {
+    resolve_current: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<RouteTarget>>>,
+{
     let backend_address = lease.socket_addr();
-    let mut backend = match connect_backend(backend_address).await {
+    let backend = match connect_backend(backend_address).await {
         Ok(backend) => backend,
         Err(error) => {
             tracing::debug!(server_id = %lease.server_id, generation = lease.generation,
@@ -170,9 +179,40 @@ async fn proxy_to_backend(
             .await;
         }
     };
+    // The database route and backend TCP connection cannot be made atomic. At
+    // least re-read after connect and before forwarding any client bytes so a
+    // placement replaced during connect never receives a stale handshake.
+    let mut backend = match validate_connected_lease(backend, &lease, resolve_current).await? {
+        Some(backend) => backend,
+        None => {
+            tracing::debug!(server_id = %lease.server_id, generation = lease.generation,
+                backend = %backend_address, "Java placement changed before backend handshake");
+            return send_login_disconnect(
+                &mut client,
+                "Server is restarting. Please reconnect shortly.",
+            )
+            .await;
+        }
+    };
     backend.write_all(&handshake.framed).await?;
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
     Ok(())
+}
+
+async fn validate_connected_lease<F, Fut>(
+    backend: TcpStream,
+    lease: &RouteLease,
+    resolve_current: F,
+) -> Result<Option<TcpStream>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<RouteTarget>>>,
+{
+    let current = resolve_current().await?;
+    Ok(current
+        .as_ref()
+        .filter(|target| lease.matches(target))
+        .map(|_| backend))
 }
 
 async fn wait_for_backend(
@@ -213,7 +253,11 @@ async fn wait_for_backend(
             };
         }
         if let Some(lease) = java_lease(&target) {
-            return proxy_to_backend(client, handshake, lease).await;
+            let hostname = handshake.hostname.clone();
+            return proxy_to_backend(client, handshake, lease, || {
+                routes.resolve_current(&hostname)
+            })
+            .await;
         }
         if target.state == ObservedState::Online || target.worker_healthy == Some(false) {
             return send_login_disconnect(
@@ -659,6 +703,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_connected_during_reassignment_receives_no_stale_handshake() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let mut old_target = route_target(ObservedState::Online);
+        old_target.java_port = Some(backend_address.port());
+        let lease = java_lease(&old_target).expect("old Java placement");
+        let mut replacement = old_target.clone();
+        replacement.generation += 1;
+
+        let connected = connect_backend(lease.socket_addr()).await.unwrap();
+        let validated =
+            validate_connected_lease(connected, &lease, || async move { Ok(Some(replacement)) })
+                .await
+                .unwrap();
+
+        assert!(validated.is_none(), "replaced placement must be fenced");
+        assert!(
+            backend.await.unwrap().is_empty(),
+            "no handshake bytes may leak"
+        );
+    }
+
+    #[tokio::test]
     async fn online_backend_receives_original_handshake_without_waiting_hop() {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
@@ -689,7 +763,15 @@ mod tests {
         target.java_port = Some(backend_address.port());
         let lease = java_lease(&target).expect("direct Java lease");
         client.shutdown().await.unwrap();
-        proxy_to_backend(accepted, handshake, lease).await.unwrap();
+        let current = target.clone();
+        proxy_to_backend(
+            accepted,
+            handshake,
+            lease,
+            || async move { Ok(Some(current)) },
+        )
+        .await
+        .unwrap();
         backend.await.unwrap();
 
         let packet = read_frame(&mut client, 1024).await.unwrap();

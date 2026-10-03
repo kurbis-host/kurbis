@@ -91,6 +91,11 @@ struct RouteRegistry {
 struct RouteRegistryState {
     next_id: u64,
     by_ufrag: HashMap<String, SignalRouteLease>,
+    // Highest generation observed from a successful signaling lookup in this
+    // process. This fences active sessions once a replacement is observed, but
+    // is not an atomic/live control-plane lease: without a newer lookup or a
+    // control-plane push, an already-active UDP session cannot learn that its
+    // backend placement was revoked.
     generations: HashMap<Uuid, i64>,
 }
 
@@ -215,6 +220,11 @@ fn purge_expired_routes(state: &mut RouteRegistryState) {
 }
 
 fn route_generation_is_current(state: &RouteRegistryState, route: &SignalRoute) -> bool {
+    // This is intentionally an observed-generation fence, not proof that the
+    // control plane still considers the assignment active. The signal API
+    // returns a point-in-time assignment and current UDP sessions do not
+    // re-query it on every datagram; hard revocation requires a pushed or
+    // atomic backend-validated lease, which the current protocol lacks.
     route
         .server_id
         .zip(route.generation)
@@ -1590,6 +1600,80 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn active_udp_session_stops_forwarding_after_newer_generation_is_observed() {
+        let old_worker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let replacement_worker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let registry = RouteRegistry::new();
+        let server_id = Uuid::new_v4();
+        let old_route = direct_route(server_id, 4, old_worker.local_addr().unwrap());
+        let newer_route = direct_route(server_id, 5, replacement_worker.local_addr().unwrap());
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    old_route,
+                    vec!["old-active".into()]
+                )
+                .await
+        );
+        let waiting_route = SignalRoute {
+            server_id: None,
+            generation: None,
+            hostname: None,
+            signal: replacement_worker.local_addr().unwrap(),
+            bedrock: replacement_worker.local_addr().unwrap(),
+        };
+        let public_address = public.local_addr().unwrap();
+        let relay_task = tokio::spawn(relay(public, waiting_route, registry.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&stun_request("server:old-active"), public_address)
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 1500];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), old_worker.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], stun_request("server:old-active"));
+
+        assert!(
+            registry
+                .register(
+                    "127.0.0.1".parse().unwrap(),
+                    newer_route,
+                    vec!["new-active".into()]
+                )
+                .await
+        );
+        // Once the relay observes the replacement generation, the existing
+        // client endpoint must not keep sending through its stale socket or be
+        // silently migrated to the replacement worker.
+        client.send_to(&[0x80, 0x44], public_address).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                old_worker.recv_from(&mut buffer)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                replacement_worker.recv_from(&mut buffer)
+            )
+            .await
+            .is_err()
+        );
+
+        relay_task.abort();
+        assert!(relay_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
