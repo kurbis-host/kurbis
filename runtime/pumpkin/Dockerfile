@@ -12,12 +12,12 @@ RUN git apply --check /tmp/host-control.patch \
     && git apply --unidiff-zero /tmp/nethernet-gateway.patch
 COPY runtime/pumpkin/host_control.rs crates/pumpkin/src/net/host_control.rs
 ENV CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTUP_TOOLCHAIN=1.98.1
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target cargo build --locked --release --package pumpkin --bin pumpkin && mkdir /artifacts && cp target/release/pumpkin /artifacts/pumpkin && strip /artifacts/pumpkin
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --locked --release --package pumpkin --bin pumpkin && mkdir /artifacts && cp target/release/pumpkin /artifacts/pumpkin && strip /artifacts/pumpkin
 
 COPY plugins/kurbis-control/Cargo.toml plugins/kurbis-control/Cargo.lock /source/plugins/kurbis-control/
 COPY plugins/kurbis-control/src /source/plugins/kurbis-control/src
 RUN rustup target add wasm32-wasip2
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target cargo build --locked --release --target wasm32-wasip2 --manifest-path plugins/kurbis-control/Cargo.toml && mkdir -p /artifacts && cp plugins/kurbis-control/target/wasm32-wasip2/release/kurbis_control.wasm /artifacts/kurbis-control.wasm
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --locked --release --target wasm32-wasip2 --manifest-path plugins/kurbis-control/Cargo.toml && mkdir -p /artifacts && cp plugins/kurbis-control/target/wasm32-wasip2/release/kurbis_control.wasm /artifacts/kurbis-control.wasm
 
 FROM debian:bookworm-slim AS host-control
 ARG BUILD_REVISION=development

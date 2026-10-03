@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import tarfile
 import time
 import uuid
 from pathlib import Path
@@ -33,6 +34,7 @@ CHECKOUT_BACKUP = ROOT / "deploy-checkout-overrides"
 WORKER_BACKUP = ROOT / "worker-rollbacks"
 ENV_BACKUP = ROOT / "worker-bundle-rollbacks"
 MARKER = ROOT / "deployed-release.json"
+TRANSACTIONS = ROOT / "worker-release-transactions"
 LEGACY = (b"identity_not_linked", b"Link this Minecraft account")
 ADMISSION = b"Join with online Minecraft authentication enabled to create it"
 
@@ -51,6 +53,15 @@ def run(args: Sequence[str], *, input_text: str | None = None, cwd: Path | None 
 def root_only() -> None:
     if os.geteuid() != 0:
         raise Error("respond5 release verification requires root")
+
+
+def valid_sha(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+
+def git_blob(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode("ascii")
+    return hashlib.sha1(header + content).hexdigest()
 
 
 def digest(path: Path) -> str:
@@ -76,6 +87,10 @@ def identity() -> str:
             except ValueError:
                 break
     raise Error("invalid worker identity")
+
+
+def worker_id() -> str:
+    return identity()
 
 
 def worker_image() -> str:
@@ -138,8 +153,21 @@ def image_for_app(state: dict[str, list[dict[str, str]]], revision: str | None =
     return cp[0]["image"]
 
 
+def pending_worker_transactions() -> list[Path]:
+    if not TRANSACTIONS.exists():
+        return []
+    if TRANSACTIONS.is_symlink() or TRANSACTIONS.stat().st_uid != 0 or stat.S_IMODE(TRANSACTIONS.stat().st_mode) != 0o700:
+        raise Error("worker transaction directory ownership/mode invalid")
+    pending=list(TRANSACTIONS.glob("*.json"))
+    if any(path.is_symlink() or not path.is_file() for path in pending):
+        raise Error("worker transaction directory contains unsafe records")
+    return pending
+
+
 def baseline() -> dict[str, list[dict[str, str]]]:
-    root_only(); service_valid(); identity(); state = states()
+    root_only(); service_valid(); identity()
+    if pending_worker_transactions():raise Error("unresolved worker rollback transaction blocks a new rollout")
+    verify_pinned_pumpkin(worker_image()); state = states()
     for service in SERVICES:
         if len(state[service]) != 1 or state[service][0]["status"] != "running" or (service != "gateway" and state[service][0]["health"] != "healthy"):
             raise Error(f"baseline service is not unique/healthy: {service}")
@@ -157,15 +185,50 @@ def lock(token: str, acquire: bool) -> dict[str, str]:
     (LOCK / "owner").unlink(); LOCK.rmdir(); return {"status":"released"}
 
 
+def require_lock(token: str) -> None:
+    root_only()
+    if not re.fullmatch(r"[0-9a-f]{32}", token or "") or LOCK.is_symlink():
+        raise Error("invalid rollout lock ownership")
+    owner = LOCK / "owner"
+    if not owner.is_file() or owner.is_symlink() or owner.read_text(encoding="ascii").strip() != token:
+        raise Error("rollout lock ownership mismatch")
+
+
+def validate_checkout_status(status: bytes, *, allow_overrides: bool) -> None:
+    allowed = {"compose.yaml", "web/tsconfig.json"} if allow_overrides else set()
+    for record in (part for part in status.split(b"\0") if part):
+        if len(record) < 4 or record[2:3] != b" ":
+            raise Error(f"malformed Dokploy checkout status record: {record!r}")
+        code, path = record[:2].decode("ascii"), record[3:].decode("utf-8", "surrogateescape")
+        if code == "!!" and path == ".env":
+            continue
+        if code.startswith("?") or code == "!!":
+            raise Error(f"untracked/ignored Dokploy build input forbidden: {path}")
+        if code not in {" M", "M ", "MM"} or path not in allowed:
+            raise Error(f"unexpected Dokploy checkout change: {path}")
+
+
+def validate_expected_manifest(expected: dict[str, str]) -> None:
+    if not isinstance(expected, dict) or not expected:
+        raise Error("release source manifest is empty")
+    for path, blob in expected.items():
+        p = Path(path)
+        if p.is_absolute() or ".." in p.parts or not valid_sha(blob):
+            raise Error("release source manifest contains an unsafe path or blob id")
+
+
 def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]:
-    root_only(); identity();
+    root_only(); require_lock(token); identity(); validate_expected_manifest(expected)
+    if not valid_sha(revision): raise Error("invalid release SHA")
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir(): raise Error("invalid Dokploy checkout")
+    status = run(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status.encode(), allow_overrides=True)
     CHECKOUT_BACKUP.mkdir(mode=0o700, exist_ok=True)
+    if CHECKOUT_BACKUP.is_symlink() or CHECKOUT_BACKUP.stat().st_uid != 0 or stat.S_IMODE(CHECKOUT_BACKUP.stat().st_mode) != 0o700:
+        raise Error("checkout backup directory ownership/mode invalid")
     backup = CHECKOUT_BACKUP / token
     if backup.exists(): raise Error("checkout backup already exists")
     backup.mkdir(mode=0o700)
-    status = run(["git","-C",str(CHECKOUT),"status","--porcelain","-z","--untracked-files=all"])
-    if any(record.startswith(b"?? ") for record in status.encode().split(b"\0") if record): raise Error("untracked Dokploy files require review")
     changed = run(["git","-C",str(CHECKOUT),"diff","--name-only","-z","HEAD"]).split("\0")
     manifest=[]
     for relative in filter(None, changed):
@@ -173,24 +236,35 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
         if not path.is_file() or path.is_symlink() or Path(relative).is_absolute() or ".." in Path(relative).parts: raise Error(f"unsafe override: {relative}")
         m=path.stat(); content=path.read_bytes(); manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing")})
     (backup/"manifest.json").write_text(json.dumps(manifest),encoding="utf-8"); os.chmod(backup/"manifest.json",0o600)
-    run(["git","-C",str(CHECKOUT),"fetch","origin","main"])
-    if run(["git","-C",str(CHECKOUT),"rev-parse",f"{revision}^{{commit}}"] ) != revision: raise Error("release SHA unavailable on respond5")
-    run(["git","-C",str(CHECKOUT),"reset","--hard",revision]); run(["git","-C",str(CHECKOUT),"clean","-fd","--exclude=.env"])
-    if run(["git","-C",str(CHECKOUT),"status","--porcelain","--untracked-files=all"]): raise Error("staged checkout remains dirty")
+    tag=f"kurbis-release-{revision}"
+    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
+    if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"] ) != revision: raise Error("immutable release tag SHA mismatch")
+    run(["git","-C",str(CHECKOUT),"reset","--hard",revision]); run(["git","-C",str(CHECKOUT),"clean","-fdx","-e",".env"])
+    status = run(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status.encode(), allow_overrides=False)
+    tracked = set(run(["git", "-C", str(CHECKOUT), "ls-tree", "-r", "--name-only", revision]).splitlines())
+    if tracked != set(expected): raise Error("release source manifest does not cover every tracked input")
     for path, blob in expected.items():
         if run(["git","-C",str(CHECKOUT),"hash-object","--",path]) != blob: raise Error(f"source mismatch: {path}")
     return {"status":"staged","revision":revision}
 
 
 def restore(token: str) -> dict[str, str]:
-    root_only(); backup=CHECKOUT_BACKUP/token; manifest=json.loads((backup/"manifest.json").read_text(encoding="utf-8")); restored=[]; preserved=[]
+    root_only(); require_lock(token)
+    if not re.fullmatch(r"[0-9a-f]{32}", token): raise Error("invalid checkout backup token")
+    backup=CHECKOUT_BACKUP/token
+    if not backup.exists(): return {"status":"restored","restored":"[]","preserved":"[]"}
+    if backup.is_symlink() or not (backup/"manifest.json").is_file(): raise Error("checkout backup is missing or unsafe")
+    manifest=json.loads((backup/"manifest.json").read_text(encoding="utf-8")); restored=[]; preserved=[]
     for entry in manifest:
         path=CHECKOUT/entry["path"]
         current = run(["git","-C",str(CHECKOUT),"hash-object","--",entry["path"]]) if path.is_file() else "missing"
         if current != entry["target"]: preserved.append(entry["path"]); continue
         content=base64.b64decode(entry["content"]); atomic(path,content,int(entry["mode"]),int(entry["uid"]),int(entry["gid"])); restored.append(entry["path"])
+    if preserved:
+        return {"status":"preserved","restored":json.dumps(restored),"preserved":json.dumps(preserved)}
     shutil.rmtree(backup)
-    return {"status":"restored","restored":json.dumps(restored),"preserved":json.dumps(preserved)}
+    return {"status":"restored","restored":json.dumps(restored),"preserved":"[]"}
 
 
 def atomic(path: Path, content: bytes, mode: int, uid: int=0, gid: int=0) -> None:
@@ -198,6 +272,9 @@ def atomic(path: Path, content: bytes, mode: int, uid: int=0, gid: int=0) -> Non
     try:
         with os.fdopen(fd,"wb") as f: f.write(content); f.flush(); os.fsync(f.fileno())
         os.chown(temp,uid,gid); os.chmod(temp,mode); os.replace(temp,path)
+        directory_fd=os.open(path.parent,os.O_RDONLY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
     except BaseException: temp.unlink(missing_ok=True); raise
 
 
@@ -210,74 +287,410 @@ def extract(image: str, directory: Path) -> tuple[Path,Path,Path]:
     finally: run(["docker","rm",cid])
 
 
-def build_pumpkin(revision: str, expected: dict[str,str]) -> dict[str,str]:
-    root_only();
-    for path,blob in expected.items():
-        if run(["git","-C",str(CHECKOUT),"hash-object","--",path]) != blob: raise Error(f"source mismatch before Pumpkin build: {path}")
-    tag=f"{PUMPKIN_PREFIX}{revision}"
-    run(["docker","build","--target","host-control","--build-arg",f"BUILD_REVISION={revision}","-f","runtime/pumpkin/Dockerfile","-t",tag,"."],cwd=CHECKOUT)
-    data=run(["docker","image","inspect",tag,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|")
-    if len(data)!=2 or data[1]!=revision: raise Error("Pumpkin image revision label mismatch")
-    return {"status":"built","pumpkin_image":tag,"pumpkin_image_id":data[0],"pumpkin_revision":revision}
+def verify_git_archive(archive: Path, expected: dict[str, str]) -> str:
+    validate_expected_manifest(expected)
+    with tarfile.open(archive, "r:") as tar:
+        members = {}
+        for member in tar.getmembers():
+            name = member.name.removeprefix("./")
+            if name in members or Path(name).is_absolute() or ".." in Path(name).parts:
+                raise Error("immutable Git archive contains duplicate or unsafe paths")
+            if member.isfile() or member.issym():
+                members[name] = member
+        if set(members) != set(expected):
+            raise Error("immutable Git archive manifest mismatch")
+        for name, member in members.items():
+            if member.issym():
+                content = member.linkname.encode("utf-8")
+            else:
+                stream = tar.extractfile(member)
+                if stream is None:
+                    raise Error(f"immutable Git archive entry is unreadable: {name}")
+                content = stream.read()
+            if git_blob(content) != expected[name]:
+                raise Error(f"immutable Git archive blob mismatch: {name}")
+    return digest(archive)
 
 
-def set_worker_image(tag: str) -> bool:
-    if not re.fullmatch(re.escape(PUMPKIN_PREFIX)+r"[0-9a-f]{40}",tag): raise Error("invalid pinned Pumpkin image")
-    lines=WORKER_ENV.read_text(encoding="utf-8").splitlines(); matches=[i for i,l in enumerate(lines) if re.match(r"^export PUMPKIN_IMAGE=",l)]
-    if len(matches)!=1: raise Error("worker env must have one PUMPKIN_IMAGE")
-    current=lines[matches[0]].split("=",1)[1].strip().strip('"\'')
-    if current==tag:return False
-    ENV_BACKUP.mkdir(mode=0o700,exist_ok=True); old=digest(WORKER_ENV); backup=ENV_BACKUP/f"worker-env-{old}"
-    if not backup.exists(): atomic(backup,WORKER_ENV.read_bytes(),0o600)
-    lines[matches[0]]=f"export PUMPKIN_IMAGE={tag}"; atomic(WORKER_ENV,("\n".join(lines)+"\n").encode(),0o600)
-    if worker_image()!=tag: raise Error("worker image update failed")
-    return True
-
-def image_revision_files(image: str, revision: str) -> None:
-    cid=run(["docker","create","--entrypoint","/bin/true",image]); tmp=Path(tempfile.mkdtemp(prefix="kurbis-image-"))
+def build_pumpkin(revision: str, expected: dict[str,str], token: str) -> dict[str,str]:
+    require_lock(token); validate_expected_manifest(expected)
+    if not valid_sha(revision): raise Error("invalid Pumpkin build revision")
+    root=ROOT/"release-builds"
+    if not root.exists():root.mkdir(mode=0o700)
+    if root.is_symlink() or root.stat().st_uid!=0 or stat.S_IMODE(root.stat().st_mode)!=0o700: raise Error("release build root ownership/mode invalid")
+    source=root/revision
+    if source.exists(): raise Error("detached release source path already exists")
+    run(["git","-C",str(CHECKOUT),"worktree","add","--detach",str(source),revision])
     try:
-        for target in ("control-plane","gateway","worker"): run(["docker","cp",f"{cid}:/usr/local/bin/{target}",str(tmp/target)])
-        cp=(tmp/"control-plane").read_bytes(); gw=(tmp/"gateway").read_bytes(); w=(tmp/"worker").read_bytes()
-        if any(marker in cp or marker in gw for marker in LEGACY) or ADMISSION not in gw: raise Error("application binaries failed admission marker scan")
-        if any(revision.encode() not in data for data in (cp,gw,w)): raise Error("application binary lacks embedded release SHA")
-        return
-    finally: run(["docker","rm",cid]); shutil.rmtree(tmp,ignore_errors=True)
+        if run(["git","-C",str(source),"status","--porcelain=v1","--untracked-files=all","--ignored"]): raise Error("detached source build directory is not clean")
+        for path,blob in expected.items():
+            if run(["git","-C",str(source),"hash-object","--",path])!=blob: raise Error(f"detached source mismatch: {path}")
+        with tempfile.TemporaryDirectory(prefix="kurbis-release-archive-") as d:
+            archive=Path(d)/"release.tar"
+            with archive.open("wb") as output:
+                result=subprocess.run(["git","-C",str(source),"archive","--format=tar",revision],stdout=output,stderr=subprocess.PIPE,check=False)
+            if result.returncode: raise Error("git archive failed")
+            archive_sha=verify_git_archive(archive,expected)
+        tag=f"{PUMPKIN_PREFIX}{revision}"
+        run(["docker","build","--target","host-control","--build-arg",f"BUILD_REVISION={revision}","-f","runtime/pumpkin/Dockerfile","-t",tag,"."],cwd=source)
+        image_id,label=run(["docker","image","inspect",tag,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
+        if label!=revision: raise Error("Pumpkin image revision label mismatch")
+        upstream=run(["git","-C",str(source),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
+        pump_id,pump_sha=verify_pumpkin(tag,revision,upstream)
+        if pump_id!=image_id: raise Error("Pumpkin immutable image ID changed during verification")
+        return {"status":"built","pumpkin_image":tag,"pumpkin_image_id":image_id,"pumpkin_revision":revision,"pumpkin_sha256":pump_sha,"archive_sha256":archive_sha}
+    finally: run(["git","-C",str(CHECKOUT),"worktree","remove","--force",str(source)])
+
+def updated_worker_env(current:bytes,tag:str)->bytes:
+    if tag!=f"{PUMPKIN_PREFIX}{tag.removeprefix(PUMPKIN_PREFIX)}" or not re.fullmatch(r"[0-9a-f]{40}",tag.removeprefix(PUMPKIN_PREFIX)): raise Error("invalid SHA-pinned worker Pumpkin image")
+    lines=current.decode("utf-8").splitlines(); matches=[i for i,line in enumerate(lines) if line.startswith("export PUMPKIN_IMAGE=")]
+    if len(matches)!=1: raise Error("worker env must have exactly one PUMPKIN_IMAGE")
+    lines[matches[0]]=f"export PUMPKIN_IMAGE={tag}"
+    return ("\n".join(lines)+"\n").encode()
+
+def extract_binary(image_id:str,name:str,directory:Path)->Path:
+    cid=run(["docker","create","--entrypoint","/bin/true",image_id]);destination=directory/name
+    try:run(["docker","cp",f"{cid}:/usr/local/bin/{name}",str(destination)])
+    finally:run(["docker","rm",cid])
+    return destination
 
 
-def wait_sync(revision: str, pumpkin: str, baseline_state: dict[str,list[dict[str,str]]], expected: dict[str,str]) -> dict[str,str]:
-    require_production_paths(); deadline=time.monotonic()+900
-    while time.monotonic()<deadline:
-        state=states(); cp,gw=state["control-plane"],state["gateway"]
-        if len(cp)==1 and len(gw)==1 and cp[0]["id"] not in {x["id"] for x in baseline_state["control-plane"]} and gw[0]["id"] not in {x["id"] for x in baseline_state["gateway"]} and cp[0]["image"]==gw[0]["image"] and cp[0]["revision"]==revision and gw[0]["revision"]==revision and cp[0]["health"]=="healthy" and all(len(state[s])==1 and state[s][0]["status"]=="running" and state[s][0]["health"]=="healthy" for s in ("panel","waiting-pumpkin","postgres")):
-            break
-        time.sleep(5)
-    else: raise Error("Dokploy containers did not become exact/healthy before timeout")
-    image=cp[0]["image"]; image_revision_files(image,revision)
-    cpbin,gwbin,wbin=extract(image,Path(tempfile.mkdtemp(prefix="kurbis-extract-")))
-    old=digest(WORKER); new=digest(wbin); old_env=digest(WORKER_ENV); env_changed=set_worker_image(pumpkin); backup=None; env_backup=ENV_BACKUP/f"worker-env-{old_env}"
-    if old != new:
-        WORKER_BACKUP.mkdir(mode=0o700,exist_ok=True); backup=WORKER_BACKUP/f"worker-{old}"; atomic(backup,WORKER.read_bytes(),stat.S_IMODE(WORKER.stat().st_mode)); atomic(WORKER,wbin.read_bytes(),stat.S_IMODE(WORKER.stat().st_mode))
-    if old != new or env_changed: run(["systemctl","restart",WORKER_SERVICE])
+def verify_application_image(image_id:str,revision:str)->tuple[dict[str,str],bytes]:
+    label=run(["docker","image","inspect",image_id,"--format",'{{index .Config.Labels "org.opencontainers.image.revision"}}'])
+    if label!=revision:raise Error("application image label differs from release SHA")
+    with tempfile.TemporaryDirectory(prefix="kurbis-app-verify-") as directory:
+        root=Path(directory);binaries={name:extract_binary(image_id,name,root) for name in ("control-plane","gateway","worker")}
+        data={name:path.read_bytes() for name,path in binaries.items()}
+        if any(revision.encode("ascii") not in value for value in data.values()):raise Error("compiled app binary missing exact BUILD_REVISION")
+        if any(mark in data["control-plane"] or mark in data["gateway"] for mark in LEGACY):raise Error("legacy account-link flow detected in runtime app binary")
+        if ADMISSION not in data["gateway"]:raise Error("gateway binary lacks auto-admission release marker")
+        hashes={"control_plane_sha256":digest(binaries["control-plane"]),"gateway_sha256":digest(binaries["gateway"]),"worker_sha256":digest(binaries["worker"])}
+        return hashes,data["worker"]
+
+
+def verify_image_revision(image_id: str, revision: str) -> str:
+    details=run(["docker","image","inspect",image_id,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}'])
+    parts=details.split("|",1)
+    if len(parts)!=2 or parts[0]!=image_id or parts[1]!=revision:
+        raise Error("container image OCI revision label mismatch")
+    return parts[0]
+
+
+def verify_pinned_pumpkin(image: str) -> tuple[str, str]:
+    prefix=PUMPKIN_PREFIX
+    if not image.startswith(prefix):raise Error("worker Pumpkin image tag is not SHA-pinned")
+    revision=image[len(prefix):]
+    if not valid_sha(revision):raise Error("worker Pumpkin image tag has invalid source SHA")
+    cid=run(["docker","create","--entrypoint","/bin/true",image])
     try:
-        pid=single_worker(); time.sleep(35); pid=single_worker(); lease(state["postgres"][0]["id"])
-        result={"status":"verified","image_id":image,"control_plane_container_id":cp[0]["id"],"gateway_container_id":gw[0]["id"],"control_plane_sha256":digest(cpbin),"gateway_sha256":digest(gwbin),"worker_sha256":new,"worker_pid":str(pid),"worker_id":identity(),"worker_lease_verified":"true","pumpkin_image":pumpkin}
-        return result
-    except BaseException:
-        if backup:
-            atomic(WORKER,backup.read_bytes(),stat.S_IMODE(WORKER.stat().st_mode))
-        if env_changed and env_backup.exists(): atomic(WORKER_ENV,env_backup.read_bytes(),0o600)
-        if backup or env_changed: run(["systemctl","restart",WORKER_SERVICE])
+        with tempfile.TemporaryDirectory(prefix="kurbis-pinned-pumpkin-") as directory:
+            root=Path(directory);build_revision=root/"build-revision";upstream_revision=root/"upstream-revision"
+            run(["docker","cp",f"{cid}:/usr/share/doc/kurbis/build-revision",str(build_revision)])
+            run(["docker","cp",f"{cid}:/usr/share/doc/pumpkin/REVISION",str(upstream_revision)])
+            if build_revision.read_text(encoding="utf-8").strip()!=revision:raise Error("worker Pumpkin embedded source revision mismatch")
+            return verify_pumpkin(image,revision,upstream_revision.read_text(encoding="utf-8").strip())
+    finally:run(["docker","rm",cid])
+
+
+def verify_pumpkin(image:str,revision:str,upstream:str)->tuple[str,str]:
+    if image!=f"{PUMPKIN_PREFIX}{revision}":raise Error("Pumpkin image tag is not pinned to exact release SHA")
+    image_id,label=run(["docker","image","inspect",image,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
+    if label!=revision or not image_id.startswith("sha256:"):raise Error("Pumpkin immutable image label/digest mismatch")
+    with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-verify-") as directory:
+        root=Path(directory);revision_file=run(["docker","create","--entrypoint","/bin/true",image_id])
+        try:
+            for source,target in (("/usr/share/doc/kurbis/build-revision","build-revision"),("/usr/share/doc/pumpkin/REVISION","upstream-revision"),("/usr/local/bin/pumpkin","pumpkin")):
+                run(["docker","cp",f"{revision_file}:{source}",str(root/target)])
+        finally:run(["docker","rm",revision_file])
+        if (root/"build-revision").read_text().strip()!=revision or (root/"upstream-revision").read_text().strip()!=upstream:raise Error("Pumpkin image embedded source provenance mismatch")
+        return image_id,digest(root/"pumpkin")
+
+
+def verify_waiting(container:dict[str,str],revision:str,upstream:str,pumpkin_image:str)->None:
+    if container["revision"]!=revision:raise Error("waiting runtime container OCI revision mismatch")
+    image_id,label=run(["docker","image","inspect",container["image"],"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
+    if image_id!=container["image"] or label!=revision:raise Error("waiting runtime image OCI revision label mismatch")
+    _,expected=verify_pumpkin(pumpkin_image,revision,upstream)
+    with tempfile.TemporaryDirectory(prefix="kurbis-waiting-verify-") as directory:
+        root=Path(directory);cid=run(["docker","create","--entrypoint","/bin/true",container["image"]])
+        try:
+            for source,target in (("/usr/local/bin/pumpkin","pumpkin"),("/usr/share/doc/kurbis/build-revision","build-revision"),("/usr/share/doc/pumpkin/REVISION","upstream-revision")):
+                run(["docker","cp",f"{cid}:{source}",str(root/target)])
+        finally:run(["docker","rm",cid])
+        if (root/"build-revision").read_text().strip()!=revision or (root/"upstream-revision").read_text().strip()!=upstream:raise Error("waiting runtime embedded source provenance mismatch")
+        if digest(root/"pumpkin")!=expected:raise Error("waiting Pumpkin executable differs from release-built host-control image")
+
+
+def save_backup(directory:Path,name:str,content:bytes,mode:int,uid:int=0,gid:int=0)->Path:
+    if not directory.exists():directory.mkdir(mode=0o700)
+    if directory.is_symlink() or directory.stat().st_uid!=0 or stat.S_IMODE(directory.stat().st_mode)!=0o700:raise Error("worker rollback directory must be root-owned mode 0700")
+    path=directory/name
+    if path.is_symlink():raise Error("worker rollback backup must not be a symlink")
+    if not path.exists():atomic(path,content,mode,uid,gid)
+    if not path.is_file() or path.stat().st_uid!=0 or stat.S_IMODE(path.stat().st_mode)!=mode or digest(path)!=hashlib.sha256(content).hexdigest():raise Error("worker rollback backup integrity/metadata mismatch")
+    return path
+
+
+def transaction_path(token: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise Error("invalid worker transaction token")
+    if not TRANSACTIONS.exists():
+        TRANSACTIONS.mkdir(mode=0o700)
+    if TRANSACTIONS.is_symlink() or TRANSACTIONS.stat().st_uid != 0 or stat.S_IMODE(TRANSACTIONS.stat().st_mode) != 0o700:
+        raise Error("worker transaction directory ownership/mode invalid")
+    return TRANSACTIONS / f"{token}.json"
+
+
+def write_transaction(token: str, record: dict[str, object]) -> Path:
+    path = transaction_path(token)
+    if path.exists() or path.is_symlink():
+        raise Error("worker transaction already exists for rollout lock")
+    atomic(path, (json.dumps(record, sort_keys=True) + "\n").encode(), 0o600, 0, 0)
+    return path
+
+
+class BundleMutationError(Error):
+    def __init__(self, message: str, *, rollback_verified: bool):
+        super().__init__(message)
+        self.rollback_verified = rollback_verified
+
+
+def mutate_worker_bundle(*, old_binary: bytes, new_binary: bytes, old_env: bytes, new_env: bytes,
+                         binary_changed: bool, env_changed: bool, write_binary, write_env,
+                         restart, verify_new, verify_old) -> None:
+    try:
+        if env_changed:
+            write_env(new_env)
+        if binary_changed:
+            write_binary(new_binary)
+        if binary_changed or env_changed:
+            restart()
+        verify_new()
+    except BaseException as failure:
+        try:
+            # Always restore both files: a failed atomic write may have replaced its target
+            # before a later fsync, restart, or verification failure surfaced.
+            write_binary(old_binary)
+            write_env(old_env)
+            restart()
+            verify_old()
+        except BaseException as rollback:
+            raise BundleMutationError(
+                f"worker release mutation failed ({failure}); rollback incomplete: {rollback}",
+                rollback_verified=False,
+            ) from failure
+        raise BundleMutationError(
+            f"worker release mutation failed and prior worker/env were restored: {failure}",
+            rollback_verified=True,
+        ) from failure
+
+
+def worker_transaction(new_binary:bytes,pumpkin_image:str,*,token:str,revision:str,restart,verify_new,verify_old)->dict[str,str]:
+    require_lock(token)
+    service_valid();old_bin=WORKER.read_bytes();bm=WORKER.stat();old_env=WORKER_ENV.read_bytes();em=WORKER_ENV.stat()
+    if em.st_uid!=0 or stat.S_IMODE(em.st_mode)!=0o600:raise Error("worker env must remain root-owned mode 0600")
+    new_env=updated_worker_env(old_env,pumpkin_image);bin_changed=old_bin!=new_binary;env_changed=old_env!=new_env
+    old_image=worker_image()
+    old_bin_hash=hashlib.sha256(old_bin).hexdigest();old_env_hash=hashlib.sha256(old_env).hexdigest()
+    bin_backup=save_backup(WORKER_BACKUP,f"worker-{old_bin_hash}",old_bin,stat.S_IMODE(bm.st_mode),bm.st_uid,bm.st_gid)
+    env_backup=save_backup(ENV_BACKUP,f"worker-env-{old_env_hash}",old_env,0o600,0,0)
+    transaction={"token":token,"source_revision":revision,"old_worker_sha256":old_bin_hash,"old_worker_env_sha256":old_env_hash,
+        "old_worker_mode":stat.S_IMODE(bm.st_mode),"old_worker_uid":bm.st_uid,"old_worker_gid":bm.st_gid,
+        "old_worker_image":old_image,"new_worker_sha256":hashlib.sha256(new_binary).hexdigest(),"new_pumpkin_image":pumpkin_image}
+    tx_path=write_transaction(token,transaction)
+    try:
+        mutate_worker_bundle(
+            old_binary=old_bin, new_binary=new_binary, old_env=old_env, new_env=new_env,
+            binary_changed=bin_changed, env_changed=env_changed,
+            write_binary=lambda content: atomic(WORKER,content,stat.S_IMODE(bm.st_mode),bm.st_uid,bm.st_gid),
+            write_env=lambda content: atomic(WORKER_ENV,content,0o600,0,0),
+            restart=restart, verify_new=verify_new, verify_old=verify_old,
+        )
+    except BundleMutationError as error:
+        if error.rollback_verified:
+            tx_path.unlink(missing_ok=True)
         raise
+    return {"worker_sha256":hashlib.sha256(new_binary).hexdigest(),"worker_changed":str(bin_changed or env_changed).lower(),
+        "rollback_worker_sha256":old_bin_hash,"rollback_worker_env_sha256":old_env_hash}
 
 
-def mark(receipt: str) -> dict[str,str]:
-    root_only(); data=json.loads(receipt)
-    if data.get("status")!="verified": raise Error("cannot mark unverified release")
-    required=("source_revision","deployment_id","image_id","control_plane_sha256","gateway_sha256","worker_sha256","worker_lease_verified")
-    if any(not data.get(k) for k in required): raise Error("release receipt incomplete")
-    atomic(MARKER,(json.dumps(data,sort_keys=True)+"\n").encode(),0o600)
-    return {"status":"marked"}
+def rollback_worker(token: str) -> dict[str, str]:
+    require_lock(token)
+    tx_path=transaction_path(token)
+    if not tx_path.exists(): return {"status":"no-pending-worker-transaction"}
+    if tx_path.is_symlink(): raise Error("worker transaction record is unsafe")
+    data=json.loads(tx_path.read_text(encoding="utf-8"))
+    if data.get("token")!=token or not valid_sha(str(data.get("source_revision", ""))):raise Error("worker transaction record is invalid")
+    old_hash=str(data.get("old_worker_sha256", ""));old_env_hash=str(data.get("old_worker_env_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}",old_hash) or not re.fullmatch(r"[0-9a-f]{64}",old_env_hash):raise Error("worker rollback hashes are invalid")
+    bin_backup=WORKER_BACKUP/f"worker-{old_hash}";env_backup=ENV_BACKUP/f"worker-env-{old_env_hash}"
+    if bin_backup.is_symlink() or env_backup.is_symlink() or digest(bin_backup)!=old_hash or digest(env_backup)!=old_env_hash:raise Error("worker rollback backup missing or corrupt")
+    verify_pinned_pumpkin(str(data["old_worker_image"]))
+    atomic(WORKER,bin_backup.read_bytes(),int(data["old_worker_mode"]),int(data["old_worker_uid"]),int(data["old_worker_gid"]))
+    atomic(WORKER_ENV,env_backup.read_bytes(),0o600,0,0)
+    run(["systemctl","restart",WORKER_SERVICE])
+    started=time.monotonic()
+    deadline=started+75
+    last_error=""
+    while time.monotonic()<deadline:
+        try:
+            pid=single_worker()
+            if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker executable hash mismatch")
+            if digest(WORKER_ENV)!=old_env_hash or worker_image()!=data["old_worker_image"]:raise Error("rollback worker environment mismatch")
+            state=states()
+            if len(state["postgres"])!=1 or state["postgres"][0]["status"]!="running":raise Error("database is unavailable for worker rollback verification")
+            lease(state["postgres"][0]["id"])
+            if time.monotonic()-started < 35:
+                time.sleep(min(3, 35-(time.monotonic()-started)))
+                continue
+            # Confirm a fresh lease after a full heartbeat window, not just a stale pre-restart lease.
+            pid=single_worker()
+            if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker executable changed during lease window")
+            lease(state["postgres"][0]["id"])
+            break
+        except (Error, OSError, ValueError) as error:
+            last_error=str(error);time.sleep(3)
+    else:raise Error(f"prior worker rollback could not be verified: {last_error}")
+    try:
+        marker=json.loads(MARKER.read_text(encoding="utf-8"))
+        if marker.get("source_revision")==data["source_revision"] and marker.get("deployment_id")==data.get("deployment_id"):
+            MARKER.unlink()
+    except FileNotFoundError:
+        pass
+    tx_path.unlink()
+    return {"status":"rolled-back","worker_sha256":old_hash,"worker_env_sha256":old_env_hash}
 
+
+def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->None:
+    if run(["git","-C",str(checkout),"rev-parse","HEAD"])!=revision:raise Error("Dokploy checkout HEAD differs from release SHA")
+    validate_expected_manifest(expected)
+    status=run(["git","-C",str(checkout),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status.encode(), allow_overrides=False)
+    tracked=set(run(["git","-C",str(checkout),"ls-tree","-r","--name-only",revision]).splitlines())
+    if tracked!=set(expected):raise Error("expected manifest does not cover all tracked build inputs")
+    for path,blob in expected.items():
+        if run(["git","-C",str(checkout),"hash-object","--",path])!=blob:raise Error(f"Dokploy build input mismatch: {path}")
+    for ignore in (checkout/".dockerignore",checkout/"web/.dockerignore"):
+        if not ignore.is_file() or ".env*" not in ignore.read_text().splitlines():raise Error("Docker context does not exclude .env secrets")
+    values={}
+    for line in ENV.read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+            key,value=line.split("=",1);values[key]=value.strip().strip("\"'")
+    required={"BUILD_REVISION":revision,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1"}
+    if any(values.get(k)!=v for k,v in required.items()):raise Error("Dokploy env does not match exact release/prod binds")
+    configured=json.loads(run(["docker","compose","-p",PROJECT,"--env-file",str(ENV),"-f",str(checkout/"compose.yaml"),"config","--format","json"]))
+    services=configured.get("services",{})
+    if set(SERVICES)-set(services):raise Error("rendered Compose configuration omits production services")
+    if services["control-plane"].get("image")!=services["gateway"].get("image"):
+        raise Error("control-plane/gateway Compose services do not share the expected image")
+    expected_contexts={"control-plane":checkout,"panel":checkout/"web","waiting-pumpkin":checkout}
+    for service,expected_context in expected_contexts.items():
+        build=services[service].get("build",{})
+        args=build.get("args",{}) or {}
+        if args.get("BUILD_REVISION")!=revision:raise Error(f"Compose build revision mismatch: {service}")
+        if Path(str(build.get("context", ""))).resolve()!=expected_context.resolve():raise Error(f"Compose build context differs from tracked source: {service}")
+        if build.get("additional_contexts"):raise Error(f"unexpected external Compose build context: {service}")
+    waiting=services["waiting-pumpkin"].get("build",{})
+    if waiting.get("dockerfile")!="runtime/pumpkin/Dockerfile" or waiting.get("target")!="waiting":
+        raise Error("waiting Pumpkin service does not use the revision-pinned waiting target")
+    panel_ports=services["panel"].get("ports",[])
+    if not any((isinstance(port,dict) and port.get("host_ip")=="127.0.0.1") or str(port).startswith("127.0.0.1:") for port in panel_ports):raise Error("panel port is not bound to localhost")
+
+def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
+    require_lock(token)
+    if not valid_sha(revision):raise Error("invalid release SHA")
+    verify_build_context(CHECKOUT,revision,expected)
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        current=states();cp=current["control-plane"];gw=current["gateway"]
+        replaced=lambda name:len(current[name])==1 and current[name][0]["id"] not in {x["id"] for x in baseline_state[name]}
+        healthy=(replaced("control-plane") and replaced("gateway") and len(cp)==len(gw)==1 and cp[0]["image"]==gw[0]["image"] and cp[0]["revision"]==gw[0]["revision"]==revision and cp[0]["status"]==gw[0]["status"]=="running" and cp[0]["health"]=="healthy")
+        healthy=healthy and all(len(current[name])==1 and current[name][0]["status"]=="running" and current[name][0]["health"]=="healthy" and current[name][0]["revision"]==revision for name in ("panel","waiting-pumpkin"))
+        healthy=healthy and len(current["postgres"])==1 and current["postgres"][0]["status"]=="running" and current["postgres"][0]["health"]=="healthy"
+        if healthy:break
+        time.sleep(5)
+    else:raise Error("Dokploy services did not become healthy at exact release SHA")
+    image=cp[0]["image"];app_hashes,new_worker=verify_application_image(image,revision)
+    verify_image_revision(current["panel"][0]["image"],revision)
+    upstream=run(["git","-C",str(CHECKOUT),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
+    pumpkin_id,pumpkin_sha=verify_pumpkin(pumpkin_image,revision,upstream)
+    verify_waiting(current["waiting-pumpkin"][0],revision,upstream,pumpkin_image)
+    database_id=current["postgres"][0]["id"]
+    old_env=WORKER_ENV.read_bytes()
+    old_image=worker_image()
+    verify_pinned_pumpkin(old_image)
+    old_hash=digest(WORKER)
+    def verify_new():
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=app_hashes["worker_sha256"]:raise Error("new worker binary hash mismatch")
+        if worker_image()!=pumpkin_image:raise Error("worker environment did not switch to the verified Pumpkin image")
+        time.sleep(35)
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=app_hashes["worker_sha256"]:raise Error("worker binary changed during lease check")
+        lease(database_id)
+        final=states()
+        if any(len(final[name])!=1 or final[name][0]["id"]!=current[name][0]["id"] for name in SERVICES):raise Error("Compose service changed during worker update")
+        if any(final[name][0]["status"]!="running" or (name!="gateway" and final[name][0]["health"]!="healthy") for name in SERVICES):raise Error("Compose health changed during worker update")
+        verify_waiting(final["waiting-pumpkin"][0],revision,upstream,pumpkin_image)
+    def verify_old():
+        time.sleep(35)
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker binary hash mismatch")
+        if digest(WORKER_ENV)!=hashlib.sha256(old_env).hexdigest() or worker_image()!=old_image:raise Error("rollback worker environment mismatch")
+        lease(database_id)
+    worker=worker_transaction(new_worker,pumpkin_image,token=token,revision=revision,restart=lambda:run(["systemctl","restart",WORKER_SERVICE]),verify_new=verify_new,verify_old=verify_old)
+    return {"status":"verified","image_id":image,"pumpkin_image":pumpkin_image,"pumpkin_image_id":pumpkin_id,"pumpkin_sha256":pumpkin_sha,**app_hashes,**worker,"worker_id":worker_id(),"worker_lease_verified":"true","worker_pid":str(single_worker())}
+
+def mark(receipt:str,token:str)->dict[str,str]:
+    require_lock(token);data=json.loads(receipt)
+    required=("source_revision","deployment_id","image_id","control_plane_sha256","gateway_sha256","worker_sha256","worker_id","worker_lease_verified","pumpkin_image_id","pumpkin_image","pumpkin_sha256","worker_pid","rollback_worker_sha256","rollback_worker_env_sha256","release_tag","source_archive_sha256","host_control_pumpkin_image")
+    if data.get("status")!="verified" or any(not data.get(key) for key in required):raise Error("release receipt is incomplete")
+    revision=data["source_revision"]
+    if not valid_sha(revision) or data["release_tag"]!=f"kurbis-release-{revision}":raise Error("release receipt source SHA/tag is invalid")
+    if data.get("worker_lease_verified")!="true" or data.get("host_control_pumpkin_image")!=data.get("pumpkin_image_id"):
+        raise Error("release receipt worker or host-control image provenance is inconsistent")
+    for key in ("control_plane_sha256","gateway_sha256","worker_sha256","pumpkin_sha256","rollback_worker_sha256","rollback_worker_env_sha256","source_archive_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}",str(data.get(key,""))):raise Error(f"release receipt has invalid digest: {key}")
+    current=states();cp=current["control-plane"];gw=current["gateway"]
+    if len(cp)!=1 or len(gw)!=1 or cp[0]["image"]!=gw[0]["image"] or cp[0]["image"]!=data["image_id"]:raise Error("active application image differs from verified receipt")
+    if cp[0]["revision"]!=revision or gw[0]["revision"]!=revision:raise Error("active application revision differs from verified receipt")
+    if any(len(current[name])!=1 or current[name][0]["status"]!="running" or (name!="gateway" and current[name][0]["health"]!="healthy") for name in SERVICES):raise Error("production service health failed before acceptance marker")
+    if any(current[name][0]["revision"]!=revision for name in ("panel","waiting-pumpkin")):raise Error("panel/waiting container revision changed before acceptance marker")
+    verify_image_revision(current["panel"][0]["image"],revision)
+    hashes,_=verify_application_image(data["image_id"],revision)
+    if any(data.get(key)!=value for key,value in hashes.items()):raise Error("application executable hashes differ from receipt")
+    pid=single_worker()
+    if str(pid)!=str(data.get("worker_pid")) or digest(Path(f"/proc/{pid}/exe"))!=data["worker_sha256"]:raise Error("worker PID/hash changed before release marker")
+    if identity()!=data.get("worker_id") or worker_image()!=data["pumpkin_image"]:raise Error("worker identity/environment differs from verified receipt")
+    lease(current["postgres"][0]["id"])
+    upstream=run(["git","-C",str(CHECKOUT),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
+    pumpkin_id,pumpkin_sha=verify_pumpkin(data["pumpkin_image"],revision,upstream)
+    if pumpkin_id!=data["pumpkin_image_id"] or pumpkin_sha!=data.get("pumpkin_sha256"):raise Error("Pumpkin digest differs from verified receipt")
+    verify_waiting(current["waiting-pumpkin"][0],revision,upstream,data["pumpkin_image"])
+    if ROOT.is_symlink() or ROOT.stat().st_uid!=0 or ROOT.stat().st_mode&0o022:raise Error("Kurbis release marker root is unsafe")
+    tx_path=transaction_path(token)
+    if not tx_path.is_file() or tx_path.is_symlink():raise Error("pending worker transaction is missing")
+    tx=json.loads(tx_path.read_text(encoding="utf-8"))
+    if tx.get("source_revision")!=revision or tx.get("old_worker_sha256")!=data["rollback_worker_sha256"] or tx.get("old_worker_env_sha256")!=data["rollback_worker_env_sha256"]:
+        raise Error("worker transaction and release receipt provenance differ")
+    tx["deployment_id"]=data["deployment_id"]
+    atomic(tx_path,(json.dumps(tx,sort_keys=True)+"\n").encode(),0o600,0,0)
+    atomic(MARKER,(json.dumps(data,sort_keys=True)+"\n").encode(),0o600,0,0)
+    return {"status":"marked","path":str(MARKER)}
+
+
+def finalize_worker(token: str, revision: str, receipt: str) -> dict[str, str]:
+    require_lock(token)
+    data=json.loads(receipt)
+    if data.get("source_revision")!=revision or data.get("status")!="verified":raise Error("finalized worker receipt does not match release")
+    marker=json.loads(MARKER.read_text(encoding="utf-8"))
+    if marker.get("source_revision")!=revision or marker.get("deployment_id")!=data.get("deployment_id"):raise Error("acceptance marker does not match worker transaction")
+    tx_path=transaction_path(token)
+    if not tx_path.is_file() or tx_path.is_symlink():raise Error("pending worker transaction is missing")
+    tx=json.loads(tx_path.read_text(encoding="utf-8"))
+    if tx.get("source_revision")!=revision or tx.get("deployment_id")!=data.get("deployment_id"):raise Error("worker transaction provenance mismatch")
+    tx_path.unlink()
+    return {"status":"finalized"}
 
 def main() -> int:
     parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--receipt"); args=parser.parse_args()
@@ -288,9 +701,16 @@ def main() -> int:
         elif args.remote=="baseline": result={"status":"snapshot","snapshot":baseline()}
         elif args.remote=="stage": result=stage(args.revision,args.token,expected)
         elif args.remote=="restore": result=restore(args.token)
-        elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected)
-        elif args.remote=="wait": result=wait_sync(args.revision,args.pumpkin,json.loads(args.baseline),expected)
-        elif args.remote=="mark": result=mark(args.receipt)
+        elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected,args.token)
+        elif args.remote=="wait": result=wait_sync(args.revision,args.pumpkin,json.loads(args.baseline),expected,args.token)
+        elif args.remote=="mark": result=mark(args.receipt,args.token)
+        elif args.remote=="rollback-worker": result=rollback_worker(args.token)
+        elif args.remote=="finalize-worker": result=finalize_worker(args.token,args.revision,args.receipt)
+        elif args.remote=="accept-stage":
+            require_lock(args.token)
+            result=restore(args.token)
+            if result.get("status")!="restored":raise Error("staged checkout changed unexpectedly; preserved backup for inspection")
+            result["status"]="accepted"
         else: raise Error("unknown rollout operation")
         print(json.dumps(result,sort_keys=True)); return 0
     except (Error, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
