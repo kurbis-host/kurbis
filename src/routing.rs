@@ -105,6 +105,7 @@ pub async fn resolve_subdomain(
         subdomain: String,
         state: ObservedState,
         account_suspended: bool,
+        generation: Option<i64>,
         worker_healthy: Option<bool>,
         worker_valid_until: Option<DateTime<Utc>>,
         worker_address: Option<String>,
@@ -115,6 +116,7 @@ pub async fn resolve_subdomain(
     let row = sqlx::query_as::<_, Row>(
         "SELECT s.id AS server_id, s.subdomain, s.observed_state AS state,
                 u.account_status <> 'active' AS account_suspended,
+                p.generation,
                 CASE WHEN p.server_id IS NULL THEN NULL
                      ELSE w.heartbeat_at > now() - interval '30 seconds'
                 END AS worker_healthy,
@@ -143,6 +145,7 @@ pub async fn resolve_subdomain(
         subdomain: row.subdomain,
         state: row.state,
         account_suspended: row.account_suspended,
+        generation: row.generation.unwrap_or_default(),
         worker_healthy: row.worker_healthy,
         worker_valid_until: row.worker_valid_until,
         worker_address: row.worker_address,

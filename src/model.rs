@@ -186,6 +186,11 @@ pub struct RouteTarget {
     pub subdomain: String,
     pub state: ObservedState,
     pub account_suspended: bool,
+    /// Placement generation used to fence stale backend connections.
+    ///
+    /// A target without an active placement has generation `0`; direct
+    /// routing must never treat that value as a valid lease.
+    pub generation: i64,
     pub worker_healthy: Option<bool>,
     pub worker_valid_until: Option<DateTime<Utc>>,
     pub worker_address: Option<String>,
