@@ -266,11 +266,23 @@ pub(super) async fn update_server(
             "server not found",
         )
     })?;
-    if current.observed_state != ObservedState::Sleeping {
+    if input.subdomain.is_some() && current.observed_state != ObservedState::Sleeping {
         return Err(ApiError::with_code(
             StatusCode::CONFLICT,
             "server_not_sleeping",
-            "server must be sleeping to change configuration",
+            "server address can only be changed while the server is sleeping",
+        ));
+    }
+    if input.settings.is_some()
+        && !matches!(
+            current.observed_state,
+            ObservedState::Sleeping | ObservedState::Online
+        )
+    {
+        return Err(ApiError::with_code(
+            StatusCode::CONFLICT,
+            "server_transitioning",
+            "server settings can only be changed while the server is sleeping or online",
         ));
     }
 

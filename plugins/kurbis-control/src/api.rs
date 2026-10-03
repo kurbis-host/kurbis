@@ -76,7 +76,9 @@ fn is_local_http_authority(authority: &str) -> bool {
             .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
             .map_or(authority, |(host, _)| host)
     };
-    host.eq_ignore_ascii_case("localhost")
+    (host.eq_ignore_ascii_case("kurbis-runtime-api-proxy")
+        && authority.rsplit_once(':').is_some_and(|(_, port)| port == "8080"))
+        || host.eq_ignore_ascii_case("localhost")
         || IpAddr::from_str(host).is_ok_and(|address| {
             address.is_loopback()
                 || matches!(address, IpAddr::V4(value) if value.is_private())
@@ -112,7 +114,19 @@ pub(crate) fn delete(path: &str) -> Result<Value> {
 }
 
 pub(crate) fn server_path(suffix: &str) -> Result<String> {
-    server_path_for(crate::config()?.server_id, suffix)
+    let config = crate::config()?;
+    if config.ci_preview {
+        anyhow::ensure!(
+            suffix.is_empty()
+                || suffix.starts_with('/') && !suffix.starts_with("//") && !suffix.contains('#'),
+            "invalid CI preview API suffix"
+        );
+        return Ok(format!(
+            "/internal/ci/previews/{}{}",
+            config.server_id, suffix
+        ));
+    }
+    server_path_for(config.server_id, suffix)
 }
 
 fn server_path_for(server_id: uuid::Uuid, suffix: &str) -> Result<String> {
@@ -128,7 +142,10 @@ pub(crate) fn update_setting(key: &str, value: Value) -> Result<()> {
     validate_setting_value(key, &value)?;
     let mut settings = serde_json::Map::new();
     settings.insert(key.to_owned(), value);
-    patch(&server_path("")?, &serde_json::json!({"settings": settings}))?;
+    patch(
+        &server_path("")?,
+        &serde_json::json!({"settings": settings}),
+    )?;
     Ok(())
 }
 
@@ -177,31 +194,60 @@ fn cycle_string(current: Option<&str>, options: &[&str], direction: i8) -> Resul
 fn validate_setting_value(key: &str, value: &Value) -> Result<()> {
     match key {
         "motd" if value.as_str().is_some_and(|text| text.len() <= 120) => Ok(()),
-        "difficulty" if value
-            .as_str()
-            .is_some_and(|value| matches!(value, "Peaceful" | "Easy" | "Normal" | "Hard")) => Ok(()),
-        "gamemode" if value.as_str().is_some_and(|value| {
-            matches!(value, "Survival" | "Creative" | "Adventure" | "Spectator")
-        }) => Ok(()),
+        "difficulty"
+            if value
+                .as_str()
+                .is_some_and(|value| matches!(value, "Peaceful" | "Easy" | "Normal" | "Hard")) =>
+        {
+            Ok(())
+        }
+        "gamemode"
+            if value.as_str().is_some_and(|value| {
+                matches!(value, "Survival" | "Creative" | "Adventure" | "Spectator")
+            }) =>
+        {
+            Ok(())
+        }
         "view_distance" | "simulation_distance"
-            if value.as_u64().is_some_and(|value| (2..=32).contains(&value)) => Ok(()),
+            if value
+                .as_u64()
+                .is_some_and(|value| (2..=32).contains(&value)) =>
+        {
+            Ok(())
+        }
         "hardcore" | "whitelist" if value.as_bool().is_some() => Ok(()),
         _ => anyhow::bail!("invalid settings key or value"),
     }
 }
 
 pub(crate) fn create_login_link() -> Result<String> {
+    anyhow::ensure!(
+        !crate::config()?.ci_preview,
+        "server login links are unavailable for CI previews"
+    );
     let response = post_empty("/api/v1/server/login-links")?;
-    let url = response
+    response
         .get("url")
         .and_then(Value::as_str)
-        .context("login link response omitted its URL")?;
-    Ok(force_https_url(url))
+        .map(str::to_owned)
+        .context("login link response omitted its URL")
 }
 
-fn force_https_url(url: &str) -> String {
-    url.strip_prefix("http://")
-        .map_or_else(|| url.to_owned(), |rest| format!("https://{rest}"))
+pub(crate) fn add_whitelist_entry(name: &str) -> Result<()> {
+    post(
+        &server_path("/whitelist")?,
+        &serde_json::json!({"name": name}),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn remove_whitelist_entry(player_id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(player_id).context("whitelist entry has an invalid player id")?;
+    delete(&format!(
+        "{}?player_id={player_id}",
+        server_path("/whitelist")?
+    ))?;
+    Ok(())
 }
 
 pub(crate) fn server_command(
@@ -430,9 +476,30 @@ mod tests {
     }
 
     #[test]
-    fn login_links_are_upgraded_to_https_before_they_reach_chat() {
-        assert_eq!(force_https_url("http://panel.example/auth/server#token=x"), "https://panel.example/auth/server#token=x");
-        assert_eq!(force_https_url("https://panel.example/auth/server#token=x"), "https://panel.example/auth/server#token=x");
+    fn insecure_http_is_limited_to_the_fixed_runtime_proxy_endpoint() {
+        assert!(Endpoint::parse("http://kurbis-runtime-api-proxy:8080", true).is_ok());
+        assert!(Endpoint::parse("http://kurbis-runtime-api-proxy:8081", true).is_err());
+        assert!(Endpoint::parse("http://other-proxy:8080", true).is_err());
+        assert!(Endpoint::parse("http://kurbis-runtime-api-proxy:8080", false).is_err());
+    }
+
+    #[test]
+    fn setting_values_are_validated_before_being_sent_to_the_control_plane() {
+        for (key, value) in [
+            ("motd", serde_json::json!("Welcome")),
+            ("difficulty", serde_json::json!("Hard")),
+            ("gamemode", serde_json::json!("Creative")),
+            ("view_distance", serde_json::json!(32)),
+            ("simulation_distance", serde_json::json!(2)),
+            ("hardcore", serde_json::json!(true)),
+            ("whitelist", serde_json::json!(false)),
+        ] {
+            assert!(validate_setting_value(key, &value).is_ok(), "{key}={value}");
+        }
+        assert!(validate_setting_value("view_distance", &serde_json::json!(1)).is_err());
+        assert!(validate_setting_value("difficulty", &serde_json::json!("Impossible")).is_err());
+        assert!(validate_setting_value("unknown", &serde_json::json!(true)).is_err());
+        assert!(validate_setting_value("motd", &serde_json::json!("x".repeat(121))).is_err());
     }
 
     #[test]

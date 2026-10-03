@@ -8,7 +8,7 @@ use pumpkin_plugin_api::{
     commands::CommandHandler,
     text::TextComponent,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     actions, api, chat,
@@ -24,6 +24,7 @@ pub(crate) fn command() -> Command {
         .then(view("logs"))
         .then(view("activity"))
         .then(view("settings"))
+        .then(view("whitelist"))
         .then(view("snapshots"))
         .then(settings_command())
         .then(whitelist_command())
@@ -62,7 +63,7 @@ fn whitelist_command() -> CommandNode {
         .execute(Handler("whitelist"))
         .then(
             CommandNode::literal("add")
-                .then(word("player_id").then(word("name").execute(Handler("whitelist_add")))),
+                .then(word("name").execute(Handler("whitelist_add"))),
         )
         .then(
             CommandNode::literal("remove")
@@ -114,8 +115,8 @@ impl CommandHandler for Handler {
                 }
                 "status" => page(&sender, View::Status)?,
                 "players" => page(&sender, View::Players(0))?,
-                "logs" => page(&sender, View::Logs)?,
-                "activity" => page(&sender, View::Activity)?,
+                "logs" => page(&sender, View::Logs(0))?,
+                "activity" => page(&sender, View::Activity(0))?,
                 "settings" => page(&sender, View::Settings)?,
                 "whitelist" => page(&sender, View::Whitelist(0))?,
                 "snapshots" => page(&sender, View::Snapshots(0))?,
@@ -147,21 +148,20 @@ impl CommandHandler for Handler {
                 }
                 "set" => update_setting(&sender, &args)?,
                 "whitelist_add" => {
-                    let player_id = uuid::Uuid::parse_str(&arg(&args, "player_id")?)?;
                     let name = arg(&args, "name")?;
-                    api::post(
-                        &api::server_path("/whitelist")?,
-                        &json!({"player_id": player_id, "name": name}),
-                    )?;
+                    api::add_whitelist_entry(&name)?;
                     say(&sender, &format!("Added {name} to the whitelist."));
+                    if let Some(player) = sender.as_player() {
+                        let _ = menu::open(&player, View::Whitelist(0));
+                    }
                 }
                 "whitelist_remove" => {
-                    let player_id = uuid::Uuid::parse_str(&arg(&args, "player_id")?)?;
-                    api::delete(&format!(
-                        "{}?player_id={player_id}",
-                        api::server_path("/whitelist")?
-                    ))?;
+                    let player_id = arg(&args, "player_id")?;
+                    api::remove_whitelist_entry(&player_id)?;
                     say(&sender, &format!("Removed {player_id} from the whitelist."));
+                    if let Some(player) = sender.as_player() {
+                        let _ = menu::open(&player, View::Whitelist(0));
+                    }
                 }
                 actions::RESTORE_PROMPT_HANDLER => {
                     let generation = positive_generation(&arg(&args, "generation")?)?;
@@ -229,9 +229,12 @@ fn update_setting(sender: &CommandSender, args: &ConsumedArgs) -> Result<()> {
     say(
         sender,
         &format!(
-            "Updated server setting {key}. Settings can be changed while the server is sleeping."
+            "Updated server setting {key}. Runtime configuration changes apply after the next server start."
         ),
     );
+    if let Some(player) = sender.as_player() {
+        let _ = menu::open(&player, View::Settings);
+    }
     Ok(())
 }
 

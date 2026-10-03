@@ -1,5 +1,4 @@
 mod actions;
-mod book;
 mod api;
 mod chat;
 mod command;
@@ -14,7 +13,10 @@ use std::{
 
 use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata,
-    events::{EventPriority, InventoryClickEvent, InventoryCloseEvent, InventoryDragEvent},
+    events::{
+        BedrockFormResponseEvent, EventPriority, InventoryClickEvent, InventoryCloseEvent,
+        InventoryDragEvent, PlayerChatEvent,
+    },
     permission::{Permission, PermissionDefault, PermissionLevel},
     permissions, register_plugin,
 };
@@ -29,6 +31,8 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 pub(crate) struct Config {
     pub api_base_url: String,
     pub allow_insecure_local_http: bool,
+    #[serde(default)]
+    pub ci_preview: bool,
     pub server_id: Uuid,
     pub capability: String,
 }
@@ -111,8 +115,13 @@ impl Plugin for KurbisControl {
             EventPriority::High,
             true,
         )?;
-        context.register_event_handler::<pumpkin_plugin_api::events::PlayerEditBookEvent, _>(
-            menu::EditBook,
+        context.register_event_handler::<PlayerChatEvent, _>(
+            menu::ChatInput,
+            EventPriority::High,
+            true,
+        )?;
+        context.register_event_handler::<BedrockFormResponseEvent, _>(
+            menu::BedrockForm,
             EventPriority::High,
             true,
         )?;

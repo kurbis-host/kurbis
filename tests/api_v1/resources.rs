@@ -144,10 +144,10 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         ))
         .await
         .unwrap();
-    assert_eq!(online_settings.status(), StatusCode::CONFLICT);
+    assert_eq!(online_settings.status(), StatusCode::OK);
     assert_eq!(
-        json_body(online_settings).await["code"],
-        "server_not_sleeping"
+        json_body(online_settings).await["settings"]["difficulty"],
+        "Hard"
     );
 
     let online_subdomain = app
@@ -161,6 +161,10 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .await
         .unwrap();
     assert_eq!(online_subdomain.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(online_subdomain).await["code"],
+        "server_not_sleeping"
+    );
     sqlx::query(
         "UPDATE servers SET observed_state = 'sleeping', desired_state = 'stopped' WHERE id = $1",
     )
