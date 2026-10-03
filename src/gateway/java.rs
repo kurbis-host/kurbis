@@ -5,15 +5,21 @@ use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    time::{Instant, sleep},
 };
 
 use crate::{
     config::GatewayConfig,
-    gateway::routes::RouteCache,
+    gateway::{
+        route_wait::{RouteLease, RouteProtocol},
+        routes::RouteCache,
+    },
     model::{ObservedState, RouteTarget},
 };
 
 const MAX_HANDSHAKE_FRAME: usize = 8 * 1024;
+const ROUTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const CLIENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Debug)]
 struct Handshake {
@@ -63,13 +69,61 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
             if !routes.accepts_server_address(&handshake.hostname) {
                 return send_login_disconnect(&mut client, "Unknown server address").await;
             }
-            handle_login(client, config, handshake).await
+            handle_login(client, config, routes, handshake).await
         }
         _ => Ok(()),
     }
 }
 
 async fn handle_login(
+    client: TcpStream,
+    config: &GatewayConfig,
+    routes: &RouteCache,
+    handshake: Handshake,
+) -> Result<()> {
+    let target = routes.resolve(&handshake.hostname).await?;
+    let Some(target) = target else {
+        // An accepted but unregistered hostname still needs the waiting
+        // runtime: it authenticates the player and performs admission/account
+        // creation before the first server can be selected.
+        return proxy_to_waiting(client, config, handshake).await;
+    };
+
+    if target.account_suspended {
+        let mut client = client;
+        return send_login_disconnect(
+            &mut client,
+            "Server suspended. Contact the hosting operator.",
+        )
+        .await;
+    }
+
+    if let Some(lease) = java_lease(&target) {
+        return proxy_to_backend(client, handshake, lease).await;
+    }
+
+    if target.state == ObservedState::Failed {
+        let mut client = client;
+        return send_login_disconnect(
+            &mut client,
+            "Server failed to start. Retry it from the panel.",
+        )
+        .await;
+    }
+
+    if target.state == ObservedState::Online || target.worker_healthy == Some(false) {
+        let mut client = client;
+        return send_login_disconnect(
+            &mut client,
+            "Server is temporarily unavailable. Please reconnect shortly.",
+        )
+        .await;
+    }
+
+    wait_for_backend(client, config, routes, handshake, target).await
+}
+
+async fn proxy_to_waiting(
     mut client: TcpStream,
     config: &GatewayConfig,
     handshake: Handshake,
@@ -88,6 +142,124 @@ async fn handle_login(
     waiting.write_all(&handshake.framed).await?;
     let _ = tokio::io::copy_bidirectional(&mut client, &mut waiting).await?;
     Ok(())
+}
+
+async fn proxy_to_backend(
+    mut client: TcpStream,
+    handshake: Handshake,
+    lease: RouteLease,
+) -> Result<()> {
+    let backend_address = lease.socket_addr();
+    let mut backend = match connect_backend(backend_address).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::debug!(server_id = %lease.server_id, generation = lease.generation,
+                backend = %backend_address, ?error, "Java backend is unreachable");
+            return send_login_disconnect(
+                &mut client,
+                "Server is temporarily unavailable. Please reconnect shortly.",
+            )
+            .await;
+        }
+    };
+    backend.write_all(&handshake.framed).await?;
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    Ok(())
+}
+
+async fn wait_for_backend(
+    mut client: TcpStream,
+    config: &GatewayConfig,
+    routes: &RouteCache,
+    handshake: Handshake,
+    mut target: RouteTarget,
+) -> Result<()> {
+    let deadline = Instant::now() + config.wake_timeout;
+    let mut wake_requested = false;
+
+    loop {
+        if target.account_suspended {
+            return send_login_disconnect(
+                &mut client,
+                "Server suspended. Contact the hosting operator.",
+            )
+            .await;
+        }
+        if target.state == ObservedState::Failed {
+            return send_login_disconnect(
+                &mut client,
+                "Server failed to start. Retry it from the panel.",
+            )
+            .await;
+        }
+        if let Some(lease) = java_lease(&target) {
+            return proxy_to_backend(client, handshake, lease).await;
+        }
+        if target.state == ObservedState::Online || target.worker_healthy == Some(false) {
+            return send_login_disconnect(
+                &mut client,
+                "Server is temporarily unavailable. Please reconnect shortly.",
+            )
+            .await;
+        }
+
+        if !wake_requested && wake_allowed(target.state) {
+            if let Err(error) = crate::gateway::wake::request_wake(config, target.server_id).await {
+                tracing::warn!(server_id = %target.server_id, ?error, "failed to wake Java route");
+                return send_login_disconnect(
+                    &mut client,
+                    "Server could not be started. Please reconnect shortly.",
+                )
+                .await;
+            }
+            wake_requested = true;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return send_login_disconnect(
+                &mut client,
+                "Server is taking too long to start. Please reconnect shortly.",
+            )
+            .await;
+        }
+        sleep((deadline - now).min(ROUTE_POLL_INTERVAL)).await;
+        if client_disconnected(&client).await {
+            return Ok(());
+        }
+
+        target = match routes.resolve(&handshake.hostname).await? {
+            Some(target) => target,
+            None => {
+                return send_login_disconnect(&mut client, "Unknown or deleted server address.")
+                    .await;
+            }
+        };
+    }
+}
+
+fn java_lease(target: &RouteTarget) -> Option<RouteLease> {
+    RouteLease::from_target(target, RouteProtocol::Java)
+}
+
+fn wake_allowed(state: ObservedState) -> bool {
+    matches!(
+        state,
+        ObservedState::Sleeping
+            | ObservedState::Queued
+            | ObservedState::Restoring
+            | ObservedState::Starting
+            | ObservedState::Stopping
+            | ObservedState::Snapshotting
+    )
+}
+
+async fn client_disconnected(client: &TcpStream) -> bool {
+    let mut probe = [0_u8; 1];
+    match tokio::time::timeout(CLIENT_PROBE_TIMEOUT, client.peek(&mut probe)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => true,
+        Ok(Ok(_)) | Err(_) => false,
+    }
 }
 
 async fn connect_backend(address: impl tokio::net::ToSocketAddrs) -> Result<TcpStream> {
@@ -351,7 +523,9 @@ mod tests {
             backend.shutdown().await.unwrap();
         });
         client.shutdown().await.unwrap();
-        handle_login(accepted, &config, handshake).await.unwrap();
+        proxy_to_waiting(accepted, &config, handshake)
+            .await
+            .unwrap();
         waiting.await.unwrap();
 
         let packet = read_frame(&mut client, 1024).await.unwrap();
@@ -400,7 +574,9 @@ mod tests {
             framed: Vec::new(),
         };
 
-        handle_login(accepted, &config, handshake).await.unwrap();
+        proxy_to_waiting(accepted, &config, handshake)
+            .await
+            .unwrap();
 
         let packet = read_frame(&mut client, 1024).await.unwrap();
         let mut cursor = 0;
@@ -411,6 +587,97 @@ mod tests {
             message["text"],
             "Waiting server is temporarily unavailable. Please reconnect shortly."
         );
+    }
+
+    fn route_target(state: ObservedState) -> RouteTarget {
+        RouteTarget {
+            server_id: uuid::Uuid::new_v4(),
+            subdomain: "friends".into(),
+            state,
+            account_suspended: false,
+            generation: 1,
+            worker_healthy: Some(true),
+            worker_valid_until: None,
+            worker_address: Some("127.0.0.1".into()),
+            java_port: Some(25565),
+            bedrock_port: Some(19132),
+        }
+    }
+
+    #[test]
+    fn only_healthy_online_routes_bypass_waiting() {
+        assert_eq!(
+            java_lease(&route_target(ObservedState::Online)).map(|lease| lease.socket_addr()),
+            Some("127.0.0.1:25565".parse().unwrap())
+        );
+        assert!(java_lease(&route_target(ObservedState::Starting)).is_none());
+
+        let mut unhealthy = route_target(ObservedState::Online);
+        unhealthy.worker_healthy = Some(false);
+        assert!(java_lease(&unhealthy).is_none());
+
+        let mut suspended = route_target(ObservedState::Online);
+        suspended.account_suspended = true;
+        assert!(java_lease(&suspended).is_none());
+    }
+
+    #[test]
+    fn startup_states_request_one_idempotent_wake() {
+        for state in [
+            ObservedState::Sleeping,
+            ObservedState::Queued,
+            ObservedState::Restoring,
+            ObservedState::Starting,
+            ObservedState::Stopping,
+            ObservedState::Snapshotting,
+        ] {
+            assert!(wake_allowed(state), "{state:?} should request a wake");
+        }
+        assert!(!wake_allowed(ObservedState::Online));
+        assert!(!wake_allowed(ObservedState::Resetting));
+        assert!(!wake_allowed(ObservedState::Failed));
+    }
+
+    #[tokio::test]
+    async fn online_backend_receives_original_handshake_without_waiting_hop() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let outbound = TcpStream::connect(client_listener.local_addr().unwrap());
+        let (accepted, outbound) = tokio::join!(client_listener.accept(), outbound);
+        let (accepted, _) = accepted.unwrap();
+        let mut client = outbound.unwrap();
+
+        let handshake = Handshake {
+            protocol: 777,
+            hostname: "friends.example.test".into(),
+            next_state: 2,
+            framed: vec![0x05, 0x00, 0x01, 0x02, 0x03, 0x04],
+        };
+        let expected = handshake.framed.clone();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let mut received = vec![0; expected.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            send_login_disconnect(&mut stream, "direct backend fixture")
+                .await
+                .unwrap();
+        });
+
+        let mut target = route_target(ObservedState::Online);
+        target.java_port = Some(backend_address.port());
+        let lease = java_lease(&target).expect("direct Java lease");
+        client.shutdown().await.unwrap();
+        proxy_to_backend(accepted, handshake, lease).await.unwrap();
+        backend.await.unwrap();
+
+        let packet = read_frame(&mut client, 1024).await.unwrap();
+        let mut cursor = 0;
+        assert_eq!(read_varint(&packet, &mut cursor).unwrap(), 0);
+        let message: serde_json::Value =
+            serde_json::from_str(&read_string(&packet, &mut cursor, 255).unwrap()).unwrap();
+        assert_eq!(message["text"], "direct backend fixture");
     }
 
     #[test]
