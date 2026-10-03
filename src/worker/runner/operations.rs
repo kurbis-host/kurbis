@@ -14,10 +14,16 @@ impl WorkerRunner {
             {
                 tracing::error!(operation_id = %op.id, ?error, "operation failed");
                 let error = format!("{error:#}");
-                if self.control_plane.retry_operation(&op, &error).await? {
-                    tracing::warn!(operation_id = %op.id, attempt = op.attempt, "operation scheduled for retry");
-                } else {
-                    tracing::error!(operation_id = %op.id, "operation exhausted retries");
+                match self.control_plane.retry_operation(&op, &error).await? {
+                    OperationRetryOutcome::Scheduled => {
+                        tracing::warn!(operation_id = %op.id, attempt = op.attempt, "operation scheduled for retry");
+                    }
+                    OperationRetryOutcome::Exhausted => {
+                        tracing::error!(operation_id = %op.id, "operation exhausted retries");
+                    }
+                    OperationRetryOutcome::NoLongerCurrent => {
+                        tracing::debug!(operation_id = %op.id, "operation was already finalized or superseded; continuing worker reconciliation");
+                    }
                 }
             }
             if let Err(error) = self.maintain_online_servers().await {
@@ -316,7 +322,6 @@ impl WorkerRunner {
         self.control_plane
             .complete_restore(op, target_generation, snapshot_generation, snapshot_size)
             .await?;
-        clear_players(&self.control_plane, op.server_id, op.generation).await?;
         self.idle_since.remove(&op.server_id);
         self.last_snapshot.remove(&op.server_id);
         Ok(())
@@ -693,7 +698,6 @@ impl WorkerRunner {
         self.control_plane
             .complete_stop(op, snapshot_generation, snapshot_size)
             .await?;
-        clear_players(&self.control_plane, op.server_id, op.generation).await?;
         self.idle_since.remove(&op.server_id);
         self.last_snapshot.remove(&op.server_id);
         Ok(())

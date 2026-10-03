@@ -15,6 +15,13 @@ const MAX_WORKER_ERROR_BYTES: usize = 1_000;
 #[serde(deny_unknown_fields)]
 pub(super) struct EmptyRequest {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperationRetryOutcome {
+    Scheduled,
+    Exhausted,
+    NoLongerCurrent,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerControl {
     base_url: Url,

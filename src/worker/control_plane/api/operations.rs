@@ -1,11 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::contracts::worker::OperationProgress;
 use crate::model::OperationRecord;
 
-use super::super::{EmptyRequest, WorkerControl, bounded_worker_error};
+use super::super::{EmptyRequest, OperationRetryOutcome, WorkerControl, bounded_worker_error};
 
 impl WorkerControl {
     pub async fn claim_operation(&self) -> Result<Option<OperationRecord>> {
@@ -31,15 +32,45 @@ impl WorkerControl {
         .await
     }
 
-    pub async fn retry_operation(&self, operation: &OperationRecord, error: &str) -> Result<bool> {
+    pub(crate) async fn retry_operation(
+        &self,
+        operation: &OperationRecord,
+        error: &str,
+    ) -> Result<OperationRetryOutcome> {
         let error = bounded_worker_error(error);
-        let response: RetryOperationResponse = self
-            .post_json(
-                &format!("/internal/worker/control/operations/{}/retry", operation.id),
-                &OperationErrorFenceRequest::new(operation, error.as_ref()),
-            )
-            .await?;
-        Ok(response.retry_scheduled)
+        let path = format!("/internal/worker/control/operations/{}/retry", operation.id);
+        let response = self
+            .authorized_request(Method::POST, self.endpoint(&path)?)?
+            .json(&OperationErrorFenceRequest::new(operation, error.as_ref()))
+            .send()
+            .await
+            .context("send worker control-plane request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            if status == StatusCode::CONFLICT
+                && serde_json::from_str::<WorkerControlError>(&body)
+                    .is_ok_and(|response| response.code == "stale_worker_assignment")
+            {
+                return Ok(OperationRetryOutcome::NoLongerCurrent);
+            }
+            bail!(
+                "worker control-plane request {path} failed with status {status}: {}",
+                body.trim()
+            );
+        }
+        let response: RetryOperationResponse = response
+            .json()
+            .await
+            .context("decode worker control-plane response")?;
+        Ok(if response.retry_scheduled {
+            OperationRetryOutcome::Scheduled
+        } else {
+            OperationRetryOutcome::Exhausted
+        })
     }
 
     pub async fn begin_snapshot_retry(&self, operation: &OperationRecord) -> Result<()> {
@@ -98,6 +129,8 @@ impl WorkerControl {
         snapshot_generation: i64,
         storage_bytes: i64,
     ) -> Result<()> {
+        self.clear_players(operation.server_id, operation.generation)
+            .await?;
         self.complete_operation(
             operation,
             OperationCompletion::Stop {
@@ -115,6 +148,8 @@ impl WorkerControl {
         snapshot_generation: i64,
         storage_bytes: i64,
     ) -> Result<()> {
+        self.clear_players(operation.server_id, operation.generation)
+            .await?;
         self.complete_operation(
             operation,
             OperationCompletion::Restore {
@@ -267,6 +302,11 @@ impl<'a> OperationErrorFenceRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkerControlError {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetryOperationResponse {
     retry_scheduled: bool,
@@ -322,4 +362,180 @@ enum OperationCompletion {
         was_running: bool,
     },
     Delete,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::{
+        model::{OperationKind, OperationStatus},
+        worker::control_plane::OperationRetryOutcome,
+    };
+
+    #[derive(Clone, Default)]
+    struct RequestOrder(Arc<Mutex<Vec<&'static str>>>);
+
+    async fn clear_players(State(order): State<RequestOrder>) -> StatusCode {
+        order.0.lock().unwrap().push("clear_players");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn complete_operation(State(order): State<RequestOrder>) -> StatusCode {
+        order.0.lock().unwrap().push("complete_operation");
+        StatusCode::NO_CONTENT
+    }
+
+    fn operation(kind: OperationKind) -> OperationRecord {
+        let now = Utc::now();
+        OperationRecord {
+            id: Uuid::new_v4(),
+            server_id: Uuid::new_v4(),
+            worker_id: Some(Uuid::new_v4()),
+            kind,
+            status: OperationStatus::Running,
+            generation: 7,
+            attempt: 1,
+            payload: Value::Null,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn control_plane_app(app: Router) -> (WorkerControl, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let control =
+            WorkerControl::new(&format!("http://{address}"), &"a".repeat(43), true).unwrap();
+        (control, task)
+    }
+
+    #[tokio::test]
+    async fn stop_and_restore_clear_players_before_releasing_the_operation_fence() {
+        let order = RequestOrder::default();
+        let app = Router::new()
+            .route(
+                "/internal/worker/control/servers/{server_id}/players",
+                post(clear_players),
+            )
+            .route(
+                "/internal/worker/control/operations/{operation_id}/complete",
+                post(complete_operation),
+            )
+            .with_state(order.clone());
+        let (control, server) = control_plane_app(app).await;
+
+        control
+            .complete_stop(&operation(OperationKind::Stop), 8, 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            order.0.lock().unwrap().as_slice(),
+            &["clear_players", "complete_operation"]
+        );
+
+        order.0.lock().unwrap().clear();
+        control
+            .complete_restore(&operation(OperationKind::Restore), 3, 9, 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            order.0.lock().unwrap().as_slice(),
+            &["clear_players", "complete_operation"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_prevents_operation_completion() {
+        let order = RequestOrder::default();
+        let app = Router::new()
+            .route(
+                "/internal/worker/control/servers/{server_id}/players",
+                post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "code": "worker_assignment_invalid",
+                            "message": "assignment no longer current"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/internal/worker/control/operations/{operation_id}/complete",
+                post(complete_operation),
+            )
+            .with_state(order.clone());
+        let (control, server) = control_plane_app(app).await;
+
+        assert!(
+            control
+                .complete_stop(&operation(OperationKind::Stop), 8, 1024)
+                .await
+                .is_err()
+        );
+        assert!(order.0.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unrelated_retry_conflicts_remain_errors() {
+        let app = Router::new().route(
+            "/internal/worker/control/operations/{operation_id}/retry",
+            post(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "code": "operation_retry_denied",
+                        "message": "retry is not permitted"
+                    })),
+                )
+            }),
+        );
+        let (control, server) = control_plane_app(app).await;
+
+        let error = control
+            .retry_operation(&operation(OperationKind::Stop), "transient failure")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("operation_retry_denied"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_of_a_completed_or_superseded_operation_is_not_fatal() {
+        let app = Router::new().route(
+            "/internal/worker/control/operations/{operation_id}/retry",
+            post(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "code": "stale_worker_assignment",
+                        "message": "operation is no longer current"
+                    })),
+                )
+            }),
+        );
+        let (control, server) = control_plane_app(app).await;
+
+        assert_eq!(
+            control
+                .retry_operation(&operation(OperationKind::Stop), "late cleanup")
+                .await
+                .unwrap(),
+            OperationRetryOutcome::NoLongerCurrent
+        );
+        server.abort();
+    }
 }

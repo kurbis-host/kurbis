@@ -25,7 +25,7 @@ use crate::{
         SERVER_STORAGE_BYTES, SnapshotReason,
     },
     worker::{
-        control_plane::WorkerControl,
+        control_plane::{OperationRetryOutcome, WorkerControl},
         docker::DockerRuntime,
         idle::IdleTimer,
         panel_state::{
