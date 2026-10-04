@@ -16,6 +16,7 @@ import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import tarfile
@@ -47,7 +48,7 @@ from runtime_verification_protocol import (
 from verify_host_control import rpc
 
 
-def build_runtime_api_proxy_image(base_image: str, bin_dir: Path, root: Path, identifier: str) -> str:
+def build_runtime_api_proxy_image(proxy_base_image: str, bin_dir: Path, root: Path, identifier: str) -> str:
     image = f"melon-runtime-api-proxy-{identifier}:test"
     context = root / "runtime-api-proxy-image"
     context.mkdir(parents=True, exist_ok=True)
@@ -56,7 +57,7 @@ def build_runtime_api_proxy_image(base_image: str, bin_dir: Path, root: Path, id
         raise RuntimeError(f"runtime API proxy binary is missing: {binary}")
     shutil.copy2(binary, context / "runtime-api-proxy")
     (context / "Dockerfile").write_text(
-        f"FROM {base_image}\n"
+        f"FROM {proxy_base_image}\n"
         "USER 0:0\n"
         "COPY runtime-api-proxy /usr/local/bin/runtime-api-proxy\n"
         "RUN chmod 0755 /usr/local/bin/runtime-api-proxy\n"
@@ -88,10 +89,10 @@ def api_proxy_probe(image: str, network: str, url: str, token: str, method="GET"
     return json.loads(result.stdout)
 
 
-def api_proxy_egress_probe(image: str, network: str, target: str):
+def api_proxy_egress_probe(container: str, target: str):
     result = subprocess.run(
-        ["docker", "run", "--rm", "--network", network, "--interactive",
-         "--entrypoint", "/usr/local/bin/runtime-api-proxy", image, "--probe-egress"],
+        ["docker", "exec", "--interactive", container,
+         "/usr/local/bin/runtime-api-proxy", "--probe-egress"],
         input=target,
         text=True,
         capture_output=True,
@@ -150,10 +151,20 @@ def create_ci_fixture_artifact(base_image: str, root: Path, bin_dir: Path, previ
     return artifact_bytes, digest, commit, architecture
 
 
+def can_open_local_port(port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--pumpkin-image", default="melon-pumpkin:host-control")
+    parser.add_argument("--runtime-host-image", default="melon-hoster:local",
+                        help="worker image containing the iptables-backed API proxy")
     parser.add_argument("--output", type=Path, default=Path("/opt/melon-hoster-verification/results"))
     parser.add_argument("--native-binary", type=Path)
     parser.add_argument("--plugin-wasm", type=Path)
@@ -197,9 +208,11 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="melon-runtime-", dir="/tmp" if native else "/opt/melon-hoster-verification"))
     identifier = uuid.uuid4().hex[:12]
-    proxy_image = None if native else build_runtime_api_proxy_image(args.pumpkin_image, args.bin_dir, root, identifier)
+    proxy_image = None if native else build_runtime_api_proxy_image(args.runtime_host_image, args.bin_dir, root, identifier)
     proxy_egress_network = None if native else f"kurbis-runtime-api-egress-{identifier}"
     proxy_upstream = None
+    egress_gateway = None
+    egress_canary_port = None
     postgres = f"melon-runtime-db-{identifier}"
     server = str(uuid.uuid4())
     owner = str(uuid.uuid4())
@@ -509,6 +522,14 @@ def main():
         assert all(capability not in value for value in proxy_environment.values()), "raw server capability reached API proxy environment"
         assert not inspect["HostConfig"]["PortBindings"], "API proxy must not publish a host port"
         assert inspect["HostConfig"]["ReadonlyRootfs"] and inspect["HostConfig"]["CapDrop"] == ["ALL"]
+        assert set(inspect["HostConfig"]["CapAdd"]) == {"NET_ADMIN", "SETUID", "SETGID", "SETPCAP"}
+        proxy_process_status = run("docker", "exec", "--user", "65532:65532",
+                                   f"kurbis-api-proxy-{uuid.UUID(server).hex}",
+                                   "sh", "-c", "grep -E '^(Uid|Gid|CapEff|NoNewPrivs):' /proc/1/status").stdout
+        assert "Uid:\t65532\t65532\t65532\t65532" in proxy_process_status
+        assert "Gid:\t65532\t65532\t65532\t65532" in proxy_process_status
+        assert "CapEff:\t0000000000000000" in proxy_process_status
+        assert "NoNewPrivs:\t1" in proxy_process_status
         assert set(inspect["NetworkSettings"]["Networks"]) == {network, proxy_egress_network}
         runtime_inspect = json.loads(run("docker", "inspect", backend).stdout)[0]
         runtime_environment = dict(item.split("=", 1) for item in runtime_inspect["Config"]["Env"] if "=" in item)
@@ -530,18 +551,31 @@ def main():
             f"{proxy_url}/api/v1/servers/{sibling_id}/players", capability,
         )
         assert sibling["status"] == 404, sibling
-        direct = api_proxy_egress_probe(proxy_image, network, "http://1.1.1.1/")
+        direct = api_proxy_egress_probe(backend, "http://1.1.1.1/")
         assert direct == {"reachable": False}, direct
-        proxy_direct = api_proxy_egress_probe(proxy_image, proxy_egress_network, "http://1.1.1.1/")
-        assert proxy_direct == {"reachable": False}, proxy_direct
+        proxy_name = f"kurbis-api-proxy-{uuid.UUID(server).hex}"
+        allowed_upstream = api_proxy_egress_probe(proxy_name, f"{proxy_upstream}/healthz")
+        assert allowed_upstream == {"reachable": True, "status": 204}, allowed_upstream
+        denied_host_service = api_proxy_egress_probe(proxy_name, f"http://{egress_gateway}:{egress_canary_port}/")
+        assert denied_host_service == {"reachable": False}, denied_host_service
+        denied_ipv6 = api_proxy_egress_probe(proxy_name, f"http://[2606:4700:4700::1111]:{egress_canary_port}/")
+        assert denied_ipv6 == {"reachable": False}, denied_ipv6
+        ipv4_policy = run("docker", "exec", "--user", "0:0", proxy_name, "/usr/sbin/iptables", "-S", "OUTPUT").stdout
+        ipv6_policy = run("docker", "exec", "--user", "0:0", proxy_name, "/usr/sbin/ip6tables", "-S", "OUTPUT").stdout
+        assert "-P OUTPUT DROP" in ipv4_policy and f"--dport {api_port} -j ACCEPT" in ipv4_policy
+        assert f"--dport {egress_canary_port} -j ACCEPT" not in ipv4_policy
+        assert "-P OUTPUT DROP" in ipv6_policy and "-A OUTPUT" not in ipv6_policy
         evidence["checks"].append({
             "managed_plugin_api_proxy": {
                 "runtime": "normal",
                 "own_server_api_status": own["status"],
                 "account_api_denied_status": account["status"],
                 "sibling_server_api_denied_status": sibling["status"],
-                "direct_external_egress_blocked": True,
-                "proxy_external_egress_blocked": True,
+                "runtime_direct_external_egress_blocked": True,
+                "configured_origin_reachable_from_proxy": allowed_upstream["status"] == 204,
+                "alternate_host_service_blocked_by_proxy_firewall": True,
+                "ipv6_egress_blocked": True,
+                "ipv4_and_ipv6_output_policies_verified": True,
             }
         })
 
@@ -623,18 +657,31 @@ def main():
             capability,
         )
         assert sibling["status"] == 404, sibling
-        direct = api_proxy_egress_probe(proxy_image, network, "http://1.1.1.1/")
+        direct = api_proxy_egress_probe(f"kurbis-ci-{uuid.UUID(preview_id).hex}", "http://1.1.1.1/")
         assert direct == {"reachable": False}, direct
-        proxy_direct = api_proxy_egress_probe(proxy_image, proxy_egress_network, "http://1.1.1.1/")
-        assert proxy_direct == {"reachable": False}, proxy_direct
+        proxy_name = f"kurbis-api-proxy-{uuid.UUID(preview_id).hex}"
+        allowed_upstream = api_proxy_egress_probe(proxy_name, f"{proxy_upstream}/healthz")
+        assert allowed_upstream == {"reachable": True, "status": 204}, allowed_upstream
+        denied_host_service = api_proxy_egress_probe(proxy_name, f"http://{egress_gateway}:{egress_canary_port}/")
+        assert denied_host_service == {"reachable": False}, denied_host_service
+        denied_ipv6 = api_proxy_egress_probe(proxy_name, f"http://[2606:4700:4700::1111]:{egress_canary_port}/")
+        assert denied_ipv6 == {"reachable": False}, denied_ipv6
+        ipv4_policy = run("docker", "exec", "--user", "0:0", proxy_name, "/usr/sbin/iptables", "-S", "OUTPUT").stdout
+        ipv6_policy = run("docker", "exec", "--user", "0:0", proxy_name, "/usr/sbin/ip6tables", "-S", "OUTPUT").stdout
+        assert "-P OUTPUT DROP" in ipv4_policy and f"--dport {api_port} -j ACCEPT" in ipv4_policy
+        assert f"--dport {egress_canary_port} -j ACCEPT" not in ipv4_policy
+        assert "-P OUTPUT DROP" in ipv6_policy and "-A OUTPUT" not in ipv6_policy
         evidence["checks"].append({
             "managed_plugin_api_proxy": {
                 "runtime": "ci",
                 "own_preview_api_status": own["status"],
                 "account_api_denied_status": account["status"],
                 "sibling_preview_api_denied_status": sibling["status"],
-                "direct_external_egress_blocked": True,
-                "proxy_external_egress_blocked": True,
+                "runtime_direct_external_egress_blocked": True,
+                "configured_origin_reachable_from_proxy": allowed_upstream["status"] == 204,
+                "alternate_host_service_blocked_by_proxy_firewall": True,
+                "ipv6_egress_blocked": True,
+                "ipv4_and_ipv6_output_policies_verified": True,
             }
         })
         stopping = api_proxy_probe(
@@ -860,6 +907,16 @@ def main():
             except (TimeoutError, urllib.error.URLError):
                 return False
         wait(control_plane_ready, "control-plane HTTP readiness", timeout=90)
+        if not native:
+            egress_canary_port = free_port()
+            canary = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(egress_canary_port),
+                 "--bind", "0.0.0.0", "--directory", str(root)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            processes.append(canary)
+            wait(lambda: canary.poll() is None and can_open_local_port(egress_canary_port),
+                 "alternate host egress canary readiness", 20)
         seed_account(owner, owner, "Runtime Test", link_runtime_player=True)
         sql(f"INSERT INTO servers(id,owner_id,subdomain) VALUES('{server}','{owner}','live'); UPDATE servers SET settings = '{{\"view_distance\":2,\"simulation_distance\":2}}' WHERE id = '{server}'")
         cookie = user_session()
