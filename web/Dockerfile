@@ -7,11 +7,14 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile --ignore-scripts
 
 FROM dependencies AS build
+ARG BUILD_REVISION=development
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm run build
 
 FROM base AS runtime
+ARG BUILD_REVISION=development
+LABEL org.opencontainers.image.revision=${BUILD_REVISION}
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME=0.0.0.0
