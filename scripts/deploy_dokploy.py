@@ -340,8 +340,10 @@ def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
     return result
 
 
-def legacy_wait_baseline(manifest: dict) -> dict[str,list[dict[str,str]]]:
-    inventory=manifest["expected_inventory"]
+def legacy_wait_baseline(inventory: dict) -> dict[str,list[dict[str,str]]]:
+    # Bootstrap returns the captured inventory itself; tests/operators may also pass
+    # the reviewed manifest wrapper used elsewhere in the rollout.
+    inventory=inventory.get("expected_inventory",inventory)
     return {name:[{"id":item["container_id"],"image":item["image_id"],"status":item["status"],
                    "health":item["health"],"revision":""}]
             for name,item in inventory["services"].items()}

@@ -61,6 +61,7 @@ class LegacyBaselineTests(unittest.TestCase):
         self.assertEqual(snapshot["control-plane"][0]["image"],expected["control-plane"]["image_id"])
         self.assertEqual(snapshot["control-plane"][0]["revision"],"")
         self.assertEqual(snapshot["waiting-pumpkin"][0]["health"],"healthy")
+        self.assertEqual(snapshot,deploy.legacy_wait_baseline(FIXTURE["expected_inventory"]))
         self.assertEqual(deploy.legacy_revision(FIXTURE),legacy.LEGACY_REVISION_CLAIM)
         stale=json.loads(json.dumps(FIXTURE));stale["source_revision_claim"]="a"*40
         with self.assertRaisesRegex(deploy.DeploymentError,"does not claim"):
