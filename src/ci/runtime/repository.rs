@@ -88,10 +88,18 @@ impl CiPreviewRuntimeRepository {
 
         if preview.state == "running" {
             let placement = load_current_placement(&mut tx, preview_id).await?;
-            tx.commit().await?;
-            return Ok(RuntimeLease::AlreadyRunning(placement));
+            if worker_alive(&mut tx, placement.worker_id).await? {
+                tx.commit().await?;
+                return Ok(RuntimeLease::AlreadyRunning(placement));
+            }
+            // A running alias is not proof that its worker is still alive. Fall
+            // through to the fenced replacement path, which requires a durable
+            // world checkpoint before changing worker ownership.
         }
-        if !matches!(preview.state.as_str(), "queued" | "ready" | "booting") {
+        if !matches!(
+            preview.state.as_str(),
+            "queued" | "ready" | "booting" | "running"
+        ) {
             bail!("CI preview cannot start from state {}", preview.state);
         }
 
@@ -133,7 +141,7 @@ impl CiPreviewRuntimeRepository {
                     tx.commit().await?;
                     return Ok(RuntimeLease::NoWorker);
                 };
-                if existing.active {
+                if existing.state != CiRuntimeState::Stopped {
                     release_active_capacity(&mut tx, existing.worker_id).await?;
                 }
                 sqlx::query("UPDATE workers SET reserved_disk_bytes=GREATEST(0,reserved_disk_bytes-$2) WHERE id=$1")
@@ -166,13 +174,13 @@ impl CiPreviewRuntimeRepository {
         sqlx::query(
             "INSERT INTO ci_runtime_placements
                 (preview_id, worker_id, generation, lease_token, java_port, bedrock_port,
-                 signal_port, state, active, last_activity_at, capability_hash)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,'starting',false,now(),$8)
+                 signal_port, state, active, capacity_reserved, last_activity_at, capability_hash)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'starting',false,true,now(),$8)
              ON CONFLICT (preview_id) DO UPDATE SET
                 worker_id = EXCLUDED.worker_id, generation = EXCLUDED.generation,
                 lease_token = EXCLUDED.lease_token, java_port = EXCLUDED.java_port,
                 bedrock_port = EXCLUDED.bedrock_port, signal_port = EXCLUDED.signal_port,
-                state = 'starting', active = false, last_activity_at = now(),
+                state = 'starting', active = false, capacity_reserved = true, last_activity_at = now(),
                 snapshot_requested_at = NULL, capability_hash = EXCLUDED.capability_hash, updated_at = now()",
         )
         .bind(preview_id)
@@ -265,7 +273,7 @@ impl CiPreviewRuntimeRepository {
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'stopped', active = false,
+            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, capacity_reserved = false,
                     updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
                AND lease_token = $4 AND state = 'starting'",
@@ -477,7 +485,7 @@ impl CiPreviewRuntimeRepository {
         }
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, snapshot_requested_at = NULL, updated_at = now()
+            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, capacity_reserved = false, snapshot_requested_at = NULL, updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
                AND lease_token = $4 AND state = 'stopping' AND active",
         )
@@ -597,6 +605,18 @@ impl CiPreviewRuntimeRepository {
     /// was stopped and its isolated world removed on its owning worker.
     pub async fn complete_expiry(&self, placement: &CiRuntimePlacement) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
+        let capacity_reserved: bool = sqlx::query_scalar(
+            "SELECT capacity_reserved FROM ci_runtime_placements
+             WHERE preview_id=$1 AND worker_id=$2 AND generation=$3
+               AND lease_token=$4 AND state='deleting' FOR UPDATE",
+        )
+        .bind(placement.preview_id)
+        .bind(placement.worker_id)
+        .bind(placement.generation)
+        .bind(placement.lease_token)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
         let removed = sqlx::query(
             "DELETE FROM ci_runtime_placements runtime USING ci_preview_aliases alias
              WHERE runtime.preview_id = $1 AND runtime.worker_id = $2
@@ -623,9 +643,9 @@ impl CiPreviewRuntimeRepository {
                  WHERE id = $1",
             )
             .bind(placement.worker_id)
-            .bind(if placement.active { CI_RUNTIME_MEMORY_BYTES } else { 0 })
+            .bind(if capacity_reserved { CI_RUNTIME_MEMORY_BYTES } else { 0 })
             .bind(CI_RUNTIME_DISK_BYTES)
-            .bind(if placement.active { CI_RUNTIME_CPU_MILLIS } else { 0 })
+            .bind(if capacity_reserved { CI_RUNTIME_CPU_MILLIS } else { 0 })
             .execute(&mut *tx)
             .await?;
             sqlx::query("DELETE FROM ci_preview_aliases WHERE id = $1 AND state = 'expired'")
@@ -655,7 +675,7 @@ impl CiPreviewRuntimeRepository {
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, snapshot_requested_at = NULL, updated_at = now()
+            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, capacity_reserved = false, snapshot_requested_at = NULL, updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
                AND lease_token = $4 AND state = 'running' AND active",
         )
@@ -808,6 +828,40 @@ pub struct CiWorldSnapshot {
 }
 
 impl CiPreviewRuntimeRepository {
+    /// Reclaim running previews whose worker heartbeat has expired, but only
+    /// when a durable world checkpoint makes cross-worker recovery safe. The
+    /// generation/lease rotation in claim_start fences a recovered old worker.
+    pub async fn reconcile_stale_workers(&self, limit: i64) -> Result<u64> {
+        if !(1..=128).contains(&limit) {
+            bail!("invalid stale CI worker reconciliation limit");
+        }
+        let preview_ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT runtime.preview_id
+             FROM ci_runtime_placements runtime
+             JOIN ci_preview_aliases alias ON alias.id=runtime.preview_id
+             JOIN workers worker ON worker.id=runtime.worker_id
+             JOIN ci_world_snapshots snapshot ON snapshot.preview_id=runtime.preview_id
+             WHERE runtime.state='running' AND runtime.active AND alias.state='running'
+               AND alias.expires_at > now() AND worker.heartbeat_at <= now()-interval '30 seconds'
+             ORDER BY worker.heartbeat_at, runtime.preview_id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut reclaimed = 0;
+        for preview_id in preview_ids {
+            let capability = rand::random::<[u8; 32]>();
+            let hash = blake3::hash(&capability);
+            match self.claim_start(preview_id, hash.as_bytes()).await? {
+                RuntimeLease::Claimed(_) => reclaimed += 1,
+                RuntimeLease::Starting(_)
+                | RuntimeLease::AlreadyRunning(_)
+                | RuntimeLease::NoWorker => {}
+            }
+        }
+        Ok(reclaimed)
+    }
+
     /// Request a bounded periodic world checkpoint so an unavailable worker can
     /// be replaced without losing more than one cadence window of CI progress.
     pub async fn request_due_world_snapshots(&self, limit: i64) -> Result<u64> {

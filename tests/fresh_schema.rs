@@ -48,8 +48,8 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
             .await?;
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4],
-        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, and bounded Check Run tombstone migrations"
+        vec![1, 2, 3, 4, 5],
+        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, bounded Check Run tombstone, and reservation accounting migrations"
     );
 
     let forbidden: i64 = sqlx::query_scalar(

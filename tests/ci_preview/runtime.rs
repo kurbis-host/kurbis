@@ -380,7 +380,49 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(coordinator.stop_idle().await.unwrap(), 1);
+    let mut idle_claims = runtimes
+        .claim_idle(chrono::Duration::seconds(CI_RUNTIME_IDLE_SECONDS), 16)
+        .await
+        .unwrap();
+    assert_eq!(idle_claims.len(), 1);
+    let idle_stopping = idle_claims.pop().unwrap();
+    assert_eq!(idle_stopping.state, CiRuntimeState::Stopping);
+    assert!(idle_stopping.active);
+    host.stop(&idle_stopping, true).await.unwrap();
+    let idle_snapshot_bytes =
+        Bytes::from_static(b"checkpoint-published-before-idle-capacity-release");
+    let idle_snapshot_uri = format!(
+        "/internal/worker/control/ci/runtimes/{}/world-snapshot/{}/{}",
+        preview.id, idle_stopping.generation, idle_stopping.lease_token
+    );
+    let idle_upload = Request::builder()
+        .method(Method::PUT)
+        .uri(&idle_snapshot_uri)
+        .header("authorization", format!("Bearer {worker_token}"))
+        .header("x-worker-lease", worker_lease.to_string())
+        .header("content-length", idle_snapshot_bytes.len())
+        .body(Body::from(idle_snapshot_bytes.clone()))
+        .unwrap();
+    assert_eq!(
+        service.clone().oneshot(idle_upload).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "the authenticated Router accepts the final snapshot while the idle stop is stopping+active"
+    );
+    let idle_stopped = worker_json_request(
+        service.clone(),
+        &format!(
+            "/internal/worker/control/ci/runtimes/{}/stopped",
+            preview.id
+        ),
+        &worker_token,
+        worker_lease,
+        serde_json::json!({
+            "generation": idle_stopping.generation,
+            "lease_token": idle_stopping.lease_token,
+        }),
+    )
+    .await;
+    assert_eq!(idle_stopped.status(), StatusCode::NO_CONTENT);
     assert!(host.worlds.lock().unwrap().contains(&preview.id));
     let stopped = runtimes.current(preview.id).await.unwrap().unwrap();
     assert!(!stopped.active);
@@ -455,7 +497,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
         to_bytes(response.into_body(), 2 * 1024 * 1024)
             .await
             .unwrap(),
-        periodic_snapshot_bytes
+        idle_snapshot_bytes
     );
     let foreign_worker = Uuid::new_v4();
     let foreign_token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
@@ -588,34 +630,34 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     .await
     .unwrap();
     assert!(extended_ttl_hours >= 71.9);
-    assert!(
-        runtimes
-            .mark_runtime_lost(
-                preview.id,
-                restarted.worker_id,
-                restarted.generation,
-                restarted.lease_token,
-            )
-            .await
-            .unwrap()
-    );
     sqlx::query("UPDATE workers SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1")
         .bind(worker_id)
         .execute(&pool)
         .await
         .unwrap();
-    // Execute the failover admission steps separately so the test can read the
-    // remote world snapshot at the exact Starting fence, as the real worker does
-    // before launching Pumpkin and reporting `started`.
-    let transferred_capability = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let transferred_capability_hash = blake3::hash(transferred_capability.as_bytes());
-    let failover_lease = runtimes
-        .claim_start(preview.id, transferred_capability_hash.as_bytes())
-        .await
+    // Exercise the real admission Router against a dead worker heartbeat. A
+    // running alias must not be reported as live when its worker is stale; the
+    // authenticated admission path reassigns only because the shared snapshot
+    // exists and rotates the generation/lease.
+    let stale_admission = Request::builder()
+        .method(Method::POST)
+        .uri("/internal/ci/previews/admit")
+        .header("authorization", "Bearer snapshot-api-internal-secret")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"hostname": hostname.value}).to_string(),
+        ))
         .unwrap();
-    let kurbis_hoster::ci::RuntimeLease::Claimed(transferred) = failover_lease else {
-        panic!("durable snapshot should permit assignment to the compatible replacement worker");
-    };
+    let stale_admission_response = service.clone().oneshot(stale_admission).await.unwrap();
+    assert_eq!(stale_admission_response.status(), StatusCode::ACCEPTED);
+    let stale_admission_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(stale_admission_response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale_admission_payload["state"], "booting");
+    let transferred = runtimes.current(preview.id).await.unwrap().unwrap();
     assert_eq!(transferred.worker_id, foreign_worker);
     assert_eq!(transferred.generation, 4);
     assert_eq!(transferred.state, CiRuntimeState::Starting);
@@ -645,7 +687,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
         to_bytes(transferred_download.into_body(), 2 * 1024 * 1024)
             .await
             .unwrap(),
-        periodic_snapshot_bytes,
+        idle_snapshot_bytes,
         "the new assigned worker can restore only the authenticated persisted world snapshot"
     );
     let old_worker_download = worker_request(
@@ -666,12 +708,6 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
                 transferred.generation,
                 transferred.lease_token,
             )
-            .await
-            .unwrap()
-    );
-    assert!(
-        runtimes
-            .capability_valid(preview.id, transferred.generation, &transferred_capability,)
             .await
             .unwrap()
     );
@@ -696,6 +732,45 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     assert_eq!(old_reserved_disk, 0);
     assert_eq!(new_reserved_disk, CI_RUNTIME_DISK_BYTES);
 
+    // The periodic control-plane reconciler independently detects a second
+    // heartbeat loss and rehomes the live generation using the same durable
+    // checkpoint fence; no worker-side runtime_lost callback is involved.
+    sqlx::query("UPDATE workers SET heartbeat_at=now()+interval '5 minutes' WHERE id=$1")
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1")
+        .bind(foreign_worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(runtimes.reconcile_stale_workers(16).await.unwrap(), 1);
+    let recovered_again = runtimes.current(preview.id).await.unwrap().unwrap();
+    assert_eq!(recovered_again.worker_id, worker_id);
+    assert_eq!(recovered_again.generation, 5);
+    assert_eq!(recovered_again.state, CiRuntimeState::Starting);
+    let recovered_snapshot_uri = format!(
+        "/internal/worker/control/ci/runtimes/{}/world-snapshot/{}/{}",
+        preview.id, recovered_again.generation, recovered_again.lease_token
+    );
+    let recovered_snapshot = worker_request(
+        service.clone(),
+        Method::GET,
+        &recovered_snapshot_uri,
+        &worker_token,
+        worker_lease,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(recovered_snapshot.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(recovered_snapshot.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+        idle_snapshot_bytes
+    );
+
     let now = Utc::now() + chrono::Duration::seconds(1);
     sqlx::query("UPDATE ci_preview_aliases SET expires_at = $2 - interval '1 second' WHERE id=$1")
         .bind(preview.id)
@@ -706,9 +781,12 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     previews.expire(now).await.unwrap();
     let expired = runtimes.claim_expired(now, 16).await.unwrap();
     assert_eq!(expired.len(), 1);
-    assert_eq!(expired[0].placement.worker_id, foreign_worker);
-    assert_eq!(expired[0].placement.generation, 4);
-    assert_eq!(expired[0].placement.lease_token, transferred.lease_token);
+    assert_eq!(expired[0].placement.worker_id, worker_id);
+    assert_eq!(expired[0].placement.generation, 5);
+    assert_eq!(
+        expired[0].placement.lease_token,
+        recovered_again.lease_token
+    );
     host.stop(&expired[0].placement, false).await.unwrap();
     host.delete_world(&expired[0].placement).await.unwrap();
     let deleted_uri = format!(
@@ -718,9 +796,9 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     let delete_response = worker_json_request(
         service.clone(),
         &deleted_uri,
-        &foreign_token,
-        foreign_lease,
-        serde_json::json!({"generation": transferred.generation, "lease_token": transferred.lease_token}),
+        &worker_token,
+        worker_lease,
+        serde_json::json!({"generation": recovered_again.generation, "lease_token": recovered_again.lease_token}),
     )
     .await;
     assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
@@ -759,8 +837,8 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     let events = host.events.lock().unwrap().clone();
     assert!(events.contains(&"stop:1:retain=true".into()));
     assert!(events.contains(&"start:3".into()));
-    assert!(events.contains(&"stop:4:retain=false".into()));
-    assert!(events.contains(&"delete:4".into()));
+    assert!(events.contains(&"stop:5:retain=false".into()));
+    assert!(events.contains(&"delete:5".into()));
 
     sqlx::query("DELETE FROM worker_credentials WHERE worker_id=$1")
         .bind(foreign_worker)

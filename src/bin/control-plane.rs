@@ -82,6 +82,11 @@ async fn main() -> Result<()> {
                 if let Err(error) = runtime_repository.claim_expired(now, 128).await {
                     tracing::error!(?error, "failed to queue expired CI runtime cleanup");
                 }
+                // Rehome checkpointed runtimes before the idle claimant can
+                // transition a stale worker's placement to `stopping`.
+                if let Err(error) = runtime_repository.reconcile_stale_workers(128).await {
+                    tracing::error!(?error, "failed to reconcile stale CI preview workers");
+                }
                 if let Err(error) = runtime_repository
                     .claim_idle(chrono::Duration::seconds(CI_RUNTIME_IDLE_SECONDS), 128)
                     .await

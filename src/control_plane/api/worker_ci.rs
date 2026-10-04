@@ -390,7 +390,7 @@ pub(super) async fn world_snapshot(
                         && placement.generation == generation
                         && placement.lease_token == lease_token
                         && ((placement.state == crate::ci::CiRuntimeState::Stopping
-                            && !placement.active)
+                            && placement.active)
                             || (placement.state == crate::ci::CiRuntimeState::Running
                                 && placement.active))
                 })

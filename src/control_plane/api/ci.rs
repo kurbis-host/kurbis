@@ -139,7 +139,10 @@ pub(super) async fn admit(
     } else {
         preview
     };
-    if preview.state == CiPreviewState::Ready {
+    if matches!(
+        preview.state,
+        CiPreviewState::Ready | CiPreviewState::Running
+    ) {
         let runtimes = CiPreviewRuntimeRepository::new(state.pool.clone());
         let capability_hash = blake3::hash(&rand::random::<[u8; 32]>());
         match runtimes
@@ -153,7 +156,11 @@ pub(super) async fn admit(
             RuntimeLease::AlreadyRunning(_) => {
                 preview.state = CiPreviewState::Running;
             }
-            RuntimeLease::NoWorker => {}
+            RuntimeLease::NoWorker => {
+                // A build can be ready without a live worker or free capacity.
+                // Never project an unverified stale placement as running.
+                preview.state = CiPreviewState::Ready;
+            }
         }
     }
     let status = match preview.state {
