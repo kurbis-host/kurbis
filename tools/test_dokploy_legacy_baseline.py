@@ -4,6 +4,7 @@ import importlib.util
 import datetime as dt
 import json
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +103,75 @@ class LegacyBaselineTests(unittest.TestCase):
         altered_manifest["expected_inventory"] = labeled
         with self.assertRaisesRegex(legacy.BaselineError, "unlabelled"):
             legacy.validate_manifest(altered_manifest, labeled)
+
+    def test_refreshed_release_checkout_is_accepted_only_for_exact_tag_tree_and_clean_inputs(self):
+        revision=""
+        with tempfile.TemporaryDirectory() as directory:
+            checkout=Path(directory)
+            subprocess.run(["git","-c","init.defaultBranch=main","init","-q",str(checkout)],check=True)
+            subprocess.run(["git","-C",str(checkout),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(checkout),"config","user.email","test@example.invalid"],check=True)
+            (checkout/".gitignore").write_text(".env\n",encoding="utf-8")
+            (checkout/"compose.yaml").write_text("services: {}\n",encoding="utf-8")
+            (checkout/"src").mkdir();(checkout/"src/app.rs").write_text("fn main() {}\n",encoding="utf-8")
+            (checkout/".env").write_text("BUILD_REVISION=old\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(checkout),"add",".gitignore","compose.yaml","src/app.rs"],check=True)
+            subprocess.run(["git","-C",str(checkout),"commit","-qm","legacy base"],check=True)
+            checkout_head=subprocess.check_output(["git","-C",str(checkout),"rev-parse","HEAD"],text=True).strip()
+            (checkout/"compose.yaml").write_text("services: {release: {}}\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(checkout),"add","compose.yaml"],check=True)
+            subprocess.run(["git","-C",str(checkout),"commit","-qm","release"],check=True)
+            revision=subprocess.check_output(["git","-C",str(checkout),"rev-parse","HEAD"],text=True).strip()
+            subprocess.run(["git","-C",str(checkout),"tag",f"kurbis-release-{revision}"],check=True)
+            expected={path:subprocess.check_output(["git","-C",str(checkout),"rev-parse",f"HEAD:{path}"],text=True).strip()
+                      for path in (".gitignore","compose.yaml","src/app.rs")}
+            subprocess.run(["git","-C",str(checkout),"reset","--hard",checkout_head],stdout=subprocess.DEVNULL,check=True)
+            with patch.object(legacy,"CHECKOUT",checkout):
+                self.assertEqual(legacy.verify_attested_candidate_source(revision,expected),checkout_head)
+                wrong={**expected,"src/app.rs":"0"*40}
+                with self.assertRaisesRegex(legacy.BaselineError,"source mismatch"):
+                    legacy.verify_attested_candidate_source(revision,wrong)
+                (checkout/"compose.yaml").write_text("services: {changed: {}}\n",encoding="utf-8")
+                with self.assertRaisesRegex(legacy.BaselineError,"source mismatch|unexpected checkout change"):
+                    legacy.verify_attested_candidate_source(revision,expected)
+            with patch.object(legacy,"CHECKOUT",checkout),self.assertRaisesRegex(legacy.BaselineError,"main history|immutable release tag"):
+                legacy.verify_attested_candidate_source("b"*40,expected)
+
+    def test_existing_legacy_attestation_revalidates_exact_refreshed_release_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);audit=root/"legacy-baseline.json"
+            expected=FIXTURE["expected_inventory"]
+            manifest_sha=legacy.canonical_hash({"schema":FIXTURE["schema"],"source_revision_claim":FIXTURE["source_revision_claim"],
+                "operator":FIXTURE["operator"],"reason":FIXTURE["reason"],"expected_inventory":expected})
+            saved={"schema":FIXTURE["schema"],"source_revision_claim":FIXTURE["source_revision_claim"],
+                   "provenance_status":"legacy-unproven","operator":FIXTURE["operator"],"reason":FIXTURE["reason"],
+                   "manifest_sha256":manifest_sha,"inventory":expected}
+            audit.write_text("preserve existing audit\n",encoding="utf-8")
+            candidate="a"*40;tracked={"compose.yaml":"1"*40,"web/tsconfig.json":"2"*40}
+            current=json.loads(json.dumps(expected));current["source"]["checkout_head"]=candidate
+            current["source"]["modified_inputs"]=[{"code":"!!","path":".env"}]
+            with patch.object(legacy,"require_lock"),patch.object(legacy,"OperationLock",NoopLock), \
+                 patch.object(legacy,"AUDIT",audit),patch.object(legacy,"load_attestation",return_value=saved), \
+                 patch.object(legacy,"authorized_worker_images_for_inventory",return_value={legacy.PUMPKIN_LEGACY}), \
+                 patch.object(legacy,"verify_attested_candidate_source",return_value=candidate) as verify_source, \
+                 patch.object(legacy,"collect_inventory",return_value=current) as collect, \
+                 patch.object(legacy,"verify_attested_legacy_services") as compare, \
+                 patch.object(legacy,"restore_baseline_compose_env") as restore:
+                result=legacy.bootstrap(FIXTURE,"a"*32,candidate_revision=candidate,expected_sources=tracked)
+            self.assertEqual(result["status"],"already-recorded")
+            verify_source.assert_called_once_with(candidate,tracked)
+            collect.assert_called_once_with(allowed_worker_images={legacy.PUMPKIN_LEGACY},expected_checkout_head=candidate)
+            compare.assert_called_once_with(current,expected,manifest_sha,candidate_revision=candidate,inventory_checkout_head=candidate)
+            restore.assert_not_called()
+            self.assertEqual(audit.read_text(encoding="utf-8"),"preserve existing audit\n")
+
+    def test_refreshed_checkout_cannot_create_a_new_legacy_attestation(self):
+        with patch.object(legacy,"require_lock"),patch.object(legacy,"OperationLock",NoopLock), \
+             patch.object(legacy,"AUDIT",Path("/tmp/kurbis-missing-legacy-attestation")), \
+             patch.object(legacy,"collect_inventory") as collect, \
+             self.assertRaisesRegex(legacy.BaselineError,"cannot create a legacy attestation from refreshed"):
+            legacy.bootstrap(FIXTURE,"a"*32,candidate_revision="a"*40,expected_sources={"compose.yaml":"1"*40})
+        collect.assert_not_called()
 
     def test_one_time_audit_bootstrap_is_idempotent_and_does_not_rewrite_live_state(self):
         with tempfile.TemporaryDirectory() as directory:

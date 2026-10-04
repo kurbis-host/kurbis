@@ -101,3 +101,82 @@ def authorized_worker_images_for_inventory(manifest: dict[str, Any]) -> set[str]
         or not isinstance(image_id,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",image_id)):
         raise BaselineError("worker migration journal candidate identity is invalid")
     return {PUMPKIN_LEGACY,tag}
+
+
+def verify_attested_candidate_source(candidate_revision: str, expected_sources: dict[str, str]) -> str:
+    if not valid_sha(candidate_revision) or not isinstance(expected_sources,dict) or not expected_sources:
+        raise BaselineError("exact release SHA and tracked source manifest are required for refreshed baseline verification")
+    if CHECKOUT.is_symlink() or not (CHECKOUT/".git").is_dir():
+        raise BaselineError("refreshed Dokploy release checkout is unsafe")
+    branch=run_text(["git","-C",str(CHECKOUT),"branch","--show-current"])
+    checkout_head=run_text(["git","-C",str(CHECKOUT),"rev-parse","HEAD"])
+    ancestry=subprocess.run(["git","-C",str(CHECKOUT),"merge-base","--is-ancestor",checkout_head,candidate_revision],
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+    if branch!="main" or ancestry.returncode!=0:
+        raise BaselineError("Dokploy checkout must be clean main history at or before the exact requested release")
+    tag=f"kurbis-release-{candidate_revision}"
+    resolved=subprocess.run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"],
+        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,check=False)
+    if resolved.returncode:
+        try:run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
+        except BaselineError as error:raise BaselineError("could not fetch the exact immutable release tag for attested inventory verification") from error
+        resolved=subprocess.run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"],
+            stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,check=False)
+    if resolved.returncode or resolved.stdout.strip()!=candidate_revision:
+        raise BaselineError("refreshed Dokploy checkout lacks the exact immutable release tag")
+    tracked=set(run_text(["git","-C",str(CHECKOUT),"ls-tree","-r","--name-only",candidate_revision]).splitlines())
+    if tracked!=set(expected_sources):
+        raise BaselineError("refreshed release manifest does not cover the exact tracked source tree")
+    for path,blob in expected_sources.items():
+        if Path(path).is_absolute() or ".." in Path(path).parts or not re.fullmatch(r"[0-9a-f]{40}",str(blob)):
+            raise BaselineError("refreshed release manifest contains an unsafe path/blob")
+        if run_text(["git","-C",str(CHECKOUT),"rev-parse",f"{candidate_revision}:{path}"])!=blob:
+            raise BaselineError(f"refreshed release source mismatch: {path}")
+    status=checkout_status(checkout_head)
+    if status!=[{"code":"!!","path":".env"}]:
+        raise BaselineError("refreshed release checkout is dirty beyond the protected ignored Dokploy .env")
+    return checkout_head
+
+
+def verify_attested_legacy_services(current: dict[str, Any], expected: dict[str, Any], manifest_sha: str,
+                                    *, candidate_revision: str | None = None,
+                                    inventory_checkout_head: str | None = None) -> None:
+    if current.get("compose_id")!=expected.get("compose_id") or current.get("project")!=expected.get("project"):
+        raise BaselineError("legacy Compose identity changed after attestation")
+    current_source=current.get("source",{});expected_source=expected.get("source",{})
+    if candidate_revision is None:
+        source_keys=("checkout_head","modified_inputs")
+    else:
+        if (not valid_sha(candidate_revision) or not valid_sha(inventory_checkout_head or "")
+            or current_source.get("checkout_head")!=inventory_checkout_head):
+            raise BaselineError("Dokploy inventory checkout HEAD differs from the verified release history")
+        if current_source.get("modified_inputs")!=[{"code":"!!","path":".env"}]:
+            raise BaselineError("refreshed release checkout contains unexpected tracked/ignored build inputs")
+        source_keys=("build_revision_env_present","compose_env_file_sha256","compose_env_file_mode",
+                     "compose_env_file_uid","compose_env_file_gid","safe_compose_settings")
+    for key in source_keys:
+        if current_source.get(key)!=expected_source.get(key):
+            raise BaselineError(f"legacy checkout source/environment differs from approved state: {key}")
+    for name,before in expected["services"].items():
+        after=current["services"].get(name,{})
+        for key in ("image_id","image_tag","status","health","image","payloads","ports"):
+            if after.get(key)!=before.get(key):raise BaselineError(f"legacy service changed after attestation: {name}/{key}")
+    before=expected["worker"];after=current["worker"]
+    fixed=("service","service_active","worker_id","worker_path","worker_mode","worker_uid","worker_gid","worker_sha256","worker_process_sha256",
+           "worker_process_count","service_unit_sha256","launcher_sha256","worker_env_mode","worker_env_uid","legacy_pumpkin_image","lease")
+    for key in fixed:
+        if after.get(key)!=before.get(key):raise BaselineError(f"legacy worker changed after attestation: {key}")
+    migration=migration_record_from_hash(manifest_sha)
+    config=after.get("configured_pumpkin_image");process=after.get("process_pumpkin_image")
+    env_sha=after.get("worker_env_sha256")
+    if config==PUMPKIN_LEGACY and process==PUMPKIN_LEGACY:
+        if env_sha==before.get("worker_env_sha256"):return
+        if migration and migration.get("status")=="rolled_back" and env_sha==migration.get("old_worker_env_sha256"):return
+        raise BaselineError("legacy worker env digest changed without a matching migration/rollback record")
+    if not migration or migration.get("status") not in {"pending","migrated"}:
+        raise BaselineError("worker moved from legacy config without a protected migration record")
+    allowed={PUMPKIN_LEGACY,migration.get("candidate_tag")}
+    if config not in allowed or process not in allowed:
+        raise BaselineError("current worker config/process differs from protected migration journal")
+    if env_sha not in {before.get("worker_env_sha256"),migration.get("new_worker_env_sha256")}:
+        raise BaselineError("worker config digest differs from baseline or migration journal")

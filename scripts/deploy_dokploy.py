@@ -19,6 +19,7 @@ from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = ROOT / "scripts/dokploy_worker_sync.py"
+WORKER_TLS = ROOT / "scripts/dokploy_worker_tls.py"
 LEGACY_REMOTE = ROOT / "scripts/dokploy_legacy_baseline.py"
 LEGACY_RECOVERY = ROOT / "scripts/dokploy_legacy_worker_recovery.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
@@ -287,6 +288,21 @@ def wait_deployment(commit: str, previous: set[str], timeout: int) -> str:
     raise DeploymentError("Dokploy deployment timed out")
 
 
+def worker_sync_source() -> str:
+    source=REMOTE.read_text(encoding="utf-8")
+    marker="# __TLS_HELPERS__"
+    if source.count(marker)!=1:
+        raise DeploymentError("Respond5 worker TLS verification injection point is invalid")
+    helper=WORKER_TLS.read_text(encoding="utf-8")
+    local_loader='''if __file__ != "<stdin>":
+    _tls_module=Path(__file__).with_name("dokploy_worker_tls.py")
+    exec(compile(_tls_module.read_text(encoding="utf-8"),str(_tls_module),"exec"),globals())
+'''
+    if source.count(local_loader)!=1:
+        raise DeploymentError("Respond5 worker TLS verification local loader is invalid")
+    return source.replace(local_loader,"").replace(marker,helper)
+
+
 def remote(host: str, operation: str, *, token: str | None = None, revision: str | None = None,
            expected: dict | None = None, baseline: dict | None = None,
            pumpkin: str | None = None, upstream: str | None = None,
@@ -297,7 +313,7 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
         if value is not None:
             command.extend([f"--{key}", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))])
     output = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(command)],
-                 input_text=REMOTE.read_text(encoding="utf-8"), timeout=1800)
+                 input_text=worker_sync_source(), timeout=1800)
     try:
         result = json.loads(output)
     except json.JSONDecodeError as error:
@@ -531,7 +547,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if legacy_manifest is not None:
                 # Explicit operator-selected bootstrap: the rollback source ref and exact inventory
                 # attestation precede any Dokploy environment, checkout, worker, or runtime mutation.
-                legacy_record=legacy_remote(args.worker_host,"bootstrap",manifest=legacy_manifest,token=token)
+                legacy_record=legacy_remote(args.worker_host,"bootstrap",manifest=legacy_manifest,
+                    expected_sources=expected,token=token,candidate_revision=commit)
                 if legacy_record.get("status") not in {"recorded","already-recorded"}:
                     raise DeploymentError("respond5 did not attest the exact legacy inventory")
                 baseline=legacy_wait_baseline(legacy_record["inventory"])

@@ -88,10 +88,10 @@ def valid_sha(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40}", value))
 
 
-def checkout_status() -> list[dict[str, str]]:
+def checkout_status(expected_head: str = LEGACY_REVISION_CLAIM) -> list[dict[str, str]]:
     raw = run(["git", "-C", str(CHECKOUT), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"])
     records = [part for part in raw.split(b"\0") if part]
-    allowed = {"compose.yaml", "web/tsconfig.json"}
+    allowed = {"compose.yaml", "web/tsconfig.json"} if expected_head == LEGACY_REVISION_CLAIM else set()
     parsed = []
     for record in records:
         if len(record) < 4 or record[2:3] != b" ":
@@ -105,8 +105,8 @@ def checkout_status() -> list[dict[str, str]]:
             raise BaselineError(f"legacy inventory has an unexpected checkout change: {path}")
         parsed.append({"code": code, "path": path})
     head = run_text(["git", "-C", str(CHECKOUT), "rev-parse", "HEAD"])
-    if head != LEGACY_REVISION_CLAIM:
-        raise BaselineError("respond5 checkout is not at the operator-approved legacy source commit")
+    if head != expected_head:
+        raise BaselineError("respond5 checkout does not match the expected exact source commit")
     overrides = {}
     for path in sorted(allowed):
         file_path = CHECKOUT / path
@@ -166,7 +166,8 @@ def image_payload_hashes(image_id: str, service: str) -> dict[str, dict[str, Any
     return result
 
 
-def collect_inventory(*, allowed_worker_images: set[str] | None = None) -> dict[str, Any]:
+def collect_inventory(*, allowed_worker_images: set[str] | None = None,
+                      expected_checkout_head: str = LEGACY_REVISION_CLAIM) -> dict[str, Any]:
     root_only()
     allowed_worker_images={PUMPKIN_LEGACY} if allowed_worker_images is None else allowed_worker_images
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir() or WORKER.is_symlink() or not WORKER.is_file():
@@ -291,7 +292,7 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None) -> dict[
         "services": services,
         "source": {
             "checkout_head": run_text(["git", "-C", str(CHECKOUT), "rev-parse", "HEAD"]),
-            "modified_inputs": checkout_status(),
+            "modified_inputs": checkout_status(expected_checkout_head),
             "build_revision_env_present": "BUILD_REVISION" in compose_env,
             "compose_env_file_sha256": sha256_file(ENV_FILE_CHECKOUT),
             "compose_env_file_mode": stat.S_IMODE(ENV_FILE_CHECKOUT.stat().st_mode),
@@ -863,38 +864,6 @@ def migration_record_from_hash(manifest_sha: str) -> dict[str, Any] | None:
     return record
 
 
-def verify_attested_legacy_services(current: dict[str, Any], expected: dict[str, Any], manifest_sha: str) -> None:
-    if current.get("compose_id")!=expected.get("compose_id") or current.get("project")!=expected.get("project"):
-        raise BaselineError("legacy Compose identity changed after attestation")
-    current_source=current.get("source",{});expected_source=expected.get("source",{})
-    for key in ("checkout_head","modified_inputs"):
-        if current_source.get(key)!=expected_source.get(key):
-            raise BaselineError(f"legacy checkout source changed after attestation: {key}")
-    for name,before in expected["services"].items():
-        after=current["services"].get(name,{})
-        for key in ("image_id","image_tag","status","health","image","payloads","ports"):
-            if after.get(key)!=before.get(key):raise BaselineError(f"legacy service changed after attestation: {name}/{key}")
-    before=expected["worker"];after=current["worker"]
-    fixed=("service","service_active","worker_id","worker_path","worker_mode","worker_uid","worker_gid","worker_sha256","worker_process_sha256",
-           "worker_process_count","service_unit_sha256","launcher_sha256","worker_env_mode","worker_env_uid","legacy_pumpkin_image","lease")
-    for key in fixed:
-        if after.get(key)!=before.get(key):raise BaselineError(f"legacy worker changed after attestation: {key}")
-    migration=migration_record_from_hash(manifest_sha)
-    config=after.get("configured_pumpkin_image");process=after.get("process_pumpkin_image")
-    env_sha=after.get("worker_env_sha256")
-    if config==PUMPKIN_LEGACY and process==PUMPKIN_LEGACY:
-        if env_sha==before.get("worker_env_sha256"):return
-        if migration and migration.get("status")=="rolled_back" and env_sha==migration.get("old_worker_env_sha256"):return
-        raise BaselineError("legacy worker env digest changed without a matching migration/rollback record")
-    if not migration or migration.get("status") not in {"pending","migrated"}:
-        raise BaselineError("worker moved from legacy config without a protected migration record")
-    allowed={PUMPKIN_LEGACY,migration.get("candidate_tag")}
-    if config not in allowed or process not in allowed:
-        raise BaselineError("current worker config/process differs from protected migration journal")
-    if env_sha not in {before.get("worker_env_sha256"),migration.get("new_worker_env_sha256")}:
-        raise BaselineError("worker config digest differs from baseline or migration journal")
-
-
 def save_baseline_compose_env(inventory: dict[str, Any]) -> dict[str, Any]:
     source=inventory["source"]
     if not COMPOSE_ENV_BACKUPS.exists():COMPOSE_ENV_BACKUPS.mkdir(mode=0o700)
@@ -926,7 +895,8 @@ def restore_baseline_compose_env(record: dict[str, Any]) -> bool:
     return True
 
 
-def bootstrap(manifest: dict[str, Any], token: str) -> dict[str, Any]:
+def bootstrap(manifest: dict[str, Any], token: str, *, candidate_revision: str | None = None,
+              expected_sources: dict[str, str] | None = None) -> dict[str, Any]:
     require_lock(token)
     with OperationLock():
         expected=manifest.get("expected_inventory") if isinstance(manifest,dict) else None
@@ -936,6 +906,12 @@ def bootstrap(manifest: dict[str, Any], token: str) -> dict[str, Any]:
         if AUDIT.exists():
             attestation=load_attestation(manifest)
             allowed_worker_images=authorized_worker_images_for_inventory(manifest)
+            if candidate_revision is not None:
+                checkout_head=verify_attested_candidate_source(candidate_revision,expected_sources or {})
+                current=collect_inventory(allowed_worker_images=allowed_worker_images,expected_checkout_head=checkout_head)
+                verify_attested_legacy_services(current,attestation["inventory"],manifest_sha,
+                                                candidate_revision=candidate_revision,inventory_checkout_head=checkout_head)
+                return {"status":"already-recorded","manifest_sha256":manifest_sha,"inventory":current}
             current=collect_inventory(allowed_worker_images=allowed_worker_images)
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
             restore_baseline_compose_env(attestation)
@@ -944,6 +920,8 @@ def bootstrap(manifest: dict[str, Any], token: str) -> dict[str, Any]:
                 raise BaselineError("protected baseline environment/checkout restoration did not match exact attested source")
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
             return {"status":"already-recorded","manifest_sha256":manifest_sha,"inventory":current}
+        if candidate_revision is not None:
+            raise BaselineError("cannot create a legacy attestation from refreshed release source; exact old baseline checkout is required")
         current=collect_inventory()
         manifest_sha=validate_manifest(manifest,current)
         compose_env_backup=save_baseline_compose_env(current)
@@ -971,7 +949,8 @@ def main() -> int:
         if args.operation=="capture":result=collect_inventory()
         elif args.operation=="bootstrap":
             if manifest is None or not args.token:raise BaselineError("operator-reviewed manifest and rollout lock token are required")
-            result=bootstrap(manifest,args.token)
+            result=bootstrap(manifest,args.token,candidate_revision=args.candidate_revision,
+                             expected_sources=json.loads(args.expected_sources_json) if args.expected_sources_json else None)
         elif args.operation=="bootstrap-worker":
             if manifest is None or not args.candidate_image_id or not args.candidate_revision or not args.token:raise BaselineError("manifest, candidate image, revision and rollout token are required")
             result=bootstrap_worker(manifest,args.candidate_image_id,args.candidate_revision,args.token)

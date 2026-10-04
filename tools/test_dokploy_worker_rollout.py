@@ -719,7 +719,7 @@ class RolloutTests(unittest.TestCase):
             inspected=json.dumps([{"Mounts":[{"Destination":"/run/kurbis-tls","Source":str(tls),"RW":False}]}])
             with patch.object(sync,"run",side_effect=[gateway_id,inspected]):
                 with self.assertRaisesRegex(sync.Error,"must not be accessible to other"):
-                    sync.verify_bedrock_tls_assets({},str(tls),"example.test")
+                    sync.verify_bedrock_tls_assets(str(tls),"example.test",error_cls=sync.Error,run_command=sync.run,project=sync.PROJECT)
 
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is needed to render the production Compose fixture")
     def test_rendered_production_compose_has_required_read_only_bedrock_tls_and_ports(self):
@@ -737,7 +737,7 @@ class RolloutTests(unittest.TestCase):
                 cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
             self.assertEqual(output.returncode,0,output.stderr)
             services=json.loads(output.stdout)["services"]
-            sync.verify_gateway_tls_configuration(services,"/srv/kurbis/certs","19132")
+            sync.verify_gateway_tls_configuration(services,"/srv/kurbis/certs","19132",error_cls=sync.Error)
             gateway=services["gateway"]
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_CERT_FILE"],"/run/kurbis-tls/fullchain.pem")
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_KEY_FILE"],"/run/kurbis-tls/privkey.pem")
@@ -746,7 +746,7 @@ class RolloutTests(unittest.TestCase):
             self.assertEqual(mount["source"],"/srv/kurbis/certs")
             broken=json.loads(json.dumps(services));next(v for v in broken["gateway"]["volumes"] if v.get("target")=="/run/kurbis-tls")["read_only"]=False
             with self.assertRaisesRegex(sync.Error,"mounted read-only"):
-                sync.verify_gateway_tls_configuration(broken,"/srv/kurbis/certs","19132")
+                sync.verify_gateway_tls_configuration(broken,"/srv/kurbis/certs","19132",error_cls=sync.Error)
 
     def test_first_join_regression_is_part_of_release_gate(self):
         test_file = ROOT / "tests/first_join_flow.rs"
@@ -760,6 +760,13 @@ class RolloutTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "TEST_DATABASE_URL"):
                 deploy.run_release_tests()
         run_mock.assert_not_called()
+
+    def test_worker_sync_remote_payload_inlines_tls_module_and_compiles(self):
+        source=deploy.worker_sync_source()
+        self.assertNotIn("__TLS_HELPERS__",source)
+        self.assertIn("def verify_gateway_tls_configuration",source)
+        self.assertIn("def verify_bedrock_tls_assets",source)
+        compile(source,"<respond5-worker-sync-stdin>","exec")
 
     def test_legacy_remote_payload_inlines_recovery_module_and_compiles(self):
         source=deploy.legacy_remote_source()
