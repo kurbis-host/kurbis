@@ -37,6 +37,12 @@ class DeploymentError(RuntimeError):
     pass
 
 
+class DeploymentRollbackError(DeploymentError):
+    def __init__(self, message: str, *, app_rolled_back: bool):
+        super().__init__(message)
+        self.app_rolled_back = app_rolled_back
+
+
 def run(command: Sequence[str], *, input_text: str | None = None, cwd: Path | None = None, timeout: int | None = None) -> str:
     result = subprocess.run(
         list(command), input=input_text, cwd=cwd, text=True,
@@ -105,13 +111,27 @@ def api(endpoint: str, params: dict, *, post: bool = False) -> object:
 
 
 def validate_compose_execution(info: dict) -> None:
-    # Dokploy documents only docker-compose mode as supporting Compose `build:`;
-    # Stack mode does not support builds. Its `command` field replaces Dokploy's
-    # default command, so only an unset override is safe for this build-based release.
+    # Dokploy's createCommand uses this generated command only when `command` is
+    # unset. A populated command overrides the default, even when it resembles it.
     if info.get("composeType") != "docker-compose":
         raise DeploymentError("Dokploy target must use the documented docker-compose mode")
     if "command" not in info or info.get("command") not in (None, ""):
-        raise DeploymentError("Dokploy custom Compose command is not allowed; the default build-enabled command is required")
+        raise DeploymentError("Dokploy custom Compose commands are not allowed; leave the command unset")
+    default_command = api("compose.getDefaultCommand", {"composeId": COMPOSE_ID})
+    if isinstance(default_command, dict):
+        default_command = default_command.get("command")
+    if not isinstance(default_command, str) or not default_command.strip():
+        raise DeploymentError("Dokploy documented default Compose command is unavailable")
+    try:
+        tokens = shlex.split(default_command)
+    except ValueError as error:
+        raise DeploymentError("Dokploy documented default Compose command is malformed") from error
+    if len(tokens) < 2 or tokens[:2] != ["docker", "compose"]:
+        raise DeploymentError("Dokploy default command is not the documented Docker Compose command")
+    if "up" not in tokens or "-d" not in tokens or "--build" not in tokens or "--no-build" in tokens:
+        raise DeploymentError("Dokploy default command is not the documented build-enabled Compose command")
+    if any(token in {";", "|", "&&", "||", ">", "<"} for token in tokens):
+        raise DeploymentError("Dokploy default Compose command contains shell control operators")
 
 
 def compose_info() -> dict:
@@ -222,6 +242,17 @@ def assert_no_active_deployments() -> set[str]:
     return {str(item["deploymentId"]) for item in records if isinstance(item.get("deploymentId"), str)}
 
 
+def wait_for_terminal_deployments(timeout: int) -> None:
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        records=deployment_list()
+        active=[item for item in records if str(item.get("status","")).lower() not in TERMINAL]
+        if not active:
+            return
+        time.sleep(5)
+    raise DeploymentError("an active Dokploy deployment did not finish before rollback")
+
+
 def run_release_tests() -> None:
     if not os.environ.get("TEST_DATABASE_URL"):
         raise DeploymentError("TEST_DATABASE_URL is required for the disposable first-join database regression")
@@ -254,10 +285,11 @@ def wait_deployment(commit: str, previous: set[str], timeout: int) -> str:
 
 def remote(host: str, operation: str, *, token: str | None = None, revision: str | None = None,
            expected: dict | None = None, baseline: dict | None = None,
-           pumpkin: str | None = None, receipt: dict | None = None) -> dict:
+           pumpkin: str | None = None, upstream: str | None = None,
+           receipt: dict | None = None) -> dict:
     command = ["python3", "-", "--remote", operation]
     for key, value in (("token", token), ("revision", revision), ("expected", expected),
-                       ("baseline", baseline), ("pumpkin", pumpkin), ("receipt", receipt)):
+                       ("baseline", baseline), ("pumpkin", pumpkin), ("upstream", upstream), ("receipt", receipt)):
         if value is not None:
             command.extend([f"--{key}", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))])
     output = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(command)],
@@ -271,6 +303,84 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
     return result
 
 
+def update_build_revision(revision: str) -> None:
+    info=compose_info()
+    api("compose.saveEnvironment", {"composeId": COMPOSE_ID, "env": patch_env(str(info["env"]), {"BUILD_REVISION": revision})}, post=True)
+    if parse_env(str(compose_info()["env"])).get("BUILD_REVISION")!=revision:
+        raise DeploymentError("Dokploy BUILD_REVISION did not persist")
+
+
+def queue_and_wait_deployment(revision: str, title: str, timeout: int) -> str:
+    previous=assert_no_active_deployments()
+    output=run([os.getenv("DOKPLOY_CLI", "dokploy"), "compose", "deploy", "--composeId", COMPOSE_ID,
+        "--title", title, "--description", f"Deploy exact source revision {revision}", "--json"], timeout=60)
+    try:
+        queued=json.loads(output)
+    except json.JSONDecodeError as error:
+        raise DeploymentError("Dokploy CLI returned invalid deployment response") from error
+    if not isinstance(queued,dict) or queued.get("success") is not True:
+        raise DeploymentError("Dokploy did not confirm deployment queueing")
+    return wait_deployment(revision,previous,timeout)
+
+
+def rollback_application(host: str, branch: str, revision: str, baseline: dict, token: str, timeout: int) -> str:
+    if not revision or len(revision)!=40:
+        raise DeploymentError("prior running app revision is unavailable; cannot safely roll back production")
+    tag=ensure_release_tag(revision)
+    wait_for_terminal_deployments(timeout)
+    update_build_revision(revision)
+    set_branch(tag)
+    deployment_id=queue_and_wait_deployment(revision,f"Rollback to {revision[:12]}",timeout)
+    checked=remote(host,"verify-app-revision",token=token,revision=revision,baseline=baseline)
+    if checked.get("status")!="app-rolled-back":
+        raise DeploymentError("respond5 did not verify restoration of the prior app revision")
+    set_branch(branch)
+    return deployment_id
+
+
+def dispatch_worker_wait(remote_call, rollback_call, on_attempt, **kwargs):
+    # Set the rollback guard before SSH dispatch: the remote may mutate state and
+    # the response may be lost after that mutation completed.
+    on_attempt()
+    try:
+        return remote_call(**kwargs)
+    except Exception:
+        rollback_call()
+        raise
+
+
+def should_restore_dokploy_source(*, deployment_attempted: bool, app_revision_restored: bool, marked: bool) -> bool:
+    return not deployment_attempted or app_revision_restored or marked
+
+
+def rollback_failed_release(worker_rollback, app_rollback):
+    worker_error = None
+    try:
+        worker=worker_rollback()
+        if worker.get("status")=="already-accepted":
+            return {"status":"already-accepted"}
+        if worker.get("status") not in {"rolled-back","no-pending-worker-transaction"}:
+            worker_error=DeploymentError("worker bundle rollback was not verified")
+    except Exception as error:
+        worker_error=error
+    # Always request app rollback, even when worker rollback failed; accepting a mixed
+    # state is forbidden, but both independent recovery paths should still be attempted.
+    try:
+        app=app_rollback()
+        if app.get("status")!="app-rolled-back":
+            raise DeploymentError("prior app revision rollback was not verified")
+    except Exception as app_error:
+        if worker_error:
+            raise DeploymentError(f"worker rollback failed ({worker_error}); app rollback failed ({app_error})") from app_error
+        raise
+    if worker_error:
+        raise DeploymentRollbackError(
+            f"prior app revision was restored, but worker rollback could not be verified: {worker_error}",
+            app_rolled_back=True,
+        ) from worker_error
+    return app
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -279,12 +389,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args(argv)
     token = secrets.token_hex(16)
-    locked = staged = prepared = wait_attempted = marked = False
+    locked = staged = prepared = wait_attempted = deployment_attempted = finalization_attempted = marked = False
     old_env = ""
     branch = "main"
-    tag = ""
     commit = ""
+    baseline_revision = ""
+    baseline: dict | None = None
     receipt: dict | None = None
+    rollback_verified = False
+    rollback_app_revision_restored = False
     try:
         lock_path = Path.home() / ".cache/kurbis/deploy.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,96 +410,128 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.compose_id != COMPOSE_ID:
                 raise DeploymentError("only approved Kurbis production Compose target is allowed")
             expected = source_inputs(commit)
-            # Both behavioral suites run before any production setting or checkout is mutated.
             run_release_tests()
             remote(args.worker_host, "lock", token=token)
             locked = True
-            baseline_result = remote(args.worker_host, "baseline")
-            baseline = baseline_result.get("snapshot")
-            if baseline_result.get("status") != "snapshot" or not baseline:
-                raise DeploymentError("respond5 baseline service/worker lease check failed")
-            initial_config = compose_info()
-            branch, old_env = str(initial_config.get("branch", "main")), str(initial_config.get("env", ""))
-            if branch != "main":
-                raise DeploymentError("Dokploy production source branch is not main")
-            prepared = True
+            preflight=remote(args.worker_host,"baseline-preflight")
+            if preflight.get("status")!="preflight" or not isinstance(preflight.get("snapshot"),dict):
+                raise DeploymentError("respond5 did not provide a safe pre-bootstrap snapshot")
+            baseline_revision=str(preflight.get("app_revision",""))
+            initial_config=compose_info()
+            branch,old_env=str(initial_config.get("branch","main")),str(initial_config.get("env",""))
+            if branch!="main":raise DeploymentError("Dokploy production source branch is not main")
+            prepared=True
             prepare_dokploy(commit)
-            tag = ensure_release_tag(commit)
-            set_branch(tag)
-            staged = True  # remote stage may fail after preserving a backup but before returning
-            staged_result = remote(args.worker_host, "stage", token=token, revision=commit, expected=expected)
-            if staged_result.get("status") != "staged" or staged_result.get("revision") != commit:
+            ensure_release_tag(commit)
+            staged=True
+            staged_result=remote(args.worker_host,"stage",token=token,revision=commit,expected=expected)
+            if staged_result.get("status")!="staged" or staged_result.get("revision")!=commit:
                 raise DeploymentError("respond5 did not stage the exact tagged source tree")
-            pumpkin = remote(args.worker_host, "build-pumpkin", token=token, revision=commit, expected=expected)
-            if pumpkin.get("status") != "built" or pumpkin.get("pumpkin_image") != f"melon-pumpkin:host-control-{commit}":
+            # Migrate the legacy mutable Pumpkin reference before strict baseline verification.
+            # Rebuild the active app revision and require executable byte identity before retagging.
+            preflight_worker=str(preflight.get("worker_image",""))
+            baseline_pinned=f"melon-pumpkin:host-control-{baseline_revision}"
+            if preflight_worker!=baseline_pinned:
+                baseline_expected=source_inputs(baseline_revision)
+                ensure_release_tag(baseline_revision)
+                bootstrap_image=remote(args.worker_host,"build-pumpkin",token=token,revision=baseline_revision,expected=baseline_expected)
+                if bootstrap_image.get("status")!="built" or bootstrap_image.get("pumpkin_image")!=f"melon-pumpkin:host-control-{baseline_revision}":
+                    raise DeploymentError("could not build source-pinned Pumpkin for the active production revision")
+                baseline_upstream=run(["git","-C",str(ROOT),"show",f"{baseline_revision}:runtime/pumpkin/REVISION"]).strip()
+                bootstrapped=remote(args.worker_host,"bootstrap-worker-image",token=token,revision=baseline_revision,
+                                    pumpkin=bootstrap_image["pumpkin_image"],upstream=baseline_upstream)
+                if bootstrapped.get("status")!="bootstrapped":
+                    raise DeploymentError("legacy worker Pumpkin image was not safely migrated")
+            baseline_result=remote(args.worker_host,"baseline")
+            baseline=baseline_result.get("snapshot")
+            if baseline_result.get("status")!="snapshot" or not baseline:
+                raise DeploymentError("respond5 strict baseline service/worker lease check failed")
+            pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected)
+            if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
                 raise DeploymentError("respond5 host-control Pumpkin image is not pinned to source SHA")
-            previous = assert_no_active_deployments()
-            command_output = run([os.getenv("DOKPLOY_CLI", "dokploy"), "compose", "deploy", "--composeId", COMPOSE_ID,
-                "--title", f"Deploy {commit[:12]}", "--description", f"Deploy exact origin/main revision {commit}", "--json"], timeout=60)
-            try:
-                queued = json.loads(command_output)
-            except json.JSONDecodeError as error:
-                raise DeploymentError("Dokploy CLI returned invalid deployment response") from error
-            if not isinstance(queued, dict) or queued.get("success") is not True:
-                raise DeploymentError("Dokploy did not confirm deployment queueing")
-            deployment_id = wait_deployment(commit, previous, args.timeout)
-            wait_attempted = True
-            receipt = remote(args.worker_host, "wait", token=token, revision=commit, pumpkin=pumpkin["pumpkin_image"],
-                             baseline=baseline, expected=expected)
-            if receipt.get("status") != "verified":
-                raise DeploymentError("respond5 failed image/worker/lease verification")
-            receipt.update(status="verified", source_revision=commit, deployment_id=deployment_id,
+            tag=ensure_release_tag(commit)
+            set_branch(tag)
+            update_build_revision(commit)
+            deployment_attempted=True
+            deployment_id=queue_and_wait_deployment(commit,f"Deploy {commit[:12]}",args.timeout)
+            def mark_wait_attempted() -> None:
+                nonlocal wait_attempted
+                wait_attempted=True
+            receipt=dispatch_worker_wait(
+                lambda **kwargs: remote(args.worker_host,"wait",**kwargs),
+                lambda: remote(args.worker_host,"rollback-worker",token=token), mark_wait_attempted,
+                token=token,revision=commit,pumpkin=pumpkin["pumpkin_image"],baseline=baseline,expected=expected)
+            if receipt.get("status")!="verified":raise DeploymentError("respond5 failed image/worker/lease verification")
+            receipt.update(status="verified",source_revision=commit,deployment_id=deployment_id,
                            host_control_pumpkin_image=pumpkin.get("pumpkin_image_id"),
-                           source_archive_sha256=pumpkin.get("archive_sha256"), release_tag=tag)
-            if release_revision() != commit:
-                raise DeploymentError("origin/main or the local release checkout changed during rollout")
-            # autoDeploy stays false by policy. Dokploy temporarily points to the immutable tag
-            # only for this manually queued build, then returns to the canonical main branch.
+                           source_archive_sha256=pumpkin.get("archive_sha256"),release_tag=tag)
+            if release_revision()!=commit:raise DeploymentError("origin/main or local release checkout changed during rollout")
             set_branch(branch)
-            latest = [item for item in deployment_list() if str(item.get("deploymentId")) not in previous]
-            if len(latest) != 1 or str(latest[0].get("deploymentId")) != deployment_id or str(latest[0].get("status", "")).lower() != "done":
-                raise DeploymentError("Dokploy deployment was superseded or changed before acceptance")
-            accepted = remote(args.worker_host, "accept-stage", token=token, revision=commit)
-            if accepted.get("status") != "accepted":
-                raise DeploymentError("respond5 did not safely restore the staged checkout overrides")
-            staged = False
-            marked_result = remote(args.worker_host, "mark", token=token, receipt=receipt)
-            if marked_result.get("status") != "marked":
-                raise DeploymentError("respond5 did not write the verified release marker")
-            finalized = remote(args.worker_host, "finalize-worker", token=token, revision=commit, receipt=receipt)
-            if finalized.get("status") != "finalized":
-                raise DeploymentError("respond5 did not finalize the worker transaction")
-            marked = True
-            print(json.dumps(receipt, sort_keys=True))
+            accepted=remote(args.worker_host,"accept-stage",token=token,revision=commit)
+            if accepted.get("status")!="accepted":raise DeploymentError("respond5 did not safely restore staged checkout overrides")
+            staged=False
+            marked_result=remote(args.worker_host,"mark",token=token,receipt=receipt)
+            if marked_result.get("status")!="marked":raise DeploymentError("respond5 did not write the verified release marker")
+            finalization_attempted=True
+            finalized=remote(args.worker_host,"finalize-worker",token=token,revision=commit,receipt=receipt)
+            if finalized.get("status")!="finalized":raise DeploymentError("respond5 did not finalize the worker transaction")
+            marked=True
+            print(json.dumps(receipt,sort_keys=True))
             return 0
-    except (DeploymentError, OSError, subprocess.TimeoutExpired) as error:
-        print(f"deployment not accepted: {error}", file=sys.stderr)
+    except (DeploymentError,OSError,subprocess.TimeoutExpired) as error:
+        if finalization_attempted and locked and receipt is not None:
+            try:
+                recovery=remote(args.worker_host,"rollback-worker",token=token)
+                if recovery.get("status")=="already-accepted":
+                    marked=True
+                    print(json.dumps(receipt,sort_keys=True))
+                    return 0
+            except Exception:
+                pass
+        print(f"deployment not accepted: {error}",file=sys.stderr)
         return 1
     finally:
-        if locked and wait_attempted and not marked:
+        if deployment_attempted and not marked:
             try:
-                remote(args.worker_host, "rollback-worker", token=token)
+                if baseline is None or not baseline_revision:
+                    raise DeploymentError("prior app snapshot was not verified; cannot safely accept mixed release state")
+                result=rollback_failed_release(
+                    lambda:remote(args.worker_host,"rollback-worker",token=token),
+                    lambda:rollback_application(args.worker_host,branch,baseline_revision,baseline,token,args.timeout),
+                )
+                rollback_verified=result.get("status")=="app-rolled-back"
+                rollback_app_revision_restored=rollback_verified
+                if result.get("status")=="already-accepted":marked=True
             except Exception as error:
-                print(f"respond5 worker rollback could not be verified; transaction retained: {error}", file=sys.stderr)
+                rollback_app_revision_restored=bool(getattr(error,"app_rolled_back",False))
+                rollback_verified=rollback_app_revision_restored and bool(getattr(error,"worker_rolled_back",False))
+                print(f"prior production app/worker rollback could not be verified: {error}",file=sys.stderr)
         if staged and locked:
             try:
-                remote(args.worker_host, "restore", token=token)
+                remote(args.worker_host,"restore",token=token)
             except Exception as error:
-                print(f"Dokploy checkout override restore failed; inspect backup: {error}", file=sys.stderr)
-        if prepared:
+                print(f"Dokploy checkout override restore failed; inspect backup: {error}",file=sys.stderr)
+        if prepared and should_restore_dokploy_source(
+            deployment_attempted=deployment_attempted,
+            app_revision_restored=rollback_app_revision_restored,
+            marked=marked,
+        ):
             try:
-                if compose_info().get("branch") != branch:
-                    set_branch(branch)
-                # Deliberately keep autoDeploy disabled and keep the successful revision pin.
+                if compose_info().get("branch")!=branch:set_branch(branch)
                 if not marked:
-                    restore_build_revision(old_env)
+                    if deployment_attempted and rollback_app_revision_restored and baseline_revision:
+                        update_build_revision(baseline_revision)
+                    elif not rollback_verified:
+                        restore_build_revision(old_env)
             except Exception as error:
-                print(f"Dokploy release configuration restore failed: {error}", file=sys.stderr)
-        if locked:
-            try:
-                remote(args.worker_host, "unlock", token=token)
-            except Exception as error:
-                print(f"respond5 rollout lock retained: {error}", file=sys.stderr)
+                print(f"Dokploy release configuration restore failed: {error}",file=sys.stderr)
+        elif prepared:
+            print("Dokploy immutable rollback source and BUILD_REVISION intentionally retained because app rollback is unverified",file=sys.stderr)
+        if locked and (not deployment_attempted or marked or rollback_verified):
+            try:remote(args.worker_host,"unlock",token=token)
+            except Exception as error:print(f"respond5 rollout lock retained: {error}",file=sys.stderr)
+        elif locked:
+            print("respond5 rollout lock intentionally retained because production rollback is unverified",file=sys.stderr)
 
 
 if __name__ == "__main__":

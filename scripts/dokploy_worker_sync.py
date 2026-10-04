@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ PROJECT = "kurbis-hoster-fbikvd"
 SERVICES = ("control-plane", "gateway", "panel", "waiting-pumpkin", "postgres")
 PUMPKIN_PREFIX = "melon-pumpkin:host-control-"
 LOCK = Path("/run/lock/kurbis-production-deploy.lock")
+OPERATION_LOCK = Path("/run/lock/kurbis-production-deploy-operation.lock")
 CHECKOUT_BACKUP = ROOT / "deploy-checkout-overrides"
 WORKER_BACKUP = ROOT / "worker-rollbacks"
 ENV_BACKUP = ROOT / "worker-bundle-rollbacks"
@@ -102,11 +104,21 @@ def worker_id() -> str:
     return identity()
 
 
-def worker_image() -> str:
+def worker_image_value() -> str:
     values = [line.split("=", 1)[1].strip().strip("\"'") for line in WORKER_ENV.read_text(encoding="utf-8").splitlines() if re.match(r"^export PUMPKIN_IMAGE=", line)]
-    if len(values) != 1 or not re.fullmatch(re.escape(PUMPKIN_PREFIX) + r"[0-9a-f]{40}", values[0]):
+    if len(values) != 1:
+        raise Error("worker env must contain exactly one PUMPKIN_IMAGE")
+    value=values[0]
+    if value != "melon-pumpkin:host-control" and not re.fullmatch(re.escape(PUMPKIN_PREFIX) + r"[0-9a-f]{40}", value):
+        raise Error("worker PUMPKIN_IMAGE is neither the recognized legacy tag nor a full SHA-pinned Kurbis image")
+    return value
+
+
+def worker_image() -> str:
+    image=worker_image_value()
+    if not re.fullmatch(re.escape(PUMPKIN_PREFIX) + r"[0-9a-f]{40}", image):
         raise Error("worker PUMPKIN_IMAGE is not a full SHA-pinned Kurbis image")
-    return values[0]
+    return image
 
 
 def service_valid() -> None:
@@ -122,6 +134,16 @@ def states() -> dict[str, list[dict[str, str]]]:
         items = json.loads(run(["docker", "inspect", *ids])) if ids else []
         out[service] = [{"id": x["Id"], "image": x["Image"], "status": x["State"]["Status"], "health": x["State"].get("Health", {}).get("Status", "none"), "revision": x.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision", "")} for x in items]
     return out
+
+
+def worker_process_environment(pid: int) -> dict[str, str]:
+    raw=Path(f"/proc/{pid}/environ").read_bytes()
+    values={}
+    for entry in raw.split(b"\0"):
+        if b"=" not in entry:continue
+        key,value=entry.split(b"=",1)
+        values[key.decode("utf-8","surrogateescape")]=value.decode("utf-8","surrogateescape")
+    return values
 
 
 def single_worker() -> int:
@@ -167,20 +189,143 @@ def pending_worker_transactions() -> list[Path]:
         return []
     if TRANSACTIONS.is_symlink() or TRANSACTIONS.stat().st_uid != 0 or stat.S_IMODE(TRANSACTIONS.stat().st_mode) != 0o700:
         raise Error("worker transaction directory ownership/mode invalid")
-    pending=list(TRANSACTIONS.glob("*.json"))
-    if any(path.is_symlink() or not path.is_file() for path in pending):
-        raise Error("worker transaction directory contains unsafe records")
+    pending=[]
+    try:marker=json.loads(MARKER.read_text(encoding="utf-8"))
+    except (OSError,json.JSONDecodeError):marker={}
+    for path in TRANSACTIONS.glob("*.json"):
+        if path.is_symlink() or not path.is_file():raise Error("worker transaction directory contains unsafe records")
+        record=json.loads(path.read_text(encoding="utf-8"))
+        if record.get("status")=="accepted":
+            if (marker.get("source_revision")==record.get("source_revision") and marker.get("deployment_id")==record.get("deployment_id")
+                and digest(WORKER)==record.get("new_worker_sha256") and worker_image_value()==record.get("new_pumpkin_image")):
+                path.unlink()
+                continue
+            raise Error("accepted worker transaction does not match current release marker/runtime")
+        pending.append(path)
     return pending
 
 
-def baseline() -> dict[str, list[dict[str, str]]]:
+def _baseline_locked() -> dict[str, list[dict[str, str]]]:
     root_only(); service_valid(); identity()
     if pending_worker_transactions():raise Error("unresolved worker rollback transaction blocks a new rollout")
-    verify_pinned_pumpkin(worker_image()); state = states()
+    pinned=worker_image();state=states()
     for service in SERVICES:
         if len(state[service]) != 1 or state[service][0]["status"] != "running" or (service != "gateway" and state[service][0]["health"] != "healthy"):
             raise Error(f"baseline service is not unique/healthy: {service}")
-    single_worker(); lease(state["postgres"][0]["id"]); return state
+    app_revision=state["control-plane"][0]["revision"]
+    if not valid_sha(app_revision) or state["gateway"][0]["revision"]!=app_revision or pinned!=f"{PUMPKIN_PREFIX}{app_revision}":
+        raise Error("strict baseline app, worker binary and Pumpkin image revisions do not match")
+    if any(state[name][0]["revision"]!=app_revision for name in ("panel","waiting-pumpkin")):
+        raise Error("strict baseline panel/waiting services have mixed app revisions")
+    image=image_for_app(state,app_revision);worker_sha=verify_worker_binary_in_app_image(image,app_revision)
+    verify_image_revision(state["panel"][0]["image"],app_revision)
+    upstream=run(["git","-C",str(CHECKOUT),"show",f"{app_revision}:runtime/pumpkin/REVISION"]).strip()
+    verify_waiting(state["waiting-pumpkin"][0],app_revision,upstream,pinned)
+    pid=single_worker()
+    if digest(Path(f"/proc/{pid}/exe"))!=worker_sha:raise Error("baseline worker executable differs from active app image")
+    if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned:raise Error("baseline worker process environment differs from its protected config")
+    verify_pinned_pumpkin(pinned);lease(state["postgres"][0]["id"]);return state
+
+
+def baseline() -> dict[str, list[dict[str, str]]]:
+    with OperationLock():
+        return _baseline_locked()
+
+
+def _baseline_preflight_locked() -> dict[str, object]:
+    """Validate the live service/lease before allowing a safe legacy-image migration."""
+    root_only(); service_valid(); identity()
+    if pending_worker_transactions():raise Error("unresolved worker rollback transaction blocks a new rollout")
+    state=states()
+    for service in SERVICES:
+        if len(state[service])!=1 or state[service][0]["status"]!="running" or (service!="gateway" and state[service][0]["health"]!="healthy"):
+            raise Error(f"pre-bootstrap service is not unique/healthy: {service}")
+    app_revision=state["control-plane"][0]["revision"]
+    if not valid_sha(app_revision) or state["gateway"][0]["revision"]!=app_revision:
+        raise Error("current app release has no consistent full-SHA OCI revision; safe worker bootstrap is impossible")
+    if any(state[name][0]["revision"]!=app_revision for name in ("panel","waiting-pumpkin")):
+        raise Error("current production services have mixed revisions; safe worker bootstrap is impossible")
+    verify_image_revision(state["panel"][0]["image"],app_revision)
+    upstream=run(["git","-C",str(CHECKOUT),"show",f"{app_revision}:runtime/pumpkin/REVISION"]).strip()
+    waiting_id,label=run(["docker","image","inspect",state["waiting-pumpkin"][0]["image"],"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
+    if waiting_id!=state["waiting-pumpkin"][0]["image"] or label!=app_revision:raise Error("current waiting image label differs from active app revision")
+    app_image=image_for_app(state,app_revision)
+    app_worker_sha=verify_worker_binary_in_app_image(app_image,app_revision)
+    image=worker_image_value()
+    if image != "melon-pumpkin:host-control":
+        verify_pinned_pumpkin(image)
+    else:
+        run(["docker","image","inspect",image,"--format","{{.Id}}"])
+    pid=single_worker()
+    if digest(Path(f"/proc/{pid}/exe"))!=app_worker_sha:
+        raise Error("running worker binary differs from the active app image; safe bootstrap is impossible")
+    if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=image:
+        raise Error("running worker environment differs from protected config; safe bootstrap is impossible")
+    lease(state["postgres"][0]["id"])
+    return {"status":"preflight","snapshot":state,"app_revision":app_revision,"worker_image":image,"upstream_revision":upstream}
+
+
+def baseline_preflight() -> dict[str, object]:
+    with OperationLock():
+        return _baseline_preflight_locked()
+
+
+def _bootstrap_worker_image_locked(token: str, revision: str, pinned_image: str, upstream: str) -> dict[str, str]:
+    require_lock(token)
+    if not valid_sha(revision) or pinned_image!=f"{PUMPKIN_PREFIX}{revision}":raise Error("bootstrap image is not pinned to the active app revision")
+    old_env=WORKER_ENV.read_bytes();old_image=worker_image_value()
+    state=states()
+    if any(len(state.get(name,[]))!=1 or state[name][0]["revision"]!=revision or state[name][0]["status"]!="running"
+           for name in ("control-plane","gateway","panel","waiting-pumpkin")):
+        raise Error("production services changed after preflight; refusing legacy image bootstrap")
+    verify_image_revision(state["panel"][0]["image"],revision)
+    verify_waiting(state["waiting-pumpkin"][0],revision,upstream,pinned_image)
+    if old_image==pinned_image:
+        verify_pinned_pumpkin(old_image)
+        return {"status":"already-pinned","pumpkin_image":pinned_image}
+    pinned_id,pinned_sha=verify_pumpkin(pinned_image,revision,upstream)
+    if old_image=="melon-pumpkin:host-control":
+        old_id=run(["docker","image","inspect",old_image,"--format","{{.Id}}"])
+    else:
+        old_id,_=verify_pinned_pumpkin(old_image)
+    old_payload=pumpkin_runtime_payload_hashes(old_id)
+    pinned_payload=pumpkin_runtime_payload_hashes(pinned_id)
+    if old_payload!=pinned_payload or old_payload.get("pumpkin")!=pinned_sha:
+        raise Error("current Pumpkin runtime bundle differs from source-pinned active-release build; refusing migration")
+    new_env=updated_worker_env(old_env,pinned_image)
+    database=state["postgres"]
+    if len(database)!=1 or database[0]["status"]!="running":raise Error("database unavailable before worker bootstrap")
+    database_id=database[0]["id"]
+    old_hash=digest(WORKER)
+    def verify_old():
+        if worker_image_value()!=old_image or digest(WORKER_ENV)!=hashlib.sha256(old_env).hexdigest():raise Error("legacy worker environment was not restored")
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("legacy worker executable changed during rollback")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=old_image:raise Error("legacy worker process retained a partial bootstrap environment")
+        lease(database_id)
+    def verify_new():
+        if worker_image()!=pinned_image:raise Error("pinned worker image bootstrap did not persist")
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("worker executable changed during image-only bootstrap")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned_image:raise Error("worker process did not load the SHA-pinned Pumpkin environment")
+        time.sleep(35)
+        pid=single_worker()
+        if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("worker executable changed during bootstrap lease window")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned_image:raise Error("worker process environment changed during bootstrap lease window")
+        lease(database_id)
+    try:
+        mutate_worker_bundle(old_binary=WORKER.read_bytes(),new_binary=WORKER.read_bytes(),old_env=old_env,new_env=new_env,
+            binary_changed=False,env_changed=True,write_binary=lambda content:None,
+            write_env=lambda content:atomic(WORKER_ENV,content,0o600,0,0),
+            restart=lambda:run(["systemctl","restart",WORKER_SERVICE]),verify_new=verify_new,verify_old=verify_old)
+    except BundleMutationError as error:
+        raise Error(f"worker image bootstrap failed: {error}") from error
+    return {"status":"bootstrapped","pumpkin_image":pinned_image,"pumpkin_image_id":pinned_id,"pumpkin_sha256":pinned_sha}
+
+
+def bootstrap_worker_image(token: str, revision: str, pinned_image: str, upstream: str) -> dict[str, str]:
+    with OperationLock():
+        return _bootstrap_worker_image_locked(token,revision,pinned_image,upstream)
 
 
 def lock(token: str, acquire: bool) -> dict[str, str]:
@@ -192,6 +337,24 @@ def lock(token: str, acquire: bool) -> dict[str, str]:
         LOCK.mkdir(mode=0o700); (LOCK / "owner").write_text(token + "\n", encoding="ascii"); os.chmod(LOCK / "owner", 0o600); return {"status":"locked"}
     if LOCK.is_symlink() or not (LOCK / "owner").is_file() or (LOCK / "owner").read_text().strip() != token: raise Error("rollout lock ownership mismatch")
     (LOCK / "owner").unlink(); LOCK.rmdir(); return {"status":"released"}
+
+
+class OperationLock:
+    def __enter__(self):
+        root_only()
+        OPERATION_LOCK.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        flags=os.O_CREAT|os.O_RDWR|getattr(os,"O_NOFOLLOW",0)
+        self.fd=os.open(OPERATION_LOCK,flags,0o600)
+        metadata=os.fstat(self.fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid!=0 or stat.S_IMODE(metadata.st_mode)!=0o600:
+            os.close(self.fd)
+            raise Error("worker operation lock must be a root-owned regular mode-0600 file")
+        fcntl.flock(self.fd,fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self,*exc):
+        fcntl.flock(self.fd,fcntl.LOCK_UN)
+        os.close(self.fd)
 
 
 def require_lock(token: str) -> None:
@@ -244,7 +407,10 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
         relative = raw_relative.decode("utf-8", "surrogateescape")
         path=CHECKOUT/relative
         if not path.is_file() or path.is_symlink() or Path(relative).is_absolute() or ".." in Path(relative).parts: raise Error(f"unsafe override: {relative}")
-        m=path.stat(); content=path.read_bytes(); manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing")})
+        m=path.stat(); content=path.read_bytes()
+        head_target=subprocess.run(["git","-C",str(CHECKOUT),"rev-parse",f"HEAD:{relative}"],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=False)
+        original_target=head_target.stdout.strip() if head_target.returncode==0 else "missing"
+        manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing"),"original_target":original_target})
     (backup/"manifest.json").write_text(json.dumps(manifest),encoding="utf-8"); os.chmod(backup/"manifest.json",0o600)
     tag=f"kurbis-release-{revision}"
     run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
@@ -269,7 +435,8 @@ def restore(token: str) -> dict[str, str]:
     for entry in manifest:
         path=CHECKOUT/entry["path"]
         current = run(["git","-C",str(CHECKOUT),"hash-object","--",entry["path"]]) if path.is_file() else "missing"
-        if current != entry["target"]: preserved.append(entry["path"]); continue
+        allowed_targets={entry.get("target","missing"),entry.get("original_target","missing")}
+        if current not in allowed_targets: preserved.append(entry["path"]); continue
         content=base64.b64decode(entry["content"]); atomic(path,content,int(entry["mode"]),int(entry["uid"]),int(entry["gid"])); restored.append(entry["path"])
     if preserved:
         return {"status":"preserved","restored":json.dumps(restored),"preserved":json.dumps(preserved)}
@@ -325,6 +492,10 @@ def verify_git_archive(archive: Path, expected: dict[str, str]) -> str:
 def build_pumpkin(revision: str, expected: dict[str,str], token: str) -> dict[str,str]:
     require_lock(token); validate_expected_manifest(expected)
     if not valid_sha(revision): raise Error("invalid Pumpkin build revision")
+    tag_name=f"kurbis-release-{revision}"
+    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag_name}:refs/tags/{tag_name}"])
+    if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag_name}^{{commit}}"] )!=revision:
+        raise Error("Pumpkin source tag does not resolve to requested release SHA")
     root=ROOT/"release-builds"
     if not root.exists():root.mkdir(mode=0o700)
     if root.is_symlink() or root.stat().st_uid!=0 or stat.S_IMODE(root.stat().st_mode)!=0o700: raise Error("release build root ownership/mode invalid")
@@ -378,6 +549,14 @@ def verify_application_image(image_id:str,revision:str)->tuple[dict[str,str],byt
         return hashes,data["worker"]
 
 
+def verify_worker_binary_in_app_image(image_id: str, revision: str) -> str:
+    label=run(["docker","image","inspect",image_id,"--format",'{{index .Config.Labels "org.opencontainers.image.revision"}}'])
+    if label!=revision:raise Error("application image OCI revision label differs from expected source SHA")
+    with tempfile.TemporaryDirectory(prefix="kurbis-prior-worker-") as directory:
+        binary=extract_binary(image_id,"worker",Path(directory))
+        return digest(binary)
+
+
 def verify_image_revision(image_id: str, revision: str) -> str:
     details=run(["docker","image","inspect",image_id,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}'])
     parts=details.split("|",1)
@@ -400,6 +579,19 @@ def verify_pinned_pumpkin(image: str) -> tuple[str, str]:
             if build_revision.read_text(encoding="utf-8").strip()!=revision:raise Error("worker Pumpkin embedded source revision mismatch")
             return verify_pumpkin(image,revision,upstream_revision.read_text(encoding="utf-8").strip())
     finally:run(["docker","rm",cid])
+
+
+def pumpkin_runtime_payload_hashes(image_id: str) -> dict[str, str]:
+    files={"pumpkin":"/usr/local/bin/pumpkin",
+           "plugin":"/usr/local/share/kurbis-control.wasm",
+           "entrypoint":"/usr/local/bin/hosted-entrypoint"}
+    with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-exe-") as directory:
+        root=Path(directory);cid=run(["docker","create","--entrypoint","/bin/true",image_id])
+        try:
+            for name,source in files.items():run(["docker","cp",f"{cid}:{source}",str(root/name)])
+        finally:run(["docker","rm",cid])
+        return {name:digest(root/name) for name in files}
+
 
 
 def verify_pumpkin(image:str,revision:str,upstream:str)->tuple[str,str]:
@@ -524,17 +716,29 @@ def worker_transaction(new_binary:bytes,pumpkin_image:str,*,token:str,revision:s
         "rollback_worker_sha256":old_bin_hash,"rollback_worker_env_sha256":old_env_hash}
 
 
-def rollback_worker(token: str) -> dict[str, str]:
+def _rollback_worker_locked(token: str) -> dict[str, str]:
     require_lock(token)
     tx_path=transaction_path(token)
     if not tx_path.exists(): return {"status":"no-pending-worker-transaction"}
     if tx_path.is_symlink(): raise Error("worker transaction record is unsafe")
     data=json.loads(tx_path.read_text(encoding="utf-8"))
     if data.get("token")!=token or not valid_sha(str(data.get("source_revision", ""))):raise Error("worker transaction record is invalid")
+    if data.get("status")=="accepted":
+        try:marker=json.loads(MARKER.read_text(encoding="utf-8"))
+        except (OSError,json.JSONDecodeError) as error:raise Error("accepted worker record has no valid release marker") from error
+        if marker.get("source_revision")!=data.get("source_revision") or marker.get("deployment_id")!=data.get("deployment_id") or digest(WORKER)!=data.get("new_worker_sha256") or worker_image()!=data.get("new_pumpkin_image"):
+            raise Error("accepted worker record no longer matches the live release")
+        return {"status":"already-accepted"}
     old_hash=str(data.get("old_worker_sha256", ""));old_env_hash=str(data.get("old_worker_env_sha256", ""))
     if not re.fullmatch(r"[0-9a-f]{64}",old_hash) or not re.fullmatch(r"[0-9a-f]{64}",old_env_hash):raise Error("worker rollback hashes are invalid")
     bin_backup=WORKER_BACKUP/f"worker-{old_hash}";env_backup=ENV_BACKUP/f"worker-env-{old_env_hash}"
     if bin_backup.is_symlink() or env_backup.is_symlink() or digest(bin_backup)!=old_hash or digest(env_backup)!=old_env_hash:raise Error("worker rollback backup missing or corrupt")
+    try:
+        marker=json.loads(MARKER.read_text(encoding="utf-8"))
+        if marker.get("source_revision")==data["source_revision"] and marker.get("deployment_id")==data.get("deployment_id"):
+            MARKER.unlink()
+    except FileNotFoundError:
+        pass
     verify_pinned_pumpkin(str(data["old_worker_image"]))
     atomic(WORKER,bin_backup.read_bytes(),int(data["old_worker_mode"]),int(data["old_worker_uid"]),int(data["old_worker_gid"]))
     atomic(WORKER_ENV,env_backup.read_bytes(),0o600,0,0)
@@ -561,14 +765,13 @@ def rollback_worker(token: str) -> dict[str, str]:
         except (Error, OSError, ValueError) as error:
             last_error=str(error);time.sleep(3)
     else:raise Error(f"prior worker rollback could not be verified: {last_error}")
-    try:
-        marker=json.loads(MARKER.read_text(encoding="utf-8"))
-        if marker.get("source_revision")==data["source_revision"] and marker.get("deployment_id")==data.get("deployment_id"):
-            MARKER.unlink()
-    except FileNotFoundError:
-        pass
     tx_path.unlink()
     return {"status":"rolled-back","worker_sha256":old_hash,"worker_env_sha256":old_env_hash}
+
+
+def rollback_worker(token: str) -> dict[str, str]:
+    with OperationLock():
+        return _rollback_worker_locked(token)
 
 
 def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->None:
@@ -606,7 +809,7 @@ def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->Non
     panel_ports=services["panel"].get("ports",[])
     if not any((isinstance(port,dict) and port.get("host_ip")=="127.0.0.1") or str(port).startswith("127.0.0.1:") for port in panel_ports):raise Error("panel port is not bound to localhost")
 
-def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
+def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
     require_lock(token)
     if not valid_sha(revision):raise Error("invalid release SHA")
     verify_build_context(CHECKOUT,revision,expected)
@@ -634,9 +837,11 @@ def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[s
         pid=single_worker()
         if digest(Path(f"/proc/{pid}/exe"))!=app_hashes["worker_sha256"]:raise Error("new worker binary hash mismatch")
         if worker_image()!=pumpkin_image:raise Error("worker environment did not switch to the verified Pumpkin image")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pumpkin_image:raise Error("running worker process did not load the verified Pumpkin image")
         time.sleep(35)
         pid=single_worker()
         if digest(Path(f"/proc/{pid}/exe"))!=app_hashes["worker_sha256"]:raise Error("worker binary changed during lease check")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pumpkin_image:raise Error("worker process environment changed during lease check")
         lease(database_id)
         final=states()
         if any(len(final[name])!=1 or final[name][0]["id"]!=current[name][0]["id"] for name in SERVICES):raise Error("Compose service changed during worker update")
@@ -647,9 +852,48 @@ def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[s
         pid=single_worker()
         if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker binary hash mismatch")
         if digest(WORKER_ENV)!=hashlib.sha256(old_env).hexdigest() or worker_image()!=old_image:raise Error("rollback worker environment mismatch")
+        if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=old_image:raise Error("worker process environment rollback mismatch")
         lease(database_id)
     worker=worker_transaction(new_worker,pumpkin_image,token=token,revision=revision,restart=lambda:run(["systemctl","restart",WORKER_SERVICE]),verify_new=verify_new,verify_old=verify_old)
     return {"status":"verified","image_id":image,"pumpkin_image":pumpkin_image,"pumpkin_image_id":pumpkin_id,"pumpkin_sha256":pumpkin_sha,**app_hashes,**worker,"worker_id":worker_id(),"worker_lease_verified":"true","worker_pid":str(single_worker())}
+
+def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
+    with OperationLock():
+        return _wait_sync_locked(revision,pumpkin_image,baseline_state,expected,token,timeout)
+
+
+def _verify_app_revision_locked(revision: str, expected_ids: dict[str, list[dict[str, str]]], token: str) -> dict[str, str]:
+    require_lock(token)
+    if not valid_sha(revision):raise Error("rollback app revision is not a full SHA")
+    for service in ("control-plane","gateway","panel","waiting-pumpkin"):
+        prior=expected_ids.get(service,[])
+        if len(prior)!=1 or prior[0].get("revision")!=revision:
+            raise Error("rollback revision does not match the pre-deploy production snapshot")
+    state=states()
+    cp,gw=state["control-plane"],state["gateway"]
+    if len(cp)!=1 or len(gw)!=1 or cp[0]["image"]!=gw[0]["image"] or cp[0]["revision"]!=revision or gw[0]["revision"]!=revision:
+        raise Error("control-plane/gateway rollback does not match prior accepted revision")
+    if cp[0]["status"]!="running" or gw[0]["status"]!="running" or cp[0]["health"]!="healthy":raise Error("rolled-back app services are unhealthy")
+    if any(len(state[name])!=1 or state[name][0]["status"]!="running" or state[name][0]["health"]!="healthy" or state[name][0]["revision"]!=revision for name in ("panel","waiting-pumpkin")):
+        raise Error("rolled-back panel/waiting services do not match prior accepted revision")
+    if len(state["postgres"])!=1 or state["postgres"][0]["status"]!="running" or state["postgres"][0]["health"]!="healthy":raise Error("database health failed after app rollback")
+    app_worker_sha=verify_worker_binary_in_app_image(cp[0]["image"],revision)
+    verify_image_revision(state["panel"][0]["image"],revision)
+    upstream=run(["git","-C",str(CHECKOUT),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
+    pinned=worker_image()
+    if pinned!=f"{PUMPKIN_PREFIX}{revision}":raise Error("rollback worker Pumpkin image differs from prior app revision")
+    verify_waiting(state["waiting-pumpkin"][0],revision,upstream,pinned)
+    pid=single_worker()
+    if digest(Path(f"/proc/{pid}/exe"))!=app_worker_sha:raise Error("rollback worker executable differs from prior app image")
+    if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned:raise Error("rollback worker process environment differs from prior app revision")
+    lease(state["postgres"][0]["id"])
+    return {"status":"app-rolled-back","revision":revision,"worker_pid":str(pid),"worker_image":pinned}
+
+
+def verify_app_revision(revision: str, expected_ids: dict[str, list[dict[str, str]]], token: str) -> dict[str, str]:
+    with OperationLock():
+        return _verify_app_revision_locked(revision,expected_ids,token)
+
 
 def mark(receipt:str,token:str)->dict[str,str]:
     require_lock(token);data=json.loads(receipt)
@@ -699,16 +943,20 @@ def finalize_worker(token: str, revision: str, receipt: str) -> dict[str, str]:
     if not tx_path.is_file() or tx_path.is_symlink():raise Error("pending worker transaction is missing")
     tx=json.loads(tx_path.read_text(encoding="utf-8"))
     if tx.get("source_revision")!=revision or tx.get("deployment_id")!=data.get("deployment_id"):raise Error("worker transaction provenance mismatch")
-    tx_path.unlink()
+    tx["status"]="accepted"
+    atomic(tx_path,(json.dumps(tx,sort_keys=True)+"\n").encode(),0o600,0,0)
     return {"status":"finalized"}
 
 def main() -> int:
-    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--receipt"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--upstream"); parser.add_argument("--receipt"); args=parser.parse_args()
     try:
         expected=json.loads(args.expected) if args.expected else None
         if args.remote=="lock": result=lock(args.token,True)
         elif args.remote=="unlock": result=lock(args.token,False)
         elif args.remote=="baseline": result={"status":"snapshot","snapshot":baseline()}
+        elif args.remote=="baseline-preflight": result=baseline_preflight()
+        elif args.remote=="bootstrap-worker-image": result=bootstrap_worker_image(args.token,args.revision,args.pumpkin,args.upstream)
+        elif args.remote=="verify-app-revision": result=verify_app_revision(args.revision,json.loads(args.baseline),args.token)
         elif args.remote=="stage": result=stage(args.revision,args.token,expected)
         elif args.remote=="restore": result=restore(args.token)
         elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected,args.token)

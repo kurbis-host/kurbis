@@ -27,10 +27,145 @@ sync = load("sync", ROOT / "scripts/dokploy_worker_sync.py")
 deploy = load("deploy", ROOT / "scripts/deploy_dokploy.py")
 
 
+class NoopOperationLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
 class RolloutTests(unittest.TestCase):
+    def test_preflight_accepts_only_the_known_legacy_tag_before_verified_bootstrap(self):
+        revision = "f" * 40
+        state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": revision}]
+                 for name in sync.SERVICES}
+        def fake_run(args, **kwargs):
+            if args[:3] == ["docker", "image", "inspect"]:
+                return f"sha256:app|{revision}" if args[3] == "sha256:app" else "sha256:legacy"
+            if args[:3] == ["git", "-C", str(sync.CHECKOUT)]:
+                return "upstream-pin"
+            raise AssertionError(args)
+        with patch.object(sync, "OperationLock", NoopOperationLock), patch.object(sync, "root_only"), patch.object(sync, "service_valid"), patch.object(sync, "identity", return_value="worker"), \
+             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "states", return_value=state), \
+             patch.object(sync, "image_for_app", return_value="sha256:app"), patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
+             patch.object(sync, "run", side_effect=fake_run), \
+             patch.object(sync, "verify_worker_binary_in_app_image", return_value="1" * 64), \
+             patch.object(sync, "worker_image_value", return_value="melon-pumpkin:host-control"), \
+             patch.object(sync, "single_worker", return_value=77), patch.object(sync, "worker_process_environment", return_value={"PUMPKIN_IMAGE": "melon-pumpkin:host-control"}), \
+             patch.object(sync, "digest", return_value="1" * 64), patch.object(sync, "lease"):
+            result = sync.baseline_preflight()
+        self.assertEqual(result["status"], "preflight")
+        self.assertEqual(result["worker_image"], "melon-pumpkin:host-control")
+        self.assertEqual(result["app_revision"], revision)
+        self.assertEqual(result["snapshot"], state)
+
+    def test_strict_baseline_rejects_worker_pumpkin_from_another_app_revision(self):
+        active = "f" * 40
+        other = "e" * 40
+        state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": active}]
+                 for name in sync.SERVICES}
+        with patch.object(sync, "OperationLock", NoopOperationLock), patch.object(sync, "root_only"), patch.object(sync, "service_valid"), patch.object(sync, "identity", return_value="worker"), \
+             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "worker_image", return_value=f"{sync.PUMPKIN_PREFIX}{other}"), \
+             patch.object(sync, "states", return_value=state), self.assertRaisesRegex(sync.Error, "revisions do not match"):
+            sync.baseline()
+
+    def test_preflight_rejects_inconsistent_active_app_before_bootstrap(self):
+        state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": "a" * 40}]
+                 for name in sync.SERVICES}
+        state["gateway"][0]["revision"] = "b" * 40
+        with patch.object(sync, "OperationLock", NoopOperationLock), patch.object(sync, "root_only"), patch.object(sync, "service_valid"), patch.object(sync, "identity", return_value="worker"), \
+             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "states", return_value=state), \
+             self.assertRaisesRegex(sync.Error, "consistent full-SHA"):
+            sync.baseline_preflight()
+
+    def test_worker_process_environment_reads_nul_delimited_exports_exactly(self):
+        raw = b"PATH=/usr/bin\0PUMPKIN_IMAGE=melon-pumpkin:host-control-" + b"a" * 40 + b"\0WORKER_ID=worker\0"
+        with patch.object(Path, "read_bytes", return_value=raw):
+            environment = sync.worker_process_environment(123)
+        self.assertEqual(environment["PUMPKIN_IMAGE"], "melon-pumpkin:host-control-" + "a" * 40)
+        self.assertEqual(environment["WORKER_ID"], "worker")
+
     def test_no_mutable_cargo_target_cache_mounts(self):
         for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
             self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
+
+    def test_legacy_worker_image_bootstraps_to_active_revision_pin_without_touching_data(self):
+        revision = "d" * 40
+        pinned = f"{sync.PUMPKIN_PREFIX}{revision}"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = root / "worker"
+            env = root / "worker.env"
+            data = root / "server-data" / "world.db"
+            data.parent.mkdir()
+            worker.write_bytes(b"current worker executable")
+            env.write_text(f"export PUMPKIN_IMAGE=melon-pumpkin:host-control\n", encoding="utf-8")
+            env.chmod(0o600)
+            data.write_bytes(b"do not delete or rewrite")
+            original_digest = sync.digest
+            def fake_digest(path):
+                if str(path) == "/proc/4321/exe":
+                    return hashlib.sha256(worker.read_bytes()).hexdigest()
+                return original_digest(Path(path))
+            def fake_atomic(path, content, mode, uid=0, gid=0):
+                Path(path).write_bytes(content)
+                Path(path).chmod(mode)
+            runtime_state = {name: [{"id": name, "image": "sha256:app" if name != "waiting-pumpkin" else "sha256:waiting",
+                                      "status": "running", "health": "healthy", "revision": revision}]
+                             for name in sync.SERVICES}
+            def fake_run(args, **kwargs):
+                if args[:3] == ["docker", "image", "inspect"]:
+                    return f"sha256:waiting|{revision}" if args[3] == "sha256:waiting" else "sha256:legacy"
+                if args[:2] == ["systemctl", "restart"]:
+                    return ""
+                raise AssertionError(args)
+            with patch.object(sync, "WORKER", worker), patch.object(sync, "WORKER_ENV", env), patch.object(sync, "OperationLock", NoopOperationLock), \
+                 patch.object(sync, "require_lock"), patch.object(sync, "states", return_value=runtime_state), \
+                 patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
+                 patch.object(sync, "single_worker", return_value=4321), \
+                 patch.object(sync, "worker_process_environment", side_effect=lambda pid: {"PUMPKIN_IMAGE": sync.worker_image_value()}), \
+                 patch.object(sync, "lease"), patch.object(sync, "time") as mock_time, \
+                 patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "atomic", side_effect=fake_atomic), \
+                 patch.object(sync, "verify_pumpkin", return_value=("sha256:pinned", "same-pumpkin-binary")), \
+                 patch.object(sync, "pumpkin_runtime_payload_hashes", return_value={"pumpkin": "same-pumpkin-binary", "plugin": "same-wasm", "entrypoint": "same-entrypoint"}), \
+                 patch.object(sync, "digest", side_effect=fake_digest):
+                mock_time.sleep.return_value = None
+                result = sync.bootstrap_worker_image("a" * 32, revision, pinned, "upstream-pin")
+            self.assertEqual(result["status"], "bootstrapped")
+            self.assertEqual(env.read_text(encoding="utf-8"), f"export PUMPKIN_IMAGE={pinned}\n")
+            self.assertEqual(worker.read_bytes(), b"current worker executable")
+            self.assertEqual(data.read_bytes(), b"do not delete or rewrite")
+
+    def test_legacy_worker_image_bootstrap_refuses_executable_mismatch_without_mutation(self):
+        revision = "e" * 40
+        pinned = f"{sync.PUMPKIN_PREFIX}{revision}"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker, env = root / "worker", root / "worker.env"
+            worker.write_bytes(b"worker")
+            original_env = b"export PUMPKIN_IMAGE=melon-pumpkin:host-control\n"
+            env.write_bytes(original_env)
+            env.chmod(0o600)
+            runtime_state = {name: [{"id": name, "image": "sha256:app" if name != "waiting-pumpkin" else "sha256:waiting",
+                                      "status": "running", "health": "healthy", "revision": revision}]
+                             for name in sync.SERVICES}
+            def fake_run(args, **kwargs):
+                if args[:3] == ["docker", "image", "inspect"]:
+                    return f"sha256:waiting|{revision}" if args[3] == "sha256:waiting" else "sha256:legacy"
+                raise AssertionError(args)
+            with patch.object(sync, "WORKER", worker), patch.object(sync, "WORKER_ENV", env), patch.object(sync, "OperationLock", NoopOperationLock), \
+                 patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "verify_pumpkin", return_value=("sha256:pinned", "new-binary")), \
+                 patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "states", return_value=runtime_state), \
+                 patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
+                 patch.object(sync, "pumpkin_runtime_payload_hashes", side_effect=[
+                     {"pumpkin": "new-binary", "plugin": "legacy-wasm", "entrypoint": "same-entrypoint"},
+                     {"pumpkin": "new-binary", "plugin": "new-wasm", "entrypoint": "same-entrypoint"},
+                 ]), \
+                 self.assertRaisesRegex(sync.Error, "differs from source-pinned"):
+                sync.bootstrap_worker_image("a" * 32, revision, pinned, "upstream-pin")
+            self.assertEqual(env.read_bytes(), original_env)
+            self.assertEqual(worker.read_bytes(), b"worker")
 
     def test_run_bytes_preserves_git_nul_records_and_leading_status_spaces(self):
         output = sync.run_bytes(["python3", "-c", "import sys; sys.stdout.buffer.write(bytes([32,77,32,99,111,109,112,111,115,101,46,121,97,109,108,0,33,33,32,46,101,110,118,0]))"])
@@ -75,12 +210,14 @@ class RolloutTests(unittest.TestCase):
                  patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "identity", return_value="worker-id"), \
                  patch.object(Path, "stat", stat_with_root_backup_owner):
                 result = sync.stage(revision, token, expected)
+                manifest = json.loads((backup_root / token / "manifest.json").read_text(encoding="utf-8"))
+                restored = sync.restore(token)
             self.assertEqual(result, {"status": "staged", "revision": revision})
-            self.assertEqual((checkout / "compose.yaml").read_text(encoding="utf-8"), "services: {app: {image: app:old}}\n")
-            self.assertEqual((checkout / ".env").read_text(encoding="utf-8"), "PRESERVE_ME=1\n")
-            manifest = json.loads((backup_root / token / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest[0]["path"], "compose.yaml")
             self.assertEqual(base64.b64decode(manifest[0]["content"]).decode(), override)
+            self.assertEqual(restored["status"], "restored")
+            self.assertEqual((checkout / "compose.yaml").read_text(encoding="utf-8"), override)
+            self.assertEqual((checkout / ".env").read_text(encoding="utf-8"), "PRESERVE_ME=1\n")
 
     def test_checkout_status_allows_only_explicit_env_and_reviewed_overrides(self):
         sync.validate_checkout_status(b"!! .env\0 M compose.yaml\0", allow_overrides=True)
@@ -301,6 +438,51 @@ class RolloutTests(unittest.TestCase):
                     sync.require_lock("a" * 32)
                 sync.require_lock("b" * 32)
 
+    def test_app_rollback_verifier_accepts_healthy_prior_revision_without_forcing_recreate(self):
+        revision = "9" * 40
+        state = {name: [{"id": name, "image": "sha256:prior-app", "status": "running", "health": "healthy", "revision": revision}]
+                 for name in sync.SERVICES}
+        class NoopLock:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        worker_hash = "1" * 64
+        with patch.object(sync, "OperationLock", NoopLock), patch.object(sync, "require_lock"), \
+             patch.object(sync, "states", return_value=state), patch.object(sync, "verify_worker_binary_in_app_image", return_value=worker_hash), \
+             patch.object(sync, "verify_image_revision"), patch.object(sync, "run", return_value="upstream-pin"), \
+             patch.object(sync, "worker_image", return_value=f"{sync.PUMPKIN_PREFIX}{revision}"), \
+             patch.object(sync, "verify_waiting"), patch.object(sync, "single_worker", return_value=12), \
+             patch.object(sync, "digest", return_value=worker_hash), \
+             patch.object(sync, "worker_process_environment", return_value={"PUMPKIN_IMAGE": f"{sync.PUMPKIN_PREFIX}{revision}"}), patch.object(sync, "lease"):
+            result = sync.verify_app_revision(revision, state, "a" * 32)
+        self.assertEqual(result["status"], "app-rolled-back")
+        self.assertEqual(result["revision"], revision)
+
+    def test_app_rollback_verifier_requires_prior_snapshot_revision(self):
+        revision = "9" * 40
+        state = {name: [{"id": name, "image": "sha256:prior-app", "status": "running", "health": "healthy", "revision": revision}]
+                 for name in sync.SERVICES}
+        snapshot = {name: [dict(items[0])] for name, items in state.items()}
+        snapshot["control-plane"][0]["revision"] = "8" * 40
+        class NoopLock:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        with patch.object(sync, "OperationLock", NoopLock), patch.object(sync, "require_lock"), patch.object(sync, "states", return_value=state), \
+             self.assertRaisesRegex(sync.Error, "pre-deploy production snapshot"):
+            sync.verify_app_revision(revision, snapshot, "a" * 32)
+
+    def test_app_rollback_verifier_rejects_mixed_gateway_revision(self):
+        revision = "9" * 40
+        state = {name: [{"id": name, "image": "sha256:prior-app", "status": "running", "health": "healthy", "revision": revision}]
+                 for name in sync.SERVICES}
+        snapshot = {name: [dict(items[0])] for name, items in state.items()}
+        state["gateway"][0]["revision"] = "8" * 40
+        class NoopLock:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        with patch.object(sync, "OperationLock", NoopLock), patch.object(sync, "require_lock"), patch.object(sync, "states", return_value=state), \
+             self.assertRaisesRegex(sync.Error, "prior accepted revision"):
+            sync.verify_app_revision(revision, snapshot, "a" * 32)
+
     def test_marker_refuses_mixed_control_plane_gateway_revisions(self):
         revision = "a" * 40
         receipt = {
@@ -326,14 +508,24 @@ class RolloutTests(unittest.TestCase):
                 "owner": "kurbis-host", "repository": "kurbis", "branch": "main", "composePath": "./compose.yaml",
                 "environment": {"name": "production"}, "composeType": "docker-compose", "command": None,
                 "env": "", "autoDeploy": False}
-        for update in ({"composeType": "docker-stack"}, {"command": "docker compose up -d"}, {"command": "docker compose up -d --build"}, {"command": "absent"}):
+        default = "docker compose up -d --build"
+        for update in ({"composeType": "docker-stack"}, {"command": "docker compose up -d"},
+                       {"command": "docker compose up -d --no-build"}, {"command": "absent"}):
             value = {**base, **update}
             if update == {"command": "absent"}:
                 value.pop("command")
-            with self.subTest(update=update), patch.object(deploy, "api", return_value=value), self.assertRaises(deploy.DeploymentError):
+            def fake_api(endpoint, params):
+                return value if endpoint == "compose.one" else default
+            with self.subTest(update=update), patch.object(deploy, "api", side_effect=fake_api), self.assertRaises(deploy.DeploymentError):
                 deploy.compose_info()
-        with patch.object(deploy, "api", return_value=base):
+        def safe_api(endpoint, params):
+            return base if endpoint == "compose.one" else default
+        with patch.object(deploy, "api", side_effect=safe_api):
             self.assertEqual(deploy.compose_info()["composeType"], "docker-compose")
+        custom_default = {**base, "command": default}
+        with patch.object(deploy, "api", side_effect=lambda endpoint, params: custom_default if endpoint == "compose.one" else default):
+            with self.assertRaisesRegex(deploy.DeploymentError,"custom Compose command"):
+                deploy.compose_info()
 
     def test_compose_source_and_auto_deploy_policy_persist(self):
         state = {
@@ -349,6 +541,8 @@ class RolloutTests(unittest.TestCase):
             calls.append((endpoint, params, post))
             if endpoint == "compose.one":
                 return dict(state)
+            if endpoint == "compose.getDefaultCommand":
+                return "docker compose up -d --build"
             if endpoint == "compose.update":
                 state["autoDeploy"] = params["autoDeploy"]
                 return {}
@@ -381,6 +575,87 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("BUILD_REVISION=old", saved[0])
         self.assertIn("KEEP=value", saved[0])
         self.assertIs(state["autoDeploy"], False)
+
+    def test_lost_wait_response_rolls_back_worker_before_prior_app_revision(self):
+        state = {"worker": "old", "app": "new"}
+        attempts = {"rollback": 0, "app": 0}
+        wait_attempted = False
+        def on_attempt():
+            nonlocal wait_attempted
+            wait_attempted = True
+        def remote_wait(**kwargs):
+            state["worker"] = "new"
+            raise TimeoutError("SSH response lost after remote mutation")
+        def worker_rollback():
+            attempts["rollback"] += 1
+            if state["worker"] == "new":
+                state["worker"] = "old"
+                return {"status": "rolled-back"}
+            return {"status": "no-pending-worker-transaction"}
+        def app_rollback():
+            attempts["app"] += 1
+            self.assertEqual(state["worker"], "old")
+            state["app"] = "old"
+            return {"status": "app-rolled-back"}
+        with self.assertRaisesRegex(TimeoutError, "response lost"):
+            deploy.dispatch_worker_wait(remote_wait, worker_rollback, on_attempt, token="token")
+        result = deploy.rollback_failed_release(worker_rollback, app_rollback)
+        self.assertTrue(wait_attempted)
+        self.assertEqual(result["status"], "app-rolled-back")
+        self.assertEqual(state, {"worker": "old", "app": "old"})
+        self.assertEqual(attempts, {"rollback": 2, "app": 1})
+
+    def test_unverified_app_rollback_keeps_immutable_dokploy_source_and_lock(self):
+        self.assertFalse(deploy.should_restore_dokploy_source(deployment_attempted=True, app_revision_restored=False, marked=False))
+        self.assertTrue(deploy.should_restore_dokploy_source(deployment_attempted=True, app_revision_restored=True, marked=False))
+        self.assertTrue(deploy.should_restore_dokploy_source(deployment_attempted=False, app_revision_restored=False, marked=False))
+        self.assertTrue(deploy.should_restore_dokploy_source(deployment_attempted=True, app_revision_restored=False, marked=True))
+
+    def test_accepted_worker_release_is_not_rolled_back_after_finalize_response_loss(self):
+        app_rollback = unittest.mock.Mock(side_effect=AssertionError("accepted release must not roll back app"))
+        result = deploy.rollback_failed_release(lambda: {"status": "already-accepted"}, app_rollback)
+        self.assertEqual(result["status"], "already-accepted")
+        app_rollback.assert_not_called()
+
+    def test_worker_verification_failure_rolls_back_old_app_after_worker(self):
+        actions = []
+        def worker_rollback():
+            actions.append("worker")
+            return {"status": "rolled-back"}
+        def app_rollback():
+            actions.append("app")
+            return {"status": "app-rolled-back"}
+        result = deploy.rollback_failed_release(worker_rollback, app_rollback)
+        self.assertEqual(result["status"], "app-rolled-back")
+        self.assertEqual(actions, ["worker", "app"])
+
+    def test_app_rollback_is_still_attempted_when_worker_rollback_is_unverified(self):
+        actions = []
+        def worker_rollback():
+            actions.append("worker")
+            raise TimeoutError("rollback acknowledgement unavailable")
+        def app_rollback():
+            actions.append("app")
+            return {"status": "app-rolled-back"}
+        with self.assertRaisesRegex(deploy.DeploymentRollbackError, "worker rollback could not be verified") as raised:
+            deploy.rollback_failed_release(worker_rollback, app_rollback)
+        self.assertTrue(raised.exception.app_rolled_back)
+        self.assertEqual(actions, ["worker", "app"])
+
+    def test_rollback_waits_for_superseded_deployment_to_finish(self):
+        samples = [
+            [{"deploymentId": "new-release", "status": "running"}],
+            [{"deploymentId": "new-release", "status": "done"}],
+        ]
+        with patch.object(deploy, "deployment_list", side_effect=samples), patch.object(deploy.time, "sleep") as sleep:
+            deploy.wait_for_terminal_deployments(10)
+        sleep.assert_called_once_with(5)
+
+    def test_rollback_refuses_to_start_overlapping_when_deploy_never_finishes(self):
+        with patch.object(deploy, "deployment_list", return_value=[{"deploymentId": "stuck", "status": "running"}]), \
+             patch.object(deploy.time, "monotonic", side_effect=[0, 2]), patch.object(deploy.time, "sleep"), \
+             self.assertRaisesRegex(deploy.DeploymentError, "did not finish before rollback"):
+            deploy.wait_for_terminal_deployments(1)
 
     def test_deployment_gate_rejects_existing_active_run(self):
         with patch.object(deploy, "deployment_list", return_value=[{"deploymentId": "active", "status": "running"}]), self.assertRaises(deploy.DeploymentError):
