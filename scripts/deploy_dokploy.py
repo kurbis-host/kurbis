@@ -306,10 +306,11 @@ def worker_sync_source() -> str:
 def remote(host: str, operation: str, *, token: str | None = None, revision: str | None = None,
            expected: dict | None = None, baseline: dict | None = None,
            pumpkin: str | None = None, upstream: str | None = None,
-           receipt: dict | None = None) -> dict:
+           receipt: dict | None = None, release_environment: dict | None = None) -> dict:
     command = ["python3", "-", "--remote", operation]
     for key, value in (("token", token), ("revision", revision), ("expected", expected),
-                       ("baseline", baseline), ("pumpkin", pumpkin), ("upstream", upstream), ("receipt", receipt)):
+                       ("baseline", baseline), ("pumpkin", pumpkin), ("upstream", upstream), ("receipt", receipt),
+                       ("release-environment",release_environment)):
         if value is not None:
             command.extend([f"--{key}", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))])
     output = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(command)],
@@ -576,7 +577,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             staged_result=remote(args.worker_host,"stage",token=token,revision=commit,expected=expected)
             if staged_result.get("status")!="staged" or staged_result.get("revision")!=commit:
                 raise DeploymentError("respond5 did not stage the exact tagged source tree")
-            tls_context=remote(args.worker_host,"verify-build-context",token=token,revision=commit,expected=expected)
+            tls_context=remote(args.worker_host,"verify-build-context",token=token,revision=commit,expected=expected,
+                               release_environment={"BUILD_REVISION":commit,**ENV_UPDATES})
             if tls_context.get("status")!="build-context-verified" or tls_context.get("revision")!=commit:
                 raise DeploymentError("Respond5 did not verify release build inputs and Bedrock TLS assets before deployment")
             pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected)

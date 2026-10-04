@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import stat
@@ -278,7 +279,9 @@ class RolloutTests(unittest.TestCase):
             (checkout / ".dockerignore").write_text(".env*\n")
             (checkout / "web/.dockerignore").write_text(".env*\n")
             env_file = checkout / ".env"
-            env_file.write_text("BUILD_REVISION=" + revision + "\nBEDROCK_TLS_HOST_DIRECTORY=/srv/kurbis/certs\nPANEL_BIND_ADDRESS=127.0.0.1\nROOT_DOMAIN=kurbis.host\nBEDROCK_PORT=19132\n")
+            # Dokploy's protected source .env predates the centrally stored release-only
+            # settings; these must be overlaid from the reviewed prepared Dokploy values.
+            env_file.write_text("ROOT_DOMAIN=kurbis.host\nBEDROCK_PORT=19132\n")
             config = {"services": {
                 "control-plane": {"image": "app:local", "build": {"context": str(checkout), "args": {"BUILD_REVISION": revision}}},
                 "gateway": {"image": "app:local", "user": "2613:2613",
@@ -300,13 +303,25 @@ class RolloutTests(unittest.TestCase):
                 if "hash-object" in args:
                     return expected[args[-1]]
                 if "compose" in args and "config" in args:
+                    env_args=[args[i+1] for i,value in enumerate(args[:-1]) if value=="--env-file"]
+                    self.assertEqual(len(env_args),2)
+                    self.assertEqual(Path(env_args[0]),env_file)
+                    override_values={}
+                    for line in Path(env_args[1]).read_text(encoding="utf-8").splitlines():
+                        key,value=line.split("=",1);override_values[key]=value
+                    self.assertEqual(override_values,{"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs",
+                        "BUILD_REVISION":revision,"PANEL_BIND_ADDRESS":"127.0.0.1"})
+                    self.assertEqual(Path(env_args[1]).stat().st_mode & 0o777,0o600)
                     return json.dumps(config)
                 raise AssertionError(args)
             with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"), patch.object(sync, "verify_bedrock_tls_assets"):
-                sync.verify_build_context(checkout, revision, expected)
+                release_env={"BUILD_REVISION":revision,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1"}
+                sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
                 config["services"]["waiting-pumpkin"]["build"]["target"] = "host-control"
                 with self.assertRaises(sync.Error):
-                    sync.verify_build_context(checkout, revision, expected)
+                    sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                with self.assertRaisesRegex(sync.Error,"environment overrides differ"):
+                    sync.verify_build_context(checkout,revision,expected,release_environment={**release_env,"PANEL_BIND_ADDRESS":"0.0.0.0"})
 
     def test_pending_worker_rollback_blocks_another_release(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -746,21 +761,28 @@ class RolloutTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is needed to render the production Compose fixture")
     def test_rendered_production_compose_has_required_read_only_bedrock_tls_and_ports(self):
         with tempfile.TemporaryDirectory() as directory:
-            rendered_env=Path(directory)/"production.env"
+            rendered_env=Path(directory)/"legacy-production.env"
+            release_env=Path(directory)/"release-overrides.env"
             values={}
             for line in (ROOT/".env.example").read_text(encoding="utf-8").splitlines():
                 if line and not line.lstrip().startswith("#") and "=" in line:
                     key,value=line.split("=",1);values[key]=value
-            values.update({"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","BEDROCK_PORT":"19132",
-                           "JAVA_PORT":"25565","BUILD_REVISION":"a"*40})
+            for key in ("BEDROCK_TLS_HOST_DIRECTORY","PANEL_BIND_ADDRESS","BUILD_REVISION"):
+                values.pop(key,None)
+            values.update({"BEDROCK_PORT":"19132","JAVA_PORT":"25565"})
             rendered_env.write_text("".join(f"{key}={value}\n" for key,value in values.items()),encoding="utf-8")
-            output=subprocess.run([shutil.which("docker"),"compose","--env-file",str(rendered_env),
+            release_values={"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1","BUILD_REVISION":"a"*40}
+            release_env.write_text("".join(f"{key}={value}\n" for key,value in release_values.items()),encoding="utf-8")
+            release_env.chmod(0o600)
+            output=subprocess.run([shutil.which("docker"),"compose","--env-file",str(rendered_env),"--env-file",str(release_env),
                 "-f",str(ROOT/"compose.yaml"),"config","--format","json"],
                 cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
             self.assertEqual(output.returncode,0,output.stderr)
             services=json.loads(output.stdout)["services"]
             sync.verify_gateway_tls_configuration(services,"/srv/kurbis/certs","19132",error_cls=sync.Error)
             gateway=services["gateway"]
+            self.assertEqual(services["control-plane"]["build"]["args"]["BUILD_REVISION"],"a"*40)
+            self.assertEqual(services["panel"]["ports"][0]["host_ip"],"127.0.0.1")
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_CERT_FILE"],"/run/kurbis-tls/fullchain.pem")
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_KEY_FILE"],"/run/kurbis-tls/privkey.pem")
             mount=next(v for v in gateway["volumes"] if v.get("target")=="/run/kurbis-tls")
@@ -796,6 +818,18 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(source.count("from __future__ import annotations"),1)
         self.assertIn("def verify_restarted_worker_impl",source)
         compile(source,"<respond5-legacy-stdin>","exec")
+
+    def test_remote_sends_only_reviewed_release_environment_overrides(self):
+        overrides={"BUILD_REVISION":"a"*40,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs",
+                   "PANEL_BIND_ADDRESS":"127.0.0.1"}
+        with patch.object(deploy,"run",return_value="{}") as remote_run:
+            result=deploy.remote("respond5","verify-build-context",token="token",revision="a"*40,
+                                 release_environment=overrides)
+        self.assertEqual(result,{})
+        command=shlex.split(remote_run.call_args.args[0][-1])
+        index=command.index("--release-environment")
+        self.assertEqual(json.loads(command[index+1]),overrides)
+        self.assertNotIn("POSTGRES_PASSWORD",command[index+1])
 
     def test_release_suite_runs_rollout_behavior_and_first_join_database_tests(self):
         with patch.dict(os.environ, {"TEST_DATABASE_URL": "postgres://disposable"}), patch.object(deploy, "run") as run_mock:

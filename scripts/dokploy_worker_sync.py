@@ -783,7 +783,7 @@ if __file__ != "<stdin>":
     exec(compile(_tls_module.read_text(encoding="utf-8"),str(_tls_module),"exec"),globals())
 # __TLS_HELPERS__
 
-def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->None:
+def verify_build_context(checkout:Path,revision:str,expected:dict[str,str],release_environment:dict[str,str]|None=None)->None:
     if run(["git","-C",str(checkout),"rev-parse","HEAD"])!=revision:raise Error("Dokploy checkout HEAD differs from release SHA")
     validate_expected_manifest(expected)
     status=run_bytes(["git","-C",str(checkout),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
@@ -799,8 +799,26 @@ def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->Non
         if line.strip() and not line.lstrip().startswith("#") and "=" in line:
             key,value=line.split("=",1);values[key]=value.strip().strip("\"'")
     required={"BUILD_REVISION":revision,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1"}
-    if any(values.get(k)!=v for k,v in required.items()):raise Error("Dokploy env does not match exact release/prod binds")
-    configured=json.loads(run(["docker","compose","-p",PROJECT,"--env-file",str(ENV),"-f",str(checkout/"compose.yaml"),"config","--format","json"]))
+    compose_env_files=["--env-file",str(ENV)]
+    if release_environment is not None:
+        if set(release_environment)!=set(required) or release_environment!=required:
+            raise Error("pre-deploy Compose environment overrides differ from reviewed release/prod values")
+        values.update(release_environment)
+        fd,override_name=tempfile.mkstemp(prefix="kurbis-release-env-",suffix=".env")
+        override=Path(override_name)
+        try:
+            with os.fdopen(fd,"w",encoding="utf-8") as output:
+                for key in sorted(release_environment):output.write(f"{key}={release_environment[key]}\n")
+                output.flush();os.fsync(output.fileno())
+            os.chmod(override,0o600)
+            compose_env_files.extend(["--env-file",str(override)])
+            if any(values.get(k)!=v for k,v in required.items()):raise Error("Dokploy env does not match exact release/prod binds")
+            configured=json.loads(run(["docker","compose","-p",PROJECT,*compose_env_files,"-f",str(checkout/"compose.yaml"),"config","--format","json"]))
+        finally:
+            override.unlink(missing_ok=True)
+    else:
+        if any(values.get(k)!=v for k,v in required.items()):raise Error("Dokploy env does not match exact release/prod binds")
+        configured=json.loads(run(["docker","compose","-p",PROJECT,*compose_env_files,"-f",str(checkout/"compose.yaml"),"config","--format","json"]))
     services=configured.get("services",{})
     if set(SERVICES)-set(services):raise Error("rendered Compose configuration omits production services")
     if services["control-plane"].get("image")!=services["gateway"].get("image"):
@@ -960,7 +978,7 @@ def finalize_worker(token: str, revision: str, receipt: str) -> dict[str, str]:
     return {"status":"finalized"}
 
 def main() -> int:
-    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--upstream"); parser.add_argument("--receipt"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--upstream"); parser.add_argument("--receipt"); parser.add_argument("--release-environment"); args=parser.parse_args()
     try:
         expected=json.loads(args.expected) if args.expected else None
         if args.remote=="lock": result=lock(args.token,True)
@@ -971,7 +989,9 @@ def main() -> int:
         elif args.remote=="verify-app-revision": result=verify_app_revision(args.revision,json.loads(args.baseline),args.token)
         elif args.remote=="stage": result=stage(args.revision,args.token,expected)
         elif args.remote=="verify-build-context":
-            require_lock(args.token);verify_build_context(CHECKOUT,args.revision,expected)
+            require_lock(args.token)
+            release_environment=json.loads(args.release_environment) if args.release_environment else None
+            verify_build_context(CHECKOUT,args.revision,expected,release_environment=release_environment)
             result={"status":"build-context-verified","revision":args.revision}
         elif args.remote=="restore": result=restore(args.token)
         elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected,args.token)
