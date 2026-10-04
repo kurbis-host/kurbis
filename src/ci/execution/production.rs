@@ -10,7 +10,7 @@ use super::{DockerRootlessBuildRuntime, RustPumpkinBuilder};
 /// Limits used by the rootless Docker Pumpkin builder. These are deliberately separate
 /// from runtime limits: compilation needs more memory, but remains bounded.
 pub const ROOTLESS_BUILD_LIMITS: SandboxLimits = SandboxLimits {
-    memory_bytes: 8 * 1024 * 1024 * 1024,
+    memory_bytes: 10 * 1024 * 1024 * 1024,
     cpu_millis: 2000,
     pid_limit: 512,
     disk_bytes: 5 * 1024 * 1024 * 1024,

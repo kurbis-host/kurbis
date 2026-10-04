@@ -147,3 +147,8 @@ fn only_the_compilation_workspace_explicitly_allows_exec() {
             .any(|flag| flag == "exec")
     );
 }
+
+#[test]
+fn default_build_limits_reserve_ten_gib_for_pumpkin_compilation() {
+    assert_eq!(default_build_limits().memory_bytes, 10 * 1024 * 1024 * 1024);
+}

@@ -13,7 +13,7 @@ pub(super) const MAX_PLUGIN_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn default_build_limits() -> SandboxLimits {
     SandboxLimits {
-        memory_bytes: 8 * 1024 * 1024 * 1024,
+        memory_bytes: 10 * 1024 * 1024 * 1024,
         cpu_millis: 2000,
         pid_limit: 512,
         disk_bytes: 5 * 1024 * 1024 * 1024,

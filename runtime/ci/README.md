@@ -47,8 +47,9 @@ daemon. Provision the dedicated builder host with enough disk for the pinned too
 image and rootless Docker data root. Per-build source, target, and temporary scratch
 are volatile bounded tmpfs mounts. The pre-seeded Cargo package/git cache remains
 in the immutable image and is read-only to workloads; only the image and bounded
-Docker logs persist on the host. Compilation is serialized, with release LTO
-disabled and 16 codegen units to fit the builder's memory limit. The Kurbis
+Docker logs persist on the host. Compilation is serialized, with a 10 GiB
+memory cap, release LTO disabled, and 16 codegen units. Provision the dedicated
+builder with at least 16 GiB RAM so its host and Docker daemon retain headroom. The Kurbis
 startup probe rejects builders whose cgroup v2, user namespace, CPU/memory/PID
 controls, no-egress policy, read-only image root, or bounded workspace tmpfs do
 not pass disposable workload tests. Builder workspaces use a per-container

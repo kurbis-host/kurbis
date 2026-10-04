@@ -109,7 +109,7 @@ impl DockerRootlessBuildRuntime {
             toolchain_version,
             expected_rustc,
             sandbox: DockerSandbox,
-            // A compile uses an 8 GiB bounded tmpfs-backed workspace. Keep one
+            // A compile uses a 10 GiB memory limit and bounded tmpfs-backed workspace. Keep one
             // host build active per control-plane process to avoid aggregate
             // memory overcommit from concurrent PR and branch requests.
             build_slots: Arc::new(Semaphore::new(1)),
