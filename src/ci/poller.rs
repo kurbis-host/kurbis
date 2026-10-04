@@ -198,10 +198,15 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .check_run_reconciliation_candidates(128)
             .await?
         {
-            let (build_log, expires_at, preview_hostnames) = self
-                .repository
-                .build_diagnostics(candidate.build_id, &self.config.root_domain)
-                .await?;
+            let (build_log, expires_at, preview_hostnames) = if candidate.tombstone {
+                (String::new(), None, Vec::new())
+            } else {
+                let (build_log, expires_at, preview_hostnames) = self
+                    .repository
+                    .build_diagnostics(candidate.build_id, &self.config.root_domain)
+                    .await?;
+                (build_log, Some(expires_at), preview_hostnames)
+            };
             let details_url = self
                 .config
                 .public_status_base_url
@@ -231,7 +236,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .rev()
                     .collect(),
                 preview_hostnames,
-                expires_at: Some(expires_at.to_rfc3339()),
+                expires_at: expires_at.map(|expires_at| expires_at.to_rfc3339()),
                 details_url,
             };
             match check_runs
@@ -244,7 +249,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             {
                 Ok(()) => {
                     self.repository
-                        .mark_check_run_stage_synced(candidate.build_id, candidate.stage)
+                        .mark_check_run_stage_synced(
+                            candidate.build_id,
+                            candidate.stage,
+                            candidate.tombstone,
+                        )
                         .await?;
                 }
                 Err(error) => tracing::warn!(

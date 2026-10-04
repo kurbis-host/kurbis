@@ -88,6 +88,9 @@ async fn main() -> Result<()> {
                 {
                     tracing::error!(?error, "failed to queue idle CI runtime shutdown");
                 }
+                if let Err(error) = runtime_repository.request_due_world_snapshots(128).await {
+                    tracing::error!(?error, "failed to request periodic CI world snapshots");
+                }
                 if let Err(error) = artifact_cache.delete_expired(now).await {
                     tracing::error!(?error, "failed to delete expired CI artifacts");
                 }

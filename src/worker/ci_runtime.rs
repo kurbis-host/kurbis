@@ -2,6 +2,7 @@
 //! represented as account servers and run with the same DockerSandbox policy.
 
 use std::{
+    collections::HashSet,
     fs,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -91,7 +92,13 @@ impl CiPreviewWorker {
     }
 
     pub async fn reconcile(&self) -> Result<()> {
-        for placement in self.control_plane.ci_runtime_assignments().await? {
+        let assignments = self.control_plane.ci_runtime_assignments().await?;
+        let assigned = assignments
+            .iter()
+            .filter(|placement| placement.worker_id == self.worker_id)
+            .map(|placement| placement.preview_id)
+            .collect::<HashSet<_>>();
+        for placement in assignments {
             if placement.worker_id != self.worker_id {
                 continue;
             }
@@ -106,6 +113,20 @@ impl CiPreviewWorker {
                 tracing::error!(preview_id = %placement.preview_id, generation = placement.generation,
                     state = ?placement.state, ?error, "CI runtime reconciliation failed");
             }
+        }
+        // Retained idle worlds appear as `stopped` assignments above. A world
+        // transferred to another worker after a durable snapshot no longer does;
+        // clean its old local quota volume if this worker later comes back.
+        for preview_id in self.storage.managed_server_ids().await? {
+            if assigned.contains(&preview_id) {
+                continue;
+            }
+            let generation = self.container_label_generation(preview_id).await?;
+            self.remove_stale(preview_id, generation.unwrap_or(1))
+                .await?;
+            self.storage.remove(preview_id).await?;
+            remove_owned_runtime_dir(&self.runtime_root, preview_id)?;
+            tracing::info!(%preview_id, "removed orphaned worker-local CI preview world");
         }
         Ok(())
     }
@@ -211,6 +232,26 @@ impl CiPreviewWorker {
         fs::create_dir_all(&runtime_dir)?;
         write_runtime_owner(&runtime_dir, placement.preview_id)?;
         ensure_rootless_volume_owner(&runtime_dir, daemon_uid, daemon_gid).await?;
+        let snapshot_path = runtime_dir.join("world-snapshot.tar.gz");
+        if self
+            .control_plane
+            .ci_world_snapshot_download(placement, &snapshot_path, CI_RUNTIME_DISK_BYTES as u64)
+            .await?
+            .is_some()
+        {
+            // The local volume may belong to a different host after CI failover.
+            // Replace it only after the authenticated shared snapshot is fully
+            // downloaded and its size/checksum have been verified.
+            self.storage.reset(placement.preview_id).await?;
+            unpack_world_snapshot(
+                &snapshot_path,
+                &world,
+                CI_RUNTIME_DISK_BYTES as u64,
+                daemon_uid,
+                daemon_gid,
+            )?;
+            fs::remove_file(&snapshot_path)?;
+        }
         let archive = self.control_plane.download_ci_artifact(placement).await?;
         let metadata = unpack_artifact(&archive, &runtime_dir)?;
         let target = format!("{}-linux", std::env::consts::ARCH);
@@ -447,6 +488,28 @@ impl CiPreviewWorker {
             self.control_plane.ci_runtime_lost(placement).await?;
             return Ok(());
         }
+        if self
+            .control_plane
+            .ci_world_snapshot_requested(placement)
+            .await?
+        {
+            let capability = fs::read_to_string(
+                self.runtime_dir(placement.preview_id)
+                    .join("runtime.capability"),
+            )?;
+            let socket = self
+                .storage
+                .path(placement.preview_id)
+                .join("run/host-control.sock");
+            PumpkinControl::new(capability.trim().to_owned())
+                .save(&socket)
+                .await
+                .context("save CI world before requested snapshot")?;
+            self.persist_world_snapshot(placement).await?;
+            self.control_plane
+                .ci_world_snapshot_complete(placement)
+                .await?;
+        }
         let capability = fs::read_to_string(
             self.runtime_dir(placement.preview_id)
                 .join("runtime.capability"),
@@ -477,6 +540,7 @@ impl CiPreviewWorker {
     async fn stop(&self, placement: &CiRuntimePlacement, retain_world: bool) -> Result<()> {
         if retain_world {
             self.graceful_stop(placement).await?;
+            self.persist_world_snapshot(placement).await?;
             self.control_plane.ci_runtime_stopped(placement).await?;
         } else {
             self.force_stop(placement).await?;
@@ -536,6 +600,19 @@ impl CiPreviewWorker {
             .remove_server(placement.preview_id)
             .await?;
         Ok(())
+    }
+
+    async fn persist_world_snapshot(&self, placement: &CiRuntimePlacement) -> Result<()> {
+        let runtime_dir = self.runtime_dir(placement.preview_id);
+        let path = runtime_dir.join(format!("world-snapshot-{}.tar.gz", placement.generation));
+        let world = self.storage.path(placement.preview_id);
+        let (size_bytes, _checksum) = pack_world(&world, &path, CI_RUNTIME_DISK_BYTES as u64)?;
+        let result = self
+            .control_plane
+            .ci_world_snapshot_upload(placement, &path, size_bytes)
+            .await;
+        let _ = fs::remove_file(&path);
+        result
     }
 
     async fn force_stop(&self, placement: &CiRuntimePlacement) -> Result<()> {
@@ -720,7 +797,9 @@ impl CiPreviewWorker {
 }
 
 mod helpers;
+mod world_snapshot;
 use helpers::*;
+use world_snapshot::{pack_world, unpack_world_snapshot};
 
 #[cfg(test)]
 mod tests {

@@ -81,3 +81,25 @@ patches, validates/extracts/patches source archives inside the rootless,
 quota-bounded workload before compilation. The trusted plugin source is copied
 from the image build context into the control-plane image; it is not accepted
 from the Pumpkin commit.
+
+## Preview world snapshots and worker loss
+
+CI previews now publish full 72-hour world checkpoints into the existing object
+store under a preview-specific `ci-previews/<preview-id>/worlds/` namespace.
+A small `ci_world_snapshots` row stores the latest verified size, checksum, and
+source runtime generation; it is separate from account-owned `snapshots` and
+`servers`. The control plane requests periodic checkpoints every ten minutes,
+and an idle stop saves and publishes one before releasing active capacity. The
+managed plugin's `snapshot` command requests the same worker-authenticated
+checkpoint path. Archive packing excludes generated `pumpkin.toml`, host-control
+sockets, the managed plugin binary, and its capability-bearing config; these are
+regenerated from the trusted runtime assignment on start.
+
+If a worker heartbeat expires, the runtime may be assigned to a compatible
+worker only if a complete shared checkpoint exists. The replacement downloads
+and verifies the snapshot digest before extracting into its quota volume. A
+worker without an assignment removes its orphaned local preview world on
+reconciliation. If no checkpoint exists, the system fails closed rather than
+silently starting an empty world on a different host. Expired-preview cleanup
+removes the checkpoint object and metadata along with the generation-fenced
+worker world, port leases, and resource reservations.

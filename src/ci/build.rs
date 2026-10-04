@@ -169,7 +169,7 @@ where
             Ok(()) => {
                 if let Err(error) = self
                     .repository
-                    .mark_check_run_stage_synced(build_id, stage)
+                    .mark_check_run_stage_synced(build_id, stage, false)
                     .await
                 {
                     tracing::warn!(build_id = %build_id, ?error, "failed to persist synchronized CI Check Run stage");

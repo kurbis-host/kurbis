@@ -31,6 +31,7 @@ pub struct CheckRunReconciliation {
     pub artifact_digest: Option<String>,
     pub failure_stage: Option<CiBuildStage>,
     pub failure_message: Option<String>,
+    pub tombstone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -394,16 +395,29 @@ impl CiPreviewRepository {
         limit: i64,
     ) -> Result<Vec<CheckRunReconciliation>> {
         let rows = sqlx::query_as::<_, CheckRunReconciliationRow>(
-            "SELECT build.id AS build_id, check_run.external_id AS check_run_id,
-                    build.repository, build.commit_sha, build.patch_fingerprint,
-                    build.toolchain_version, build.target_architecture, build.stage,
-                    build.artifact_digest, build.failure_stage, build.failure_message
-             FROM ci_check_runs check_run
-             JOIN ci_builds build ON build.id = check_run.build_id
-             WHERE check_run.external_id IS NOT NULL
-               AND check_run.last_stage IS DISTINCT FROM build.stage
-             ORDER BY build.updated_at, build.id
-             LIMIT $1",
+            "WITH candidates AS (
+                SELECT build.id AS build_id, check_run.external_id AS check_run_id,
+                       build.repository, build.commit_sha, build.patch_fingerprint,
+                       build.toolchain_version, build.target_architecture, build.stage,
+                       build.artifact_digest, build.failure_stage, build.failure_message,
+                       FALSE AS tombstone, build.updated_at
+                FROM ci_check_runs check_run
+                JOIN ci_builds build ON build.id = check_run.build_id
+                WHERE check_run.external_id IS NOT NULL
+                  AND check_run.last_stage IS DISTINCT FROM build.stage
+                UNION ALL
+                SELECT tombstone.build_id, tombstone.external_id,
+                       tombstone.repository, tombstone.commit_sha, tombstone.patch_fingerprint,
+                       tombstone.toolchain_version, tombstone.target_architecture, tombstone.stage,
+                       NULL::text AS artifact_digest, NULL::text AS failure_stage,
+                       NULL::text AS failure_message, TRUE AS tombstone, tombstone.updated_at
+                FROM ci_check_run_tombstones tombstone
+                WHERE tombstone.last_stage IS DISTINCT FROM tombstone.stage
+            )
+            SELECT build_id, check_run_id, repository, commit_sha, patch_fingerprint,
+                   toolchain_version, target_architecture, stage, artifact_digest,
+                   failure_stage, failure_message, tombstone
+            FROM candidates ORDER BY updated_at, build_id LIMIT $1",
         )
         .bind(limit.clamp(1, 256))
         .fetch_all(&self.pool)
@@ -415,18 +429,31 @@ impl CiPreviewRepository {
         &self,
         build_id: Uuid,
         stage: CiBuildStage,
+        tombstone: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE ci_check_runs check_run SET last_stage = $2, updated_at = now()
-             FROM ci_builds build
-             WHERE check_run.build_id = $1 AND build.id = check_run.build_id
-               AND build.stage = $2 AND check_run.external_id IS NOT NULL",
-        )
-        .bind(build_id)
-        .bind(stage.to_string())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let rows = if tombstone {
+            sqlx::query(
+                "UPDATE ci_check_run_tombstones SET last_stage=$2, updated_at=now()
+                 WHERE build_id=$1 AND stage=$2",
+            )
+            .bind(build_id)
+            .bind(stage.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE ci_check_runs check_run SET last_stage = $2, updated_at = now()
+                 FROM ci_builds build
+                 WHERE check_run.build_id = $1 AND build.id = check_run.build_id
+                   AND build.stage = $2 AND check_run.external_id IS NOT NULL",
+            )
+            .bind(build_id)
+            .bind(stage.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        };
         Ok(rows == 1)
     }
 
@@ -943,22 +970,43 @@ impl CiPreviewRepository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        // Runtime-bearing aliases remain as tombstones until their worker has
-        // confirmed world deletion. Build-only aliases and unreferenced builds
-        // can be removed in this transaction without orphaning a runtime.
-        // If GitHub has been unavailable for a full week after expiration,
-        // stop retaining failed logs solely for an external status retry.
-        // The regular poller still retries terminal Check Run updates throughout
-        // that grace period; after it, the build/check metadata can be collected.
+        // Expired build diagnostics have the same 72-hour lifetime as the
+        // artifact. Preserve only the small provider reconciliation tombstone
+        // if GitHub has not yet accepted the terminal Check Run update.
         sqlx::query(
-            "DELETE FROM ci_check_runs check_run USING ci_builds build
-             WHERE check_run.build_id = build.id AND build.stage = 'expired'
-               AND check_run.last_stage IS DISTINCT FROM build.stage
-               AND check_run.updated_at <= $1 - interval '7 days'",
+            "UPDATE ci_builds SET build_log='', failure_message=NULL, updated_at=now()
+             WHERE stage='expired' AND expires_at <= $1 AND (build_log <> '' OR failure_message IS NOT NULL)",
         )
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO ci_check_run_tombstones(
+                build_id,repository,commit_sha,patch_fingerprint,toolchain_version,
+                target_architecture,external_id,stage,last_stage,updated_at)
+             SELECT build.id,build.repository,build.commit_sha,build.patch_fingerprint,
+                    build.toolchain_version,build.target_architecture,check_run.external_id,
+                    build.stage,check_run.last_stage,now()
+             FROM ci_check_runs check_run JOIN ci_builds build ON build.id=check_run.build_id
+             WHERE build.stage='expired' AND build.expires_at <= $1
+               AND check_run.external_id IS NOT NULL
+               AND check_run.last_stage IS DISTINCT FROM build.stage
+             ON CONFLICT(build_id) DO UPDATE SET
+                stage=EXCLUDED.stage,last_stage=EXCLUDED.last_stage,updated_at=now()",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM ci_check_runs check_run USING ci_builds build
+             WHERE check_run.build_id=build.id AND build.stage='expired' AND build.expires_at <= $1",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM ci_check_run_tombstones WHERE last_stage=stage")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM ci_preview_aliases alias
              WHERE alias.state = 'expired'
@@ -970,12 +1018,7 @@ impl CiPreviewRepository {
             "DELETE FROM ci_builds build
              WHERE build.stage = 'expired'
                AND NOT EXISTS (SELECT 1 FROM ci_preview_aliases alias WHERE alias.build_id = build.id)
-               AND NOT EXISTS (
-                   SELECT 1 FROM ci_check_runs check_run
-                   WHERE check_run.build_id = build.id
-                     AND check_run.external_id IS NOT NULL
-                     AND check_run.last_stage IS DISTINCT FROM build.stage
-               )",
+",
         )
         .execute(&mut *tx)
         .await?;

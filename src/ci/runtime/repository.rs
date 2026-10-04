@@ -16,6 +16,7 @@ pub const CI_RUNTIME_MEMORY_BYTES: i64 = 1024 * 1024 * 1024;
 pub const CI_RUNTIME_DISK_BYTES: i64 = crate::model::SERVER_STORAGE_BYTES;
 pub const CI_RUNTIME_CPU_MILLIS: i64 = 1000;
 pub const CI_RUNTIME_IDLE_SECONDS: i64 = 300;
+pub const CI_RUNTIME_WORLD_SNAPSHOT_SECONDS: i64 = 600;
 
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
@@ -96,7 +97,10 @@ impl CiPreviewRuntimeRepository {
 
         let old = load_optional_placement(&mut tx, preview_id).await?;
         let (worker_id, base_port, generation) = match old.as_ref() {
-            Some(existing) if existing.state == CiRuntimeState::Starting => {
+            Some(existing)
+                if existing.state == CiRuntimeState::Starting
+                    && worker_alive(&mut tx, existing.worker_id).await? =>
+            {
                 tx.commit().await?;
                 return Ok(RuntimeLease::Starting(existing.clone()));
             }
@@ -110,7 +114,42 @@ impl CiPreviewRuntimeRepository {
                 reserve_active_capacity(&mut tx, existing.worker_id).await?;
                 (existing.worker_id, port, existing.generation + 1)
             }
-            Some(_) => bail!("the CI preview world is pinned to an unavailable worker"),
+            Some(existing) => {
+                let has_snapshot: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM ci_world_snapshots WHERE preview_id=$1)",
+                )
+                .bind(preview_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !has_snapshot {
+                    bail!("CI runtime worker is unavailable and no durable world snapshot exists");
+                }
+                // Reassignment is safe only after a complete last-known-good
+                // snapshot has been published. Find and lock a replacement before
+                // releasing the previous worker's reservation; when capacity is
+                // unavailable, leave accounting untouched for a later retry.
+                let candidate = select_worker(&mut tx, &preview.target_architecture).await?;
+                let Some((worker_id, port)) = candidate else {
+                    tx.commit().await?;
+                    return Ok(RuntimeLease::NoWorker);
+                };
+                if existing.active {
+                    release_active_capacity(&mut tx, existing.worker_id).await?;
+                }
+                sqlx::query("UPDATE workers SET reserved_disk_bytes=GREATEST(0,reserved_disk_bytes-$2) WHERE id=$1")
+                    .bind(existing.worker_id)
+                    .bind(CI_RUNTIME_DISK_BYTES)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM ci_port_leases WHERE preview_id=$1")
+                    .bind(preview_id)
+                    .execute(&mut *tx)
+                    .await?;
+                reserve_ci_ports(&mut tx, worker_id, preview_id, port).await?;
+                reserve_disk(&mut tx, worker_id).await?;
+                reserve_active_capacity(&mut tx, worker_id).await?;
+                (worker_id, port, existing.generation + 1)
+            }
             None => {
                 let worker = select_worker(&mut tx, &preview.target_architecture).await?;
                 let Some((worker_id, port)) = worker else {
@@ -134,7 +173,7 @@ impl CiPreviewRuntimeRepository {
                 lease_token = EXCLUDED.lease_token, java_port = EXCLUDED.java_port,
                 bedrock_port = EXCLUDED.bedrock_port, signal_port = EXCLUDED.signal_port,
                 state = 'starting', active = false, last_activity_at = now(),
-                capability_hash = EXCLUDED.capability_hash, updated_at = now()",
+                snapshot_requested_at = NULL, capability_hash = EXCLUDED.capability_hash, updated_at = now()",
         )
         .bind(preview_id)
         .bind(worker_id)
@@ -438,7 +477,7 @@ impl CiPreviewRuntimeRepository {
         }
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, updated_at = now()
+            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, snapshot_requested_at = NULL, updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
                AND lease_token = $4 AND state = 'stopping' AND active",
         )
@@ -616,7 +655,7 @@ impl CiPreviewRuntimeRepository {
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, updated_at = now()
+            "UPDATE ci_runtime_placements SET state = 'stopped', active = false, snapshot_requested_at = NULL, updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
                AND lease_token = $4 AND state = 'running' AND active",
         )
@@ -651,7 +690,7 @@ impl CiPreviewRuntimeRepository {
              JOIN ci_preview_aliases alias ON alias.id = runtime.preview_id
              JOIN ci_builds build ON build.id = alias.build_id
              JOIN workers worker ON worker.id = runtime.worker_id
-             WHERE runtime.worker_id = $1 AND runtime.state IN ('starting','running','stopping','deleting')
+             WHERE runtime.worker_id = $1 AND runtime.state IN ('starting','running','stopping','stopped','deleting')
              ORDER BY runtime.preview_id",
         )
         .bind(worker_id)
@@ -757,5 +796,250 @@ impl CiPreviewRuntimeRepository {
         .fetch_optional(&self.pool)
         .await?;
         row.map(TryInto::try_into).transpose()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct CiWorldSnapshot {
+    pub object_key: String,
+    pub size_bytes: i64,
+    pub checksum: String,
+    pub source_generation: i64,
+}
+
+impl CiPreviewRuntimeRepository {
+    /// Request a bounded periodic world checkpoint so an unavailable worker can
+    /// be replaced without losing more than one cadence window of CI progress.
+    pub async fn request_due_world_snapshots(&self, limit: i64) -> Result<u64> {
+        if !(1..=128).contains(&limit) {
+            bail!("invalid CI world snapshot sweep limit");
+        }
+        let result = sqlx::query(
+            "WITH candidates AS (
+                SELECT runtime.preview_id FROM ci_runtime_placements runtime
+                JOIN ci_preview_aliases alias ON alias.id=runtime.preview_id
+                LEFT JOIN ci_world_snapshots snapshot ON snapshot.preview_id=runtime.preview_id
+                WHERE runtime.active AND runtime.state='running' AND alias.state='running'
+                  AND alias.expires_at > now() AND runtime.snapshot_requested_at IS NULL
+                  AND (snapshot.preview_id IS NULL OR snapshot.created_at <= now() - $2::interval)
+                ORDER BY snapshot.created_at NULLS FIRST, runtime.preview_id
+                LIMIT $1 FOR UPDATE OF runtime SKIP LOCKED
+             )
+             UPDATE ci_runtime_placements runtime SET snapshot_requested_at=now(),updated_at=now()
+             FROM candidates WHERE runtime.preview_id=candidates.preview_id",
+        )
+        .bind(limit)
+        .bind(format!("{CI_RUNTIME_WORLD_SNAPSHOT_SECONDS} seconds"))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn request_world_snapshot(&self, preview_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE ci_runtime_placements SET snapshot_requested_at = COALESCE(snapshot_requested_at, now()), updated_at = now()
+             WHERE preview_id = $1 AND state = 'running' AND active
+               AND EXISTS (SELECT 1 FROM ci_preview_aliases alias WHERE alias.id = $1 AND alias.state = 'running' AND alias.expires_at > now())",
+        )
+        .bind(preview_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn world_snapshot_requested(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT snapshot_requested_at IS NOT NULL FROM ci_runtime_placements
+             WHERE preview_id = $1 AND worker_id = $2 AND generation = $3 AND lease_token = $4
+               AND state = 'running' AND active",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("CI snapshot request has a stale runtime assignment")
+    }
+
+    pub async fn complete_world_snapshot_request(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE ci_runtime_placements SET snapshot_requested_at=NULL, updated_at=now()
+             WHERE preview_id=$1 AND worker_id=$2 AND generation=$3 AND lease_token=$4
+               AND state='running' AND active AND snapshot_requested_at IS NOT NULL
+               AND EXISTS (SELECT 1 FROM ci_world_snapshots WHERE preview_id=$1)",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn world_snapshot_metadata(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<Option<CiWorldSnapshot>> {
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_runtime_placements WHERE preview_id=$1 AND worker_id=$2
+             AND generation=$3 AND lease_token=$4 AND state='starting' AND NOT active)",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_one(&self.pool)
+        .await?;
+        if !authorized {
+            bail!("CI world snapshot request has a stale worker assignment");
+        }
+        Ok(sqlx::query_as::<_, CiWorldSnapshot>(
+            "SELECT object_key, size_bytes, checksum, source_generation
+             FROM ci_world_snapshots WHERE preview_id=$1",
+        )
+        .bind(preview_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn publish_world_snapshot(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+        object_key: &str,
+        size_bytes: i64,
+        checksum: &str,
+    ) -> Result<Option<String>> {
+        if !(1..=CI_RUNTIME_DISK_BYTES).contains(&size_bytes)
+            || checksum.len() != 64
+            || !checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("CI world snapshot metadata is invalid");
+        }
+        let parsed = object_store::path::Path::parse(object_key)?;
+        if parsed.as_ref() != object_key
+            || !object_key.starts_with(&format!("ci-previews/{preview_id}/worlds/"))
+        {
+            bail!("CI world snapshot object key is outside its preview namespace");
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, (String, bool)>(
+            "SELECT runtime.state::text, runtime.snapshot_requested_at IS NOT NULL
+             FROM ci_runtime_placements runtime JOIN ci_preview_aliases alias ON alias.id=runtime.preview_id
+             WHERE runtime.preview_id=$1 AND runtime.worker_id=$2 AND runtime.generation=$3
+               AND runtime.lease_token=$4
+               AND ((runtime.state='stopping' AND alias.state IN ('stopping','expired'))
+                    OR (runtime.state='running' AND runtime.active AND runtime.snapshot_requested_at IS NOT NULL
+                        AND alias.state='running'))
+             FOR UPDATE OF runtime",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((state, requested_at)) = row else {
+            bail!("CI world snapshot worker assignment is stale");
+        };
+        if state != "stopping" && !(state == "running" && requested_at) {
+            bail!("CI world snapshot is not requested for this runtime state");
+        }
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT object_key FROM ci_world_snapshots WHERE preview_id=$1 FOR UPDATE",
+        )
+        .bind(preview_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO ci_world_snapshots(preview_id, object_key, size_bytes, checksum, source_generation)
+             VALUES($1,$2,$3,$4,$5)
+             ON CONFLICT(preview_id) DO UPDATE SET object_key=EXCLUDED.object_key,
+                size_bytes=EXCLUDED.size_bytes, checksum=EXCLUDED.checksum,
+                source_generation=EXCLUDED.source_generation, created_at=now()",
+        )
+        .bind(preview_id)
+        .bind(object_key)
+        .bind(size_bytes)
+        .bind(checksum)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(old.filter(|old_key| old_key != object_key))
+    }
+
+    pub async fn world_snapshot_for_deletion(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<Option<CiWorldSnapshot>> {
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_runtime_placements WHERE preview_id=$1 AND worker_id=$2
+             AND generation=$3 AND lease_token=$4 AND state='deleting')",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_one(&self.pool)
+        .await?;
+        if !authorized {
+            bail!("CI world snapshot deletion assignment is stale");
+        }
+        Ok(sqlx::query_as::<_, CiWorldSnapshot>(
+            "SELECT object_key, size_bytes, checksum, source_generation
+             FROM ci_world_snapshots WHERE preview_id=$1",
+        )
+        .bind(preview_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn complete_world_snapshot_deletion(
+        &self,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+        object_key: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM ci_world_snapshots snapshot USING ci_runtime_placements runtime
+             WHERE snapshot.preview_id=$1 AND snapshot.object_key=$5
+               AND runtime.preview_id=$1 AND runtime.worker_id=$2 AND runtime.generation=$3
+               AND runtime.lease_token=$4 AND runtime.state='deleting'",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .bind(object_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 }

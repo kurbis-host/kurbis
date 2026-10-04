@@ -207,11 +207,18 @@ pub(super) async fn command(
         }
         ServerCommandRequest::Start { .. } => "online",
         ServerCommandRequest::Snapshot { .. } => {
-            return Err(ApiError::with_code(
-                StatusCode::NOT_IMPLEMENTED,
-                "ci_preview_snapshot_unavailable",
-                "CI preview snapshots are created automatically when the runtime is stopped",
-            ));
+            if !runtimes
+                .request_world_snapshot(preview_id)
+                .await
+                .map_err(ApiError::from)?
+            {
+                return Err(ApiError::with_code(
+                    StatusCode::CONFLICT,
+                    "ci_preview_not_running",
+                    "CI preview is not currently running",
+                ));
+            }
+            "running"
         }
         ServerCommandRequest::Restore { .. }
         | ServerCommandRequest::Reset { .. }

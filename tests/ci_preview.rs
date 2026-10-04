@@ -256,3 +256,6 @@ impl kurbis_hoster::ci::CheckRunClient for TestCheckRuns {
         Ok(())
     }
 }
+
+#[path = "ci_preview/runtime.rs"]
+mod runtime;

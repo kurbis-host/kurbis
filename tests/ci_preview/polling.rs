@@ -123,7 +123,10 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
         .with_check_runs(check_runs.clone())
         .with_builder(builder.clone());
 
-    poller.poll_once(watched.id).await.unwrap();
+    let (first_poll, overlapping_poll) =
+        tokio::join!(poller.poll_once(watched.id), poller.poll_once(watched.id),);
+    first_poll.unwrap();
+    overlapping_poll.unwrap();
     poller.poll_once(watched.id).await.unwrap();
 
     assert_eq!(
@@ -132,7 +135,7 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
             "contributor/Pumpkin".to_owned(),
             "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
         )],
-        "the fork's immutable head is fetched once; the second poll reuses the successful build"
+        "overlapping pollers and later polls fetch the immutable fork head only once"
     );
     assert_eq!(
         components
@@ -549,7 +552,7 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
 }
 
 #[tokio::test]
-async fn expired_check_run_is_retained_until_terminal_update_is_reconciled() {
+async fn expired_check_run_keeps_only_a_minimal_reconciliation_tombstone() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
@@ -559,7 +562,7 @@ async fn expired_check_run_is_retained_until_terminal_update_is_reconciled() {
         .await
         .unwrap();
     let key = BuildKey::new(
-        repository_name,
+        &repository_name,
         "fedcba9876543210fedcba9876543210fedcba98",
         "patch-v1",
         "rust-1.98@sha256:test",
@@ -580,40 +583,84 @@ async fn expired_check_run_is_retained_until_terminal_update_is_reconciled() {
         .record_check_run(build.id, Some(check_run_id), None, CiBuildStage::Failed)
         .await
         .unwrap();
-    sqlx::query("UPDATE ci_builds SET expires_at = now() - interval '1 second' WHERE id = $1")
-        .bind(build.id)
+    let alias = CiHostname::for_ref(
+        CiRefKind::Commit,
+        &key.commit_sha,
+        kurbis_hoster::ci::CI_ROOT_DOMAIN,
+    )
+    .unwrap();
+    let expired_alias = repository
+        .ensure_preview(
+            &repository_name,
+            &key.commit_sha,
+            CiRefKind::Commit,
+            None,
+            &alias,
+            build.id,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ci_preview_aliases SET expires_at=now()-interval '1 second' WHERE id=$1")
+        .bind(expired_alias.id)
         .execute(&pool)
         .await
         .unwrap();
-
-    repository.expire(Utc::now()).await.unwrap();
-    let retained_stage: String = sqlx::query_scalar("SELECT stage FROM ci_builds WHERE id = $1")
-        .bind(build.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(retained_stage, "expired");
-    let pending = repository
-        .check_run_reconciliation_candidates(8)
-        .await
-        .unwrap();
-    let pending = pending
-        .into_iter()
-        .find(|candidate| candidate.build_id == build.id)
-        .expect("expired build awaits a terminal Check Run update");
-    assert_eq!(pending.stage, CiBuildStage::Expired);
-    assert_eq!(pending.check_run_id, check_run_id);
-
     sqlx::query(
-        "UPDATE ci_check_runs SET updated_at = now() - interval '8 days' WHERE build_id = $1",
+        "UPDATE ci_builds SET build_log=$2, expires_at=now()-interval '1 second' WHERE id=$1",
     )
     .bind(build.id)
+    .bind("private compiler output that must not survive build/artifact expiry")
     .execute(&pool)
     .await
     .unwrap();
+
+    repository.expire(Utc::now()).await.unwrap();
+    let retained_build: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_builds WHERE id=$1)")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !retained_build,
+        "expired build diagnostics are deleted with the build"
+    );
+    let old_check_run: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_check_runs WHERE build_id=$1)")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!old_check_run);
+    let tombstone_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ci_check_run_tombstones WHERE build_id=$1")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(tombstone_count, 1);
+
+    let candidate = repository
+        .check_run_reconciliation_candidates(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.build_id == build.id)
+        .expect("minimal tombstone continues terminal Check Run reconciliation");
+    assert!(candidate.tombstone);
+    assert_eq!(candidate.stage, CiBuildStage::Expired);
+    assert_eq!(candidate.check_run_id, check_run_id);
+    assert!(candidate.artifact_digest.is_none());
+    assert!(candidate.failure_message.is_none());
+    assert!(
+        repository
+            .mark_check_run_stage_synced(candidate.build_id, candidate.stage, true)
+            .await
+            .unwrap()
+    );
     repository.expire(Utc::now()).await.unwrap();
     let deleted =
-        sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS(SELECT 1 FROM ci_builds WHERE id = $1)")
+        sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS(SELECT 1 FROM ci_builds WHERE id=$1)")
             .bind(build.id)
             .fetch_one(&pool)
             .await
