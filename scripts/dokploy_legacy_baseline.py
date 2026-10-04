@@ -166,8 +166,9 @@ def image_payload_hashes(image_id: str, service: str) -> dict[str, dict[str, Any
     return result
 
 
-def collect_inventory() -> dict[str, Any]:
+def collect_inventory(*, allowed_worker_images: set[str] | None = None) -> dict[str, Any]:
     root_only()
+    allowed_worker_images={PUMPKIN_LEGACY} if allowed_worker_images is None else allowed_worker_images
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir() or WORKER.is_symlink() or not WORKER.is_file():
         raise BaselineError("respond5 source checkout or worker path is unsafe")
     if WORKER_UNIT.is_symlink() or WORKER_LAUNCHER.is_symlink() or not WORKER_UNIT.is_file() or not WORKER_LAUNCHER.is_file():
@@ -224,8 +225,8 @@ def collect_inventory() -> dict[str, Any]:
         worker_id = str(uuid.UUID(worker_id))
     except ValueError as error:
         raise BaselineError("invalid protected worker identity") from error
-    if values.get("PUMPKIN_IMAGE") != PUMPKIN_LEGACY:
-        raise BaselineError("respond5 does not have the exact known legacy Pumpkin worker setting")
+    if values.get("PUMPKIN_IMAGE") not in allowed_worker_images:
+        raise BaselineError("respond5 worker setting differs from legacy baseline or protected migration journal")
     env_stat = ENV_FILE.stat()
     if ENV_FILE.is_symlink() or env_stat.st_uid != 0 or stat.S_IMODE(env_stat.st_mode) != 0o600:
         raise BaselineError("worker env file must remain root-owned mode 0600")
@@ -251,8 +252,8 @@ def collect_inventory() -> dict[str, Any]:
             key, value = entry.split(b"=", 1)
             if key.decode("utf-8", "replace") == "PUMPKIN_IMAGE":
                 process_env["PUMPKIN_IMAGE"] = value.decode("utf-8", "replace")
-    if process_env.get("PUMPKIN_IMAGE") != PUMPKIN_LEGACY:
-        raise BaselineError("running worker process does not use the protected legacy Pumpkin setting")
+    if process_env.get("PUMPKIN_IMAGE") not in allowed_worker_images:
+        raise BaselineError("running worker process differs from legacy baseline or protected migration journal")
     legacy_worker_image = image_info(PUMPKIN_LEGACY)
     legacy_worker_image["tag"] = PUMPKIN_LEGACY
     legacy_worker_image["payloads"] = image_payload_hashes(legacy_worker_image["image_id"], "waiting-pumpkin")
@@ -504,16 +505,46 @@ def current_service_inventory() -> dict[str, dict[str, Any]]:
     return result
 
 
-def worker_lease(worker_id: str, postgres_container_id: str) -> str:
+def worker_lease_snapshot(worker_id: str, postgres_container_id: str, *, require_fresh: bool = True) -> dict[str, str]:
+    timestamp_format="YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\""
     sql=("SELECT wc.worker_id::text,(wc.revoked_at IS NULL AND wc.lease_expires_at > now()),"
          "(w.heartbeat_at > now()-interval '30 seconds'),(SELECT count(*) FROM worker_credentials c "
-         f"WHERE c.worker_id=wc.worker_id AND c.revoked_at IS NULL AND c.lease_expires_at > now()) FROM worker_credentials wc "
+         f"WHERE c.worker_id=wc.worker_id AND c.revoked_at IS NULL AND c.lease_expires_at > now()),"
+         f"to_char(w.heartbeat_at AT TIME ZONE 'UTC','{timestamp_format}'),"
+         f"to_char(now() AT TIME ZONE 'UTC','{timestamp_format}') FROM worker_credentials wc "
          f"JOIN workers w ON w.id=wc.worker_id WHERE wc.worker_id='{worker_id}'::uuid AND wc.revoked_at IS NULL;")
     got=run_text(["docker","exec","-i",postgres_container_id,"sh","-lc",
                   'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F "|" -f -'],input_text=sql)
-    expected=f"{worker_id}|t|t|1"
-    if got!=expected:raise BaselineError("worker lease is not uniquely active and renewing")
-    return got
+    fields=got.split("|")
+    if len(fields)!=6 or fields[0]!=worker_id or fields[1]!="t" or fields[3]!="1" or (require_fresh and fields[2]!="t"):
+        raise BaselineError("worker lease is not uniquely active and renewing")
+    return {"raw":"|".join(fields[:4]),"heartbeat_at":fields[4],"database_now":fields[5]}
+
+
+def worker_lease(worker_id: str, postgres_container_id: str) -> str:
+    return worker_lease_snapshot(worker_id,postgres_container_id)["raw"]
+
+
+def systemd_worker_pid() -> int:
+    return int(run_text(["systemctl","show","--property=MainPID","--value","kurbis-worker.service"]))
+
+
+def verify_restarted_worker(worker_id: str, postgres_container_id: str, **kwargs) -> dict[str, Any]:
+    return verify_restarted_worker_impl(worker_id,postgres_container_id,
+        systemd_worker_pid=systemd_worker_pid,
+        service_active=lambda:run_text(["systemctl","is-active","kurbis-worker.service"])=="active",
+        worker_process_start_ticks=lambda pid:read_process_start_ticks(pid,BaselineError),
+        worker_process_environment=worker_process_environment,
+        executable_sha256=lambda pid:sha256_file(Path(f"/proc/{pid}/exe")),
+        env_sha256=lambda:sha256_file(ENV_FILE),worker_lease_snapshot=worker_lease_snapshot,
+        error_cls=BaselineError,**kwargs)
+
+
+# Remote invocations inline the companion module at this marker; local imports load it from disk.
+if __file__ != "<stdin>":
+    _heartbeat_module=Path(__file__).with_name("dokploy_legacy_worker_recovery.py")
+    exec(compile(_heartbeat_module.read_text(encoding="utf-8"),str(_heartbeat_module),"exec"),globals())
+# __LEGACY_HEARTBEAT_HELPERS__
 
 
 def validate_candidate_runtime(expected_inventory: dict[str, Any], candidate_revision: str,
@@ -780,17 +811,25 @@ def rollback_app(manifest: dict[str, Any], expected_sources: dict[str, str], tok
             raise BaselineError("original worker environment backup missing or corrupt")
         if old_worker_path.is_symlink() or not old_worker_path.is_file() or sha256_file(old_worker_path)!=migration["old_worker_sha256"]:
             raise BaselineError("original worker executable backup missing or corrupt")
+        worker=expected["worker"]
+        previous_pid=systemd_worker_pid()
+        previous_start_ticks=read_process_start_ticks(previous_pid,BaselineError)
+        previous_lease=worker_lease_snapshot(worker["worker_id"],expected["services"]["postgres"]["container_id"],require_fresh=False)
         atomic_file(WORKER,old_worker_path.read_bytes(),int(migration["old_worker_mode"]),int(migration["old_worker_uid"]),int(migration["old_worker_gid"]))
         atomic_file(ENV_FILE,old_env_path.read_bytes(),0o600,0,0)
+        restored_env_sha256=sha256_file(ENV_FILE)
+        if restored_env_sha256!=migration["old_worker_env_sha256"]:
+            raise BaselineError("restored worker environment does not match the protected original digest")
         subprocess.run(["systemctl","restart","kurbis-worker.service"],check=True,stdout=subprocess.DEVNULL)
-        worker=expected["worker"];pid=int(run_text(["systemctl","show","--property=MainPID","--value","kurbis-worker.service"]))
-        if run_text(["systemctl","is-active","kurbis-worker.service"])!="active" or sha256_file(Path(f"/proc/{pid}/exe"))!=worker["worker_sha256"] or worker_process_environment(pid).get("PUMPKIN_IMAGE")!=PUMPKIN_LEGACY:
-            raise BaselineError("legacy worker rollback did not restore exact original executable/config")
-        lease=worker_lease(worker["worker_id"],expected["services"]["postgres"]["container_id"])
+        verified_worker=verify_restarted_worker(worker["worker_id"],expected["services"]["postgres"]["container_id"],
+            previous_pid=previous_pid,previous_start_ticks=previous_start_ticks,
+            previous_heartbeat_at=previous_lease["heartbeat_at"],expected_worker_sha256=worker["worker_sha256"],
+            expected_env_sha256=restored_env_sha256,expected_pumpkin_image=PUMPKIN_LEGACY)
+        pid=verified_worker["pid"];lease=verified_worker["lease"]
         final_services=current_service_inventory()
         for service in SERVICES:
             if final_services[service]["image_id"]!=expected["services"][service]["image_id"]:raise BaselineError(f"legacy rollback digest mismatch: {service}")
-        migration["status"]="rolled_back";migration["rollback_worker_pid"]=pid;migration["rollback_lease"]=lease
+        migration["status"]="rolled_back";migration["rollback_worker_pid"]=pid;migration["rollback_worker_start_ticks"]=verified_worker["start_ticks"];migration["rollback_lease"]=lease;migration["rollback_heartbeat_at"]=verified_worker["heartbeat_at"]
         atomic_json(WORKER_MIGRATION,migration,0o600)
         return {"status":"app-rolled-back","source_revision_claim":revision,"provenance_status":"legacy-unproven",
                 "image_ids":{name:expected["services"][name]["image_id"] for name in SERVICES},
@@ -896,10 +935,11 @@ def bootstrap(manifest: dict[str, Any], token: str) -> dict[str, Any]:
         if AUDIT.is_symlink():raise BaselineError("legacy audit file cannot be a symlink")
         if AUDIT.exists():
             attestation=load_attestation(manifest)
-            current=collect_inventory()
+            allowed_worker_images=authorized_worker_images_for_inventory(manifest)
+            current=collect_inventory(allowed_worker_images=allowed_worker_images)
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
             restore_baseline_compose_env(attestation)
-            current=collect_inventory()
+            current=collect_inventory(allowed_worker_images=allowed_worker_images)
             if current.get("source")!=attestation["inventory"].get("source"):
                 raise BaselineError("protected baseline environment/checkout restoration did not match exact attested source")
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
@@ -919,7 +959,7 @@ def bootstrap(manifest: dict[str, Any], token: str) -> dict[str, Any]:
 
 def main() -> int:
     parser=argparse.ArgumentParser()
-    parser.add_argument("--operation",choices=("capture","bootstrap","bootstrap-worker","check-worker-compatibility","rollback-app"),required=True)
+    parser.add_argument("--operation",choices=("capture","bootstrap","bootstrap-worker","reconcile-worker-bootstrap","check-worker-compatibility","rollback-app"),required=True)
     parser.add_argument("--manifest-json")
     parser.add_argument("--expected-sources-json")
     parser.add_argument("--candidate-image-id")
@@ -935,6 +975,9 @@ def main() -> int:
         elif args.operation=="bootstrap-worker":
             if manifest is None or not args.candidate_image_id or not args.candidate_revision or not args.token:raise BaselineError("manifest, candidate image, revision and rollout token are required")
             result=bootstrap_worker(manifest,args.candidate_image_id,args.candidate_revision,args.token)
+        elif args.operation=="reconcile-worker-bootstrap":
+            if manifest is None or not args.token:raise BaselineError("manifest and rollout token are required")
+            result=reconcile_worker_bootstrap(manifest,args.token)
         elif args.operation=="check-worker-compatibility":
             if manifest is None or not args.candidate_image_id or not args.candidate_revision or not args.token:raise BaselineError("manifest, candidate image, revision and rollout token are required")
             result=verify_worker_compatibility(manifest,args.candidate_image_id,args.candidate_revision,args.token)

@@ -20,6 +20,7 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = ROOT / "scripts/dokploy_worker_sync.py"
 LEGACY_REMOTE = ROOT / "scripts/dokploy_legacy_baseline.py"
+LEGACY_RECOVERY = ROOT / "scripts/dokploy_legacy_worker_recovery.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 PROJECT = "kurbis-hoster-fbikvd"
 EXPECTED_SOURCE = ("github", "kurbis-host", "kurbis", "main", "./compose.yaml")
@@ -306,6 +307,22 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
     return result
 
 
+def legacy_remote_source() -> str:
+    source=LEGACY_REMOTE.read_text(encoding="utf-8")
+    marker="# __LEGACY_HEARTBEAT_HELPERS__"
+    if source.count(marker)!=1:
+        raise DeploymentError("legacy worker heartbeat source injection point is invalid")
+    helper=LEGACY_RECOVERY.read_text(encoding="utf-8")
+    helper=helper.replace("from __future__ import annotations\n", "", 1)
+    local_loader='''if __file__ != "<stdin>":
+    _heartbeat_module=Path(__file__).with_name("dokploy_legacy_worker_recovery.py")
+    exec(compile(_heartbeat_module.read_text(encoding="utf-8"),str(_heartbeat_module),"exec"),globals())
+'''
+    if source.count(local_loader)!=1:
+        raise DeploymentError("legacy worker recovery local loader is invalid")
+    return source.replace(local_loader,"").replace(marker,helper)
+
+
 def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
                   expected_sources: dict | None = None, token: str | None = None,
                   candidate_image_id: str | None = None, candidate_revision: str | None = None) -> dict:
@@ -316,7 +333,7 @@ def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
         if value is not None:
             command.extend([f"--{key}",value if isinstance(value,str) else json.dumps(value,separators=(",",":"))])
     output=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=10",host,shlex.join(command)],
-               input_text=LEGACY_REMOTE.read_text(encoding="utf-8"),timeout=1800)
+               input_text=legacy_remote_source(),timeout=1800)
     try:result=json.loads(output)
     except json.JSONDecodeError as error:raise DeploymentError("respond5 legacy inventory verifier returned invalid JSON") from error
     if not isinstance(result,dict):raise DeploymentError("respond5 legacy inventory verifier returned invalid result")
@@ -384,6 +401,42 @@ def rollback_application(host: str, branch: str, revision: str, baseline: dict, 
     return {"status":"app-rolled-back","deployment_id":deployment_id}
 
 
+def dispatch_legacy_worker_bootstrap(remote_call, on_attempt, **kwargs):
+    # The worker bootstrap may write a journal/config and restart before SSH returns.
+    # Mark the attempt before dispatch so pre-deploy failures always reconcile it.
+    on_attempt()
+    return remote_call(**kwargs)
+
+
+def should_rollback_failed_release(*, deployment_attempted: bool, marked: bool) -> bool:
+    return deployment_attempted and not marked
+
+
+def rollout_unlock_safe(*, deployment_attempted: bool, marked: bool,
+                        rollback_verified: bool, worker_bootstrap_attempted: bool,
+                        worker_bootstrap_reconciled: bool) -> bool:
+    if marked or rollback_verified:
+        return True
+    if deployment_attempted:
+        return False
+    return not worker_bootstrap_attempted or worker_bootstrap_reconciled
+
+
+def reconcile_predeployment_worker_bootstrap(reconcile_call, *, attempted: bool,
+                                             deployment_attempted: bool, marked: bool) -> bool:
+    if not attempted or deployment_attempted or marked:
+        return False
+    reconcile_call()
+    return True
+
+
+def reconcile_legacy_worker_bootstrap(remote_call, *, accepted_statuses=("migrated-reconciled", "migrated", "no-mutation", "rolled-back"), **kwargs):
+    result=remote_call(**kwargs)
+    if result.get("status") not in accepted_statuses:
+        raise DeploymentError("Respond5 worker bootstrap journal could not be reconciled")
+    return result
+
+
 def dispatch_worker_wait(remote_call, rollback_call, on_attempt, **kwargs):
     # Set the rollback guard before SSH dispatch: the remote may mutate state and
     # the response may be lost after that mutation completed.
@@ -442,6 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     token = secrets.token_hex(16)
     locked = staged = prepared = wait_attempted = deployment_attempted = finalization_attempted = marked = False
+    worker_bootstrap_attempted = worker_bootstrap_reconciled = False
     old_env = ""
     branch = "main"
     commit = ""
@@ -501,9 +555,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
                     token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
                 if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
-                migrated=legacy_remote(args.worker_host,"bootstrap-worker",manifest=legacy_manifest,
-                    token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                def mark_worker_bootstrap_attempted() -> None:
+                    nonlocal worker_bootstrap_attempted
+                    worker_bootstrap_attempted=True
+                migrated=dispatch_legacy_worker_bootstrap(
+                    lambda **kwargs:legacy_remote(args.worker_host,"bootstrap-worker",**kwargs),
+                    mark_worker_bootstrap_attempted,
+                    manifest=legacy_manifest,token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
                 if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
+                worker_bootstrap_reconciled=True
             else:
                 baseline_result=remote(args.worker_host,"baseline")
                 baseline=baseline_result.get("snapshot")
@@ -551,7 +611,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"deployment not accepted: {error}",file=sys.stderr)
         return 1
     finally:
-        if deployment_attempted and not marked:
+        if worker_bootstrap_attempted and not deployment_attempted and not marked:
+            try:
+                worker_bootstrap_reconciled=reconcile_predeployment_worker_bootstrap(
+                    lambda:reconcile_legacy_worker_bootstrap(
+                        lambda **kwargs:legacy_remote(args.worker_host,"reconcile-worker-bootstrap",**kwargs),
+                        manifest=legacy_manifest,token=token),
+                    attempted=worker_bootstrap_attempted,deployment_attempted=deployment_attempted,marked=marked)
+            except Exception as error:
+                print(f"Respond5 worker bootstrap journal is unresolved; retaining rollout lock: {error}",file=sys.stderr)
+        # Before a Dokploy deployment is queued, a reconciled worker migration is a
+        # valid retryable state. Do not run app rollback; it would add mutations and
+        # could incorrectly unlock after an unverified worker restore.
+        if should_rollback_failed_release(deployment_attempted=deployment_attempted,marked=marked):
             try:
                 if baseline is None or not baseline_revision:
                     raise DeploymentError("prior app snapshot was not verified; cannot safely accept mixed release state")
@@ -591,11 +663,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Dokploy release configuration restore failed: {error}",file=sys.stderr)
         elif prepared:
             print("Dokploy immutable rollback source and BUILD_REVISION intentionally retained because app rollback is unverified",file=sys.stderr)
-        if locked and (not deployment_attempted or marked or rollback_verified):
+        if locked and rollout_unlock_safe(deployment_attempted=deployment_attempted,marked=marked,
+                                         rollback_verified=rollback_verified,
+                                         worker_bootstrap_attempted=worker_bootstrap_attempted,
+                                         worker_bootstrap_reconciled=worker_bootstrap_reconciled):
             try:remote(args.worker_host,"unlock",token=token)
             except Exception as error:print(f"respond5 rollout lock retained: {error}",file=sys.stderr)
         elif locked:
-            print("respond5 rollout lock intentionally retained because production rollback is unverified",file=sys.stderr)
+            reason="worker bootstrap journal is unresolved" if worker_bootstrap_attempted and not worker_bootstrap_reconciled else "production rollback is unverified"
+            print(f"respond5 rollout lock intentionally retained because {reason}",file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import datetime as dt
 import json
 import stat
 import tempfile
@@ -161,13 +162,16 @@ class LegacyBaselineTests(unittest.TestCase):
             migrated["worker"]["process_pumpkin_image"]=tag
             migrated["worker"]["worker_env_sha256"]="8"*64
             journal={"baseline_manifest_sha256":saved["manifest_sha256"],"status":"migrated","candidate_tag":tag,
+                     "candidate_revision":revision,"candidate_image_id":"sha256:"+"9"*64,
                      "new_worker_env_sha256":"8"*64}
             with patch.object(legacy,"OperationLock",NoopLock),patch.object(legacy,"root_only"),patch.object(legacy,"require_lock"),patch.object(legacy,"ROOT",root),patch.object(legacy,"AUDIT",audit), \
-                 patch.object(legacy,"WORKER_MIGRATION",root/"worker-migration.json"),patch.object(legacy,"collect_inventory",return_value=migrated), \
+                 patch.object(legacy,"WORKER_MIGRATION",root/"worker-migration.json"),patch.object(legacy,"collect_inventory",return_value=migrated) as collect, \
                  patch.object(legacy,"load_attestation",return_value=saved),patch.object(legacy,"restore_baseline_compose_env",return_value=False), \
-                 patch.object(legacy,"migration_record_from_hash",return_value=journal),patch.object(Path,"stat",root_owned_stat):
+                 patch.object(legacy,"migration_record",return_value=journal),patch.object(legacy,"migration_record_from_hash",return_value=journal),patch.object(Path,"stat",root_owned_stat):
                 result=legacy.bootstrap(FIXTURE,"a"*32)
             self.assertEqual(result["status"],"already-recorded")
+            for call in collect.call_args_list:
+                self.assertIn(tag,call.kwargs["allowed_worker_images"])
             self.assertEqual(json.loads(audit.read_text())["manifest_sha256"],saved["manifest_sha256"])
 
     def test_bootstrap_failure_on_stale_live_inventory_writes_nothing(self):
@@ -354,6 +358,84 @@ class LegacyBaselineTests(unittest.TestCase):
             self.assertEqual(worker.read_bytes(),b"baseline-worker-binary")
             self.assertEqual(world.read_bytes(),b"persistent-server-world")
             self.assertEqual(json.loads(migration_path.read_text())["status"],"rolled_back")
+
+
+    def test_legacy_rollback_requires_new_process_and_heartbeat_renewal_across_stale_window(self):
+        worker_id=FIXTURE["expected_inventory"]["worker"]["worker_id"]
+        base=dt.datetime(2026,10,4,tzinfo=dt.timezone.utc)
+        clock=[0.0]
+        def lease_snapshot(_worker_id,_postgres_id):
+            if clock[0]<6:raise legacy.BaselineError("previous lease expired while worker restarts")
+            elapsed=int(clock[0]//8)*8
+            heartbeat=(base+dt.timedelta(seconds=elapsed)).isoformat().replace("+00:00","Z")
+            now=(base+dt.timedelta(seconds=clock[0])).isoformat(timespec="microseconds").replace("+00:00","Z")
+            return {"raw":f"{worker_id}|t|t|1","heartbeat_at":heartbeat,"database_now":now}
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(legacy,"systemd_worker_pid",return_value=9876), \
+             patch.object(legacy,"run_text",return_value="active"), \
+             patch.object(legacy,"read_process_start_ticks",return_value="new-start-ticks"), \
+             patch.object(legacy,"worker_process_environment",return_value={"WORKER_ID":worker_id,"PUMPKIN_IMAGE":legacy.PUMPKIN_LEGACY}), \
+             patch.object(legacy,"sha256_file",return_value="a"*64), \
+             patch.object(legacy,"worker_lease_snapshot",side_effect=lease_snapshot), \
+             patch.object(legacy,"ENV_FILE",Path("/fake/worker.env")), \
+             patch.object(legacy.time,"monotonic",side_effect=lambda:clock[0]), \
+             patch.object(legacy.time,"sleep",side_effect=sleep):
+            verified=legacy.verify_restarted_worker(worker_id,"postgres",previous_pid=1234,
+                previous_start_ticks="old-start-ticks",previous_heartbeat_at=base.isoformat().replace("+00:00","Z"),
+                expected_worker_sha256="a"*64,expected_env_sha256="a"*64,
+                expected_pumpkin_image=legacy.PUMPKIN_LEGACY)
+        self.assertEqual(verified["pid"],9876)
+        self.assertEqual(verified["start_ticks"],"new-start-ticks")
+        self.assertGreaterEqual(clock[0],35)
+        self.assertGreater(dt.datetime.fromisoformat(verified["heartbeat_at"].replace("Z","+00:00")),base)
+
+    def test_legacy_rollback_rejects_stale_pre_restart_heartbeat_even_with_new_pid(self):
+        worker_id=FIXTURE["expected_inventory"]["worker"]["worker_id"]
+        base=dt.datetime(2026,10,4,tzinfo=dt.timezone.utc)
+        clock=[0.0]
+        timestamp=base.isoformat().replace("+00:00","Z")
+        def sleep(seconds):clock[0]+=seconds
+        def stale_snapshot(_worker_id,_postgres_id):
+            now=(base+dt.timedelta(seconds=clock[0])).isoformat(timespec="microseconds").replace("+00:00","Z")
+            return {"raw":f"{worker_id}|t|t|1","heartbeat_at":timestamp,"database_now":now}
+        with patch.object(legacy,"systemd_worker_pid",return_value=9876), \
+             patch.object(legacy,"run_text",return_value="active"), \
+             patch.object(legacy,"read_process_start_ticks",return_value="new-start-ticks"), \
+             patch.object(legacy,"worker_process_environment",return_value={"WORKER_ID":worker_id,"PUMPKIN_IMAGE":legacy.PUMPKIN_LEGACY}), \
+             patch.object(legacy,"sha256_file",return_value="a"*64), \
+             patch.object(legacy,"ENV_FILE",Path("/fake/worker.env")), \
+             patch.object(legacy,"worker_lease_snapshot",side_effect=stale_snapshot), \
+             patch.object(legacy.time,"monotonic",side_effect=lambda:clock[0]), \
+             patch.object(legacy.time,"sleep",side_effect=sleep), \
+             self.assertRaisesRegex(legacy.BaselineError,"fresh PID/start time and renewing lease"):
+            legacy.verify_restarted_worker(worker_id,"postgres",previous_pid=1234,previous_start_ticks="old-start-ticks",
+                previous_heartbeat_at=timestamp,expected_worker_sha256="a"*64,expected_env_sha256="a"*64,
+                expected_pumpkin_image=legacy.PUMPKIN_LEGACY,timeout_seconds=40)
+        self.assertGreaterEqual(clock[0],40)
+
+    def test_retry_inventory_allows_only_exact_candidate_recorded_in_worker_journal(self):
+        revision="a"*40
+        migration={"status":"migrated","candidate_revision":revision,
+                   "candidate_tag":f"melon-pumpkin:host-control-{revision}",
+                   "candidate_image_id":"sha256:"+"b"*64}
+        with patch.object(legacy,"migration_record",return_value=migration):
+            self.assertEqual(legacy.authorized_worker_images_for_inventory(FIXTURE),
+                             {legacy.PUMPKIN_LEGACY,migration["candidate_tag"]})
+        migration["candidate_tag"]="melon-pumpkin:host-control-"+"c"*40
+        with patch.object(legacy,"migration_record",return_value=migration), \
+             self.assertRaisesRegex(legacy.BaselineError,"candidate identity is invalid"):
+            legacy.authorized_worker_images_for_inventory(FIXTURE)
+
+    def test_lost_bootstrap_response_reconciles_a_journaled_migrated_worker(self):
+        migration={"status":"migrated","candidate_tag":"melon-pumpkin:host-control-"+"a"*40,
+                   "candidate_image_id":"sha256:candidate","candidate_revision":"a"*40}
+        with patch.object(legacy,"require_lock"),patch.object(legacy,"load_attestation",return_value={"inventory":FIXTURE["expected_inventory"],"manifest_sha256":"f"*64}), \
+             patch.object(legacy,"migration_record",return_value=migration), \
+             patch.object(legacy,"verify_worker_compatibility",return_value={"worker_lease":"worker|t|t|1"}):
+            result=legacy.reconcile_worker_bootstrap(FIXTURE,"a"*32)
+        self.assertEqual(result["status"],"migrated-reconciled")
+        self.assertEqual(result["candidate_revision"],"a"*40)
+        self.assertEqual(result["worker_lease"],"worker|t|t|1")
 
     def test_migrated_worker_bootstrap_retry_is_idempotent(self):
         revision = "a" * 40

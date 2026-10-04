@@ -576,6 +576,43 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("KEEP=value", saved[0])
         self.assertIs(state["autoDeploy"], False)
 
+    def test_lost_legacy_bootstrap_response_reconciles_before_predeploy_unlock(self):
+        state={"worker":"legacy"};attempted=False
+        def on_attempt():
+            nonlocal attempted
+            attempted=True
+        def remote_bootstrap(**_kwargs):
+            state["worker"]="migrated"
+            raise TimeoutError("SSH response lost after worker migration")
+        with self.assertRaisesRegex(TimeoutError,"after worker migration"):
+            deploy.dispatch_legacy_worker_bootstrap(remote_bootstrap,on_attempt,token="token")
+        self.assertTrue(attempted)
+        def reconcile(**_kwargs):
+            self.assertEqual(state["worker"],"migrated")
+            return {"status":"migrated-reconciled"}
+        result=deploy.reconcile_legacy_worker_bootstrap(reconcile,token="token")
+        self.assertEqual(result["status"],"migrated-reconciled")
+        # A Dokploy branch/environment API failure after mutation is still pre-deploy:
+        # reconciliation keeps the worker retryable without running app rollback.
+        reconciled=[]
+        try:
+            raise deploy.DeploymentError("simulated set_branch/update_build_revision API failure")
+        except deploy.DeploymentError:
+            accepted=deploy.reconcile_predeployment_worker_bootstrap(
+                lambda:reconciled.append("migrated-reconciled"),attempted=True,
+                deployment_attempted=False,marked=False)
+        self.assertTrue(accepted)
+        self.assertEqual(reconciled,["migrated-reconciled"])
+        self.assertFalse(deploy.should_rollback_failed_release(deployment_attempted=False,marked=False))
+        self.assertTrue(deploy.rollout_unlock_safe(deployment_attempted=False,marked=False,rollback_verified=False,
+            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=accepted))
+
+    def test_predeploy_failure_cannot_unlock_unreconciled_worker_bootstrap(self):
+        self.assertFalse(deploy.rollout_unlock_safe(deployment_attempted=False,marked=False,rollback_verified=False,
+            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=False))
+        self.assertFalse(deploy.rollout_unlock_safe(deployment_attempted=True,marked=False,rollback_verified=False,
+            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=True))
+
     def test_lost_wait_response_rolls_back_worker_before_prior_app_revision(self):
         state = {"worker": "old", "app": "new"}
         attempts = {"rollback": 0, "app": 0}
@@ -681,6 +718,13 @@ class RolloutTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "TEST_DATABASE_URL"):
                 deploy.run_release_tests()
         run_mock.assert_not_called()
+
+    def test_legacy_remote_payload_inlines_recovery_module_and_compiles(self):
+        source=deploy.legacy_remote_source()
+        self.assertNotIn("__LEGACY_HEARTBEAT_HELPERS__",source)
+        self.assertEqual(source.count("from __future__ import annotations"),1)
+        self.assertIn("def verify_restarted_worker_impl",source)
+        compile(source,"<respond5-legacy-stdin>","exec")
 
     def test_release_suite_runs_rollout_behavior_and_first_join_database_tests(self):
         with patch.dict(os.environ, {"TEST_DATABASE_URL": "postgres://disposable"}), patch.object(deploy, "run") as run_mock:
