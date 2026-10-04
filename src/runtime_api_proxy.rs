@@ -7,7 +7,17 @@
 //! unchanged to the control plane.  It never receives a worker, gateway, or
 //! database credential.
 
-use std::{env, net::SocketAddr, process::Stdio, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    process::Stdio,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
@@ -23,17 +33,25 @@ use reqwest::{Client, Url, redirect::Policy};
 use tokio::{
     net::TcpListener,
     process::Command,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 use uuid::Uuid;
 
 pub const SERVICE_HOSTNAME: &str = "kurbis-runtime-api-proxy";
 pub const SERVICE_PORT: u16 = 8080;
+#[cfg(target_os = "linux")]
+const PROXY_UID: libc::uid_t = 65_532;
+#[cfg(target_os = "linux")]
+const PROXY_GID: libc::gid_t = 65_532;
 pub const SERVICE_BASE_URL: &str = "http://kurbis-runtime-api-proxy:8080";
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+const UPSTREAM_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_UPSTREAM_ADDRESSES: usize = 32;
+const IP_TABLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_GET_ATTEMPTS: usize = 2;
 const SCOPE_SERVER: &str = "server";
 const SCOPE_CI: &str = "ci";
@@ -67,6 +85,7 @@ impl Scope {
 struct ProxyState {
     config: ProxyConfig,
     client: Client,
+    upstream_healthy: Arc<AtomicBool>,
 }
 
 /// Start a capability-bound proxy attached to exactly one runtime network and
@@ -148,8 +167,18 @@ pub async fn start_container(
                 "0.25",
                 "--pids-limit",
                 "64",
+                // Root is container-namespace root only. The process installs its
+                // namespace-local OUTPUT policy, then irreversibly drops privileges.
                 "--user",
-                "65532:65532",
+                "0:0",
+                "--cap-add",
+                "NET_ADMIN",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SETGID",
+                "--cap-add",
+                "SETPCAP",
                 "--read-only",
                 "--security-opt",
                 "no-new-privileges:true",
@@ -164,9 +193,9 @@ pub async fn start_container(
                 "--health-timeout",
                 "1s",
                 "--health-retries",
-                "20",
+                "45",
                 "--health-start-period",
-                "2s",
+                "45s",
                 "--label",
                 &generation_label,
                 "--label",
@@ -242,46 +271,10 @@ pub async fn start_container(
         );
     }
 
-    // Do not admit a runtime onto a proxy whose configured origin is
-    // unreachable. This probes only the exact HTTPS origin the proxy is
-    // compiled/configured to contact; the proxy does not accept arbitrary URLs.
-    let upstream_probe = timeout(
-        Duration::from_secs(10),
-        Command::new("docker")
-            .args([
-                "exec",
-                name,
-                "/usr/local/bin/runtime-api-proxy",
-                "--verify-upstream",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    let upstream_probe = match upstream_probe {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            let _ = remove_container(name).await;
-            return Err(error).context("probe the configured control-plane egress origin");
-        }
-        Err(error) => {
-            let _ = remove_container(name).await;
-            return Err(error).context("configured control-plane egress probe timed out");
-        }
-    };
-    if !upstream_probe.status.success() {
-        let detail = String::from_utf8_lossy(&upstream_probe.stderr);
-        let _ = remove_container(name).await;
-        bail!(
-            "configured control-plane origin probe failed: {}",
-            detail.chars().take(2 * 1024).collect::<String>()
-        );
-    }
-
-    let health_result = timeout(Duration::from_secs(30), async {
+    // Readiness is owned by the proxy process: its egress policy is installed
+    // before it accepts traffic, and /healthz remains unavailable until the
+    // fixed upstream origin responds with the expected status.
+    let health_result = timeout(Duration::from_secs(60), async {
         loop {
             let output = Command::new("docker")
                 .args([
@@ -309,7 +302,7 @@ pub async fn start_container(
     if let Err(error) = match health_result {
         Ok(result) => result.context("runtime API proxy did not become healthy"),
         Err(error) => {
-            Err(error).context("runtime API proxy did not become healthy within 30 seconds")
+            Err(error).context("runtime API proxy did not become healthy within 60 seconds")
         }
     } {
         let _ = remove_container(name).await;
@@ -350,10 +343,9 @@ fn validate_egress_network_metadata(network: &serde_json::Value) -> Result<bool>
         .context("runtime API egress network has no Internal state")?;
     let ipv6 = network
         .get("EnableIPv6")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
+        .and_then(serde_json::Value::as_bool);
     ensure!(
-        driver == Some("bridge") && !ipv6,
+        driver == Some("bridge") && ipv6 == Some(false),
         "runtime API egress network must be an IPv4-only bridge"
     );
     Ok(internal)
@@ -385,31 +377,204 @@ pub fn container_name(scoped_id: Uuid) -> String {
     format!("kurbis-api-proxy-{}", scoped_id.simple())
 }
 
-/// Startup-time network test run inside the sidecar after it joins the
-/// egress network. It requests only the fixed control-plane origin's health
-/// endpoint (redirects disabled), proving that the configured origin resolves
-/// and is reachable before exposing the proxy to a Pumpkin container.
-pub async fn verify_configured_upstream() -> Result<()> {
+/// Install destination-pinned egress policy before binding a listener. DNS is
+/// retried because Docker attaches the egress network after starting this
+/// container; once resolved, every address is validated, pinned into reqwest,
+/// and allowed through the namespace firewall before the process drops root.
+pub async fn run_from_env() -> Result<()> {
     let config = ProxyConfig::from_env()?;
-    let mut health_url = config.upstream.clone();
+    let addresses = resolve_upstream_until_available(&config.upstream).await?;
+    validate_resolved_addresses(&config.upstream, &addresses)?;
+    install_egress_firewall(&config.upstream, &addresses).await?;
+    drop_proxy_privileges()?;
+
+    let client = build_pinned_client(&config.upstream, &addresses)?;
+    let upstream_healthy = Arc::new(AtomicBool::new(false));
+    let state = ProxyState {
+        config,
+        client,
+        upstream_healthy: upstream_healthy.clone(),
+    };
+    tokio::spawn(upstream_health_monitor(
+        state.config.upstream.clone(),
+        state.client.clone(),
+        upstream_healthy,
+    ));
+
+    let listener = TcpListener::bind(state.config.listen)
+        .await
+        .context("bind runtime API proxy listener")?;
+    tracing::info!(listen = %state.config.listen, upstream = %state.config.upstream, scope = ?state.config.scope, "runtime API proxy ready with destination-restricted egress");
+    axum::serve(listener, proxy_router(state))
+        .await
+        .context("runtime API proxy server failed")
+}
+
+async fn resolve_upstream_until_available(upstream: &Url) -> Result<Vec<IpAddr>> {
+    let deadline = Instant::now() + UPSTREAM_RESOLUTION_TIMEOUT;
+    loop {
+        match resolve_upstream_addresses(upstream).await {
+            Ok(addresses) => return Ok(addresses),
+            Err(error) if Instant::now() < deadline => {
+                tracing::debug!(error = %error, "waiting for configured upstream DNS to become available");
+                sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error).context("resolve configured runtime API upstream"),
+        }
+    }
+}
+
+async fn resolve_upstream_addresses(upstream: &Url) -> Result<Vec<IpAddr>> {
+    let host = upstream
+        .host_str()
+        .context("runtime API upstream has no host")?;
+    if let Ok(address) = IpAddr::from_str(host) {
+        return Ok(vec![address]);
+    }
+    let port = upstream
+        .port_or_known_default()
+        .context("runtime API upstream has no port")?;
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve configured upstream host {host}"))?
+        .map(|address| address.ip())
+        .filter(IpAddr::is_ipv4)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ensure!(
+        !addresses.is_empty() && addresses.len() <= MAX_UPSTREAM_ADDRESSES,
+        "configured runtime API upstream returned no addresses or too many addresses"
+    );
+    Ok(addresses)
+}
+
+fn validate_resolved_addresses(upstream: &Url, addresses: &[IpAddr]) -> Result<()> {
+    ensure!(
+        !addresses.is_empty() && addresses.len() <= MAX_UPSTREAM_ADDRESSES,
+        "configured runtime API upstream returned no addresses or too many addresses"
+    );
+    ensure!(
+        addresses.iter().all(IpAddr::is_ipv4),
+        "runtime API upstream must resolve to IPv4 addresses because proxy egress IPv6 is disabled"
+    );
+    let allow_local =
+        upstream.scheme() == "http" && is_loopback_or_local_http_host(upstream.host_str());
+    for address in addresses {
+        ensure!(
+            if allow_local {
+                is_local_upstream_address(*address)
+            } else {
+                is_global_unicast_address(*address)
+            },
+            "configured runtime API upstream resolved to a forbidden address"
+        );
+    }
+    Ok(())
+}
+
+fn is_local_upstream_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    }
+}
+
+/// Conservative public-unicast test for DNS answers used by the remote HTTPS
+/// control plane. Reject special-purpose, translation, documentation,
+/// benchmarking, private, local, multicast, and unspecified ranges.
+fn is_global_unicast_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_global_unicast_ipv4(address),
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_global_unicast_ipv4(mapped);
+            }
+            let segments = address.segments();
+            let in_global_unicast_space = segments[0] & 0xe000 == 0x2000;
+            let in_2001_special_purpose = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+            let in_documentation_range = segments[0] == 0x2001 && segments[1] == 0x0db8
+                || segments[0] == 0x3fff && segments[1] & 0xfff0 == 0;
+            let is_6to4 = segments[0] == 0x2002;
+            in_global_unicast_space
+                && !in_2001_special_purpose
+                && !in_documentation_range
+                && !is_6to4
+                && !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_global_unicast_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let in_shared_address_space = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    let in_special_192_0_0 = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+    let in_benchmark_range = octets[0] == 198 && matches!(octets[1], 18 | 19);
+    let in_documentation_range = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !address.is_unspecified()
+        && !in_shared_address_space
+        && !in_special_192_0_0
+        && !in_benchmark_range
+        && !in_documentation_range
+        && octets[0] != 0
+        && octets[0] < 224
+}
+
+fn build_pinned_client(upstream: &Url, addresses: &[IpAddr]) -> Result<Client> {
+    let host = upstream
+        .host_str()
+        .context("runtime API upstream has no host")?;
+    let port = upstream
+        .port_or_known_default()
+        .context("runtime API upstream has no port")?;
+    let resolved = addresses
+        .iter()
+        .copied()
+        .map(|address| SocketAddr::new(address, port))
+        .collect::<Vec<_>>();
+    Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .timeout(UPSTREAM_TIMEOUT)
+        .resolve_to_addrs(host, &resolved)
+        .build()
+        .context("build destination-pinned runtime API HTTP client")
+}
+
+async fn upstream_health_monitor(upstream: Url, client: Client, healthy: Arc<AtomicBool>) {
+    let mut health_url = upstream;
     health_url.set_path("/healthz");
     health_url.set_query(None);
     health_url.set_fragment(None);
-    let client = Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let response =
-        client.get(health_url).send().await.context(
-            "configured control-plane origin is unreachable from the proxy egress network",
-        )?;
-    ensure!(
-        response.status() == StatusCode::NO_CONTENT,
-        "configured control-plane health endpoint returned {}",
-        response.status()
-    );
-    Ok(())
+    loop {
+        let result = timeout(
+            Duration::from_secs(5),
+            client.get(health_url.clone()).send(),
+        )
+        .await;
+        let ready =
+            matches!(result, Ok(Ok(response)) if response.status() == StatusCode::NO_CONTENT);
+        healthy.store(ready, Ordering::Release);
+        if !ready {
+            tracing::warn!(upstream = %health_url, "configured runtime API upstream is not healthy; proxy remains unready");
+        }
+        sleep(UPSTREAM_HEALTH_INTERVAL).await;
+    }
 }
 
 pub async fn health_check() -> Result<()> {
@@ -423,27 +588,9 @@ pub async fn health_check() -> Result<()> {
         .context("runtime API proxy health request failed")?;
     ensure!(
         response.status() == StatusCode::NO_CONTENT,
-        "runtime API proxy is unhealthy"
+        "runtime API proxy is not ready"
     );
     Ok(())
-}
-
-pub async fn run_from_env() -> Result<()> {
-    let config = ProxyConfig::from_env()?;
-    let client = Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .timeout(UPSTREAM_TIMEOUT)
-        .build()
-        .context("build runtime API proxy HTTP client")?;
-    let state = ProxyState { config, client };
-    let listener = TcpListener::bind(state.config.listen)
-        .await
-        .context("bind runtime API proxy listener")?;
-    tracing::info!(listen = %state.config.listen, upstream = %state.config.upstream, scope = ?state.config.scope, "runtime API proxy ready");
-    axum::serve(listener, proxy_router(state))
-        .await
-        .context("runtime API proxy server failed")
 }
 
 fn proxy_router(state: ProxyState) -> Router {
@@ -451,6 +598,202 @@ fn proxy_router(state: ProxyState) -> Router {
         .route("/", any(handle))
         .fallback(handle)
         .with_state(state)
+}
+
+async fn install_egress_firewall(upstream: &Url, addresses: &[IpAddr]) -> Result<()> {
+    let port = upstream
+        .port_or_known_default()
+        .context("runtime API upstream has no port")?;
+    ensure!(port != 53, "runtime API upstream may not use a DNS port");
+    ensure!(
+        !addresses.is_empty() && addresses.len() <= MAX_UPSTREAM_ADDRESSES,
+        "runtime API upstream address set is empty or too large"
+    );
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "runtime API proxy egress firewall requires container-namespace root"
+    );
+
+    // Flush only this container's OUTPUT chain. A DROP default policy is set
+    // before any allow rule so every intermediate failure stays fail-closed.
+    for (program, ipv6) in [("/usr/sbin/iptables", false), ("/usr/sbin/ip6tables", true)] {
+        run_firewall_command(program, &["-w", "-F", "OUTPUT"]).await?;
+        run_firewall_command(program, &["-w", "-P", "OUTPUT", "DROP"]).await?;
+        if ipv6 {
+            verify_firewall_output_policy(program, 0).await?;
+            continue;
+        }
+
+        // Docker's embedded resolver is commonly 127.0.0.11. Block DNS before
+        // loopback allowances to prevent arbitrary DNS tunneling after startup.
+        for protocol in ["udp", "tcp"] {
+            run_firewall_command(
+                program,
+                &[
+                    "-w", "-A", "OUTPUT", "-p", protocol, "--dport", "53", "-j", "REJECT",
+                ],
+            )
+            .await?;
+        }
+        // Permit return packets only for flows already admitted below or the
+        // local health connection. DNS has already been explicitly rejected.
+        run_firewall_command(
+            program,
+            &[
+                "-w",
+                "-A",
+                "OUTPUT",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+        )
+        .await?;
+        // The local health client connects to the process itself; its SYN-ACK
+        // is covered by the established-state rule above.
+        run_firewall_command(
+            program,
+            &[
+                "-w",
+                "-A",
+                "OUTPUT",
+                "-o",
+                "lo",
+                "-d",
+                "127.0.0.1/32",
+                "-p",
+                "tcp",
+                "--dport",
+                "8080",
+                "-j",
+                "ACCEPT",
+            ],
+        )
+        .await?;
+        for address in addresses {
+            let address = address.to_string();
+            run_firewall_command(
+                program,
+                &[
+                    "-w",
+                    "-A",
+                    "OUTPUT",
+                    "-d",
+                    &address,
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    &port.to_string(),
+                    "-j",
+                    "ACCEPT",
+                ],
+            )
+            .await?;
+        }
+        verify_firewall_output_policy(program, addresses.len() + 4).await?;
+    }
+    Ok(())
+}
+
+async fn run_firewall_command(program: &str, arguments: &[&str]) -> Result<()> {
+    let output = timeout(
+        IP_TABLE_COMMAND_TIMEOUT,
+        Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .with_context(|| format!("{program} command timed out"))??;
+    ensure!(
+        output.status.success(),
+        "{program} {} failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(1024)
+            .collect::<String>()
+    );
+    Ok(())
+}
+
+async fn verify_firewall_output_policy(program: &str, expected_rules: usize) -> Result<()> {
+    let output = timeout(
+        IP_TABLE_COMMAND_TIMEOUT,
+        Command::new(program)
+            .args(["-S", "OUTPUT"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .with_context(|| format!("verify {program} output policy timed out"))??;
+    ensure!(
+        output.status.success(),
+        "failed to read {program} output policy"
+    );
+    let rules = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        rules.lines().any(|line| line == "-P OUTPUT DROP")
+            && rules
+                .lines()
+                .filter(|line| line.starts_with("-A OUTPUT "))
+                .count()
+                == expected_rules,
+        "{program} output policy does not match the fail-closed rule set"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drop_proxy_privileges() -> Result<()> {
+    unsafe {
+        ensure!(libc::geteuid() == 0, "proxy privilege drop requires uid 0");
+        // Drop every capability from the bounding set before changing IDs.
+        for capability in 0..=63 {
+            if libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(error).context("drop runtime API proxy capability bounding set");
+                }
+            }
+        }
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("clear runtime API proxy supplementary groups");
+        }
+        if libc::setgid(PROXY_GID) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("drop runtime API proxy group privileges");
+        }
+        if libc::setuid(PROXY_UID) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("drop runtime API proxy user privileges");
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("prevent runtime API proxy privilege regain");
+        }
+        ensure!(
+            libc::geteuid() == PROXY_UID && libc::getegid() == PROXY_GID,
+            "runtime API proxy privilege drop did not take effect"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_proxy_privileges() -> Result<()> {
+    bail!("runtime API proxy egress policy requires Linux")
 }
 
 pub fn validate_upstream_url(value: &str, allow_insecure: bool) -> Result<Url> {
@@ -511,10 +854,11 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     if path == "/healthz" && method == Method::GET {
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .expect("static health response is valid");
+        return status(if state.upstream_healthy.load(Ordering::Acquire) {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        });
     }
     if request.uri().authority().is_some()
         || !route_allowed(state.config.scope, &method, &path, state.config.expected_id)

@@ -360,7 +360,7 @@ pub async fn create_minecraft_link(
     Ok(Json(MinecraftLinkResponse {
         url: format!(
             "{}/auth/minecraft#token={token}",
-            state.config.https_public_base_url()
+            state.config.public_base_url.trim_end_matches('/')
         ),
     }))
 }

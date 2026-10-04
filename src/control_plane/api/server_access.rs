@@ -208,7 +208,7 @@ pub(super) async fn mint_server_login_link(
     Ok(no_store(Json(LoginLinkResponse {
         url: format!(
             "{}/auth/server#token={token}",
-            state.config.https_public_base_url()
+            state.config.public_base_url.trim_end_matches('/')
         ),
         expires_in_seconds: LOGIN_TOKEN_TTL_SECONDS,
     }))

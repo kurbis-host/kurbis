@@ -277,19 +277,7 @@ impl OAuthConfig {
     }
 }
 
-pub(crate) fn https_public_base_url(value: &str) -> String {
-    value.strip_prefix("http://").map_or_else(
-        || value.trim_end_matches('/').to_owned(),
-        |rest| format!("https://{}", rest.trim_end_matches('/')),
-    )
-}
-
 impl ControlPlaneConfig {
-    /// Returns the public origin using HTTPS for links that Minecraft must open.
-    pub fn https_public_base_url(&self) -> String {
-        https_public_base_url(&self.public_base_url)
-    }
-
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             common: CommonConfig::from_env()?,
@@ -673,21 +661,4 @@ fn value(name: &str, default: &str) -> String {
 fn gib_env(name: &str, default: i64) -> Result<i64> {
     let gib: i64 = value(name, &default.to_string()).parse()?;
     Ok(gib * 1024 * 1024 * 1024)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::https_public_base_url;
-
-    #[test]
-    fn minecraft_links_upgrade_http_public_origins_to_https() {
-        assert_eq!(
-            https_public_base_url("http://panel.example.test/"),
-            "https://panel.example.test"
-        );
-        assert_eq!(
-            https_public_base_url("https://panel.example.test/"),
-            "https://panel.example.test"
-        );
-    }
 }
