@@ -209,6 +209,17 @@ by an arrow key to select a process pane; `Ctrl-b z` zooms the selected pane,
 and `Ctrl-b d` detaches. Persistent PostgreSQL data is kept when stopping
 Compose. Stop hosted worlds from the panel before shutting down their worker.
 
+For Dokploy production releases, use [`deployment/production-rollout.md`](deployment/production-rollout.md)
+and run `python3 scripts/deploy_dokploy.py` from a clean checkout exactly matching
+`origin/main`. That release command waits for Dokploy's build and healthy Compose
+stack, then updates the separate systemd-managed host worker from the deployed
+application image. It verifies the worker binary, Pumpkin runtime, and renewing
+worker lease, and rolls the worker and app back together if verification fails.
+Set `TEST_DATABASE_URL` to a disposable PostgreSQL database for the required
+release regression. The first migration from the current unlabelled Respond5
+baseline additionally requires the reviewed manifest described in the rollout
+guide; do not enable Dokploy's direct auto-deploy path for production.
+
 ## Configuration
 
 Runtime configuration is loaded through environment variables. See `src/config.rs` for available settings and defaults.
