@@ -25,6 +25,44 @@ pub async fn request_wake(config: &GatewayConfig, server_id: Uuid) -> Result<()>
     Ok(())
 }
 
+pub async fn request_ci_preview_admission(
+    config: &GatewayConfig,
+    hostname: &str,
+) -> Result<crate::ci::CiPreviewState> {
+    let url = format!(
+        "{}/internal/ci/previews/admit",
+        config.control_plane_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(&config.internal_token)
+        .json(&serde_json::json!({ "hostname": hostname }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let state = body
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CI admission response omitted state"))?
+        .parse()
+        .map_err(|error: crate::ci::InvalidCiValue| anyhow::anyhow!(error))?;
+    if !status.is_success() && status != reqwest::StatusCode::ACCEPTED {
+        // Terminal preview states are returned with 503 to stop runtime
+        // admission, but remain structured so the lobby can show why.
+        if !matches!(
+            state,
+            crate::ci::CiPreviewState::Failed
+                | crate::ci::CiPreviewState::Expired
+                | crate::ci::CiPreviewState::Stopping
+        ) {
+            bail!("control plane rejected CI preview admission with {status}");
+        }
+    }
+    Ok(state)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, path::PathBuf, time::Duration};

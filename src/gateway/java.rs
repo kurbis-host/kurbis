@@ -1,4 +1,8 @@
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -15,6 +19,7 @@ use crate::{
         routes::RouteCache,
     },
     model::{ObservedState, RouteTarget},
+    routing::CiRouteTarget,
 };
 
 const MAX_HANDSHAKE_FRAME: usize = 8 * 1024;
@@ -53,6 +58,19 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
             return Ok(());
         }
     };
+    let ci_root_domain = crate::ci::CI_ROOT_DOMAIN;
+    if routes.accepts_ci_address(&handshake.hostname, &ci_root_domain) {
+        return match handshake.next_state {
+            1 => {
+                let target = routes
+                    .resolve_ci(&handshake.hostname, &ci_root_domain)
+                    .await?;
+                handle_ci_status(&mut client, &handshake, target.as_ref()).await
+            }
+            2 => handle_ci_login(client, config, routes, handshake, &ci_root_domain).await,
+            _ => Ok(()),
+        };
+    }
     match handshake.next_state {
         1 => {
             let accepted_server_address = routes.accepts_server_address(&handshake.hostname);
@@ -333,6 +351,164 @@ async fn connect_backend(address: impl tokio::net::ToSocketAddrs) -> Result<TcpS
     )
     .await
     .context("backend connection timed out")??)
+}
+
+fn ci_status_info(target: Option<&CiRouteTarget>) -> (&'static str, String) {
+    let Some(target) = target else {
+        return ("unknown", "Unknown CI preview address".into());
+    };
+    let state = target.state;
+    let label = match state {
+        crate::ci::CiPreviewState::Lobby => "lobby",
+        crate::ci::CiPreviewState::Queued => "queued",
+        crate::ci::CiPreviewState::Fetching => "fetching",
+        crate::ci::CiPreviewState::Patching => "patching",
+        crate::ci::CiPreviewState::Compiling => "compiling",
+        crate::ci::CiPreviewState::Packaging => "packaging",
+        crate::ci::CiPreviewState::Booting => "booting",
+        crate::ci::CiPreviewState::Ready => "ready",
+        crate::ci::CiPreviewState::Running => "online",
+        crate::ci::CiPreviewState::Stopping => "stopping",
+        crate::ci::CiPreviewState::Failed => "failed",
+        crate::ci::CiPreviewState::Expired => "expired",
+    };
+    let mut description = format!("Pumpkin CI preview ({state}) — {}", target.commit_sha);
+    if let Some(failure) = target.failure_message.as_deref() {
+        description.push_str("\n");
+        description.push_str(&tail_utf8(failure, 512));
+    } else if !target.build_log.is_empty() {
+        description.push_str("\n");
+        description.push_str(&tail_utf8(&target.build_log, 512));
+    }
+    (label, description)
+}
+
+fn tail_utf8(value: &str, max_bytes: usize) -> String {
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_owned()
+}
+
+async fn handle_ci_status(
+    client: &mut TcpStream,
+    handshake: &Handshake,
+    target: Option<&CiRouteTarget>,
+) -> Result<()> {
+    let request = read_frame(client, 1024).await?;
+    let mut cursor = 0;
+    if read_varint(&request, &mut cursor)? != 0 {
+        bail!("unexpected status request packet");
+    }
+    let (state, description) = ci_status_info(target);
+    let status = json!({"version":{"name":format!("kurbis ({state})"),"protocol":handshake.protocol},"players":{"max":0,"online":0,"sample":[]},"description":{"text":description}});
+    let mut packet = Vec::new();
+    write_varint(0, &mut packet);
+    write_string(&status.to_string(), &mut packet)?;
+    write_frame(client, &packet).await?;
+    if let Ok(ping) = read_frame(client, 1024).await {
+        let mut cursor = 0;
+        if read_varint(&ping, &mut cursor).ok() == Some(1) && ping.len().saturating_sub(cursor) == 8
+        {
+            write_frame(client, &ping).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_ci_login(
+    mut client: TcpStream,
+    config: &GatewayConfig,
+    routes: &RouteCache,
+    handshake: Handshake,
+    ci_root_domain: &str,
+) -> Result<()> {
+    let admission_state =
+        crate::gateway::wake::request_ci_preview_admission(config, &handshake.hostname)
+            .await
+            .ok();
+    let target = routes
+        .resolve_ci(&handshake.hostname, ci_root_domain)
+        .await?;
+    if let Some(target) = target.as_ref()
+        && let Some(lease) = ci_java_lease(target)
+    {
+        let hostname = handshake.hostname.clone();
+        return proxy_to_ci_backend(client, &handshake, lease, || async {
+            routes.resolve_ci(&hostname, ci_root_domain).await
+        })
+        .await;
+    }
+    match admission_state.or_else(|| target.as_ref().map(|target| target.state)) {
+        Some(crate::ci::CiPreviewState::Failed) => {
+            send_login_disconnect(&mut client, "CI preview build failed.").await
+        }
+        Some(crate::ci::CiPreviewState::Expired) => {
+            send_login_disconnect(&mut client, "CI preview expired.").await
+        }
+        Some(_) => proxy_to_waiting(client, config, handshake).await,
+        None => send_login_disconnect(&mut client, "Unknown or expired CI preview address.").await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CiJavaLease {
+    address: IpAddr,
+    port: u16,
+    generation: i64,
+}
+
+fn ci_java_lease(target: &CiRouteTarget) -> Option<CiJavaLease> {
+    if target.runtime_generation <= 0 || target.state != crate::ci::CiPreviewState::Running {
+        return None;
+    }
+    let address: IpAddr = target.worker_address.as_deref()?.parse().ok()?;
+    if address.is_unspecified() || address.is_multicast() {
+        return None;
+    }
+    Some(CiJavaLease {
+        address,
+        port: u16::try_from(target.java_port?).ok()?,
+        generation: target.runtime_generation,
+    })
+}
+
+async fn proxy_to_ci_backend<F, Fut>(
+    mut client: TcpStream,
+    handshake: &Handshake,
+    lease: CiJavaLease,
+    resolve_current: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<CiRouteTarget>>>,
+{
+    let backend_address = SocketAddr::new(lease.address, lease.port);
+    let mut backend = match connect_backend(backend_address).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::debug!(generation = lease.generation, backend = %backend_address, ?error,
+                "CI Java backend is unreachable");
+            return send_login_disconnect(
+                &mut client,
+                "CI preview is temporarily unavailable. Retry shortly.",
+            )
+            .await;
+        }
+    };
+    let current = resolve_current().await?;
+    let valid = current
+        .as_ref()
+        .and_then(ci_java_lease)
+        .is_some_and(|current| current == lease);
+    if !valid {
+        return send_login_disconnect(&mut client, "CI preview is restarting. Retry shortly.")
+            .await;
+    }
+    backend.write_all(&handshake.framed).await?;
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    Ok(())
 }
 
 fn status_info(

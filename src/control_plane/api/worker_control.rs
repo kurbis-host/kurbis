@@ -21,6 +21,19 @@ use crate::{
 use super::{ApiError, AppState, worker_auth};
 
 const MAX_WORKER_ERROR_BYTES: usize = 1_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HeartbeatRequest {
+    #[serde(default = "unknown_worker_architecture")]
+    runtime_architecture: String,
+    #[serde(default)]
+    supports_ci_previews: bool,
+}
+
+fn unknown_worker_architecture() -> String {
+    "unknown".to_owned()
+}
 #[derive(Debug, Serialize)]
 pub(super) struct RecoveryReport {
     operations: u64,
@@ -76,7 +89,18 @@ pub(super) async fn recover(
 pub(super) async fn heartbeat(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    Json(request): Json<HeartbeatRequest>,
 ) -> Result<StatusCode, ApiError> {
+    if !matches!(
+        request.runtime_architecture.as_str(),
+        "unknown" | "x86_64-linux" | "aarch64-linux"
+    ) {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_worker_architecture",
+            "worker reported an unsupported runtime architecture",
+        ));
+    }
     let mut authorization = state.pool.begin().await?;
     let worker_id = worker_auth::lock_authenticated_worker_id(&mut authorization, &headers).await?;
     let lease_updated = sqlx::query(
@@ -89,10 +113,15 @@ pub(super) async fn heartbeat(
     if lease_updated.rows_affected() != 1 {
         return Err(worker_auth::invalid_worker_token());
     }
-    let result = sqlx::query("UPDATE workers SET heartbeat_at = now() WHERE id = $1")
-        .bind(worker_id)
-        .execute(&mut *authorization)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE workers SET heartbeat_at = now(), runtime_architecture = $2,
+             supports_ci_previews = $3 WHERE id = $1",
+    )
+    .bind(worker_id)
+    .bind(&request.runtime_architecture)
+    .bind(request.supports_ci_previews)
+    .execute(&mut *authorization)
+    .await?;
     if result.rows_affected() != 1 {
         return Err(worker_auth::invalid_worker_token());
     }

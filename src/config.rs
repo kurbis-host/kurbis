@@ -32,6 +32,196 @@ pub struct ControlPlaneConfig {
     pub oauth: OAuthConfig,
 }
 
+#[derive(Clone)]
+pub struct CiConfig {
+    pub github_pat: String,
+    pub repository: String,
+    pub default_branch: String,
+    pub patch_fingerprint: String,
+    pub toolchain_version: String,
+    pub target_architecture: String,
+    pub builder_image: String,
+    pub builder_docker_host: String,
+    pub plugin_source: PathBuf,
+}
+
+impl CiConfig {
+    pub fn from_env() -> Result<Option<Self>> {
+        let github_pat = match env::var("CI_GITHUB_PAT") {
+            Ok(token) if token.is_empty() => return Ok(None),
+            Ok(token) if token.trim().is_empty() => return Ok(None),
+            Ok(token) => token,
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(error).context("CI_GITHUB_PAT must be valid UTF-8"),
+        };
+        ensure!(
+            !github_pat.is_empty()
+                && github_pat.len() <= 512
+                && github_pat.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
+            "CI_GITHUB_PAT must be a non-empty visible token"
+        );
+        let repository = value("CI_REPOSITORY", "kurbis-host/Pumpkin");
+        ensure!(
+            repository == "kurbis-host/Pumpkin",
+            "CI_REPOSITORY is fixed to kurbis-host/Pumpkin"
+        );
+        let patch_fingerprint = checked_in_ci_patch_fingerprint()?;
+        let builder_image = required("CI_BUILDER_IMAGE")?;
+        let builder_docker_host = required("CI_BUILDER_DOCKER_HOST")?;
+        validate_ci_builder_docker_host(&builder_docker_host)?;
+        let configured_rustc = required("CI_TOOLCHAIN_VERSION")?;
+        ensure!(
+            configured_rustc.len() <= 32
+                && configured_rustc.split('.').count() == 3
+                && configured_rustc
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+            "CI_TOOLCHAIN_VERSION must be an exact Rust release such as 1.98.1"
+        );
+        let toolchain_version =
+            crate::ci::execution::toolchain_identity(&builder_image, &configured_rustc)
+                .context("CI_BUILDER_IMAGE must be digest-pinned and match CI_TOOLCHAIN_VERSION")?;
+        let target_architecture = native_linux_target_architecture()?;
+        let plugin_source = PathBuf::from(value("CI_PLUGIN_SOURCE", "plugins/kurbis-control"));
+        let plugin_source = if plugin_source.is_absolute() {
+            plugin_source
+        } else {
+            env::current_dir()?.join(plugin_source)
+        };
+        let default_branch = value("CI_DEFAULT_BRANCH", "main");
+        ensure!(
+            !default_branch.trim().is_empty() && default_branch.len() <= 255,
+            "CI_DEFAULT_BRANCH must contain 1 to 255 bytes"
+        );
+        Ok(Some(Self {
+            github_pat,
+            repository,
+            default_branch,
+            patch_fingerprint,
+            toolchain_version,
+            target_architecture,
+            builder_image,
+            builder_docker_host,
+            plugin_source,
+        }))
+    }
+}
+
+impl fmt::Debug for CiConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CiConfig")
+            .field("github_pat", &"[redacted]")
+            .field("repository", &self.repository)
+            .field("default_branch", &self.default_branch)
+            .field("patch_fingerprint", &self.patch_fingerprint)
+            .field("toolchain_version", &self.toolchain_version)
+            .field("target_architecture", &self.target_architecture)
+            .field("builder_image", &self.builder_image)
+            .field("builder_docker_host", &self.builder_docker_host)
+            .field("plugin_source", &self.plugin_source)
+            .finish()
+    }
+}
+
+pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {
+    let host = reqwest::Url::parse(value)
+        .context("CI_BUILDER_DOCKER_HOST must be a valid SSH Docker host")?;
+    ensure!(
+        host.scheme() == "ssh"
+            && host.host_str().is_some()
+            && !host.username().is_empty()
+            && host.password().is_none()
+            && matches!(host.path(), "" | "/")
+            && host.query().is_none()
+            && host.fragment().is_none(),
+        "CI_BUILDER_DOCKER_HOST must use ssh://user@host[:port]"
+    );
+    Ok(())
+}
+
+fn checked_in_ci_patch_fingerprint() -> Result<String> {
+    let roots = [
+        env::var_os("CI_INTEGRATION_SOURCE_ROOT").map(PathBuf::from),
+        Some(env::current_dir()?),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+    ]
+    .into_iter()
+    .flatten();
+    let root = roots
+        .into_iter()
+        .find(|root| {
+            root.join("runtime/pumpkin/host-control.patch").is_file()
+                && root
+                    .join("runtime/pumpkin/nethernet-gateway.patch")
+                    .is_file()
+        })
+        .context("checked-in Pumpkin integration patches were not found")?;
+    let mut hasher = blake3::Hasher::new();
+    for (label, relative) in [
+        ("pumpkin-revision", "runtime/pumpkin/REVISION"),
+        ("host-control.patch", "runtime/pumpkin/host-control.patch"),
+        (
+            "nethernet-gateway.patch",
+            "runtime/pumpkin/nethernet-gateway.patch",
+        ),
+        ("host_control.rs", "runtime/pumpkin/host_control.rs"),
+        (
+            "trusted-plugin/Cargo.toml",
+            "plugins/kurbis-control/Cargo.toml",
+        ),
+        (
+            "trusted-plugin/Cargo.lock",
+            "plugins/kurbis-control/Cargo.lock",
+        ),
+        (
+            "trusted-plugin/src/actions.rs",
+            "plugins/kurbis-control/src/actions.rs",
+        ),
+        (
+            "trusted-plugin/src/api.rs",
+            "plugins/kurbis-control/src/api.rs",
+        ),
+        (
+            "trusted-plugin/src/chat.rs",
+            "plugins/kurbis-control/src/chat.rs",
+        ),
+        (
+            "trusted-plugin/src/command.rs",
+            "plugins/kurbis-control/src/command.rs",
+        ),
+        (
+            "trusted-plugin/src/lib.rs",
+            "plugins/kurbis-control/src/lib.rs",
+        ),
+        (
+            "trusted-plugin/src/menu.rs",
+            "plugins/kurbis-control/src/menu.rs",
+        ),
+    ] {
+        let contents =
+            std::fs::read(root.join(relative)).with_context(|| format!("read {relative}"))?;
+        hasher.update(&(label.len() as u64).to_be_bytes());
+        hasher.update(label.as_bytes());
+        hasher.update(&(contents.len() as u64).to_be_bytes());
+        hasher.update(&contents);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn native_linux_target_architecture() -> Result<String> {
+    ensure!(
+        cfg!(target_os = "linux"),
+        "the CI control plane and rootless builder require a Linux native host"
+    );
+    let architecture = match env::consts::ARCH {
+        "x86_64" => "x86_64-linux",
+        "aarch64" => "aarch64-linux",
+        other => bail!("unsupported native CI Linux architecture {other}"),
+    };
+    Ok(architecture.to_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
     pub google: OAuthProviderConfig,
@@ -133,6 +323,7 @@ pub struct WorkerConfig {
     pub name: String,
     pub address: String,
     pub signal_address: IpAddr,
+    pub gateway_address: Option<IpAddr>,
     pub root: PathBuf,
     pub storage_mode: StorageMode,
     pub runtime: RuntimeConfig,
@@ -143,6 +334,9 @@ pub struct WorkerConfig {
     pub port_max: i32,
     pub host_control_token: String,
     pub control_plane_url: String,
+    pub runtime_api_proxy_upstream: String,
+    pub runtime_api_proxy_egress_network: String,
+    pub runtime_api_proxy_image: String,
     pub public_base_url: String,
     pub api_token: String,
     pub allow_insecure_local_control_plane_http: bool,
@@ -164,6 +358,39 @@ impl WorkerConfig {
             "WORKER_SIGNAL_ADDRESS must be a private worker address"
         );
         let signal_address = signal_address.parse::<IpAddr>()?;
+        let worker_address = required("WORKER_ADDRESS")?;
+        let worker_ip = worker_address
+            .parse::<IpAddr>()
+            .context("WORKER_ADDRESS must be an IP address")?;
+        let gateway_address = match env::var("WORKER_GATEWAY_ADDRESS") {
+            Ok(address) => {
+                ensure!(
+                    crate::model::is_gateway_source_address(&address),
+                    "WORKER_GATEWAY_ADDRESS must be a concrete unicast Gateway source IP"
+                );
+                let address = address.parse::<IpAddr>()?;
+                ensure!(
+                    !address.is_unspecified()
+                        && address.is_ipv4() == signal_address.is_ipv4()
+                        && address.is_ipv4() == worker_ip.is_ipv4(),
+                    "WORKER_GATEWAY_ADDRESS must be a concrete address in the worker ingress IP family"
+                );
+                Some(address)
+            }
+            Err(env::VarError::NotPresent) if native => None,
+            Err(env::VarError::NotPresent) => {
+                bail!("WORKER_GATEWAY_ADDRESS is required for Docker workloads")
+            }
+            Err(error) => return Err(error).context("WORKER_GATEWAY_ADDRESS must be UTF-8"),
+        };
+        let control_plane_url = required("CONTROL_PLANE_URL")?;
+        let runtime_api_proxy_upstream =
+            value("WORKER_RUNTIME_API_PROXY_UPSTREAM", &control_plane_url);
+        let runtime_api_proxy_egress_network = value(
+            "WORKER_RUNTIME_API_EGRESS_NETWORK",
+            "kurbis-hoster_runtime-api-egress",
+        );
+        let runtime_api_proxy_image = value("WORKER_RUNTIME_API_PROXY_IMAGE", "melon-hoster:local");
         let native_root = format!("data/native-worker-{id}");
         let root = PathBuf::from(value(
             "WORKER_ROOT",
@@ -204,8 +431,9 @@ impl WorkerConfig {
         Ok(Self {
             id,
             name: required("WORKER_NAME")?,
-            address: required("WORKER_ADDRESS")?,
+            address: worker_address,
             signal_address,
+            gateway_address,
             root,
             storage_mode: StorageMode::from_env(native)?,
             runtime,
@@ -223,7 +451,10 @@ impl WorkerConfig {
             port_min: value("WORKER_PORT_MIN", "20000").parse()?,
             port_max: value("WORKER_PORT_MAX", "40000").parse()?,
             host_control_token: required("PUMPKIN_HOST_CONTROL_TOKEN")?,
-            control_plane_url: required("CONTROL_PLANE_URL")?,
+            control_plane_url,
+            runtime_api_proxy_upstream,
+            runtime_api_proxy_egress_network,
+            runtime_api_proxy_image,
             public_base_url: required("PUBLIC_BASE_URL")?,
             api_token: required("WORKER_API_TOKEN")?,
             allow_insecure_local_control_plane_http: value(
@@ -248,21 +479,24 @@ pub enum RuntimeConfig {
 
 impl RuntimeConfig {
     fn from_env() -> Result<Self> {
-        let default = if cfg!(target_os = "macos") {
-            "native"
-        } else {
-            "docker"
-        };
-        match value("WORKER_RUNTIME", default).as_str() {
+        match value("WORKER_RUNTIME", "docker").as_str() {
             "docker" => Ok(Self::Docker {
                 image: value("PUMPKIN_IMAGE", "melon-pumpkin:host-control"),
             }),
-            "native" => Ok(Self::Native {
-                binary: PathBuf::from(value(
-                    "PUMPKIN_BINARY",
-                    "output/native-pumpkin/target/debug/pumpkin",
-                )),
-            }),
+            "native"
+                if cfg!(debug_assertions)
+                    && value("KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV", "false") == "true" =>
+            {
+                Ok(Self::Native {
+                    binary: PathBuf::from(value(
+                        "PUMPKIN_BINARY",
+                        "output/native-pumpkin/target/debug/pumpkin",
+                    )),
+                })
+            }
+            "native" => bail!(
+                "native Pumpkin is an unsandboxed development fixture; it requires a debug build and KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV=true"
+            ),
             other => bail!("unsupported WORKER_RUNTIME {other:?}"),
         }
     }

@@ -25,6 +25,7 @@ use crate::{
         SERVER_STORAGE_BYTES, SnapshotReason,
     },
     worker::{
+        ci_runtime::CiPreviewWorker,
         control_plane::{OperationRetryOutcome, WorkerControl},
         docker::DockerRuntime,
         idle::IdleTimer,
@@ -44,6 +45,7 @@ pub struct WorkerRunner {
     config: WorkerConfig,
     control_plane: WorkerControl,
     runtime: Box<dyn ServerRuntime>,
+    ci_runtime: Option<CiPreviewWorker>,
     server_access: ServerAccess,
     snapshots: SnapshotManager,
     storage: StorageManager,
@@ -65,29 +67,30 @@ impl WorkerRunner {
             &config.control_plane_url,
             &config.api_token,
             config.allow_insecure_local_control_plane_http,
-        )?;
-        control_plane
-            .acquire_lease(config.id, signal_address)
-            .await?;
-        let recovered = control_plane.recover().await?;
-        if recovered.operations > 0 || recovered.exports > 0 {
-            tracing::warn!(
-                worker_id = %config.id,
-                operations = recovered.operations,
-                exports = recovered.exports,
-                "recovered interrupted worker work"
-            );
-        }
+        )?
+        .with_ci_preview_support(matches!(&config.runtime, RuntimeConfig::Docker { .. }));
         tokio::fs::create_dir_all(config.root.join("servers")).await?;
         let object_client = WorkerObjectClient::from_control_plane(control_plane.clone());
         let snapshots = SnapshotManager::new_worker(object_client);
         let runtime: Box<dyn ServerRuntime> = match &config.runtime {
-            RuntimeConfig::Docker { image } => Box::new(DockerRuntime::new(
-                image.clone(),
-                config.host_control_token.clone(),
-                public_address,
-                signal_address,
-            )),
+            RuntimeConfig::Docker { image } => {
+                let runtime = DockerRuntime::new(
+                    image.clone(),
+                    config.host_control_token.clone(),
+                    config.root.clone(),
+                    public_address,
+                    signal_address,
+                    config
+                        .gateway_address
+                        .context("Docker workload ingress needs WORKER_GATEWAY_ADDRESS")?,
+                    config.runtime_api_proxy_image.clone(),
+                    config.runtime_api_proxy_upstream.clone(),
+                    config.runtime_api_proxy_egress_network.clone(),
+                    config.allow_insecure_local_control_plane_http,
+                )?;
+                runtime.verify_sandbox().await?;
+                Box::new(runtime)
+            }
             RuntimeConfig::Native { binary } => Box::new(
                 NativeRuntime::new(
                     binary.clone(),
@@ -100,12 +103,48 @@ impl WorkerRunner {
                 .await?,
             ),
         };
+        let ci_runtime = match &config.runtime {
+            RuntimeConfig::Docker { image } => Some(CiPreviewWorker::new(
+                control_plane.clone(),
+                config.root.clone(),
+                image.clone(),
+                config.id,
+                config.host_control_token.clone(),
+                config
+                    .address
+                    .parse()
+                    .context("WORKER_ADDRESS must be an IP address for CI preview routing")?,
+                config.signal_address,
+                config
+                    .gateway_address
+                    .context("CI preview ingress needs WORKER_GATEWAY_ADDRESS")?,
+                config.storage_mode,
+                config.runtime_api_proxy_image.clone(),
+                config.runtime_api_proxy_upstream.clone(),
+                config.runtime_api_proxy_egress_network.clone(),
+                config.allow_insecure_local_control_plane_http,
+            )),
+            RuntimeConfig::Native { .. } => None,
+        };
+        control_plane
+            .acquire_lease(config.id, signal_address)
+            .await?;
+        let recovered = control_plane.recover().await?;
+        if recovered.operations > 0 || recovered.exports > 0 {
+            tracing::warn!(
+                worker_id = %config.id,
+                operations = recovered.operations,
+                exports = recovered.exports,
+                "recovered interrupted worker work"
+            );
+        }
         let storage = StorageManager::new(config.root.clone(), config.storage_mode);
         let server_access = ServerAccess::new(&config, control_plane.clone())?;
         Ok(Self {
             control_plane,
             config,
             runtime,
+            ci_runtime,
             server_access,
             snapshots,
             storage,

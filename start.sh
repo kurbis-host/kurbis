@@ -80,7 +80,7 @@ worker_bundle_path() {
 provision_worker_bundle() {
   local mode=$1 worker_id=${2:-$WORKER_ID} rotate=${3:-false} profile=${4:-release}
   local database_url bundle_path control_plane_url runtime storage_mode pumpkin_binary
-  local pumpkin_image plugin_wasm
+  local pumpkin_image plugin_wasm proxy_upstream proxy_egress_network proxy_image
   local variable_name
   case "$mode" in
     native) database_url=$DATABASE_URL_NATIVE ;;
@@ -108,6 +108,9 @@ provision_worker_bundle() {
       ;;
     *) die "unsupported worker bundle mode: $mode" ;;
   esac
+  proxy_upstream=${WORKER_RUNTIME_API_PROXY_UPSTREAM:-http://control-plane:8080}
+  proxy_egress_network=${WORKER_RUNTIME_API_EGRESS_NETWORK:-kurbis-hoster_runtime-api-egress}
+  proxy_image=${WORKER_RUNTIME_API_PROXY_IMAGE:-melon-hoster:local}
   bundle_path=$(worker_bundle_path "$worker_id")
   mkdir -p "$(dirname "$bundle_path")"
   local -a args=(--worker-id "$worker_id" --database-url "$database_url")
@@ -116,6 +119,9 @@ provision_worker_bundle() {
     "WORKER_ADDRESS=$WORKER_ADDRESS"
     "WORKER_SIGNAL_ADDRESS=$WORKER_SIGNAL_ADDRESS"
     "WORKER_CONTROL_PLANE_URL=$control_plane_url"
+    "WORKER_RUNTIME_API_PROXY_UPSTREAM=$proxy_upstream"
+    "WORKER_RUNTIME_API_EGRESS_NETWORK=$proxy_egress_network"
+    "WORKER_RUNTIME_API_PROXY_IMAGE=$proxy_image"
     "PUBLIC_BASE_URL=$PUBLIC_BASE_URL"
     "WORKER_RUNTIME=$runtime"
     "WORKER_STORAGE_MODE=$storage_mode"
@@ -124,6 +130,11 @@ provision_worker_bundle() {
     "SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-300}"
     "IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-300}"
   )
+  if [[ $mode == docker ]]; then
+    local gateway_address=${WORKER_GATEWAY_ADDRESS:-${GATEWAY_IP:-}}
+    [[ -n $gateway_address ]] || die "WORKER_GATEWAY_ADDRESS or GATEWAY_IP is required for Gateway-only workload ingress"
+    provision_env+=("WORKER_GATEWAY_ADDRESS=$gateway_address")
+  fi
   for variable_name in WORKER_MEMORY_GIB WORKER_DISK_GIB WORKER_CPU_MILLIS WORKER_PORT_MIN WORKER_PORT_MAX; do
     if [[ -n ${!variable_name:-} ]]; then
       provision_env+=("$variable_name=${!variable_name}")
@@ -362,6 +373,7 @@ start_docker() {
   require_command docker
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
   docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to this user"
+  [[ -n ${WORKER_GATEWAY_ADDRESS:-${GATEWAY_IP:-}} ]] || die "set WORKER_GATEWAY_ADDRESS to the Gateway's reachable source IP"
   check_docker_storage
   case "$WORKER_SIGNAL_ADDRESS" in
     127.*|::1) die "WORKER_SIGNAL_ADDRESS must be a host-private address reachable by the gateway container" ;;

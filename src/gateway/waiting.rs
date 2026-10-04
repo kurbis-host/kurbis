@@ -5,12 +5,18 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
+    ci::{CI_ROOT_DOMAIN, CiPreviewState},
     config::GatewayConfig,
-    gateway::{routes::RouteCache, wake::request_wake},
+    gateway::{
+        routes::RouteCache,
+        wake::{request_ci_preview_admission, request_wake},
+    },
     model::{ObservedState, RouteTarget},
     pumpkin_control::{PlayerEdition, PumpkinControl, WaitingPlayer},
-    routing::{AdmissionRequest, AdmissionResponse},
+    routing::{AdmissionRequest, AdmissionResponse, CiRouteTarget},
 };
+
+const CI_ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 struct WaitingState {
     startup_since: Option<Instant>,
@@ -20,6 +26,8 @@ struct WaitingState {
     admission_target: Option<RouteTarget>,
     admission_hostname: Option<String>,
     admission_complete: bool,
+    last_ci_admission: Option<Instant>,
+    ci_admission_state: Option<CiPreviewState>,
 }
 
 impl WaitingState {
@@ -32,6 +40,8 @@ impl WaitingState {
             admission_target: None,
             admission_hostname: None,
             admission_complete: false,
+            last_ci_admission: None,
+            ci_admission_state: None,
         }
     }
 
@@ -117,6 +127,9 @@ async fn handle_player(
     // Apply the same readiness boundary to all outbound routing actions.
     if !player.ready_for_transfer {
         return Ok(());
+    }
+    if routes.accepts_ci_address(&player.server_address, CI_ROOT_DOMAIN) {
+        return handle_ci_player(config, routes, control, player, state).await;
     }
     if !routes.accepts_server_address(&player.server_address) {
         control
@@ -268,6 +281,113 @@ async fn handle_player(
     Ok(())
 }
 
+async fn handle_ci_player(
+    config: &GatewayConfig,
+    routes: &RouteCache,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+) -> Result<()> {
+    if state
+        .last_ci_admission
+        .is_none_or(|last| last.elapsed() >= CI_ADMISSION_RETRY_INTERVAL)
+    {
+        state.ci_admission_state =
+            Some(request_ci_preview_admission(config, &player.server_address).await?);
+        state.last_ci_admission = Some(Instant::now());
+    }
+
+    let target = routes
+        .resolve_ci(&player.server_address, CI_ROOT_DOMAIN)
+        .await?;
+    let preview_state = target
+        .as_ref()
+        .map(|target| target.state)
+        .or(state.ci_admission_state);
+
+    if let Some(target) = target.as_ref()
+        && target.state == CiPreviewState::Running
+    {
+        if let Some((host, port)) = ci_transfer_target(config, player, target) {
+            control
+                .transfer(&config.waiting_control_socket, player.id, &host, port)
+                .await?;
+            state.transfer_sent = true;
+            tracing::info!(
+                player_id = %player.id,
+                player_name = %player.name,
+                edition = ?player.edition,
+                %host,
+                port,
+                preview = %target.preview_id,
+                generation = target.runtime_generation,
+                "transferred waiting player to running CI preview"
+            );
+            return Ok(());
+        }
+    }
+
+    match preview_state {
+        Some(CiPreviewState::Failed) => {
+            control
+                .kick(
+                    &config.waiting_control_socket,
+                    player.id,
+                    "CI preview build failed. Reconnect after a successful build.",
+                )
+                .await?;
+        }
+        Some(CiPreviewState::Expired) | None => {
+            control
+                .kick(
+                    &config.waiting_control_socket,
+                    player.id,
+                    "CI preview expired or the address is unknown.",
+                )
+                .await?;
+        }
+        Some(current) => {
+            let notice = ci_notice(current);
+            if state.last_notice.as_deref() != Some(notice) {
+                control
+                    .message(&config.waiting_control_socket, player.id, notice)
+                    .await?;
+                state.last_notice = Some(notice.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ci_transfer_target(
+    config: &GatewayConfig,
+    player: &WaitingPlayer,
+    target: &CiRouteTarget,
+) -> Option<(String, u16)> {
+    match player.edition {
+        PlayerEdition::Java => Some((
+            target.worker_address.as_deref()?.to_owned(),
+            u16::try_from(target.java_port?).ok()?,
+        )),
+        PlayerEdition::Bedrock => Some((target.hostname.clone(), config.bedrock_public_port)),
+    }
+}
+
+fn ci_notice(state: CiPreviewState) -> &'static str {
+    match state {
+        CiPreviewState::Lobby | CiPreviewState::Queued => "CI preview queued for its first build…",
+        CiPreviewState::Fetching => "Fetching the exact CI commit…",
+        CiPreviewState::Patching => "Applying Kurbis integration patches…",
+        CiPreviewState::Compiling => "Compiling the CI preview…",
+        CiPreviewState::Packaging => "Packaging the CI preview…",
+        CiPreviewState::Booting | CiPreviewState::Ready => "Starting the CI preview runtime…",
+        CiPreviewState::Running => "CI preview is ready. Transferring you now…",
+        CiPreviewState::Stopping => "CI preview is restarting…",
+        CiPreviewState::Failed => "CI preview build failed.",
+        CiPreviewState::Expired => "CI preview expired.",
+    }
+}
+
 async fn request_admission(
     config: &GatewayConfig,
     http: &reqwest::Client,
@@ -362,6 +482,39 @@ fn transfer_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ci_waiting_lobby_covers_every_public_preview_state() {
+        let cases = [
+            (
+                CiPreviewState::Lobby,
+                "CI preview queued for its first build…",
+            ),
+            (
+                CiPreviewState::Queued,
+                "CI preview queued for its first build…",
+            ),
+            (CiPreviewState::Fetching, "Fetching the exact CI commit…"),
+            (
+                CiPreviewState::Patching,
+                "Applying Kurbis integration patches…",
+            ),
+            (CiPreviewState::Compiling, "Compiling the CI preview…"),
+            (CiPreviewState::Packaging, "Packaging the CI preview…"),
+            (CiPreviewState::Booting, "Starting the CI preview runtime…"),
+            (CiPreviewState::Ready, "Starting the CI preview runtime…"),
+            (
+                CiPreviewState::Running,
+                "CI preview is ready. Transferring you now…",
+            ),
+            (CiPreviewState::Stopping, "CI preview is restarting…"),
+            (CiPreviewState::Failed, "CI preview build failed."),
+            (CiPreviewState::Expired, "CI preview expired."),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(ci_notice(state), expected);
+        }
+    }
 
     #[tokio::test]
     async fn first_join_admission_carries_verified_identity_and_display_name() {

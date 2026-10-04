@@ -80,10 +80,6 @@ impl PumpkinControl {
         Self { token }
     }
 
-    pub(crate) fn token(&self) -> &str {
-        &self.token
-    }
-
     pub async fn status(&self, socket: &Path) -> Result<PlayerStatus> {
         let response = self.request(socket, json!({"action":"status"})).await?;
         Ok(PlayerStatus {
@@ -129,10 +125,14 @@ impl PumpkinControl {
         Ok(())
     }
 
-    pub async fn replace_operators(&self, socket: &Path, owners: &[WhitelistEntry]) -> Result<()> {
+    pub async fn replace_operators(
+        &self,
+        socket: &Path,
+        operators: &[WhitelistEntry],
+    ) -> Result<()> {
         self.request(
             socket,
-            json!({"action":"operators_replace", "operators":owners}),
+            json!({"action":"operators_replace", "operators":operators}),
         )
         .await?;
         Ok(())

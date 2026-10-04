@@ -11,3 +11,7 @@ node_modules/
 /output/
 
 __pycache__/
+
+# Private CI builder SSH identity/configuration.
+/deployment/ci-builder-ssh/*
+!/deployment/ci-builder-ssh/.gitkeep

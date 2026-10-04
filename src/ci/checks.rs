@@ -1,0 +1,387 @@
+use async_trait::async_trait;
+use reqwest::{Client, StatusCode, header};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use super::domain::{CiBuildStage, validate_commit_sha};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckRunStatus {
+    Queued,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckRunConclusion {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRunDetails {
+    pub commit_sha: String,
+    pub stage: CiBuildStage,
+    pub repository: String,
+    pub artifact_digest: Option<String>,
+    pub failure_stage: Option<CiBuildStage>,
+    pub failure_message: Option<String>,
+    pub build_log: String,
+    pub preview_hostnames: Vec<String>,
+    pub expires_at: Option<String>,
+}
+impl CheckRunDetails {
+    pub fn validate(&self) -> Result<(), CheckRunError> {
+        validate_commit_sha(&self.commit_sha).map_err(|e| CheckRunError::Invalid(e.to_string()))?;
+        if self.repository.split('/').count() != 2 || self.preview_hostnames.len() > 8 {
+            return Err(CheckRunError::Invalid(
+                "invalid repository or hostname count".into(),
+            ));
+        }
+        if self
+            .failure_message
+            .as_ref()
+            .is_some_and(|message| message.len() > 8 * 1024)
+            || self.build_log.len() > 8 * 1024
+        {
+            return Err(CheckRunError::Invalid(
+                "Check Run diagnostics exceed the 8 KiB limit".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn summary(&self) -> String {
+        match self.failure_stage {
+            Some(stage) => format!("Pumpkin artifact build failed during {stage}"),
+            None => format!("Pumpkin artifact build is {}", self.stage),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckRunId(pub i64);
+
+#[derive(Debug, Error)]
+pub enum CheckRunError {
+    #[error("invalid check-run input: {0}")]
+    Invalid(String),
+    #[error("GitHub check-run request failed with status {status}: {message}")]
+    Http { status: StatusCode, message: String },
+    #[error("GitHub transport failed: {0}")]
+    Transport(#[from] reqwest::Error),
+}
+
+#[async_trait]
+pub trait CheckRunClient: Send + Sync {
+    async fn create(
+        &self,
+        repository: &str,
+        details: &CheckRunDetails,
+    ) -> Result<CheckRunId, CheckRunError>;
+    async fn update(
+        &self,
+        repository: &str,
+        id: CheckRunId,
+        details: &CheckRunDetails,
+    ) -> Result<(), CheckRunError>;
+    async fn get_or_create(
+        &self,
+        repository: &str,
+        details: &CheckRunDetails,
+    ) -> Result<CheckRunId, CheckRunError> {
+        self.create(repository, details).await
+    }
+}
+
+#[derive(Clone)]
+pub struct GitHubCheckRunClient {
+    client: Client,
+    api_base_url: String,
+    token: String,
+}
+impl GitHubCheckRunClient {
+    pub fn new(client: Client, token: impl Into<String>) -> Result<Self, CheckRunError> {
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(CheckRunError::Invalid("GitHub PAT cannot be empty".into()));
+        }
+        Ok(Self {
+            client,
+            api_base_url: "https://api.github.com".into(),
+            token,
+        })
+    }
+    pub fn with_api_base_url(mut self, value: impl Into<String>) -> Self {
+        self.api_base_url = value.into().trim_end_matches('/').into();
+        self
+    }
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, format!("{}{}", self.api_base_url, path))
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(header::USER_AGENT, "kurbis-ci-preview")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+    async fn error(response: reqwest::Response) -> CheckRunError {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "GitHub request failed".into());
+        CheckRunError::Http { status, message }
+    }
+    fn repo(value: &str) -> Result<(&str, &str), CheckRunError> {
+        let mut parts = value.split('/');
+        let owner = parts.next().unwrap_or_default();
+        let name = parts.next().unwrap_or_default();
+        if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+            return Err(CheckRunError::Invalid(
+                "repository must use owner/name".into(),
+            ));
+        };
+        Ok((owner, name))
+    }
+}
+#[derive(Debug, Deserialize)]
+struct CreatedCheckRun {
+    id: i64,
+}
+#[derive(Debug, Deserialize)]
+struct ExistingCheckRun {
+    id: i64,
+    name: String,
+    head_sha: String,
+}
+#[derive(Debug, Deserialize)]
+struct ExistingCheckRuns {
+    check_runs: Vec<ExistingCheckRun>,
+}
+#[derive(Debug, Serialize)]
+struct CheckRunPayload {
+    name: String,
+    head_sha: String,
+    status: CheckRunStatus,
+    conclusion: Option<CheckRunConclusion>,
+    details_url: Option<String>,
+    output: CheckRunOutput,
+}
+#[derive(Debug, Serialize)]
+struct CheckRunOutput {
+    title: String,
+    summary: String,
+    text: Option<String>,
+}
+fn payload(details: &CheckRunDetails) -> CheckRunPayload {
+    let status = if details.stage == CiBuildStage::Queued {
+        CheckRunStatus::Queued
+    } else if details.stage.is_terminal() {
+        CheckRunStatus::Completed
+    } else {
+        CheckRunStatus::InProgress
+    };
+    let conclusion = details.stage.github_conclusion().map(|value| match value {
+        "success" => CheckRunConclusion::Success,
+        "failure" => CheckRunConclusion::Failure,
+        _ => CheckRunConclusion::Cancelled,
+    });
+    let summary = details.summary();
+    let mut text = vec![
+        format!("Repository: {}", details.repository),
+        format!("Commit: {}", details.commit_sha),
+    ];
+    if let Some(digest) = details.artifact_digest.as_deref() {
+        text.push(format!("Artifact digest: {digest}"));
+    }
+    if !details.preview_hostnames.is_empty() {
+        text.push(format!(
+            "Preview hostnames: {}",
+            details.preview_hostnames.join(", ")
+        ));
+    }
+    if let Some(expires_at) = details.expires_at.as_deref() {
+        text.push(format!("Artifact cache expires: {expires_at}"));
+    }
+    if let Some(failure) = details.failure_message.as_deref() {
+        text.push(format!("Failure details: {}", escape_markdown(failure)));
+    }
+    if !details.build_log.is_empty() {
+        text.push(format!(
+            "Build log:\n{}",
+            escape_markdown(&details.build_log)
+        ));
+    }
+    CheckRunPayload {
+        name: "Pumpkin CI build".into(),
+        head_sha: details.commit_sha.clone(),
+        status,
+        conclusion,
+        details_url: None,
+        output: CheckRunOutput {
+            title: "Pumpkin CI build".into(),
+            summary,
+            text: Some(text.join("\n")),
+        },
+    }
+}
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len().min(8 * 1024));
+    for character in value.chars().take(8 * 1024) {
+        if matches!(
+            character,
+            '\\' | '`'
+                | '*'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '#'
+                | '+'
+                | '-'
+                | '.'
+                | '!'
+                | '|'
+        ) {
+            escaped.push('\\');
+        }
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            escaped.push(' ');
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+#[async_trait]
+impl CheckRunClient for GitHubCheckRunClient {
+    async fn create(
+        &self,
+        repository: &str,
+        details: &CheckRunDetails,
+    ) -> Result<CheckRunId, CheckRunError> {
+        details.validate()?;
+        let (owner, name) = Self::repo(repository)?;
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/repos/{owner}/{name}/check-runs"),
+            )
+            .json(&payload(details))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::error(response).await);
+        };
+        Ok(CheckRunId(
+            response
+                .json::<CreatedCheckRun>()
+                .await
+                .map_err(|e| CheckRunError::Invalid(e.to_string()))?
+                .id,
+        ))
+    }
+    async fn get_or_create(
+        &self,
+        repository: &str,
+        details: &CheckRunDetails,
+    ) -> Result<CheckRunId, CheckRunError> {
+        details.validate()?;
+        let (owner, name) = Self::repo(repository)?;
+        let response = self.request(
+            reqwest::Method::GET,
+            &format!("/repos/{owner}/{name}/commits/{}/check-runs?check_name=Pumpkin%20CI%20build&per_page=100", details.commit_sha),
+        ).send().await?;
+        if !response.status().is_success() {
+            return Err(Self::error(response).await);
+        }
+        let existing = response
+            .json::<ExistingCheckRuns>()
+            .await
+            .map_err(|error| CheckRunError::Invalid(error.to_string()))?;
+        if let Some(check) = existing
+            .check_runs
+            .into_iter()
+            .filter(|check| {
+                check.name == "Pumpkin CI build"
+                    && check.head_sha.eq_ignore_ascii_case(&details.commit_sha)
+            })
+            .max_by_key(|check| check.id)
+        {
+            return Ok(CheckRunId(check.id));
+        }
+        self.create(repository, details).await
+    }
+
+    async fn update(
+        &self,
+        repository: &str,
+        id: CheckRunId,
+        details: &CheckRunDetails,
+    ) -> Result<(), CheckRunError> {
+        details.validate()?;
+        let (owner, name) = Self::repo(repository)?;
+        let response = self
+            .request(
+                reqwest::Method::PATCH,
+                &format!("/repos/{owner}/{name}/check-runs/{}", id.0),
+            )
+            .json(&payload(details))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::error(response).await);
+        };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn check_run_escapes_untrusted_build_diagnostics_as_plain_text() {
+        let details = CheckRunDetails {
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            stage: CiBuildStage::Failed,
+            repository: "kurbis-host/Pumpkin".into(),
+            artifact_digest: None,
+            failure_stage: Some(CiBuildStage::Compiling),
+            failure_message: Some("[click](https://evil.example)".into()),
+            build_log: "![x](https://evil.example)".into(),
+            preview_hostnames: Vec::new(),
+            expires_at: None,
+        };
+        let payload = payload(&details);
+        assert!(!payload.output.summary.contains("https://evil.example"));
+        let text = payload.output.text.unwrap();
+        assert!(text.contains("\\[click\\]\\(https://evil\\.example\\)"));
+        assert!(text.contains("\\!\\[x\\]\\(https://evil\\.example\\)"));
+    }
+
+    #[test]
+    fn check_run_is_build_only_and_maps_terminal_stages() {
+        let details = CheckRunDetails {
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            stage: CiBuildStage::Ready,
+            repository: "kurbis-host/Pumpkin".into(),
+            artifact_digest: Some("sha256:abc".into()),
+            failure_stage: None,
+            failure_message: None,
+            build_log: String::new(),
+            preview_hostnames: vec![],
+            expires_at: None,
+        };
+        let p = payload(&details);
+        assert_eq!(p.status, CheckRunStatus::Completed);
+        assert_eq!(p.conclusion, Some(CheckRunConclusion::Success));
+    }
+}

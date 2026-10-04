@@ -12,6 +12,7 @@ use sqlx::{PgPool, postgres::PgListener};
 use uuid::Uuid;
 
 use crate::{
+    ci::{CiPreviewState, CiRefKind},
     model::{ObservedState, RouteTarget, subdomain_from_hostname},
     pumpkin_control::VerifiedMinecraftIdentity,
 };
@@ -45,6 +46,26 @@ pub struct BedrockSignalTarget {
     pub signal_address: String,
     pub signal_port: u16,
     pub generation: i64,
+}
+
+/// Route data for a CI preview alias. CI previews never map to account-owned servers.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CiRouteTarget {
+    pub preview_id: Uuid,
+    pub hostname: String,
+    pub repository: String,
+    pub commit_sha: String,
+    pub kind: CiRefKind,
+    pub state: CiPreviewState,
+    pub build_id: Uuid,
+    pub runtime_generation: i64,
+    pub failure_message: Option<String>,
+    pub build_log: String,
+    pub expires_at: DateTime<Utc>,
+    pub worker_address: Option<String>,
+    pub java_port: Option<i32>,
+    pub bedrock_port: Option<i32>,
 }
 
 /// Database-backed route repository used by control-plane and gateway code.
@@ -87,11 +108,135 @@ impl RouteRepository {
         resolve_subdomain(&self.pool, subdomain).await
     }
 
+    pub fn ci_subdomain_for_hostname(
+        &self,
+        hostname: &str,
+        ci_root_domain: &str,
+    ) -> Option<String> {
+        ci_subdomain_from_hostname(hostname, ci_root_domain)
+    }
+
+    pub async fn resolve_ci_hostname(
+        &self,
+        hostname: &str,
+        ci_root_domain: &str,
+    ) -> Result<Option<CiRouteTarget>, sqlx::Error> {
+        let Some(label) = self.ci_subdomain_for_hostname(hostname, ci_root_domain) else {
+            return Ok(None);
+        };
+        #[derive(sqlx::FromRow)]
+        struct CiRouteRow {
+            preview_id: Uuid,
+            hostname: String,
+            repository: String,
+            commit_sha: String,
+            kind: String,
+            build_id: Uuid,
+            state: String,
+            runtime_generation: i64,
+            failure_message: Option<String>,
+            build_log: String,
+            expires_at: DateTime<Utc>,
+            worker_address: Option<String>,
+            java_port: Option<i32>,
+            bedrock_port: Option<i32>,
+        }
+        let row = sqlx::query_as::<_, CiRouteRow>(
+            "SELECT alias.id AS preview_id, alias.hostname, alias.repository, alias.commit_sha, alias.kind, alias.build_id,
+                    CASE WHEN alias.state IN ('booting', 'running', 'stopping', 'expired') THEN alias.state
+                         WHEN alias.kind = 'branch' AND alias.state = 'lobby' THEN 'lobby'
+                         WHEN build.stage = 'failed' THEN 'failed' WHEN build.stage = 'expired' THEN 'expired'
+                         ELSE build.stage END AS state, alias.runtime_generation,
+                    build.failure_message, build.build_log, alias.expires_at,
+                    CASE WHEN runtime.active AND runtime.state = 'running'
+                                   AND worker.heartbeat_at > now() - interval '30 seconds'
+                         THEN worker.address END AS worker_address,
+                    CASE WHEN runtime.active AND runtime.state = 'running'
+                                   AND worker.heartbeat_at > now() - interval '30 seconds'
+                         THEN runtime.java_port END AS java_port,
+                    CASE WHEN runtime.active AND runtime.state = 'running'
+                                   AND worker.heartbeat_at > now() - interval '30 seconds'
+                         THEN runtime.bedrock_port END AS bedrock_port
+             FROM ci_preview_aliases alias JOIN ci_builds build ON build.id = alias.build_id
+             LEFT JOIN ci_runtime_placements runtime ON runtime.preview_id = alias.id
+             LEFT JOIN workers worker ON worker.id = runtime.worker_id
+             WHERE alias.hostname = $1 AND alias.expires_at > now()",
+        ).bind(format!("{label}.{ci_root_domain}")).fetch_optional(&self.pool).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let CiRouteRow {
+            preview_id,
+            hostname,
+            repository,
+            commit_sha,
+            kind,
+            build_id,
+            state,
+            runtime_generation,
+            failure_message,
+            build_log,
+            expires_at,
+            worker_address,
+            java_port,
+            bedrock_port,
+        } = row;
+        let kind = kind
+            .parse()
+            .map_err(|_| sqlx::Error::Protocol("invalid CI ref kind".into()))?;
+        let state = state
+            .parse()
+            .map_err(|_| sqlx::Error::Protocol("invalid CI preview state".into()))?;
+        Ok(Some(CiRouteTarget {
+            preview_id,
+            hostname,
+            repository,
+            commit_sha,
+            kind,
+            state,
+            build_id,
+            runtime_generation,
+            failure_message,
+            build_log,
+            expires_at,
+            worker_address,
+            java_port,
+            bedrock_port,
+        }))
+    }
+
     pub async fn invalidation_listener(&self) -> Result<PgListener, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen("route_changes").await?;
         Ok(listener)
     }
+}
+
+/// Parse exactly one strict CI DNS label without requiring a database connection.
+pub fn ci_subdomain_from_hostname(hostname: &str, ci_root_domain: &str) -> Option<String> {
+    let host = hostname
+        .split('\0')
+        .next()?
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let root = ci_root_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let label = host.strip_suffix(&format!(".{root}"))?;
+    if label.is_empty()
+        || label.contains('.')
+        || label.len() > 63
+        || label.starts_with('-')
+        || label.ends_with('-')
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return None;
+    }
+    Some(label.to_owned())
 }
 
 /// Resolve one canonical DNS label and its current worker placement.
@@ -220,5 +365,27 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(BedrockSignalTarget)).unwrap();
         assert!(signal_schema["properties"]["signal_address"].is_object());
         assert!(signal_schema["properties"]["generation"].is_object());
+    }
+}
+
+#[cfg(test)]
+mod ci_hostname_tests {
+    use super::ci_subdomain_from_hostname;
+
+    #[test]
+    fn ci_hostname_parser_is_single_label_and_strict() {
+        assert_eq!(
+            ci_subdomain_from_hostname("pr-12.pumpkin.kurbis.host", "pumpkin.kurbis.host"),
+            Some("pr-12".into())
+        );
+        assert!(
+            ci_subdomain_from_hostname("-pr-12.pumpkin.kurbis.host", "pumpkin.kurbis.host")
+                .is_none()
+        );
+        assert!(
+            ci_subdomain_from_hostname("pr.12.pumpkin.kurbis.host", "pumpkin.kurbis.host")
+                .is_none()
+        );
+        assert!(ci_subdomain_from_hostname("pr-12.other.host", "pumpkin.kurbis.host").is_none());
     }
 }

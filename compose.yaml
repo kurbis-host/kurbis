@@ -6,6 +6,13 @@ x-control-plane-environment: &control-plane-environment
   PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
   ROOT_DOMAIN: ${ROOT_DOMAIN}
   INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+  CI_GITHUB_PAT: ${CI_GITHUB_PAT:-}
+  CI_DEFAULT_BRANCH: ${CI_DEFAULT_BRANCH:-main}
+  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE:-}
+  CI_TOOLCHAIN_VERSION: ${CI_TOOLCHAIN_VERSION:-1.98.1}
+  CI_BUILDER_DOCKER_HOST: ${CI_BUILDER_DOCKER_HOST:-}
+  CI_PLUGIN_SOURCE: /opt/kurbis/plugins/kurbis-control
+  CI_INTEGRATION_SOURCE_ROOT: /opt/kurbis
   GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
   GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
   DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID}
@@ -47,6 +54,7 @@ services:
     environment: *control-plane-environment
     volumes:
       - object-store:/var/lib/kurbis/object-store
+      - ./deployment/ci-builder-ssh:/home/kurbis/.ssh:ro
     ports:
       - 127.0.0.1:${CONTROL_PLANE_PORT:-18080}:8080
     depends_on:
@@ -59,7 +67,7 @@ services:
       retries: 20
       start_period: 10s
     restart: unless-stopped
-    networks: [hoster]
+    networks: [hoster, runtime-api-egress]
 
   waiting-pumpkin:
     image: melon-pumpkin:waiting
@@ -138,3 +146,7 @@ networks:
     ipam:
       config:
         - subnet: ${DOCKER_SUBNET}
+  runtime-api-egress:
+    name: kurbis-hoster_runtime-api-egress
+    driver: bridge
+    internal: true

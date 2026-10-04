@@ -18,6 +18,9 @@ import stat
 import subprocess
 import tempfile
 import time
+import tarfile
+import io
+import platform
 import urllib.error
 import urllib.request
 import uuid
@@ -42,6 +45,109 @@ from runtime_verification_protocol import (
     wait,
 )
 from verify_host_control import rpc
+
+
+def build_runtime_api_proxy_image(base_image: str, bin_dir: Path, root: Path, identifier: str) -> str:
+    image = f"melon-runtime-api-proxy-{identifier}:test"
+    context = root / "runtime-api-proxy-image"
+    context.mkdir(parents=True, exist_ok=True)
+    binary = bin_dir / "runtime-api-proxy"
+    if not binary.is_file():
+        raise RuntimeError(f"runtime API proxy binary is missing: {binary}")
+    shutil.copy2(binary, context / "runtime-api-proxy")
+    (context / "Dockerfile").write_text(
+        f"FROM {base_image}\n"
+        "USER 0:0\n"
+        "COPY runtime-api-proxy /usr/local/bin/runtime-api-proxy\n"
+        "RUN chmod 0755 /usr/local/bin/runtime-api-proxy\n"
+        "USER 2613:2613\n"
+        "ENTRYPOINT [\"/usr/local/bin/runtime-api-proxy\"]\n",
+        encoding="utf-8",
+    )
+    run("docker", "build", "--pull=false", "--network=none", "--tag", image, str(context))
+    return image
+
+
+def api_proxy_probe(image: str, network: str, url: str, token: str, method="GET", body=None):
+    payload = json.dumps({
+        "url": url,
+        "method": method,
+        "bearer_token": token,
+        "body": body,
+    })
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", network, "--interactive",
+         "--entrypoint", "/usr/local/bin/runtime-api-proxy", image, "--probe-http"],
+        input=payload,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"runtime API probe failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def api_proxy_egress_probe(image: str, network: str, target: str):
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", network, "--interactive",
+         "--entrypoint", "/usr/local/bin/runtime-api-proxy", image, "--probe-egress"],
+        input=target,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"runtime egress probe failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def blake3_digest(bin_dir: Path, data: bytes) -> str:
+    result = subprocess.run(
+        [str(bin_dir / "runtime-api-proxy"), "--hash-stdin"],
+        input=data,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("could not calculate BLAKE3 digest")
+    return result.stdout.decode().strip()
+
+
+def create_ci_fixture_artifact(base_image: str, root: Path, bin_dir: Path, preview_id: str):
+    container = f"kurbis-ci-artifact-{uuid.UUID(preview_id).hex[:12]}"
+    run("docker", "create", "--name", container, base_image)
+    runtime = root / "ci-proxy-fixture"
+    runtime.mkdir(parents=True, exist_ok=True)
+    try:
+        run("docker", "cp", f"{container}:/usr/local/bin/pumpkin", str(runtime / "pumpkin"))
+        run("docker", "cp", f"{container}:/usr/local/share/kurbis-control.wasm", str(runtime / "kurbis-control.wasm"))
+    finally:
+        run("docker", "rm", container, check=False)
+    architecture = {"x86_64": "x86_64-linux", "aarch64": "aarch64-linux"}.get(platform.machine())
+    if not architecture:
+        raise RuntimeError(f"unsupported CI fixture architecture: {platform.machine()}")
+    commit = "a" * 40
+    metadata = json.dumps({
+        "repository": "kurbis-host/Pumpkin",
+        "commit_sha": commit,
+        "target_architecture": architecture,
+        "format_version": 1,
+    }).encode()
+    artifact = io.BytesIO()
+    with tarfile.open(fileobj=artifact, mode="w:gz") as archive:
+        for name, data, mode in [
+            ("pumpkin", (runtime / "pumpkin").read_bytes(), 0o755),
+            ("kurbis-control.wasm", (runtime / "kurbis-control.wasm").read_bytes(), 0o644),
+            ("metadata.json", metadata, 0o644),
+        ]:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = mode
+            archive.addfile(info, io.BytesIO(data))
+    artifact_bytes = artifact.getvalue()
+    digest = blake3_digest(bin_dir, artifact_bytes)
+    return artifact_bytes, digest, commit, architecture
 
 
 def main():
@@ -91,6 +197,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="melon-runtime-", dir="/tmp" if native else "/opt/melon-hoster-verification"))
     identifier = uuid.uuid4().hex[:12]
+    proxy_image = None if native else build_runtime_api_proxy_image(args.pumpkin_image, args.bin_dir, root, identifier)
+    proxy_egress_network = None if native else f"kurbis-runtime-api-egress-{identifier}"
+    proxy_upstream = None
     postgres = f"melon-runtime-db-{identifier}"
     server = str(uuid.uuid4())
     owner = str(uuid.uuid4())
@@ -108,6 +217,7 @@ def main():
     processes = []
     logs = []
     worker_bundles = {}
+    ci_preview_ids = []
     evidence = {
         "root": str(root),
         "server": server,
@@ -151,6 +261,9 @@ def main():
             "WORKER_ADDRESS": "127.0.0.1",
             "WORKER_SIGNAL_ADDRESS": "127.0.0.1",
             "WORKER_CONTROL_PLANE_URL": f"http://127.0.0.1:{api_port}",
+            "WORKER_RUNTIME_API_PROXY_UPSTREAM": proxy_upstream or plugin_api_base_url,
+            "WORKER_RUNTIME_API_EGRESS_NETWORK": proxy_egress_network or "bridge",
+            "WORKER_RUNTIME_API_PROXY_IMAGE": proxy_image or "unused-native-proxy-image",
             "PUBLIC_BASE_URL": plugin_api_base_url,
             "WORKER_RUNTIME": "native" if native else "docker",
             "WORKER_STORAGE_MODE": "directory" if native else "loopback_ext4",
@@ -171,6 +284,7 @@ def main():
             provisioning_environment["KURBIS_CONTROL_PLUGIN_WASM"] = str(args.plugin_wasm)
         else:
             provisioning_environment["PUMPKIN_IMAGE"] = args.pumpkin_image
+            provisioning_environment["WORKER_GATEWAY_ADDRESS"] = "127.0.0.1"
         provisioning_database_url = (
             args.database_url if native else
             f"postgres://postgres:{secret}@127.0.0.1:{db_port}/melon_runtime_test"
@@ -187,6 +301,10 @@ def main():
         assert values["WORKER_ID"] == workers[index]
         assert values["CONTROL_PLANE_URL"] == f"http://127.0.0.1:{api_port}"
         assert values["PUBLIC_BASE_URL"] == plugin_api_base_url
+        if not native:
+            assert values["WORKER_RUNTIME_API_PROXY_IMAGE"] == proxy_image
+            assert values["WORKER_RUNTIME_API_PROXY_UPSTREAM"] == proxy_upstream
+            assert values["WORKER_RUNTIME_API_EGRESS_NETWORK"] == proxy_egress_network
         assert all(
             values["WORKER_API_TOKEN"] != previous["WORKER_API_TOKEN"]
             for previous in worker_bundles.values()
@@ -355,7 +473,8 @@ def main():
         config = json.loads(config_path.read_text())
         capability = config.get("capability", "")
         assert config.get("server_id") == server
-        assert config.get("api_base_url") == plugin_api_base_url
+        expected_plugin_api_url = plugin_api_base_url if native else "http://kurbis-runtime-api-proxy:8080"
+        assert config.get("api_base_url") == expected_plugin_api_url
         assert re.fullmatch(r"[A-Za-z0-9_-]{43}", capability)
         assert capability_path.read_text().strip() == capability
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
@@ -374,6 +493,163 @@ def main():
             "plugin_sha256": plugin_hash,
         })
         return capability
+
+    def verify_runtime_api_proxy_server(index, capability):
+        if native:
+            return
+        generation = int(sql(f"SELECT generation FROM placements WHERE server_id='{server}'"))
+        network = f"kurbis-{uuid.UUID(server).hex}-g{generation}"
+        proxy_url = "http://kurbis-runtime-api-proxy:8080"
+        inspect = json.loads(run("docker", "inspect", f"kurbis-api-proxy-{uuid.UUID(server).hex}").stdout)[0]
+        proxy_environment = dict(item.split("=", 1) for item in inspect["Config"]["Env"] if "=" in item)
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_SCOPE"] == "server"
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_ID"] == server
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_UPSTREAM"] == proxy_upstream
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH"] == blake3_digest(args.bin_dir, capability.encode())
+        assert all(capability not in value for value in proxy_environment.values()), "raw server capability reached API proxy environment"
+        assert not inspect["HostConfig"]["PortBindings"], "API proxy must not publish a host port"
+        assert inspect["HostConfig"]["ReadonlyRootfs"] and inspect["HostConfig"]["CapDrop"] == ["ALL"]
+        assert set(inspect["NetworkSettings"]["Networks"]) == {network, proxy_egress_network}
+        runtime_inspect = json.loads(run("docker", "inspect", backend).stdout)[0]
+        runtime_environment = dict(item.split("=", 1) for item in runtime_inspect["Config"]["Env"] if "=" in item)
+        for forbidden in ("WORKER_API_TOKEN", "INTERNAL_TOKEN", "CONTROL_PLANE_URL", "DATABASE_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"):
+            assert forbidden not in runtime_environment, f"{forbidden} reached Pumpkin container"
+        assert set(runtime_inspect["NetworkSettings"]["Networks"]) == {network}, "Pumpkin joined the API proxy egress network"
+        own = api_proxy_probe(
+            proxy_image, network,
+            f"{proxy_url}/api/v1/servers/{server}/players", capability,
+        )
+        assert own["status"] == 200, own
+        account = api_proxy_probe(
+            proxy_image, network, f"{proxy_url}/api/v1/account", capability,
+        )
+        assert account["status"] == 404, account
+        sibling_id = str(uuid.uuid4())
+        sibling = api_proxy_probe(
+            proxy_image, network,
+            f"{proxy_url}/api/v1/servers/{sibling_id}/players", capability,
+        )
+        assert sibling["status"] == 404, sibling
+        direct = api_proxy_egress_probe(proxy_image, network, "http://1.1.1.1/")
+        assert direct == {"reachable": False}, direct
+        proxy_direct = api_proxy_egress_probe(proxy_image, proxy_egress_network, "http://1.1.1.1/")
+        assert proxy_direct == {"reachable": False}, proxy_direct
+        evidence["checks"].append({
+            "managed_plugin_api_proxy": {
+                "runtime": "normal",
+                "own_server_api_status": own["status"],
+                "account_api_denied_status": account["status"],
+                "sibling_server_api_denied_status": sibling["status"],
+                "direct_external_egress_blocked": True,
+                "proxy_external_egress_blocked": True,
+            }
+        })
+
+    def verify_runtime_api_proxy_ci():
+        if native:
+            return
+        preview_id = str(uuid.uuid4())
+        ci_preview_ids.append(preview_id)
+        build_id = str(uuid.uuid4())
+        lease = str(uuid.uuid4())
+        commit = "b" * 40
+        artifact, digest, commit, architecture = create_ci_fixture_artifact(
+            args.pumpkin_image, root, args.bin_dir, preview_id
+        )
+        object_key = f"ci-proxy-tests/{preview_id}.tar.gz"
+        object_path = root / "objects" / object_key
+        object_path.parent.mkdir(parents=True, exist_ok=True)
+        object_path.write_bytes(artifact)
+        now_expiry = "now() + interval '2 hours'"
+        sql(
+            f"INSERT INTO ci_artifacts(digest,object_key,size_bytes,expires_at) "
+            f"VALUES('{digest}','{object_key}',{len(artifact)},{now_expiry}); "
+            f"INSERT INTO ci_builds(id,repository,commit_sha,patch_fingerprint,toolchain_version,"
+            f"target_architecture,stage,artifact_digest,expires_at) VALUES('{build_id}',"
+            f"'kurbis-host/Pumpkin','{commit}','proxy-test','proxy-test','{architecture}',"
+            f"'ready','{digest}',{now_expiry}); "
+            f"INSERT INTO ci_preview_aliases(id,repository,commit_sha,kind,hostname,build_id,state,"
+            f"runtime_generation,expires_at) VALUES('{preview_id}','kurbis-host/Pumpkin','{commit}',"
+            f"'commit','proxy-{uuid.UUID(preview_id).hex[:16]}.mc.example.test','{build_id}',"
+            f"'booting',1,{now_expiry}); "
+            f"INSERT INTO ci_runtime_placements(preview_id,worker_id,generation,lease_token,java_port,"
+            f"bedrock_port,signal_port,state,active,capability_hash) VALUES('{preview_id}',"
+            f"'{workers[1]}',1,'{lease}',{worker_ports[1] + 10},{worker_ports[1] + 11},"
+            f"{worker_ports[1] + 12},'starting',false,decode(repeat('00',32),'hex')); "
+            f"INSERT INTO ci_port_leases(worker_id,port,preview_id,purpose) VALUES "
+            f"('{workers[1]}',{worker_ports[1] + 10},'{preview_id}','java'),"
+            f"('{workers[1]}',{worker_ports[1] + 11},'{preview_id}','bedrock'),"
+            f"('{workers[1]}',{worker_ports[1] + 12},'{preview_id}','signal')"
+        )
+        wait(
+            lambda: sql(
+                f"SELECT state='running' AND active FROM ci_runtime_placements "
+                f"WHERE preview_id='{preview_id}'"
+            ) == "t",
+            "CI runtime starts with a current scoped API capability",
+            180,
+        )
+        runtime_world = root / "worker-1" / "ci-preview-storage" / "servers" / preview_id
+        config_path = runtime_world / "plugins/data/kurbis-control/config.json"
+        config = json.loads(config_path.read_text())
+        capability = config["capability"]
+        assert config["server_id"] == preview_id and config["ci_preview"] is True
+        assert config["api_base_url"] == "http://kurbis-runtime-api-proxy:8080"
+        network = f"kurbis-{uuid.UUID(preview_id).hex}-g1"
+        inspect = json.loads(run("docker", "inspect", f"kurbis-api-proxy-{uuid.UUID(preview_id).hex}").stdout)[0]
+        proxy_environment = dict(item.split("=", 1) for item in inspect["Config"]["Env"] if "=" in item)
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_SCOPE"] == "ci"
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_ID"] == preview_id
+        assert proxy_environment["KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH"] == blake3_digest(args.bin_dir, capability.encode())
+        assert all(capability not in value for value in proxy_environment.values()), "raw CI capability reached API proxy environment"
+        assert not inspect["HostConfig"]["PortBindings"] and inspect["HostConfig"]["ReadonlyRootfs"]
+        assert set(inspect["NetworkSettings"]["Networks"]) == {network, proxy_egress_network}
+        runtime_inspect = json.loads(run("docker", "inspect", f"kurbis-ci-{uuid.UUID(preview_id).hex}").stdout)[0]
+        runtime_environment = dict(item.split("=", 1) for item in runtime_inspect["Config"]["Env"] if "=" in item)
+        for forbidden in ("WORKER_API_TOKEN", "INTERNAL_TOKEN", "CONTROL_PLANE_URL", "DATABASE_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"):
+            assert forbidden not in runtime_environment, f"{forbidden} reached CI Pumpkin container"
+        assert set(runtime_inspect["NetworkSettings"]["Networks"]) == {network}, "CI Pumpkin joined the API proxy egress network"
+        proxy_url = f"http://kurbis-runtime-api-proxy:8080/internal/ci/previews/{preview_id}"
+        own = api_proxy_probe(proxy_image, network, proxy_url, capability)
+        assert own["status"] == 200, own
+        account = api_proxy_probe(
+            proxy_image, network, "http://kurbis-runtime-api-proxy:8080/api/v1/account", capability,
+        )
+        assert account["status"] == 404, account
+        sibling_id = str(uuid.uuid4())
+        sibling = api_proxy_probe(
+            proxy_image, network,
+            f"http://kurbis-runtime-api-proxy:8080/internal/ci/previews/{sibling_id}",
+            capability,
+        )
+        assert sibling["status"] == 404, sibling
+        direct = api_proxy_egress_probe(proxy_image, network, "http://1.1.1.1/")
+        assert direct == {"reachable": False}, direct
+        proxy_direct = api_proxy_egress_probe(proxy_image, proxy_egress_network, "http://1.1.1.1/")
+        assert proxy_direct == {"reachable": False}, proxy_direct
+        evidence["checks"].append({
+            "managed_plugin_api_proxy": {
+                "runtime": "ci",
+                "own_preview_api_status": own["status"],
+                "account_api_denied_status": account["status"],
+                "sibling_preview_api_denied_status": sibling["status"],
+                "direct_external_egress_blocked": True,
+                "proxy_external_egress_blocked": True,
+            }
+        })
+        stopping = api_proxy_probe(
+            proxy_image, network,
+            f"http://kurbis-runtime-api-proxy:8080/internal/ci/previews/{preview_id}/commands",
+            capability, method="POST", body={"command": "stop"},
+        )
+        assert stopping["status"] == 200, stopping
+        wait(
+            lambda: sql(
+                f"SELECT state='stopped' FROM ci_runtime_placements WHERE preview_id='{preview_id}'"
+            ) == "t",
+            "CI proxy stop command releases its runtime network",
+            90,
+        )
 
     def server_management_state():
         return sql(
@@ -554,6 +830,10 @@ def main():
 
     try:
         if not native:
+            run("docker", "network", "create", "--driver", "bridge", "--internal", proxy_egress_network)
+            egress_details = json.loads(run("docker", "network", "inspect", proxy_egress_network).stdout)[0]
+            egress_gateway = egress_details["IPAM"]["Config"][0]["Gateway"]
+            proxy_upstream = f"http://{egress_gateway}:{api_port}"
             run("docker", "run", "--detach", "--name", postgres, "--publish", f"127.0.0.1:{db_port}:5432",
                 "--env", f"POSTGRES_PASSWORD={secret}", "--env", "POSTGRES_DB=melon_runtime_test", "postgres:18")
             wait(lambda: run("docker", "exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", check=False).returncode == 0, "Postgres readiness", 60)
@@ -608,6 +888,7 @@ def main():
             "One-use server login link (valid for 15 minutes):",
         ]
         initial_capability = verify_plugin_staging(0)
+        verify_runtime_api_proxy_server(0, initial_capability)
         login_link = protocol(
             gateway_java,
             "online",
@@ -844,6 +1125,9 @@ def main():
             assert after_pressure["oom_kill"] > before_pressure["oom_kill"], f"No kernel cgroup OOM kill: {before_pressure}, {after_pressure}"
             evidence["checks"].append({"memory_pressure_exit": pressure.returncode, "memory_limit_bytes": 2 * 1024 ** 3,
                                        "swap_limit_bytes": 0, "memory_events_before": before_pressure, "memory_events_after": after_pressure})
+            user_action(cookie, "stop")
+            wait(lambda: state() == "sleeping", "stop normal runtime before independent CI proxy integration")
+            verify_runtime_api_proxy_ci()
         evidence["limitations"] = (
             ["Native development processes have no hard memory cgroup or ext4 quota"]
             if native else []
@@ -899,8 +1183,19 @@ def main():
         if not native:
             waiting_logs = run("docker", "logs", waiting_container, check=False)
             (args.output / "waiting.log").write_text(waiting_logs.stdout + waiting_logs.stderr)
-            run("docker", "rm", "--force", waiting_container, backend, queued_backend, check=False)
+            runtime_containers = [
+                f"kurbis-ci-{uuid.UUID(preview_id).hex}"
+                for preview_id in ci_preview_ids
+            ] + [
+                f"kurbis-api-proxy-{uuid.UUID(preview_id).hex}"
+                for preview_id in ci_preview_ids
+            ]
+            run("docker", "rm", "--force", waiting_container, backend, queued_backend, *runtime_containers, check=False)
             run("docker", "rm", "--force", "--volumes", postgres, check=False)
+            for preview_id in ci_preview_ids:
+                mount = root / "worker-1" / "ci-preview-storage" / "servers" / preview_id
+                if mount.exists():
+                    run("umount", str(mount), check=False)
             for index in range(2):
                 mount = root / f"worker-{index}/servers" / server
                 if mount.exists():

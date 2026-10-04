@@ -51,6 +51,7 @@ class WorkerLaunch:
             "WORKER_NAME": "operator-worker-name-sentinel",
             "WORKER_ADDRESS": "operator-worker-address-sentinel",
             "WORKER_SIGNAL_ADDRESS": "operator-worker-signal-sentinel",
+            "WORKER_GATEWAY_ADDRESS": "operator-gateway-address-sentinel",
             "WORKER_ROOT": "/operator/worker-root-sentinel",
             "WORKER_STORAGE_MODE": "directory",
             "WORKER_MEMORY_GIB": "8",
@@ -59,6 +60,9 @@ class WorkerLaunch:
             "WORKER_PORT_MIN": "20000",
             "WORKER_PORT_MAX": "20040",
             "PUBLIC_BASE_URL": "https://panel.example.test",
+            "WORKER_RUNTIME_API_PROXY_UPSTREAM": "operator-proxy-upstream-sentinel",
+            "WORKER_RUNTIME_API_EGRESS_NETWORK": "operator-proxy-egress-sentinel",
+            "WORKER_RUNTIME_API_PROXY_IMAGE": "operator-proxy-image-sentinel",
             "INTERNAL_TOKEN": "operator-internal-token-sentinel",
             "PUMPKIN_GATEWAY_CONTROL_TOKEN": "operator-gateway-token-sentinel",
             "GOOGLE_OAUTH_CLIENT_SECRET": "operator-google-oauth-sentinel",
@@ -96,6 +100,9 @@ class WorkerLaunch:
             "PUMPKIN_HOST_CONTROL_TOKEN": "per-worker-host-control-secret",
             "CONTROL_PLANE_URL": "http://127.0.0.1:18080" if self.mode == "docker" else "http://127.0.0.1:8080",
             "PUBLIC_BASE_URL": "https://panel.example.test",
+            "WORKER_RUNTIME_API_PROXY_UPSTREAM": "https://control.example.test",
+            "WORKER_RUNTIME_API_EGRESS_NETWORK": "worker-egress",
+            "WORKER_RUNTIME_API_PROXY_IMAGE": "melon-hoster:local",
             "WORKER_RUNTIME": "docker" if self.mode == "docker" else "native",
             "WORKER_STORAGE_MODE": "directory",
             "WORKER_ROOT": str(self.root / "data/worker"),
@@ -103,6 +110,7 @@ class WorkerLaunch:
             "IDLE_TIMEOUT_SECONDS": "300",
         }
         if self.mode == "docker":
+            values["WORKER_GATEWAY_ADDRESS"] = "198.51.100.24"
             values["PUMPKIN_IMAGE"] = "melon-pumpkin:host-control"
         else:
             values["PUMPKIN_BINARY"] = str(self.root / "output/native-pumpkin/target/release/pumpkin")
@@ -177,9 +185,16 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                 self.assertEqual(environment["WORKER_NAME"], "browser-worker")
                 self.assertEqual(environment["WORKER_ADDRESS"], "198.51.100.20")
                 self.assertEqual(environment["WORKER_SIGNAL_ADDRESS"], "10.0.0.20")
+                if mode == "docker":
+                    self.assertEqual(environment["WORKER_GATEWAY_ADDRESS"], "198.51.100.24")
+                else:
+                    self.assertNotIn("WORKER_GATEWAY_ADDRESS", environment)
                 self.assertEqual(environment["WORKER_RUNTIME"], "docker" if mode == "docker" else "native")
                 self.assertEqual(environment["CONTROL_PLANE_URL"], "http://127.0.0.1:18080" if mode == "docker" else "http://127.0.0.1:8080")
                 self.assertEqual(environment["PUBLIC_BASE_URL"], "https://panel.example.test")
+                self.assertEqual(environment["WORKER_RUNTIME_API_PROXY_UPSTREAM"], "https://control.example.test")
+                self.assertEqual(environment["WORKER_RUNTIME_API_EGRESS_NETWORK"], "worker-egress")
+                self.assertEqual(environment["WORKER_RUNTIME_API_PROXY_IMAGE"], "melon-hoster:local")
                 self.assertEqual(environment["WORKER_ROOT"], str(launch.root / "data/worker"))
                 self.assertEqual(environment["WORKER_STORAGE_MODE"], "directory")
                 self.assertIn("PATH", environment)
@@ -231,7 +246,11 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                     "operator-database-secret",
                     "operator-internal-token-sentinel",
                     "operator-gateway-token-sentinel",
+                    "operator-gateway-address-sentinel",
                     "operator-host-control-fallback-sentinel",
+                    "operator-proxy-upstream-sentinel",
+                    "operator-proxy-egress-sentinel",
+                    "operator-proxy-image-sentinel",
                     "operator-google-oauth-sentinel",
                     "operator-discord-oauth-sentinel",
                     "operator-s3-access-sentinel",

@@ -17,6 +17,7 @@ pub fn api_state(
 ) -> Arc<AppState> {
     let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is configured");
     Arc::new(AppState {
+        ci_build_coordinator: None,
         lifecycle: Lifecycle::new(pool.clone()),
         pool,
         config: ControlPlaneConfig {

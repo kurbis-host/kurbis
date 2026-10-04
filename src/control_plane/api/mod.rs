@@ -37,6 +37,8 @@ use super::{
 mod account;
 mod activity;
 mod actor;
+mod ci;
+mod ci_runtime_public;
 mod commands;
 mod console;
 mod console_commands;
@@ -55,6 +57,7 @@ mod snapshots;
 mod types;
 mod whitelist;
 mod worker_auth;
+mod worker_ci;
 mod worker_control;
 mod worker_objects;
 mod worker_snapshots;
@@ -90,6 +93,7 @@ pub fn openapi_document() -> aide::openapi::OpenApi {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub ci_build_coordinator: Option<Arc<dyn crate::ci::BuildCoordinator>>,
     pub lifecycle: Lifecycle,
     pub config: ControlPlaneConfig,
     pub http: Client,
@@ -506,7 +510,16 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/bedrock-signal/by-subdomain/{subdomain}",
             get(internal::bedrock_signal_target_by_subdomain),
         )
+        .route(
+            "/internal/bedrock-signal/ci/{hostname}",
+            get(internal::ci_bedrock_signal_target),
+        )
         .route("/internal/admission", post(internal::admit))
+        .route("/internal/ci/previews/{preview_id}", get(ci_runtime_public::status).patch(ci_runtime_public::update_settings))
+        .route("/internal/ci/previews/{preview_id}/players", get(ci_runtime_public::players))
+        .route("/internal/ci/previews/{preview_id}/commands", post(ci_runtime_public::command))
+        .route("/internal/ci/previews/status/{hostname}", get(ci::status))
+        .route("/internal/ci/previews/admit", post(ci::admit))
         .route(
             "/internal/minecraft-login-links",
             post(internal::mint_minecraft_link),
@@ -527,6 +540,15 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/worker/control/heartbeat",
             post(worker_control::heartbeat),
         )
+        .route("/internal/worker/control/ci/runtimes", get(worker_ci::assignments))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/capability", post(worker_ci::capability))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/started", post(worker_ci::started))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/start-failed", post(worker_ci::start_failed))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/stopped", post(worker_ci::stopped))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/deleted", post(worker_ci::deleted))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/activity", post(worker_ci::activity))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/runtime-lost", post(worker_ci::runtime_lost))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/artifacts/{generation}/{lease_token}", get(worker_ci::artifact))
         .route("/internal/worker/control/lease", post(worker_state::acquire_lease))
         .route("/internal/worker/control/servers", get(worker_state::servers))
         .route("/internal/worker/control/retained-servers", get(worker_state::retained_servers))

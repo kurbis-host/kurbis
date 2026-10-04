@@ -19,7 +19,7 @@ pub mod settings;
 /// Lifecycle and persistence use the same contract for containers and host processes.
 #[async_trait]
 pub trait ServerRuntime: Send + Sync {
-    fn control(&self) -> &PumpkinControl;
+    async fn control_for(&self, server_dir: &Path) -> Result<PumpkinControl>;
     fn socket_path(&self, server_dir: &Path) -> Result<PathBuf>;
     async fn start(
         &self,
@@ -27,6 +27,7 @@ pub trait ServerRuntime: Send + Sync {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        api_capability: Option<&str>,
     ) -> Result<()>;
     async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>>;
     async fn logs_since(&self, server_id: Uuid, since: &str) -> Result<Vec<String>>;
@@ -37,11 +38,17 @@ pub trait ServerRuntime: Send + Sync {
     }
 
     async fn player_status(&self, server_dir: &Path) -> Result<PlayerStatus> {
-        self.control().status(&self.socket_path(server_dir)?).await
+        self.control_for(server_dir)
+            .await?
+            .status(&self.socket_path(server_dir)?)
+            .await
     }
 
     async fn players(&self, server_dir: &Path) -> Result<Vec<WaitingPlayer>> {
-        self.control().players(&self.socket_path(server_dir)?).await
+        self.control_for(server_dir)
+            .await?
+            .players(&self.socket_path(server_dir)?)
+            .await
     }
 
     async fn replace_whitelist(
@@ -50,29 +57,36 @@ pub trait ServerRuntime: Send + Sync {
         enabled: bool,
         entries: &[WhitelistEntry],
     ) -> Result<()> {
-        self.control()
+        self.control_for(server_dir)
+            .await?
             .replace_whitelist(&self.socket_path(server_dir)?, enabled, entries)
             .await
     }
 
     async fn replace_operators(&self, server_dir: &Path, owners: &[WhitelistEntry]) -> Result<()> {
-        self.control()
+        self.control_for(server_dir)
+            .await?
             .replace_operators(&self.socket_path(server_dir)?, owners)
             .await
     }
 
     async fn execute_command(&self, server_dir: &Path, command: &str) -> Result<Vec<String>> {
-        self.control()
+        self.control_for(server_dir)
+            .await?
             .execute_command(&self.socket_path(server_dir)?, command)
             .await
     }
 
     async fn save(&self, server_dir: &Path) -> Result<()> {
-        self.control().save(&self.socket_path(server_dir)?).await
+        self.control_for(server_dir)
+            .await?
+            .save(&self.socket_path(server_dir)?)
+            .await
     }
 
     async fn graceful_stop(&self, server_id: Uuid, server_dir: &Path) -> Result<()> {
-        self.control()
+        self.control_for(server_dir)
+            .await?
             .shutdown(&self.socket_path(server_dir)?)
             .await?;
         timeout(Duration::from_secs(60), async {

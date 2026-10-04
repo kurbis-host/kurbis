@@ -8,7 +8,8 @@ use anyhow::Result;
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::RwLock;
 
-use crate::{model::RouteTarget, routing::RouteRepository};
+use crate::routing::RouteRepository;
+use crate::{model::RouteTarget, routing::CiRouteTarget};
 
 #[derive(Clone)]
 pub struct RouteCache {
@@ -86,6 +87,23 @@ impl RouteCache {
 
     pub fn accepts_server_address(&self, hostname: &str) -> bool {
         self.repository.accepts_server_address(hostname)
+    }
+
+    pub fn accepts_ci_address(&self, hostname: &str, ci_root_domain: &str) -> bool {
+        self.repository
+            .ci_subdomain_for_hostname(hostname, ci_root_domain)
+            .is_some()
+    }
+
+    pub async fn resolve_ci(
+        &self,
+        hostname: &str,
+        ci_root_domain: &str,
+    ) -> Result<Option<CiRouteTarget>> {
+        Ok(self
+            .repository
+            .resolve_ci_hostname(hostname, ci_root_domain)
+            .await?)
     }
 
     pub async fn invalidate_all(&self) {

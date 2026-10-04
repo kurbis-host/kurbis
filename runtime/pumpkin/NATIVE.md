@@ -1,8 +1,10 @@
 # Native host development
 
 The native backend runs the same pinned and patched Pumpkin directly on macOS
-or Linux, without Docker. macOS workers default to `WORKER_RUNTIME=native`;
-Linux workers can select it explicitly. PostgreSQL, lifecycle coordination, snapshot verification, idle policy,
+or Linux, without Docker. Native mode is never selected implicitly: a debug
+worker must explicitly set `WORKER_RUNTIME=native` and
+`KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV=true`. Release workers reject native mode.
+PostgreSQL, lifecycle coordination, snapshot verification, idle policy,
 waiting clients and generation fencing are shared with Docker workers.
 
 Build locally with Rust 1.98.1, Git, CMake and a C/C++ compiler installed.
@@ -13,6 +15,7 @@ tools/build_pumpkin_native.sh debug
 tools/build_pumpkin_native.sh release
 cargo build --bins
 export DATABASE_URL=postgres://localhost/melon_hoster
+export KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV=true
 . examples/config/native-worker.env.example
 # Replace the example token before sharing this development environment.
 target/debug/worker

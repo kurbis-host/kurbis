@@ -35,7 +35,7 @@ pub struct NativeRuntime {
     binary: PathBuf,
     root: PathBuf,
     sockets: PathBuf,
-    control: PumpkinControl,
+    worker_control_key: String,
     public_address: IpAddr,
     signal_address: IpAddr,
     children: Mutex<HashMap<Uuid, Child>>,
@@ -63,7 +63,7 @@ impl NativeRuntime {
             binary,
             root,
             sockets,
-            control: PumpkinControl::new(token),
+            worker_control_key: token,
             public_address,
             signal_address,
             children: Mutex::new(HashMap::new()),
@@ -118,8 +118,23 @@ impl NativeRuntime {
 
 #[async_trait]
 impl ServerRuntime for NativeRuntime {
-    fn control(&self) -> &PumpkinControl {
-        &self.control
+    async fn control_for(&self, server_dir: &Path) -> Result<PumpkinControl> {
+        let server_id: Uuid = server_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("native server directory has no UUID")?
+            .parse()?;
+        let generation = fs::read_to_string(runtime_generation_path(&self.root, server_id))
+            .await?
+            .trim()
+            .parse::<i64>()?;
+        Ok(PumpkinControl::new(
+            crate::worker::sandbox::scoped_runtime_token(
+                &self.worker_control_key,
+                server_id,
+                generation,
+            )?,
+        ))
     }
 
     fn socket_path(&self, server_dir: &Path) -> Result<PathBuf> {
@@ -137,6 +152,7 @@ impl ServerRuntime for NativeRuntime {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        _api_capability: Option<&str>,
     ) -> Result<()> {
         if let Some(generation) = self.server_generation(server_id).await? {
             if generation != placement.generation {
@@ -159,6 +175,7 @@ impl ServerRuntime for NativeRuntime {
             ),
         )
         .await?;
+        persist_runtime_generation(&self.root, server_id, placement.generation).await?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -174,7 +191,14 @@ impl ServerRuntime for NativeRuntime {
             .env("TZ", "UTC")
             .env("PUMPKIN_PROCESS_MARKER", &marker)
             .env("PUMPKIN_HOST_CONTROL_SOCKET", self.socket_path(server_dir)?)
-            .env("PUMPKIN_HOST_CONTROL_TOKEN", self.control.token())
+            .env(
+                "PUMPKIN_HOST_CONTROL_TOKEN",
+                crate::worker::sandbox::scoped_runtime_token(
+                    &self.worker_control_key,
+                    server_id,
+                    placement.generation,
+                )?,
+            )
             .kill_on_drop(false)
             .spawn()?;
         let record = ProcessRecord {
@@ -282,6 +306,18 @@ impl ServerRuntime for NativeRuntime {
         })
         .await
         .context("native runtime removal not confirmed")??;
+        for capability_file in [
+            runtime_generation_path(&self.root, server_id),
+            self.root
+                .join("runtime-generations")
+                .join(format!("{server_id}.tmp")),
+        ] {
+            match fs::remove_file(capability_file).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         match fs::remove_file(self.record_path(server_id)).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -289,6 +325,23 @@ impl ServerRuntime for NativeRuntime {
         }
         Ok(())
     }
+}
+
+fn runtime_generation_path(root: &Path, server_id: Uuid) -> PathBuf {
+    root.join("runtime-generations").join(server_id.to_string())
+}
+
+async fn persist_runtime_generation(root: &Path, server_id: Uuid, generation: i64) -> Result<()> {
+    if generation <= 0 {
+        bail!("runtime generation must be positive");
+    }
+    let directory = root.join("runtime-generations");
+    fs::create_dir_all(&directory).await?;
+    let path = runtime_generation_path(root, server_id);
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, generation.to_string()).await?;
+    fs::rename(temporary, path).await?;
+    Ok(())
 }
 
 #[cfg(test)]

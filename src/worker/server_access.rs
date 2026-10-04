@@ -26,6 +26,7 @@ pub struct ServerAccess {
     enabled: bool,
     control_plane: WorkerControl,
     root: PathBuf,
+    runtime_api_proxy: bool,
 }
 
 impl ServerAccess {
@@ -43,6 +44,7 @@ impl ServerAccess {
                 || matches!(&config.runtime, RuntimeConfig::Docker { .. }),
             control_plane,
             root: config.root.clone(),
+            runtime_api_proxy: matches!(&config.runtime, RuntimeConfig::Docker { .. }),
         })
     }
 
@@ -51,9 +53,9 @@ impl ServerAccess {
         server_id: Uuid,
         generation: i64,
         server_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if !self.enabled {
-            return Ok(());
+            return Ok(None);
         }
         let capability = self.ensure_capability(server_id, generation).await?;
         if let Some(plugin_wasm) = &self.plugin_wasm {
@@ -62,12 +64,17 @@ impl ServerAccess {
         write_plugin_config(
             server_dir,
             &PluginConfig {
-                api_base_url: self.public_base_url.clone(),
-                allow_insecure_local_http: self.allow_insecure_local_http,
+                api_base_url: if self.runtime_api_proxy {
+                    crate::runtime_api_proxy::SERVICE_BASE_URL.to_owned()
+                } else {
+                    self.public_base_url.clone()
+                },
+                allow_insecure_local_http: self.runtime_api_proxy || self.allow_insecure_local_http,
                 server_id,
-                capability,
+                capability: capability.clone(),
             },
-        )
+        )?;
+        Ok(Some(capability))
     }
 
     pub fn remove_capability(&self, server_id: Uuid) -> Result<()> {

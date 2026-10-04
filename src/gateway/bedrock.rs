@@ -343,7 +343,28 @@ impl SignalProxy {
     }
 
     async fn route(&self, hostname: &str) -> Result<SignalRoute, StatusCode> {
-        let (url, expected_server_id, fallback_to_waiting) = if let Some(server_id) =
+        let ci_address = is_ci_hostname(hostname);
+        if ci_address {
+            match crate::gateway::wake::request_ci_preview_admission(&self.config, hostname).await {
+                Ok(crate::ci::CiPreviewState::Running) => {}
+                Ok(_) => return Ok(SignalRoute::waiting(&self.config)),
+                Err(error) => {
+                    tracing::debug!(%hostname, ?error, "CI preview is not ready for Bedrock signaling");
+                    return Ok(SignalRoute::waiting(&self.config));
+                }
+            }
+        }
+        let (url, expected_server_id, fallback_to_waiting) = if ci_address {
+            (
+                format!(
+                    "{}/internal/bedrock-signal/ci/{}",
+                    self.config.control_plane_url.trim_end_matches('/'),
+                    percent_encode_path(hostname),
+                ),
+                None,
+                true,
+            )
+        } else if let Some(server_id) =
             server_id_from_signal_hostname(hostname, &self.config.root_domain)
         {
             (
@@ -413,6 +434,23 @@ impl SignalProxy {
     async fn target(&self, hostname: &str) -> Result<SocketAddr, StatusCode> {
         Ok(self.route(hostname).await?.signal)
     }
+}
+
+fn is_ci_hostname(hostname: &str) -> bool {
+    crate::routing::ci_subdomain_from_hostname(hostname, crate::ci::CI_ROOT_DOMAIN).is_some()
+}
+
+fn percent_encode_path(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 fn validate_signal_target(

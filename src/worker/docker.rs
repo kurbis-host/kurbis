@@ -1,12 +1,14 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
-use super::runtime::{ServerRuntime, settings::render_pumpkin_config};
+use super::{
+    ingress::{GatewayIngressPolicy, PublishedWorkloadPorts, docker_publish_binding},
+    runtime::{ServerRuntime, settings::render_pumpkin_config},
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -14,38 +16,79 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
-    model::{PlacementRecord, SERVER_MEMORY_BYTES},
+    model::{PlacementRecord, SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES},
     pumpkin_control::PumpkinControl,
+    runtime_api_proxy,
+    worker::sandbox::{
+        DockerSandbox, WorkloadLimits, ensure_rootless_volume_owner,
+        scoped_runtime_environment_args, scoped_runtime_token, validate_quota_volume,
+    },
 };
 
 #[derive(Clone)]
 pub struct DockerRuntime {
     image: String,
-    host_control: PumpkinControl,
+    worker_control_key: String,
+    root: PathBuf,
+    sandbox: DockerSandbox,
+    ingress: GatewayIngressPolicy,
     public_address: IpAddr,
     signal_address: IpAddr,
+    runtime_api_proxy_image: String,
+    runtime_api_proxy_upstream: String,
+    runtime_api_proxy_egress_network: String,
+    runtime_api_proxy_allow_insecure: bool,
 }
 
 impl DockerRuntime {
     pub fn new(
         image: String,
         host_control_token: String,
+        root: PathBuf,
         public_address: IpAddr,
         signal_address: IpAddr,
-    ) -> Self {
-        Self {
+        gateway_address: IpAddr,
+        runtime_api_proxy_image: String,
+        runtime_api_proxy_upstream: String,
+        runtime_api_proxy_egress_network: String,
+        runtime_api_proxy_allow_insecure: bool,
+    ) -> Result<Self> {
+        let ingress = GatewayIngressPolicy::new(gateway_address)?;
+        crate::runtime_api_proxy::validate_upstream_url(
+            &runtime_api_proxy_upstream,
+            runtime_api_proxy_allow_insecure,
+        )?;
+        Ok(Self {
             image,
-            host_control: PumpkinControl::new(host_control_token),
+            worker_control_key: host_control_token,
+            root,
+            sandbox: DockerSandbox,
             public_address,
             signal_address,
-        }
+            ingress,
+            runtime_api_proxy_image,
+            runtime_api_proxy_upstream,
+            runtime_api_proxy_egress_network,
+            runtime_api_proxy_allow_insecure,
+        })
     }
 }
 
 #[async_trait]
 impl ServerRuntime for DockerRuntime {
-    fn control(&self) -> &PumpkinControl {
-        &self.host_control
+    async fn control_for(&self, server_dir: &Path) -> Result<PumpkinControl> {
+        let server_id = server_id_from_directory(server_dir)?;
+        let generation = tokio::fs::read_to_string(runtime_generation_path(&self.root, server_id))
+            .await
+            .context("runtime generation capability is missing")?
+            .trim()
+            .parse::<i64>()
+            .context("runtime generation capability is invalid")?;
+        Ok(PumpkinControl::new(scoped_runtime_token(
+            &self.worker_control_key,
+            server_id,
+            generation,
+        )?))
     }
     fn socket_path(&self, server_dir: &Path) -> Result<PathBuf> {
         let server_id = server_id_from_directory(server_dir)?;
@@ -58,10 +101,35 @@ impl ServerRuntime for DockerRuntime {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        api_capability: Option<&str>,
     ) -> Result<()> {
+        let api_capability =
+            api_capability.context("managed plugin capability is required for Docker runtime")?;
         let name = container_name(server_id);
+        let proxy_name = runtime_api_proxy::container_name(server_id);
         match self.running_generation(&name).await? {
             Some(generation) if generation == placement.generation => {
+                let network = crate::worker::sandbox::workload_network_name(server_id, generation);
+                runtime_api_proxy::remove_container(&proxy_name).await?;
+                runtime_api_proxy::start_container(
+                    &self.runtime_api_proxy_image,
+                    &proxy_name,
+                    "server",
+                    server_id,
+                    generation,
+                    api_capability,
+                    &self.runtime_api_proxy_upstream,
+                    &network,
+                    &self.runtime_api_proxy_egress_network,
+                    self.runtime_api_proxy_allow_insecure,
+                )
+                .await?;
+                self.sandbox
+                    .verify_isolated_network(&network, &[name.clone(), proxy_name.clone()])
+                    .await?;
+                let ports = workload_ports(self.public_address, self.signal_address, placement)?;
+                self.ingress.verify_host_policy().await?;
+                self.ingress.install(server_id, generation, ports).await?;
                 return self
                     .wait_ready(server_id, server_dir, Duration::from_secs(120))
                     .await;
@@ -75,6 +143,17 @@ impl ServerRuntime for DockerRuntime {
             None => {}
         }
         self.remove_stopped(&name).await?;
+        runtime_api_proxy::remove_container(&proxy_name).await?;
+        self.sandbox.remove_isolated_networks(server_id).await?;
+        self.ingress.remove_server(server_id).await?;
+        self.sandbox
+            .verify_with_limits(
+                &self.image,
+                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
+            )
+            .await?;
+        validate_quota_volume(server_dir, SERVER_STORAGE_BYTES as u64).await?;
+        self.ingress.verify_host_policy().await?;
         tokio::fs::create_dir_all(server_dir.join("run")).await?;
         tokio::fs::write(
             server_dir.join("pumpkin.toml"),
@@ -88,77 +167,182 @@ impl ServerRuntime for DockerRuntime {
             ),
         )
         .await?;
-        let (runtime_uid, runtime_gid) = ensure_pumpkin_ownership(server_dir).await?;
+        let (runtime_uid, runtime_gid) = self.sandbox.rootless_daemon_identity().await?;
+        ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
+        persist_runtime_generation(&self.root, server_id, placement.generation).await?;
         prepare_control_socket_alias(server_id, server_dir).await?;
 
-        let java = format!("{}:25565/tcp", placement.java_port);
-        let bedrock_udp = format!("{}:19132/udp", placement.bedrock_port);
-        let signal_host =
-            SocketAddr::new(self.signal_address, u16::try_from(placement.signal_port)?);
-        let bedrock_signal = format!("{signal_host}:19132/tcp");
-        let volume = format!("{}:/pumpkin", server_dir.display());
+        let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
+        let java = docker_publish_binding(
+            published_ports.java_tcp.ip(),
+            published_ports.java_tcp.port(),
+            25565,
+            "tcp",
+        )?;
+        let java_health = docker_publish_binding(
+            if published_ports.java_tcp.is_ipv4() {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            },
+            published_ports.java_tcp.port(),
+            25565,
+            "tcp",
+        )?;
+        let bedrock_udp = docker_publish_binding(
+            published_ports.bedrock_udp.ip(),
+            published_ports.bedrock_udp.port(),
+            19132,
+            "udp",
+        )?;
+        let bedrock_signal = docker_publish_binding(
+            published_ports.bedrock_signal_tcp.ip(),
+            published_ports.bedrock_signal_tcp.port(),
+            19132,
+            "tcp",
+        )?;
+        let volume = format!(
+            "type=bind,source={},target=/pumpkin,bind-propagation=rprivate",
+            server_dir.display()
+        );
         let generation_label = format!("kurbis.generation={}", placement.generation);
-        let lease_label = format!("kurbis.lease={}", placement.lease_token);
         let server_label = format!("kurbis.server_id={server_id}");
-        let memory = SERVER_MEMORY_BYTES.to_string();
-        let runtime_user = format!("{runtime_uid}:{runtime_gid}");
-        let output = Command::new("docker")
-            .args([
-                "run",
-                "--detach",
-                "--name",
-                &name,
-                "--restart",
-                "no",
-                "--memory",
-                &memory,
-                "--memory-swap",
-                &memory,
-                "--cpus",
-                "1.0",
-                "--pids-limit",
-                "512",
-                "--user",
-                &runtime_user,
-                "--read-only",
-                "--security-opt",
-                "no-new-privileges:true",
-                "--cap-drop",
-                "ALL",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,size=64m",
-                "--label",
-                &server_label,
-                "--label",
-                &generation_label,
-                "--label",
-                &lease_label,
-                "--env",
-                "PUMPKIN_HOST_CONTROL_SOCKET=/pumpkin/run/host-control.sock",
-                "--env",
-                &format!("PUMPKIN_HOST_CONTROL_TOKEN={}", self.host_control.token()),
-                "--publish",
-                &java,
-                "--publish",
-                &bedrock_udp,
-                "--publish",
-                &bedrock_signal,
-                "--volume",
-                &volume,
-                &self.image,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
+        let runtime_user = "0:0";
+        let network =
+            crate::worker::sandbox::workload_network_name(server_id, placement.generation);
+        let mut args = vec![
+            "run".to_owned(),
+            "--detach".to_owned(),
+            "--name".to_owned(),
+            name.clone(),
+            "--restart".to_owned(),
+            "no".to_owned(),
+            "--stop-timeout".to_owned(),
+            "10".to_owned(),
+        ];
+        args.extend(self.sandbox.run_security_args(
+            WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
+            &runtime_user,
+            &network,
+            true,
+        )?);
+        let runtime_environment_args = scoped_runtime_environment_args(
+            &self.worker_control_key,
+            server_id,
+            placement.generation,
+        )?;
+        args.extend([
+            "--label".to_owned(),
+            server_label,
+            "--label".to_owned(),
+            generation_label,
+        ]);
+        args.extend(runtime_environment_args);
+        args.extend([
+            "--publish".to_owned(),
+            java,
+            "--publish".to_owned(),
+            java_health,
+            "--publish".to_owned(),
+            bedrock_udp,
+            "--publish".to_owned(),
+            bedrock_signal,
+            "--mount".to_owned(),
+            volume,
+            self.image.clone(),
+        ]);
+        self.sandbox
+            .create_isolated_network(server_id, placement.generation)
             .await?;
+        if let Err(error) = runtime_api_proxy::start_container(
+            &self.runtime_api_proxy_image,
+            &proxy_name,
+            "server",
+            server_id,
+            placement.generation,
+            api_capability,
+            &self.runtime_api_proxy_upstream,
+            &network,
+            &self.runtime_api_proxy_egress_network,
+            self.runtime_api_proxy_allow_insecure,
+        )
+        .await
+        {
+            let _ = self
+                .sandbox
+                .remove_isolated_network(server_id, placement.generation)
+                .await;
+            remove_runtime_generation(&self.root, server_id).await?;
+            remove_control_socket_alias(server_id).await?;
+            return Err(error).context("start scoped managed-plugin API proxy");
+        }
+        if let Err(error) = self
+            .ingress
+            .install(server_id, placement.generation, published_ports)
+            .await
+        {
+            runtime_api_proxy::remove_container(&proxy_name).await?;
+            self.sandbox
+                .remove_isolated_network(server_id, placement.generation)
+                .await?;
+            remove_runtime_generation(&self.root, server_id).await?;
+            remove_control_socket_alias(server_id).await?;
+            return Err(error)
+                .context("failed to install Gateway-only ingress before workload start");
+        }
+        let output = match tokio::time::timeout(
+            Duration::from_secs(30),
+            Command::new("docker")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let cleanup = self.remove_runtime(server_id).await.err();
+                if let Some(cleanup) = cleanup {
+                    bail!("Docker start failed: {error}; cleanup also failed: {cleanup:#}");
+                }
+                return Err(error).context("start Pumpkin container");
+            }
+            Err(_) => {
+                let cleanup = self.remove_runtime(server_id).await.err();
+                if let Some(cleanup) = cleanup {
+                    bail!(
+                        "Docker did not start the workload within 30 seconds; cleanup also failed: {cleanup:#}"
+                    );
+                }
+                bail!("Docker did not start the workload within 30 seconds");
+            }
+        };
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let cleanup = self.remove_runtime(server_id).await.err();
+            if let Some(cleanup) = cleanup {
+                bail!(
+                    "docker failed to start {name} with status {}: {}; cleanup also failed: {cleanup:#}",
+                    output.status,
+                    detail,
+                );
+            }
             bail!(
                 "docker failed to start {name} with status {}: {}",
                 output.status,
-                detail.trim()
+                detail,
             );
+        }
+        if let Err(error) = self
+            .sandbox
+            .verify_isolated_network(&network, &[name.clone(), proxy_name.clone()])
+            .await
+        {
+            let _ = self.remove_runtime(server_id).await;
+            return Err(error).context("workload network isolation check failed");
         }
         if let Err(error) = self
             .wait_ready(server_id, server_dir, Duration::from_secs(120))
@@ -175,6 +359,12 @@ impl ServerRuntime for DockerRuntime {
                     String::from_utf8_lossy(&bytes).into_owned()
                 })
                 .unwrap_or_else(|| "unable to read container logs".into());
+            let cleanup_error = self.remove_runtime(server_id).await.err();
+            if let Some(cleanup_error) = cleanup_error {
+                bail!(
+                    "Pumpkin readiness failed: {error}; cleanup also failed: {cleanup_error:#}; container logs:\n{logs}"
+                );
+            }
             bail!("Pumpkin readiness failed: {error}; container logs:\n{logs}");
         }
         Ok(())
@@ -184,6 +374,11 @@ impl ServerRuntime for DockerRuntime {
         let generation = self.running_generation(&container_name(server_id)).await?;
         if generation.is_none() {
             remove_control_socket_alias(server_id).await?;
+            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
+                .await?;
+            self.sandbox.remove_isolated_networks(server_id).await?;
+            self.ingress.remove_server(server_id).await?;
+            remove_runtime_generation(&self.root, server_id).await?;
         }
         Ok(generation)
     }
@@ -219,6 +414,11 @@ impl ServerRuntime for DockerRuntime {
             || String::from_utf8_lossy(&output.stderr).contains("No such container")
         {
             remove_control_socket_alias(server_id).await?;
+            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
+                .await?;
+            self.sandbox.remove_isolated_networks(server_id).await?;
+            self.ingress.remove_server(server_id).await?;
+            remove_runtime_generation(&self.root, server_id).await?;
             return Ok(());
         }
         bail!(
@@ -226,6 +426,18 @@ impl ServerRuntime for DockerRuntime {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn workload_ports(
+    worker_address: IpAddr,
+    signal_address: IpAddr,
+    placement: &PlacementRecord,
+) -> Result<PublishedWorkloadPorts> {
+    Ok(PublishedWorkloadPorts {
+        java_tcp: SocketAddr::new(worker_address, u16::try_from(placement.java_port)?),
+        bedrock_udp: SocketAddr::new(worker_address, u16::try_from(placement.bedrock_port)?),
+        bedrock_signal_tcp: SocketAddr::new(signal_address, u16::try_from(placement.signal_port)?),
+    })
 }
 
 fn server_id_from_directory(server_dir: &Path) -> Result<Uuid> {
@@ -247,6 +459,19 @@ fn control_socket_alias_for_server(server_id: Uuid) -> PathBuf {
 }
 
 impl DockerRuntime {
+    pub async fn verify_sandbox(&self) -> Result<()> {
+        self.sandbox
+            .verify_with_limits(
+                &self.image,
+                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
+            )
+            .await?;
+        self.ingress
+            .verify_host_policy()
+            .await
+            .context("Gateway-only workload ingress requires nftables host firewall access")
+    }
+
     async fn running_generation(&self, name: &str) -> Result<Option<i64>> {
         let output = Command::new("docker")
             .args([
@@ -292,22 +517,36 @@ fn container_name(server_id: Uuid) -> String {
     format!("kurbis-{server_id}")
 }
 
-async fn ensure_pumpkin_ownership(server_dir: &Path) -> Result<(u32, u32)> {
-    let metadata = tokio::fs::metadata(server_dir).await?;
-    let (uid, gid) = (metadata.uid(), metadata.gid());
-    if uid == 0 {
-        let status = Command::new("chown")
-            .arg("-R")
-            .arg("2613:2613")
-            .arg(server_dir)
-            .status()
-            .await?;
-        if !status.success() {
-            bail!("failed to set Pumpkin volume ownership");
-        }
-        return Ok(container_identity(uid, gid));
+fn runtime_generation_path(root: &Path, server_id: Uuid) -> PathBuf {
+    root.join("runtime-generations").join(server_id.to_string())
+}
+
+async fn persist_runtime_generation(root: &Path, server_id: Uuid, generation: i64) -> Result<()> {
+    if generation <= 0 {
+        bail!("runtime generation must be positive");
     }
-    Ok(container_identity(uid, gid))
+    let directory = root.join("runtime-generations");
+    tokio::fs::create_dir_all(&directory).await?;
+    let path = runtime_generation_path(root, server_id);
+    let temporary = path.with_extension("tmp");
+    tokio::fs::write(&temporary, generation.to_string()).await?;
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+async fn remove_runtime_generation(root: &Path, server_id: Uuid) -> Result<()> {
+    for path in [
+        runtime_generation_path(root, server_id),
+        root.join("runtime-generations")
+            .join(format!("{server_id}.tmp")),
+    ] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 async fn prepare_control_socket_alias(server_id: Uuid, server_dir: &Path) -> Result<()> {
@@ -347,10 +586,6 @@ async fn remove_control_socket_alias(server_id: Uuid) -> Result<()> {
     }
 }
 
-fn container_identity(uid: u32, gid: u32) -> (u32, u32) {
-    if uid == 0 { (2613, 2613) } else { (uid, gid) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,14 +606,37 @@ mod tests {
         assert!(config.contains("view_distance = 8"));
     }
 
-    #[test]
-    fn unprivileged_worker_keeps_server_files_owned_by_its_uid() {
-        assert_eq!(container_identity(501, 20), (501, 20));
-    }
+    #[tokio::test]
+    async fn runtime_capability_is_not_persisted_under_the_mounted_server_volume() {
+        let server_id = Uuid::new_v4();
+        let root = tempfile::tempdir().unwrap();
+        let server_dir = root.path().join("servers").join(server_id.to_string());
+        tokio::fs::create_dir_all(server_dir.join("run"))
+            .await
+            .unwrap();
+        persist_runtime_generation(root.path(), server_id, 11)
+            .await
+            .unwrap();
 
-    #[test]
-    fn root_worker_uses_the_pumpkin_image_user() {
-        assert_eq!(container_identity(0, 0), (2613, 2613));
+        let environment = scoped_runtime_environment_args(
+            "worker-root-key-that-is-long-enough-for-testing",
+            server_id,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_generation_path(root.path(), server_id))
+                .await
+                .unwrap(),
+            "11"
+        );
+        assert!(!server_dir.join("run/host-control.env").exists());
+        assert!(!environment.iter().any(|argument| argument == "--env-file"));
+        assert!(environment[3].starts_with("PUMPKIN_HOST_CONTROL_TOKEN="));
+        remove_runtime_generation(root.path(), server_id)
+            .await
+            .unwrap();
     }
 
     #[test]

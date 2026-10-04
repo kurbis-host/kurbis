@@ -28,6 +28,7 @@ pub struct WorkerControl {
     client: Client,
     authorization: header::HeaderValue,
     lease_id: std::sync::Arc<std::sync::RwLock<Option<Uuid>>>,
+    supports_ci_previews: bool,
 }
 
 impl WorkerControl {
@@ -52,6 +53,7 @@ impl WorkerControl {
             client: Client::builder().redirect(Policy::none()).build()?,
             authorization,
             lease_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            supports_ci_previews: false,
         })
     }
 
@@ -68,6 +70,15 @@ impl WorkerControl {
 
     pub fn set_lease_id(&self, lease_id: Uuid) {
         *self.lease_id.write().expect("worker lease lock poisoned") = Some(lease_id);
+    }
+
+    pub fn with_ci_preview_support(mut self, supported: bool) -> Self {
+        self.supports_ci_previews = supported;
+        self
+    }
+
+    pub fn supports_ci_previews(&self) -> bool {
+        self.supports_ci_previews
     }
 
     pub fn base_url(&self) -> &Url {

@@ -113,6 +113,66 @@ fn signal_target_unavailable(status: StatusCode, message: &'static str) -> ApiEr
     ApiError::with_code(status, "signal_target_unavailable", message)
 }
 
+pub(super) async fn ci_bedrock_signal_target(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(hostname): Path<String>,
+) -> Result<Json<BedrockSignalTarget>, ApiError> {
+    require_internal(&state, &headers)?;
+    if crate::routing::RouteRepository::new(state.pool.clone(), state.config.root_domain.clone())
+        .ci_subdomain_for_hostname(&hostname, crate::ci::CI_ROOT_DOMAIN)
+        .is_none()
+    {
+        return Err(signal_target_unavailable(
+            StatusCode::NOT_FOUND,
+            "unknown CI preview address",
+        ));
+    }
+    let row = sqlx::query_as::<_, (Uuid, String, i32, String, i32, i64)>(
+        "SELECT runtime.preview_id, worker.address, runtime.bedrock_port,
+                worker.signal_address, runtime.signal_port, runtime.generation
+         FROM ci_runtime_placements runtime
+         JOIN ci_preview_aliases alias ON alias.id = runtime.preview_id
+         JOIN workers worker ON worker.id = runtime.worker_id
+         WHERE alias.hostname = $1 AND alias.expires_at > now()
+           AND alias.state = 'running' AND runtime.state = 'running' AND runtime.active
+           AND worker.heartbeat_at > now() - interval '30 seconds'",
+    )
+    .bind(hostname)
+    .fetch_optional(&state.pool)
+    .await?;
+    let target = row.ok_or_else(|| {
+        signal_target_unavailable(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI preview signaling target is unavailable",
+        )
+    })?;
+    if !crate::model::is_private_signal_address(&target.3) {
+        return Err(signal_target_unavailable(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI preview signaling target is unavailable",
+        ));
+    }
+    Ok(Json(BedrockSignalTarget {
+        server_id: target.0,
+        worker_address: target.1,
+        bedrock_port: u16::try_from(target.2).map_err(|_| {
+            signal_target_unavailable(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid CI Bedrock target",
+            )
+        })?,
+        signal_address: target.3,
+        signal_port: u16::try_from(target.4).map_err(|_| {
+            signal_target_unavailable(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid CI signal target",
+            )
+        })?,
+        generation: target.5,
+    }))
+}
+
 pub(super) async fn admit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

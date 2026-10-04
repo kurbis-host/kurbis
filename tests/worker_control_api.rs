@@ -692,6 +692,33 @@ async fn control_plane_lease_excludes_a_second_process_and_fences_expired_owners
         .await,
         StatusCode::NO_CONTENT
     );
+    let legacy_capabilities: (String, bool) = sqlx::query_as(
+        "SELECT runtime_architecture, supports_ci_previews FROM workers WHERE id = $1",
+    )
+    .bind(worker.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_capabilities, ("unknown".into(), false));
+    assert_eq!(
+        worker_api_request(
+            service.clone(),
+            "/internal/worker/control/heartbeat",
+            &worker.token,
+            Some(first),
+            json!({"runtime_architecture":"x86_64-linux", "supports_ci_previews":true})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let capabilities: (String, bool) = sqlx::query_as(
+        "SELECT runtime_architecture, supports_ci_previews FROM workers WHERE id = $1",
+    )
+    .bind(worker.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(capabilities, ("x86_64-linux".into(), true));
 
     sqlx::query("UPDATE worker_credentials SET lease_expires_at = now() - interval '1 second' WHERE worker_id = $1")
         .bind(worker.id).execute(&pool).await.unwrap();
@@ -701,7 +728,7 @@ async fn control_plane_lease_excludes_a_second_process_and_fences_expired_owners
             "/internal/worker/control/heartbeat",
             &worker.token,
             Some(first),
-            json!({})
+            json!({"runtime_architecture":"x86_64-linux", "supports_ci_previews":true})
         )
         .await,
         StatusCode::UNAUTHORIZED
@@ -723,7 +750,7 @@ async fn control_plane_lease_excludes_a_second_process_and_fences_expired_owners
             "/internal/worker/control/heartbeat",
             &worker.token,
             Some(first),
-            json!({})
+            json!({"runtime_architecture":"x86_64-linux", "supports_ci_previews":true})
         )
         .await,
         StatusCode::UNAUTHORIZED

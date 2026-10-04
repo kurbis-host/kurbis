@@ -9,6 +9,11 @@ impl WorkerRunner {
     pub(super) async fn run_operations(&mut self) -> Result<()> {
         loop {
             self.reconcile_failed_starts().await?;
+            if let Some(ci_runtime) = &self.ci_runtime {
+                if let Err(error) = ci_runtime.reconcile().await {
+                    tracing::error!(?error, "CI preview worker reconciliation failed");
+                }
+            }
             if let Some(op) = self.control_plane.claim_operation().await?
                 && let Err(error) = self.execute_operation(&op).await
             {
@@ -174,10 +179,9 @@ impl WorkerRunner {
                     idle.observe(&status, Instant::now());
                 }
                 let socket = self.runtime.socket_path(&server_dir)?;
+                let runtime_control = self.runtime.control_for(&server_dir).await?;
                 for player in self.runtime.players(&server_dir).await? {
-                    let _ = self
-                        .runtime
-                        .control()
+                    let _ = runtime_control
                         .message(
                             &socket,
                             player.id,
@@ -322,11 +326,18 @@ impl WorkerRunner {
         settings: &serde_json::Value,
     ) -> Result<()> {
         if !self.runtime.server_is_running(server_id).await? {
-            self.server_access
+            let api_capability = self
+                .server_access
                 .prepare_plugin(server_id, placement.generation, server_dir)
                 .await?;
             self.runtime
-                .start(server_id, placement, server_dir, settings)
+                .start(
+                    server_id,
+                    placement,
+                    server_dir,
+                    settings,
+                    api_capability.as_deref(),
+                )
                 .await?;
         }
         self.runtime
@@ -443,10 +454,9 @@ impl WorkerRunner {
         if stage == OperationStage::Requested {
             if was_running && self.runtime.server_is_running(op.server_id).await? {
                 let socket = self.runtime.socket_path(&server_dir)?;
+                let runtime_control = self.runtime.control_for(&server_dir).await?;
                 for player in self.runtime.players(&server_dir).await? {
-                    let _ = self
-                        .runtime
-                        .control()
+                    let _ = runtime_control
                         .message(
                             &socket,
                             player.id,
@@ -668,7 +678,8 @@ impl WorkerRunner {
         write_whitelist_file(&context, &server_dir).await?;
         write_operator_file(&context, &server_dir).await?;
 
-        self.server_access
+        let api_capability = self
+            .server_access
             .prepare_plugin(op.server_id, placement.generation, &server_dir)
             .await?;
         if payload.stage == OperationStage::Requested {
@@ -677,7 +688,13 @@ impl WorkerRunner {
                 .await?;
         }
         self.runtime
-            .start(op.server_id, &placement, &server_dir, &settings)
+            .start(
+                op.server_id,
+                &placement,
+                &server_dir,
+                &settings,
+                api_capability.as_deref(),
+            )
             .await?;
         sync_whitelist(
             &self.control_plane,

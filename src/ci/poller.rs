@@ -1,0 +1,318 @@
+use std::{sync::Arc, time::Duration};
+
+use chrono::Duration as ChronoDuration;
+
+use anyhow::Result;
+use tokio::time::sleep;
+use uuid::Uuid;
+
+use super::{
+    BuildKey, CheckRunClient, CheckRunDetails, CiBuildStage, CiHostname, CiPreviewRepository,
+    CiRefKind,
+    source_control::{PollError, SourceControlClient, SourceRefKind, retry_delay},
+};
+
+#[derive(Debug, Clone)]
+pub struct CiPollerConfig {
+    pub root_domain: String,
+    pub patch_fingerprint: String,
+    pub toolchain_version: String,
+    pub target_architecture: String,
+}
+impl Default for CiPollerConfig {
+    fn default() -> Self {
+        Self {
+            root_domain: super::domain::CI_ROOT_DOMAIN.into(),
+            patch_fingerprint: "checked-in-host-control".into(),
+            toolchain_version: "native".into(),
+            target_architecture: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        }
+    }
+}
+
+/// Durable source-control poller. A repository row lock is held by
+/// `poll_repository` across the provider request and persistence, then build
+/// records and immutable aliases are deduplicated by their database keys.
+pub struct CiPoller<C> {
+    repository: CiPreviewRepository,
+    source: Arc<C>,
+    config: CiPollerConfig,
+    check_runs: Option<Arc<dyn CheckRunClient>>,
+    builder: Option<Arc<dyn crate::ci::BuildCoordinator>>,
+}
+impl<C> Clone for CiPoller<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            repository: self.repository.clone(),
+            source: Arc::new((*self.source).clone()),
+            config: self.config.clone(),
+            check_runs: self.check_runs.clone(),
+            builder: self.builder.clone(),
+        }
+    }
+}
+impl<C: SourceControlClient + 'static> CiPoller<C> {
+    pub fn new(repository: CiPreviewRepository, source: Arc<C>) -> Self {
+        Self {
+            repository,
+            source,
+            config: CiPollerConfig::default(),
+            check_runs: None,
+            builder: None,
+        }
+    }
+    pub fn with_config(mut self, config: CiPollerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_check_runs(mut self, client: Arc<dyn CheckRunClient>) -> Self {
+        self.check_runs = Some(client);
+        self
+    }
+    pub fn with_builder(mut self, builder: Arc<dyn crate::ci::BuildCoordinator>) -> Self {
+        self.builder = Some(builder);
+        self
+    }
+    pub async fn poll_once(&self, repository_id: Uuid) -> Result<()> {
+        let poll = self
+            .repository
+            .poll_repository(repository_id, self.source.as_ref())
+            .await?;
+        let repository_name = self.repository_name(repository_id).await?;
+        for source_ref in poll.refs {
+            let kind = match source_ref.kind {
+                SourceRefKind::PullRequest => CiRefKind::PullRequest,
+                SourceRefKind::Branch => CiRefKind::Branch,
+            };
+            let key = BuildKey::new(
+                &repository_name,
+                &source_ref.commit_sha,
+                &self.config.patch_fingerprint,
+                &self.config.toolchain_version,
+                &self.config.target_architecture,
+            )?;
+            let (build, _) = self.repository.ensure_build(&key).await?;
+            let commit_alias = CiHostname::for_ref(
+                CiRefKind::Commit,
+                &source_ref.commit_sha,
+                &self.config.root_domain,
+            )?;
+            self.repository
+                .ensure_preview(
+                    &repository_name,
+                    &source_ref.commit_sha,
+                    CiRefKind::Commit,
+                    None,
+                    &commit_alias,
+                    build.id,
+                )
+                .await?;
+            let stable_alias = match source_ref.kind {
+                SourceRefKind::PullRequest => CiHostname::for_ref(
+                    CiRefKind::PullRequest,
+                    &source_ref.name,
+                    &self.config.root_domain,
+                )?,
+                SourceRefKind::Branch => CiHostname::for_ref(
+                    CiRefKind::Branch,
+                    &source_ref.name,
+                    &self.config.root_domain,
+                )?,
+            };
+            let stable_preview = self
+                .repository
+                .ensure_preview(
+                    &repository_name,
+                    &source_ref.commit_sha,
+                    kind,
+                    Some(&source_ref.name),
+                    &stable_alias,
+                    build.id,
+                )
+                .await?;
+            let should_track_check_run = !(source_ref.kind == SourceRefKind::PullRequest
+                && source_ref.closed
+                && build.stage == CiBuildStage::Queued);
+            if should_track_check_run
+                && let Some(check_runs) = self.check_runs.as_ref()
+                && self.repository.check_run_id(build.id).await?.is_none()
+            {
+                self.ensure_check_run(
+                    check_runs.as_ref(),
+                    build.id,
+                    &source_ref,
+                    &repository_name,
+                    &commit_alias,
+                    &stable_alias,
+                )
+                .await?;
+            }
+            let eager_pr = source_ref.kind == SourceRefKind::PullRequest && !source_ref.closed;
+            // A stable branch alias may still serve an older successful
+            // commit while the newly observed head is building. Once a player
+            // has admitted that alias (anything beyond the untouched lobby),
+            // keep advancing the latest candidate and its build-only Check Run.
+            // This also retries a build whose lease expired while its prior
+            // poller replica was unavailable.
+            let admitted_branch = source_ref.kind == SourceRefKind::Branch
+                && stable_preview.state != crate::ci::CiPreviewState::Lobby;
+            if eager_pr || admitted_branch {
+                if let Some(builder) = self.builder.as_ref() {
+                    let request = crate::ci::BuildRequest {
+                        key: key.clone(),
+                        source_repository: source_ref.source_repository.clone(),
+                        source_archive: Vec::new(),
+                    };
+                    builder
+                        .ensure_build(request)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
+                }
+            }
+        }
+        self.reconcile_check_runs().await?;
+        Ok(())
+    }
+
+    async fn reconcile_check_runs(&self) -> Result<()> {
+        let Some(check_runs) = self.check_runs.as_ref() else {
+            return Ok(());
+        };
+        for candidate in self
+            .repository
+            .check_run_reconciliation_candidates(128)
+            .await?
+        {
+            let (build_log, expires_at, preview_hostnames) = self
+                .repository
+                .build_diagnostics(candidate.build_id, &self.config.root_domain)
+                .await?;
+            let details = CheckRunDetails {
+                commit_sha: candidate.key.commit_sha.clone(),
+                stage: candidate.stage,
+                repository: candidate.key.repository.clone(),
+                artifact_digest: candidate.artifact_digest,
+                failure_stage: candidate.failure_stage,
+                failure_message: candidate.failure_message,
+                build_log: build_log
+                    .chars()
+                    .rev()
+                    .take(6 * 1024)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect(),
+                preview_hostnames,
+                expires_at: Some(expires_at.to_rfc3339()),
+            };
+            match check_runs
+                .update(
+                    &candidate.key.repository,
+                    crate::ci::CheckRunId(candidate.check_run_id),
+                    &details,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.repository
+                        .mark_check_run_stage_synced(candidate.build_id, candidate.stage)
+                        .await?;
+                }
+                Err(error) => tracing::warn!(
+                    build_id = %candidate.build_id,
+                    stage = %candidate.stage,
+                    ?error,
+                    "failed to reconcile GitHub CI Check Run"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_check_run(
+        &self,
+        check_runs: &dyn CheckRunClient,
+        build_id: Uuid,
+        source_ref: &crate::ci::SourceRef,
+        repository: &str,
+        commit_alias: &CiHostname,
+        stable_alias: &CiHostname,
+    ) -> Result<()> {
+        let claim = Uuid::new_v4();
+        if !self
+            .repository
+            .claim_check_run(build_id, claim, ChronoDuration::minutes(2))
+            .await?
+        {
+            return Ok(());
+        }
+        let details = CheckRunDetails {
+            commit_sha: source_ref.commit_sha.clone(),
+            stage: CiBuildStage::Queued,
+            repository: repository.to_owned(),
+            artifact_digest: None,
+            failure_stage: None,
+            failure_message: None,
+            build_log: String::new(),
+            preview_hostnames: vec![commit_alias.value.clone(), stable_alias.value.clone()],
+            expires_at: None,
+        };
+        match check_runs.get_or_create(repository, &details).await {
+            Ok(check_run) => {
+                self.repository
+                    .complete_check_run_claim(
+                        build_id,
+                        claim,
+                        check_run.0,
+                        None,
+                        CiBuildStage::Queued,
+                    )
+                    .await?;
+                Ok(())
+            }
+            Err(error) => {
+                self.repository
+                    .release_check_run_claim(build_id, claim)
+                    .await?;
+                Err(anyhow::anyhow!(
+                    "create or recover GitHub check run: {error}"
+                ))
+            }
+        }
+    }
+
+    async fn repository_name(&self, repository_id: Uuid) -> Result<String> {
+        self.repository.repository_name(repository_id).await
+    }
+    pub async fn poll_with_retry(&self, repository_id: Uuid, max_attempts: u32) -> Result<()> {
+        let attempts = max_attempts.max(1);
+        let mut attempt = 0;
+        loop {
+            match self.poll_once(repository_id).await {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt + 1 < attempts => {
+                    let poll_error = PollError::Http {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        message: error.to_string(),
+                    };
+                    sleep(retry_delay(&poll_error, attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()> {
+        let interval = interval.max(Duration::from_secs(1));
+        loop {
+            if let Err(error) = self.poll_with_retry(repository_id, 3).await {
+                tracing::error!(?error, %repository_id, "CI source-control poll failed");
+            }
+            sleep(interval).await;
+        }
+    }
+}

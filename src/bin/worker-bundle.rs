@@ -37,7 +37,11 @@ struct WorkerRecord {
     name: String,
     address: String,
     signal_address: String,
+    gateway_address: Option<String>,
     control_plane_url: String,
+    runtime_api_proxy_upstream: String,
+    runtime_api_proxy_egress_network: String,
+    runtime_api_proxy_image: String,
     public_base_url: String,
     runtime: String,
     storage_mode: String,
@@ -85,14 +89,37 @@ fn worker_from_env(id: Uuid) -> Result<WorkerRecord> {
         kurbis_hoster::model::is_private_signal_address(&signal_address),
         "WORKER_SIGNAL_ADDRESS must be a private worker IP address"
     );
+    let runtime = required_env("WORKER_RUNTIME")?;
+    let gateway_address = match env::var("WORKER_GATEWAY_ADDRESS") {
+        Ok(address) => {
+            ensure!(
+                kurbis_hoster::model::is_gateway_source_address(&address),
+                "WORKER_GATEWAY_ADDRESS must be a concrete unicast Gateway source IP"
+            );
+            Some(address)
+        }
+        Err(env::VarError::NotPresent) if runtime == "native" => None,
+        Err(env::VarError::NotPresent) => {
+            bail!("WORKER_GATEWAY_ADDRESS is required for Docker workloads")
+        }
+        Err(error) => return Err(error).context("WORKER_GATEWAY_ADDRESS must be valid UTF-8"),
+    };
+    let control_plane_url = required_env("WORKER_CONTROL_PLANE_URL")?;
     let worker = WorkerRecord {
         id,
         name: required_env("WORKER_NAME")?,
         address: required_env("WORKER_ADDRESS")?,
         signal_address,
-        control_plane_url: required_env("WORKER_CONTROL_PLANE_URL")?,
+        gateway_address,
+        runtime_api_proxy_upstream: env::var("WORKER_RUNTIME_API_PROXY_UPSTREAM")
+            .unwrap_or_else(|_| control_plane_url.clone()),
+        runtime_api_proxy_egress_network: env::var("WORKER_RUNTIME_API_EGRESS_NETWORK")
+            .unwrap_or_else(|_| "kurbis-hoster_runtime-api-egress".to_owned()),
+        runtime_api_proxy_image: env::var("WORKER_RUNTIME_API_PROXY_IMAGE")
+            .unwrap_or_else(|_| "melon-hoster:local".to_owned()),
+        control_plane_url,
         public_base_url: required_env("PUBLIC_BASE_URL")?,
-        runtime: required_env("WORKER_RUNTIME")?,
+        runtime,
         storage_mode: required_env("WORKER_STORAGE_MODE")?,
         root: required_env("WORKER_ROOT")?,
         allow_insecure_local_http: env::var("WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP")
@@ -255,7 +282,7 @@ fn write_bundle(
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let temporary = parent.join(format!(".{}.{}.tmp", worker.id, Uuid::new_v4()));
     let mut contents = format!(
-        "export WORKER_ID={}\nexport WORKER_NAME={}\nexport WORKER_ADDRESS={}\nexport WORKER_SIGNAL_ADDRESS={}\nexport WORKER_API_TOKEN={}\nexport PUMPKIN_HOST_CONTROL_TOKEN={}\nexport CONTROL_PLANE_URL={}\nexport PUBLIC_BASE_URL={}\nexport WORKER_RUNTIME={}\nexport WORKER_STORAGE_MODE={}\nexport WORKER_ROOT={}\nexport WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP={}\nexport WORKER_MEMORY_GIB={}\nexport WORKER_DISK_GIB={}\nexport WORKER_CPU_MILLIS={}\nexport WORKER_PORT_MIN={}\nexport WORKER_PORT_MAX={}\nexport SNAPSHOT_INTERVAL_SECONDS={}\nexport IDLE_TIMEOUT_SECONDS={}\n",
+        "export WORKER_ID={}\nexport WORKER_NAME={}\nexport WORKER_ADDRESS={}\nexport WORKER_SIGNAL_ADDRESS={}\nexport WORKER_API_TOKEN={}\nexport PUMPKIN_HOST_CONTROL_TOKEN={}\nexport CONTROL_PLANE_URL={}\nexport WORKER_RUNTIME_API_PROXY_UPSTREAM={}\nexport WORKER_RUNTIME_API_EGRESS_NETWORK={}\nexport WORKER_RUNTIME_API_PROXY_IMAGE={}\nexport PUBLIC_BASE_URL={}\nexport WORKER_RUNTIME={}\nexport WORKER_STORAGE_MODE={}\nexport WORKER_ROOT={}\nexport WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP={}\nexport WORKER_MEMORY_GIB={}\nexport WORKER_DISK_GIB={}\nexport WORKER_CPU_MILLIS={}\nexport WORKER_PORT_MIN={}\nexport WORKER_PORT_MAX={}\nexport SNAPSHOT_INTERVAL_SECONDS={}\nexport IDLE_TIMEOUT_SECONDS={}\n",
         shell_quote(&worker.id.to_string()),
         shell_quote(&worker.name),
         shell_quote(&worker.address),
@@ -263,6 +290,9 @@ fn write_bundle(
         shell_quote(api_token),
         shell_quote(host_control_token),
         shell_quote(&worker.control_plane_url),
+        shell_quote(&worker.runtime_api_proxy_upstream),
+        shell_quote(&worker.runtime_api_proxy_egress_network),
+        shell_quote(&worker.runtime_api_proxy_image),
         shell_quote(&worker.public_base_url),
         shell_quote(&worker.runtime),
         shell_quote(&worker.storage_mode),
@@ -276,6 +306,12 @@ fn write_bundle(
         worker.snapshot_interval_seconds,
         worker.idle_timeout_seconds,
     );
+    if let Some(address) = &worker.gateway_address {
+        contents.push_str(&format!(
+            "export WORKER_GATEWAY_ADDRESS={}\n",
+            shell_quote(address)
+        ));
+    }
     if let Some(binary) = &worker.pumpkin_binary {
         contents.push_str(&format!("export PUMPKIN_BINARY={}\n", shell_quote(binary)));
     }

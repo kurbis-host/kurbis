@@ -1,3 +1,4 @@
+mod ci;
 mod console;
 mod operations;
 mod state;

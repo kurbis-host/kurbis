@@ -282,8 +282,29 @@ impl WorkerControl {
     }
 
     pub async fn heartbeat(&self) -> Result<()> {
-        self.post_no_content("/internal/worker/control/heartbeat", &EmptyRequest {})
-            .await
+        self.post_no_content(
+            "/internal/worker/control/heartbeat",
+            &HeartbeatRequest {
+                runtime_architecture: runtime_architecture(),
+                supports_ci_previews: self.supports_ci_previews(),
+            },
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HeartbeatRequest {
+    runtime_architecture: &'static str,
+    supports_ci_previews: bool,
+}
+
+fn runtime_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64-linux",
+        "aarch64" => "aarch64-linux",
+        _ => "unknown",
     }
 }
 

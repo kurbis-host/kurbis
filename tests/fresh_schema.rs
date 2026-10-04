@@ -48,8 +48,8 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
             .await?;
     assert_eq!(
         versions,
-        vec![1],
-        "fresh bootstrap must be one canonical migration"
+        vec![1, 2],
+        "fresh bootstrap applies the canonical schema and additive CI preview migration"
     );
 
     let forbidden: i64 = sqlx::query_scalar(

@@ -47,6 +47,7 @@ fn provision(output: &std::path::Path, worker_id: Uuid, rotate: bool) -> Output 
         .env("WORKER_NAME", format!("provisioned-{worker_id}"))
         .env("WORKER_ADDRESS", "198.51.100.20")
         .env("WORKER_SIGNAL_ADDRESS", "10.0.0.20")
+        .env_remove("WORKER_GATEWAY_ADDRESS")
         .env("WORKER_CONTROL_PLANE_URL", "https://control.example.test")
         .env("PUBLIC_BASE_URL", "https://panel.example.test")
         .env("WORKER_RUNTIME", "native")

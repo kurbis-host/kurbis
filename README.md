@@ -154,7 +154,40 @@ the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
 `WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
 quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the
 permissions needed to mount ext4 loop devices; `directory` mode has no hard
-disk quota. The starter `.env` uses local snapshot storage under `data/objects`;
+disk quota. Docker workers also require `WORKER_GATEWAY_ADDRESS` to equal the
+source IP the Gateway uses to reach the worker. The worker binds published
+server ports only on the configured worker addresses and installs dedicated
+nftables input rules allowing those assigned ports only from that Gateway IP;
+missing nftables privileges fail worker startup before it acquires assignments.
+For remote Gateways, configure the actual routed source address with
+`WORKER_GATEWAY_ADDRESS` (network ACLs must preserve or predictably SNAT that
+source). Local Compose defaults it to `GATEWAY_IP`. A matching Java probe is
+also published on loopback for worker-local CI readiness checks; it is not
+reachable from remote hosts. The worker must have host `CAP_NET_ADMIN` for the
+dedicated nftables chain; this firewall privilege is separate from Docker,
+which must still run rootless under a non-root account.
+
+Managed Pumpkin plugin API traffic uses a per-server, per-generation sidecar
+proxy. The server container remains on its own Docker `internal` network with
+IPv6 and masquerading disabled; that network contains only Pumpkin and its
+proxy. Only the proxy also joins `WORKER_RUNTIME_API_EGRESS_NETWORK`. It carries
+no worker, gateway, database, or object-store credentials: it pins the request
+to the configured `WORKER_RUNTIME_API_PROXY_UPSTREAM`, checks the presented
+server/preview capability against its hash, and allows only the managed plugin's
+own server or CI-preview routes and methods. The upstream must use HTTPS. For
+local Compose only, the checked-in `.env.example` opts into private-network HTTP
+and uses `http://control-plane:8080` on the dedicated internal
+`kurbis-hoster_runtime-api-egress` network shared with the control plane and
+managed proxy sidecars (and no panel, gateway, or database service). Remote
+workers may use an IPv4 bridge with external routing for the control-plane
+origin, but must use HTTPS and apply host/cloud egress rules that allow only
+that origin; the proxy itself still pins every HTTP request to that single
+configured origin.
+Redirects are never followed; bodies are bounded; GETs retry once only for a
+connection error or timeout, while mutations are never retried. An unhealthy
+proxy fails runtime startup closed. The sidecar's port is never host-published,
+so gateway-only Minecraft ingress remains unchanged.
+The starter `.env` uses local snapshot storage under `data/objects`;
 for production durability, set `OBJECT_STORE_TYPE=s3` and configure the `S3_*`
 values. Set `DOCKER_SUBNET`, `WAITING_IP`, and `GATEWAY_IP` if the default
 Compose subnet conflicts with an existing network.
