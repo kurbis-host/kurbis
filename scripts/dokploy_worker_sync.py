@@ -435,9 +435,12 @@ def restore(token: str) -> dict[str, str]:
     for entry in manifest:
         path=CHECKOUT/entry["path"]
         current = run(["git","-C",str(CHECKOUT),"hash-object","--",entry["path"]]) if path.is_file() else "missing"
-        allowed_targets={entry.get("target","missing"),entry.get("original_target","missing")}
+        content=base64.b64decode(entry["content"])
+        backup_blob=git_blob(content)
+        allowed_targets={entry.get("target","missing"),entry.get("original_target","missing"),backup_blob}
         if current not in allowed_targets: preserved.append(entry["path"]); continue
-        content=base64.b64decode(entry["content"]); atomic(path,content,int(entry["mode"]),int(entry["uid"]),int(entry["gid"])); restored.append(entry["path"])
+        if current!=backup_blob:atomic(path,content,int(entry["mode"]),int(entry["uid"]),int(entry["gid"]))
+        restored.append(entry["path"])
     if preserved:
         return {"status":"preserved","restored":json.dumps(restored),"preserved":json.dumps(preserved)}
     shutil.rmtree(backup)

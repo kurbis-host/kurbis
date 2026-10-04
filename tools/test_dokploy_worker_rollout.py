@@ -637,10 +637,18 @@ class RolloutTests(unittest.TestCase):
         def app_rollback():
             actions.append("app")
             return {"status": "app-rolled-back"}
-        with self.assertRaisesRegex(deploy.DeploymentRollbackError, "worker rollback could not be verified") as raised:
+        with self.assertRaisesRegex(deploy.DeploymentRollbackError, "worker rollback status was not reconciled") as raised:
             deploy.rollback_failed_release(worker_rollback, app_rollback)
         self.assertTrue(raised.exception.app_rolled_back)
+        self.assertFalse(raised.exception.worker_rolled_back)
         self.assertEqual(actions, ["worker", "app"])
+
+    def test_verified_legacy_app_restore_can_reconcile_lost_worker_rollback_ack(self):
+        result=deploy.rollback_failed_release(
+            lambda: (_ for _ in ()).throw(TimeoutError("SSH response lost")),
+            lambda: {"status":"app-rolled-back","worker_bundle_restored":True},
+        )
+        self.assertEqual(result["status"],"app-rolled-back")
 
     def test_rollback_waits_for_superseded_deployment_to_finish(self):
         samples = [
@@ -678,9 +686,12 @@ class RolloutTests(unittest.TestCase):
         with patch.dict(os.environ, {"TEST_DATABASE_URL": "postgres://disposable"}), patch.object(deploy, "run") as run_mock:
             deploy.run_release_tests()
         commands = [entry.args[0] for entry in run_mock.call_args_list]
+        self.assertEqual(len(commands), 3)
         self.assertEqual(commands[0][1:4], ["-m", "unittest", "discover"])
         self.assertIn("test_dokploy_worker_rollout.py", commands[0])
-        self.assertEqual(commands[1][1:5], ["test", "--locked", "--test", "first_join_flow"])
+        self.assertEqual(commands[1][1:4], ["-m", "unittest", "discover"])
+        self.assertIn("test_dokploy_legacy_baseline.py", commands[1])
+        self.assertEqual(commands[2][1:5], ["test", "--locked", "--test", "first_join_flow"])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = ROOT / "scripts/dokploy_worker_sync.py"
+LEGACY_REMOTE = ROOT / "scripts/dokploy_legacy_baseline.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 PROJECT = "kurbis-hoster-fbikvd"
 EXPECTED_SOURCE = ("github", "kurbis-host", "kurbis", "main", "./compose.yaml")
@@ -38,9 +39,10 @@ class DeploymentError(RuntimeError):
 
 
 class DeploymentRollbackError(DeploymentError):
-    def __init__(self, message: str, *, app_rolled_back: bool):
+    def __init__(self, message: str, *, app_rolled_back: bool, worker_rolled_back: bool = False):
         super().__init__(message)
         self.app_rolled_back = app_rolled_back
+        self.worker_rolled_back = worker_rolled_back
 
 
 def run(command: Sequence[str], *, input_text: str | None = None, cwd: Path | None = None, timeout: int | None = None) -> str:
@@ -257,6 +259,7 @@ def run_release_tests() -> None:
     if not os.environ.get("TEST_DATABASE_URL"):
         raise DeploymentError("TEST_DATABASE_URL is required for the disposable first-join database regression")
     run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_dokploy_worker_rollout.py"], cwd=ROOT, timeout=300)
+    run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_dokploy_legacy_baseline.py"], cwd=ROOT, timeout=300)
     run(["cargo", "test", "--locked", "--test", "first_join_flow", "--", "--test-threads=1"], cwd=ROOT, timeout=900)
 
 
@@ -303,6 +306,37 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
     return result
 
 
+def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
+                  expected_sources: dict | None = None, token: str | None = None,
+                  candidate_image_id: str | None = None, candidate_revision: str | None = None) -> dict:
+    command=["python3","-","--operation",operation]
+    for key,value in (("manifest-json",manifest),("expected-sources-json",expected_sources),
+                      ("token",token),("candidate-image-id",candidate_image_id),
+                      ("candidate-revision",candidate_revision)):
+        if value is not None:
+            command.extend([f"--{key}",value if isinstance(value,str) else json.dumps(value,separators=(",",":"))])
+    output=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=10",host,shlex.join(command)],
+               input_text=LEGACY_REMOTE.read_text(encoding="utf-8"),timeout=1800)
+    try:result=json.loads(output)
+    except json.JSONDecodeError as error:raise DeploymentError("respond5 legacy inventory verifier returned invalid JSON") from error
+    if not isinstance(result,dict):raise DeploymentError("respond5 legacy inventory verifier returned invalid result")
+    return result
+
+
+def legacy_wait_baseline(manifest: dict) -> dict[str,list[dict[str,str]]]:
+    inventory=manifest["expected_inventory"]
+    return {name:[{"id":item["container_id"],"image":item["image_id"],"status":item["status"],
+                   "health":item["health"],"revision":""}]
+            for name,item in inventory["services"].items()}
+
+
+def legacy_revision(manifest: dict) -> str:
+    value=manifest.get("source_revision_claim")
+    if value!="f6b05712bb130747060e5cfa049d84ed27020835":
+        raise DeploymentError("explicit legacy baseline manifest does not claim the reviewed f6b0571 inventory")
+    return value
+
+
 def update_build_revision(revision: str) -> None:
     info=compose_info()
     api("compose.saveEnvironment", {"composeId": COMPOSE_ID, "env": patch_env(str(info["env"]), {"BUILD_REVISION": revision})}, post=True)
@@ -323,10 +357,22 @@ def queue_and_wait_deployment(revision: str, title: str, timeout: int) -> str:
     return wait_deployment(revision,previous,timeout)
 
 
-def rollback_application(host: str, branch: str, revision: str, baseline: dict, token: str, timeout: int) -> str:
+def rollback_application(host: str, branch: str, revision: str, baseline: dict, token: str, timeout: int,
+                         *, legacy_manifest: dict | None = None, candidate_revision: str | None = None) -> dict:
     if not revision or len(revision)!=40:
         raise DeploymentError("prior running app revision is unavailable; cannot safely roll back production")
     tag=ensure_release_tag(revision)
+    if legacy_manifest is not None:
+        wait_for_terminal_deployments(timeout)
+        if candidate_revision is None or len(candidate_revision)!=40:
+            raise DeploymentError("failed-release source SHA is required to bound legacy rollback inventory")
+        sources=source_inputs(revision)
+        result=legacy_remote(host,"rollback-app",manifest=legacy_manifest,expected_sources=sources,token=token,
+                             candidate_revision=candidate_revision)
+        if result.get("status")!="app-rolled-back" or result.get("provenance_status")!="legacy-unproven":
+            raise DeploymentError("respond5 did not verify exact legacy app/worker digest rollback")
+        set_branch(branch)
+        return result
     wait_for_terminal_deployments(timeout)
     update_build_revision(revision)
     set_branch(tag)
@@ -335,7 +381,7 @@ def rollback_application(host: str, branch: str, revision: str, baseline: dict, 
     if checked.get("status")!="app-rolled-back":
         raise DeploymentError("respond5 did not verify restoration of the prior app revision")
     set_branch(branch)
-    return deployment_id
+    return {"status":"app-rolled-back","deployment_id":deployment_id}
 
 
 def dispatch_worker_wait(remote_call, rollback_call, on_attempt, **kwargs):
@@ -374,9 +420,13 @@ def rollback_failed_release(worker_rollback, app_rollback):
             raise DeploymentError(f"worker rollback failed ({worker_error}); app rollback failed ({app_error})") from app_error
         raise
     if worker_error:
+        worker_restored_by_app = bool(app.get("worker_bundle_restored"))
+        if worker_restored_by_app:
+            return app
         raise DeploymentRollbackError(
-            f"prior app revision was restored, but worker rollback could not be verified: {worker_error}",
+            f"prior app revision was restored; worker rollback status was not reconciled by the app baseline: {worker_error}",
             app_rolled_back=True,
+            worker_rolled_back=False,
         ) from worker_error
     return app
 
@@ -387,6 +437,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--compose-id", default=COMPOSE_ID)
     parser.add_argument("--worker-host", default="respond5")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--legacy-baseline-manifest", type=Path,
+                        help="explicit operator-reviewed inventory manifest for the one-time unlabelled respond5 migration")
     args = parser.parse_args(argv)
     token = secrets.token_hex(16)
     locked = staged = prepared = wait_attempted = deployment_attempted = finalization_attempted = marked = False
@@ -396,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     baseline_revision = ""
     baseline: dict | None = None
     receipt: dict | None = None
+    legacy_manifest: dict | None = None
     rollback_verified = False
     rollback_app_revision_restored = False
     try:
@@ -411,12 +464,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise DeploymentError("only approved Kurbis production Compose target is allowed")
             expected = source_inputs(commit)
             run_release_tests()
+            if args.legacy_baseline_manifest:
+                try:legacy_manifest=json.loads(args.legacy_baseline_manifest.read_text(encoding="utf-8"))
+                except (OSError,json.JSONDecodeError) as error:raise DeploymentError("legacy baseline manifest is unreadable or invalid JSON") from error
+                baseline_revision=legacy_revision(legacy_manifest)
+                # Publish the immutable rollback source ref before any worker or runtime mutation.
+                ensure_release_tag(baseline_revision)
             remote(args.worker_host, "lock", token=token)
             locked = True
-            preflight=remote(args.worker_host,"baseline-preflight")
-            if preflight.get("status")!="preflight" or not isinstance(preflight.get("snapshot"),dict):
-                raise DeploymentError("respond5 did not provide a safe pre-bootstrap snapshot")
-            baseline_revision=str(preflight.get("app_revision",""))
+            if legacy_manifest is not None:
+                # Explicit operator-selected bootstrap: the rollback source ref and exact inventory
+                # attestation precede any Dokploy environment, checkout, worker, or runtime mutation.
+                legacy_record=legacy_remote(args.worker_host,"bootstrap",manifest=legacy_manifest,token=token)
+                if legacy_record.get("status") not in {"recorded","already-recorded"}:
+                    raise DeploymentError("respond5 did not attest the exact legacy inventory")
+                baseline=legacy_wait_baseline(legacy_record["inventory"])
+            else:
+                preflight=remote(args.worker_host,"baseline-preflight")
+                if preflight.get("status")!="preflight" or not isinstance(preflight.get("snapshot"),dict):
+                    raise DeploymentError("respond5 did not provide a safe pre-bootstrap snapshot")
+                baseline_revision=str(preflight.get("app_revision",""))
             initial_config=compose_info()
             branch,old_env=str(initial_config.get("branch","main")),str(initial_config.get("env",""))
             if branch!="main":raise DeploymentError("Dokploy production source branch is not main")
@@ -427,28 +494,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             staged_result=remote(args.worker_host,"stage",token=token,revision=commit,expected=expected)
             if staged_result.get("status")!="staged" or staged_result.get("revision")!=commit:
                 raise DeploymentError("respond5 did not stage the exact tagged source tree")
-            # Migrate the legacy mutable Pumpkin reference before strict baseline verification.
-            # Rebuild the active app revision and require executable byte identity before retagging.
-            preflight_worker=str(preflight.get("worker_image",""))
-            baseline_pinned=f"melon-pumpkin:host-control-{baseline_revision}"
-            if preflight_worker!=baseline_pinned:
-                baseline_expected=source_inputs(baseline_revision)
-                ensure_release_tag(baseline_revision)
-                bootstrap_image=remote(args.worker_host,"build-pumpkin",token=token,revision=baseline_revision,expected=baseline_expected)
-                if bootstrap_image.get("status")!="built" or bootstrap_image.get("pumpkin_image")!=f"melon-pumpkin:host-control-{baseline_revision}":
-                    raise DeploymentError("could not build source-pinned Pumpkin for the active production revision")
-                baseline_upstream=run(["git","-C",str(ROOT),"show",f"{baseline_revision}:runtime/pumpkin/REVISION"]).strip()
-                bootstrapped=remote(args.worker_host,"bootstrap-worker-image",token=token,revision=baseline_revision,
-                                    pumpkin=bootstrap_image["pumpkin_image"],upstream=baseline_upstream)
-                if bootstrapped.get("status")!="bootstrapped":
-                    raise DeploymentError("legacy worker Pumpkin image was not safely migrated")
-            baseline_result=remote(args.worker_host,"baseline")
-            baseline=baseline_result.get("snapshot")
-            if baseline_result.get("status")!="snapshot" or not baseline:
-                raise DeploymentError("respond5 strict baseline service/worker lease check failed")
             pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected)
             if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
-                raise DeploymentError("respond5 host-control Pumpkin image is not pinned to source SHA")
+                raise DeploymentError("respond5 host-control Pumpkin image is not pinned to clean source SHA")
+            if legacy_manifest is not None:
+                compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
+                    token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
+                migrated=legacy_remote(args.worker_host,"bootstrap-worker",manifest=legacy_manifest,
+                    token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
+            else:
+                baseline_result=remote(args.worker_host,"baseline")
+                baseline=baseline_result.get("snapshot")
+                if baseline_result.get("status")!="snapshot" or not baseline:
+                    raise DeploymentError("respond5 strict baseline service/worker lease check failed")
             tag=ensure_release_tag(commit)
             set_branch(tag)
             update_build_revision(commit)
@@ -497,10 +557,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise DeploymentError("prior app snapshot was not verified; cannot safely accept mixed release state")
                 result=rollback_failed_release(
                     lambda:remote(args.worker_host,"rollback-worker",token=token),
-                    lambda:rollback_application(args.worker_host,branch,baseline_revision,baseline,token,args.timeout),
+                    lambda:rollback_application(args.worker_host,branch,baseline_revision,baseline,token,args.timeout,
+                                                legacy_manifest=legacy_manifest,candidate_revision=commit),
                 )
-                rollback_verified=result.get("status")=="app-rolled-back"
-                rollback_app_revision_restored=rollback_verified
+                rollback_app_revision_restored=result.get("status")=="app-rolled-back"
+                rollback_verified=rollback_app_revision_restored and bool(result.get("worker_bundle_restored"))
                 if result.get("status")=="already-accepted":marked=True
             except Exception as error:
                 rollback_app_revision_restored=bool(getattr(error,"app_rolled_back",False))
@@ -520,7 +581,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if compose_info().get("branch")!=branch:set_branch(branch)
                 if not marked:
                     if deployment_attempted and rollback_app_revision_restored and baseline_revision:
-                        update_build_revision(baseline_revision)
+                        if legacy_manifest is not None:
+                            restore_build_revision(old_env)
+                        else:
+                            update_build_revision(baseline_revision)
                     elif not rollback_verified:
                         restore_build_revision(old_env)
             except Exception as error:
