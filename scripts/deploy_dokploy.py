@@ -379,6 +379,13 @@ def update_build_revision(revision: str) -> None:
         raise DeploymentError("Dokploy BUILD_REVISION did not persist")
 
 
+def bootstrap_legacy_with_release_tag(revision: str, ensure_tag, bootstrap_call):
+    expected=f"kurbis-release-{revision}"
+    if ensure_tag(revision)!=expected:
+        raise DeploymentError("immutable candidate release tag does not resolve to the requested SHA")
+    return bootstrap_call()
+
+
 def queue_and_wait_deployment(revision: str, title: str, timeout: int) -> str:
     previous=assert_no_active_deployments()
     output=run([os.getenv("DOKPLOY_CLI", "dokploy"), "compose", "deploy", "--composeId", COMPOSE_ID,
@@ -547,8 +554,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if legacy_manifest is not None:
                 # Explicit operator-selected bootstrap: the rollback source ref and exact inventory
                 # attestation precede any Dokploy environment, checkout, worker, or runtime mutation.
-                legacy_record=legacy_remote(args.worker_host,"bootstrap",manifest=legacy_manifest,
-                    expected_sources=expected,token=token,candidate_revision=commit)
+                legacy_record=bootstrap_legacy_with_release_tag(
+                    commit,ensure_release_tag,
+                    lambda:legacy_remote(args.worker_host,"bootstrap",manifest=legacy_manifest,
+                        expected_sources=expected,token=token,candidate_revision=commit))
                 if legacy_record.get("status") not in {"recorded","already-recorded"}:
                     raise DeploymentError("respond5 did not attest the exact legacy inventory")
                 baseline=legacy_wait_baseline(legacy_record["inventory"])

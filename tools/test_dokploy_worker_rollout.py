@@ -581,6 +581,28 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("KEEP=value", saved[0])
         self.assertIs(state["autoDeploy"], False)
 
+    def test_fresh_release_tag_is_created_and_verified_before_legacy_bootstrap(self):
+        revision="f"*40
+        tag=f"kurbis-release-{revision}"
+        remote_tags=set()
+        events=[]
+        def ensure_tag(sha):
+            events.append("ensure-release-tag")
+            self.assertEqual(sha,revision)
+            remote_tags.add(tag)  # Simulates a fresh SHA with no prior remote tag.
+            return tag
+        def legacy_bootstrap():
+            events.append("legacy-bootstrap")
+            self.assertIn(tag,remote_tags,"attestation must follow creation/verification of the candidate tag")
+            return {"status":"already-recorded"}
+        result=deploy.bootstrap_legacy_with_release_tag(revision,ensure_tag,legacy_bootstrap)
+        self.assertEqual(result["status"],"already-recorded")
+        self.assertEqual(events,["ensure-release-tag","legacy-bootstrap"])
+
+    def test_legacy_bootstrap_refuses_candidate_tag_resolving_to_wrong_sha(self):
+        with self.assertRaisesRegex(deploy.DeploymentError,"does not resolve"):
+            deploy.bootstrap_legacy_with_release_tag("f"*40,lambda _sha:"kurbis-release-"+"e"*40,lambda:None)
+
     def test_lost_legacy_bootstrap_response_reconciles_before_predeploy_unlock(self):
         state={"worker":"legacy"};attempted=False
         def on_attempt():
