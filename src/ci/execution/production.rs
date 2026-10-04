@@ -14,7 +14,7 @@ pub const ROOTLESS_BUILD_LIMITS: SandboxLimits = SandboxLimits {
     cpu_millis: 2000,
     pid_limit: 512,
     disk_bytes: 5 * 1024 * 1024 * 1024,
-    process_timeout: Duration::from_secs(60 * 60),
+    process_timeout: Duration::from_secs(90 * 60),
 };
 
 /// Construct the complete host-owned rootless Docker pipeline. The returned pipeline
