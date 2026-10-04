@@ -7,6 +7,11 @@ export const metadata: Metadata = {
 		template: "%s · kurbis",
 	},
 	description: "A Minecraft server that wakes when friends join, sleeps when they leave, and snapshots the world in between.",
+	icons: {
+		icon: "/kurbis.svg",
+		shortcut: "/kurbis.svg",
+		apple: "/kurbis.svg",
+	},
 };
 
 export default function RootLayout({

@@ -7,6 +7,7 @@ import {
   Power,
 } from "lucide-react";
 import { redirect } from "next/navigation";
+import { KurbisLogo } from "../../components/kurbis-logo";
 import { VoxelDemo } from "../../components/voxel-demo";
 import { getSessionOrNull } from "../../lib/api/server";
 
@@ -29,10 +30,7 @@ export default async function LandingPage() {
           className="flex items-center gap-[11px] font-display text-[22px] leading-none font-[830] tracking-[-0.025em] no-underline"
           href="/"
         >
-          <span
-            className="relative size-[31px] rounded-[7px] bg-pumpkin shadow-[inset_-5px_-5px_0_rgba(94,35,10,0.25)] before:absolute before:top-[-4px] before:left-3 before:size-[7px] before:rounded-t-[2px] before:bg-grass"
-            aria-hidden="true"
-          />
+          <KurbisLogo size={32} className="size-[32px] rounded-[6px] shadow-[0_3px_0_rgba(94,35,10,0.25)]" />
           <span>kurbis</span>
         </a>
         <div className="flex items-center gap-6 text-sm font-[680] [&>a]:no-underline">

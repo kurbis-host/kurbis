@@ -17,6 +17,7 @@ import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { lifecycle } from "../lib/lifecycle";
 import { queryKeys, selectedServerId } from "../lib/query";
+import { KurbisLogo } from "./kurbis-logo";
 import { RevokeServerAccess } from "./revoke-server-access";
 
 type Server = components["schemas"]["Server"];
@@ -131,7 +132,7 @@ export function ServerPanelShell({
     <div className="grid min-h-screen grid-cols-[236px_minmax(0,1fr)] max-[860px]:block">
       <aside className="sticky top-0 flex h-screen flex-col border-r border-white/8 bg-[#302b25] px-4 pt-[22px] pb-[18px] text-[#f8f1df] max-[860px]:static max-[860px]:h-auto max-[860px]:border-r-0 max-[860px]:px-3.5 max-[860px]:pt-3 max-[860px]:pb-0">
         <Link className="flex items-center gap-[11px] px-2 pt-[5px] pb-[18px] font-display text-[21px] font-[820] tracking-[-0.02em] no-underline" href={scoped ? root : "/app/servers"}>
-          <span aria-hidden="true" className="relative grid size-[30px] place-items-center rounded-[7px] bg-pumpkin shadow-[inset_-5px_-5px_0_rgba(90,35,12,0.24)] before:absolute before:top-[-4px] before:left-1/2 before:size-[7px] before:-translate-x-1/2 before:rounded-t-[2px] before:bg-grass" />
+          <KurbisLogo size={30} className="size-[30px] rounded-[6px] shadow-[0_3px_0_rgba(90,35,12,0.24)]" />
           <span>kurbis</span>
         </Link>
 
