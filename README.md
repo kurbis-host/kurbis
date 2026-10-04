@@ -148,8 +148,19 @@ other hostnames, configure `BEDROCK_TLS_CERT_FILE` and
 server subdomains.
 
 The Docker Compose deployment publishes the panel on `PANEL_PORT`, Java on
-`JAVA_PORT`, and Bedrock TCP and UDP on `BEDROCK_PORT`. Put an HTTPS reverse
-proxy in front of the panel port and point `PUBLIC_BASE_URL` at that HTTPS origin. Open
+`JAVA_PORT`, and Bedrock TCP and UDP on `BEDROCK_PORT`. For Docker deployments,
+`BEDROCK_TLS_HOST_DIRECTORY` must point to a host directory containing
+`fullchain.pem` and `privkey.pem`; Compose mounts that directory read-only at
+`/run/kurbis-tls` and configures the gateway to use those files. Provide a
+certificate trusted for `ROOT_DOMAIN` and its server subdomains. The private key
+must be readable by the gateway's container UID/GID `2613:2613` without granting
+world access (for example, a root-owned key with group `2613`, mode `0640`, and
+traversable parent directories or an equivalent ACL). Do not make the key
+world-readable to work around container permissions. The Docker gateway does not
+generate production certificates.
+
+Put an HTTPS reverse proxy in front of the panel port and point `PUBLIC_BASE_URL`
+at that HTTPS origin. Open
 the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
 `WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
 quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the

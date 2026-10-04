@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import stat
 import tempfile
@@ -277,10 +278,14 @@ class RolloutTests(unittest.TestCase):
             (checkout / ".dockerignore").write_text(".env*\n")
             (checkout / "web/.dockerignore").write_text(".env*\n")
             env_file = checkout / ".env"
-            env_file.write_text("BUILD_REVISION=" + revision + "\nBEDROCK_TLS_HOST_DIRECTORY=/srv/kurbis/certs\nPANEL_BIND_ADDRESS=127.0.0.1\n")
+            env_file.write_text("BUILD_REVISION=" + revision + "\nBEDROCK_TLS_HOST_DIRECTORY=/srv/kurbis/certs\nPANEL_BIND_ADDRESS=127.0.0.1\nROOT_DOMAIN=kurbis.host\nBEDROCK_PORT=19132\n")
             config = {"services": {
                 "control-plane": {"image": "app:local", "build": {"context": str(checkout), "args": {"BUILD_REVISION": revision}}},
-                "gateway": {"image": "app:local"},
+                "gateway": {"image": "app:local", "user": "2613:2613",
+                    "environment": {"BEDROCK_TLS_CERT_FILE": "/run/kurbis-tls/fullchain.pem",
+                                    "BEDROCK_TLS_KEY_FILE": "/run/kurbis-tls/privkey.pem"},
+                    "ports": [{"published": "19132", "target": 19132, "protocol": protocol} for protocol in ("tcp", "udp")],
+                    "volumes": [{"type": "bind", "source": "/srv/kurbis/certs", "target": "/run/kurbis-tls", "read_only": True}]},
                 "panel": {"build": {"context": str(checkout / "web"), "args": {"BUILD_REVISION": revision}}, "ports": [{"host_ip": "127.0.0.1"}]},
                 "waiting-pumpkin": {"build": {"context": str(checkout), "dockerfile": "runtime/pumpkin/Dockerfile", "target": "waiting", "args": {"BUILD_REVISION": revision}}},
                 "postgres": {},
@@ -297,7 +302,7 @@ class RolloutTests(unittest.TestCase):
                 if "compose" in args and "config" in args:
                     return json.dumps(config)
                 raise AssertionError(args)
-            with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"):
+            with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"), patch.object(sync, "verify_bedrock_tls_assets"):
                 sync.verify_build_context(checkout, revision, expected)
                 config["services"]["waiting-pumpkin"]["build"]["target"] = "host-control"
                 with self.assertRaises(sync.Error):
@@ -705,6 +710,43 @@ class RolloutTests(unittest.TestCase):
     def test_deployment_gate_rejects_existing_active_run(self):
         with patch.object(deploy, "deployment_list", return_value=[{"deploymentId": "active", "status": "running"}]), self.assertRaises(deploy.DeploymentError):
             deploy.assert_no_active_deployments()
+
+    def test_bedrock_tls_preflight_rejects_world_readable_private_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tls=Path(directory);(tls/"fullchain.pem").write_text("certificate fixture")
+            key=tls/"privkey.pem";key.write_text("private-key fixture");key.chmod(0o644)
+            gateway_id="a"*64
+            inspected=json.dumps([{"Mounts":[{"Destination":"/run/kurbis-tls","Source":str(tls),"RW":False}]}])
+            with patch.object(sync,"run",side_effect=[gateway_id,inspected]):
+                with self.assertRaisesRegex(sync.Error,"must not be accessible to other"):
+                    sync.verify_bedrock_tls_assets({},str(tls),"example.test")
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is needed to render the production Compose fixture")
+    def test_rendered_production_compose_has_required_read_only_bedrock_tls_and_ports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rendered_env=Path(directory)/"production.env"
+            values={}
+            for line in (ROOT/".env.example").read_text(encoding="utf-8").splitlines():
+                if line and not line.lstrip().startswith("#") and "=" in line:
+                    key,value=line.split("=",1);values[key]=value
+            values.update({"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","BEDROCK_PORT":"19132",
+                           "JAVA_PORT":"25565","BUILD_REVISION":"a"*40})
+            rendered_env.write_text("".join(f"{key}={value}\n" for key,value in values.items()),encoding="utf-8")
+            output=subprocess.run([shutil.which("docker"),"compose","--env-file",str(rendered_env),
+                "-f",str(ROOT/"compose.yaml"),"config","--format","json"],
+                cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            self.assertEqual(output.returncode,0,output.stderr)
+            services=json.loads(output.stdout)["services"]
+            sync.verify_gateway_tls_configuration(services,"/srv/kurbis/certs","19132")
+            gateway=services["gateway"]
+            self.assertEqual(gateway["environment"]["BEDROCK_TLS_CERT_FILE"],"/run/kurbis-tls/fullchain.pem")
+            self.assertEqual(gateway["environment"]["BEDROCK_TLS_KEY_FILE"],"/run/kurbis-tls/privkey.pem")
+            mount=next(v for v in gateway["volumes"] if v.get("target")=="/run/kurbis-tls")
+            self.assertTrue(mount["read_only"])
+            self.assertEqual(mount["source"],"/srv/kurbis/certs")
+            broken=json.loads(json.dumps(services));next(v for v in broken["gateway"]["volumes"] if v.get("target")=="/run/kurbis-tls")["read_only"]=False
+            with self.assertRaisesRegex(sync.Error,"mounted read-only"):
+                sync.verify_gateway_tls_configuration(broken,"/srv/kurbis/certs","19132")
 
     def test_first_join_regression_is_part_of_release_gate(self):
         test_file = ROOT / "tests/first_join_flow.rs"

@@ -550,6 +550,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             staged_result=remote(args.worker_host,"stage",token=token,revision=commit,expected=expected)
             if staged_result.get("status")!="staged" or staged_result.get("revision")!=commit:
                 raise DeploymentError("respond5 did not stage the exact tagged source tree")
+            tls_context=remote(args.worker_host,"verify-build-context",token=token,revision=commit,expected=expected)
+            if tls_context.get("status")!="build-context-verified" or tls_context.get("revision")!=commit:
+                raise DeploymentError("Respond5 did not verify release build inputs and Bedrock TLS assets before deployment")
             pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected)
             if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
                 raise DeploymentError("respond5 host-control Pumpkin image is not pinned to clean source SHA")

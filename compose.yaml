@@ -90,6 +90,8 @@ services:
       JAVA_LISTEN: 0.0.0.0:25565
       BEDROCK_LISTEN: 0.0.0.0:19132
       BEDROCK_PUBLIC_PORT: ${BEDROCK_PORT}
+      BEDROCK_TLS_CERT_FILE: /run/kurbis-tls/fullchain.pem
+      BEDROCK_TLS_KEY_FILE: /run/kurbis-tls/privkey.pem
       WAITING_JAVA_ADDRESS: ${WAITING_IP}:25566
       WAITING_BEDROCK_ADDRESS: ${WAITING_IP}:19133
       WAITING_SIGNAL_ADDRESS: ${WAITING_IP}:19132
@@ -104,6 +106,12 @@ services:
       - ${BEDROCK_PORT}:19132/udp
     volumes:
       - waiting-control:/run/kurbis-gateway:ro
+      - type: bind
+        source: ${BEDROCK_TLS_HOST_DIRECTORY:-./data/certs}
+        target: /run/kurbis-tls
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       control-plane:
         condition: service_healthy
