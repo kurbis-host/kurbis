@@ -18,6 +18,7 @@ pub struct CiPollerConfig {
     pub patch_fingerprint: String,
     pub toolchain_version: String,
     pub target_architecture: String,
+    pub public_status_base_url: Option<String>,
 }
 impl Default for CiPollerConfig {
     fn default() -> Self {
@@ -26,6 +27,7 @@ impl Default for CiPollerConfig {
             patch_fingerprint: "checked-in-host-control".into(),
             toolchain_version: "native".into(),
             target_architecture: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            public_status_base_url: None,
         }
     }
 }
@@ -83,7 +85,16 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .poll_repository(repository_id, self.source.as_ref())
             .await?;
         let repository_name = self.repository_name(repository_id).await?;
+        // Branch deletion is actionable only after a complete branch poll has
+        // durably marked refs deleted. Pull-request close is intentionally not
+        // mapped to preview teardown.
+        self.repository
+            .expire_deleted_branch_aliases(repository_id)
+            .await?;
         for source_ref in poll.refs {
+            if source_ref.deleted {
+                continue;
+            }
             let kind = match source_ref.kind {
                 SourceRefKind::PullRequest => CiRefKind::PullRequest,
                 SourceRefKind::Branch => CiRefKind::Branch,
@@ -191,6 +202,19 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 .repository
                 .build_diagnostics(candidate.build_id, &self.config.root_domain)
                 .await?;
+            let details_url = self
+                .config
+                .public_status_base_url
+                .as_ref()
+                .and_then(|base| {
+                    CiHostname::for_ref(
+                        CiRefKind::Commit,
+                        &candidate.key.commit_sha,
+                        &self.config.root_domain,
+                    )
+                    .ok()
+                    .map(|alias| format!("{base}/{}", alias.value))
+                });
             let details = CheckRunDetails {
                 commit_sha: candidate.key.commit_sha.clone(),
                 stage: candidate.stage,
@@ -208,6 +232,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .collect(),
                 preview_hostnames,
                 expires_at: Some(expires_at.to_rfc3339()),
+                details_url,
             };
             match check_runs
                 .update(
@@ -250,6 +275,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         {
             return Ok(());
         }
+        let details_url = self
+            .config
+            .public_status_base_url
+            .as_ref()
+            .map(|base| format!("{base}/{}", commit_alias.value));
         let details = CheckRunDetails {
             commit_sha: source_ref.commit_sha.clone(),
             stage: CiBuildStage::Queued,
@@ -260,6 +290,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             build_log: String::new(),
             preview_hostnames: vec![commit_alias.value.clone(), stable_alias.value.clone()],
             expires_at: None,
+            details_url,
         };
         match check_runs.get_or_create(repository, &details).await {
             Ok(check_run) => {

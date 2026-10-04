@@ -218,6 +218,32 @@ impl SourceWorkspace {
     }
 }
 
+fn validate_global_pax_header<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<(), ArchiveError> {
+    const MAX_GLOBAL_PAX_BYTES: u64 = 64 * 1024;
+    if entry.size() > MAX_GLOBAL_PAX_BYTES {
+        return Err(ArchiveError::Limit);
+    }
+    let extensions = entry
+        .pax_extensions()?
+        .ok_or_else(|| ArchiveError::Invalid("global PAX header has no records".into()))?;
+    for extension in extensions {
+        let extension = extension?;
+        // GitHub's codeload tarballs include a benign commit `comment` global
+        // header. Reject every other global attribute: global `path`, `size`,
+        // link, sparse, ownership, and permission overrides complicate the
+        // archive parser's security model and are unnecessary for source code.
+        if extension.key_bytes() != b"comment" {
+            return Err(ArchiveError::Invalid(
+                "source archive contains an unsupported global PAX attribute".into(),
+            ));
+        }
+        if extension.value_bytes().len() > 1024 {
+            return Err(ArchiveError::Limit);
+        }
+    }
+    Ok(())
+}
+
 pub fn unpack_source_archive(bytes: &[u8]) -> Result<SourceWorkspace, ArchiveError> {
     let _preprocess_guard = archive_preprocess_guard();
     if bytes.is_empty() || bytes.len() > MAX_COMPRESSED_SOURCE_BYTES {
@@ -239,6 +265,10 @@ pub fn unpack_source_archive(bytes: &[u8]) -> Result<SourceWorkspace, ArchiveErr
 
     for entry in entries {
         let mut entry = entry?;
+        if entry.header().entry_type().is_pax_global_extensions() {
+            validate_global_pax_header(&mut entry)?;
+            continue;
+        }
         entry_count += 1;
         if entry_count > MAX_SOURCE_ENTRIES {
             return Err(ArchiveError::Limit);
@@ -318,7 +348,9 @@ pub fn unpack_source_archive(bytes: &[u8]) -> Result<SourceWorkspace, ArchiveErr
                 set_safe_mode(&target, 0o755)?;
             }
             kind if kind.is_file() => {
-                let size = entry.header().size()?;
+                // `Entry::size` includes validated per-file PAX overrides;
+                // header.size alone may be stale when an archive uses PAX.
+                let size = entry.size();
                 if size > MAX_SOURCE_FILE_BYTES {
                     return Err(ArchiveError::Limit);
                 }
@@ -568,6 +600,34 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn global_pax_archive(source: &[u8], key: &str, value: &str) -> Vec<u8> {
+        let body = format!("{key}={value}\n");
+        let mut length = body.len() + 2;
+        let record = loop {
+            let record = format!("{length} {body}");
+            if record.len() == length {
+                break record.into_bytes();
+            }
+            length = record.len();
+        };
+        let mut header = Header::new_gnu();
+        header.set_path("pax_global_header").unwrap();
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_size(record.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut raw = header.as_bytes().to_vec();
+        raw.extend_from_slice(&record);
+        let padding = (512 - (record.len() % 512)) % 512;
+        raw.resize(raw.len() + padding, 0);
+        let mut source_tar = Vec::new();
+        GzDecoder::new(source).read_to_end(&mut source_tar).unwrap();
+        raw.extend_from_slice(&source_tar);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn archive(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
@@ -660,6 +720,31 @@ mod tests {
             .unwrap(),
             b"pub fn trusted_source() {}"
         );
+    }
+
+    #[test]
+    fn extraction_ignores_only_a_bounded_benign_github_global_pax_comment() {
+        let source = archive(&[
+            ("Pumpkin/", tar::EntryType::Directory, b""),
+            (
+                "Pumpkin/Cargo.toml",
+                tar::EntryType::Regular,
+                b"[workspace]",
+            ),
+        ]);
+        let wrapped = global_pax_archive(&source, "comment", "validated-fixture-commit");
+        let workspace = unpack_source_archive(&wrapped).unwrap();
+        assert_eq!(
+            fs::read(workspace.path().join("Cargo.toml")).unwrap(),
+            b"[workspace]"
+        );
+    }
+
+    #[test]
+    fn extraction_rejects_global_pax_path_overrides() {
+        let source = archive(&[("Cargo.toml", tar::EntryType::Regular, b"[workspace]")]);
+        let wrapped = global_pax_archive(&source, "path", "../../escape");
+        assert!(unpack_source_archive(&wrapped).is_err());
     }
 
     #[test]

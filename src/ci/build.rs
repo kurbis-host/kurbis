@@ -58,6 +58,7 @@ pub struct ControlledBuildPipeline<S, P, B, A> {
     artifacts: Arc<A>,
     limits: SandboxLimits,
     root_domain: String,
+    public_status_base_url: Option<String>,
     check_runs: Option<Arc<dyn CheckRunClient>>,
 }
 
@@ -84,12 +85,18 @@ where
             artifacts,
             limits,
             root_domain: crate::ci::CI_ROOT_DOMAIN.into(),
+            public_status_base_url: None,
             check_runs: None,
         }
     }
 
     pub fn with_root_domain(mut self, root_domain: impl Into<String>) -> Self {
         self.root_domain = root_domain.into();
+        self
+    }
+
+    pub fn with_public_status_base_url(mut self, value: impl Into<String>) -> Self {
+        self.public_status_base_url = Some(value.into().trim_end_matches('/').to_owned());
         self
     }
 
@@ -134,6 +141,15 @@ where
             }
         };
         let diagnostics = tail_utf8_bytes(&build_log, 6 * 1024);
+        let details_url = self.public_status_base_url.as_ref().and_then(|base| {
+            crate::ci::CiHostname::for_ref(
+                crate::ci::CiRefKind::Commit,
+                &key.commit_sha,
+                &self.root_domain,
+            )
+            .ok()
+            .map(|alias| format!("{base}/{}", alias.value))
+        });
         let details = CheckRunDetails {
             commit_sha: key.commit_sha.clone(),
             stage,
@@ -144,6 +160,7 @@ where
             build_log: diagnostics,
             preview_hostnames,
             expires_at: Some(expires_at.to_rfc3339()),
+            details_url,
         };
         match client
             .update(&key.repository, CheckRunId(check_id), &details)

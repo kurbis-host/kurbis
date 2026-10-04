@@ -44,15 +44,18 @@ and must not be triggered by source-controlled build files.
 The CI control-plane container does not receive a host Docker socket. It uses
 Docker's SSH transport to one dedicated Linux account running a rootless Docker
 daemon. Provision the dedicated builder host with enough disk for the pinned toolchain
-image and rootless Docker data root. Per-build source, target, and Cargo scratch
-are volatile bounded tmpfs mounts; only the immutable builder image and bounded
-Docker logs persist on the host. The Kurbis startup probe rejects builders whose cgroup v2,
-user namespace, CPU/memory/PID controls, no-egress policy, read-only image root,
-or bounded workspace tmpfs do not pass disposable workload tests. Builder
-workspaces use a per-container `tmpfs` cap sized to the configured build disk
-budget; input, `/tmp`, and `/dev/shm` caps are deducted from that same budget.
-This avoids reliance on rootless Docker's unsupported overlay `--storage-opt`
-while preserving a hard bound on writable build storage.
+image and rootless Docker data root. Per-build source, target, and temporary scratch
+are volatile bounded tmpfs mounts. The pre-seeded Cargo package/git cache remains
+in the immutable image and is read-only to workloads; only the image and bounded
+Docker logs persist on the host. Compilation is serialized, with release LTO
+disabled and 16 codegen units to fit the builder's memory limit. The Kurbis
+startup probe rejects builders whose cgroup v2, user namespace, CPU/memory/PID
+controls, no-egress policy, read-only image root, or bounded workspace tmpfs do
+not pass disposable workload tests. Builder workspaces use a per-container
+tmpfs cap sized to the configured build disk budget; input, `/tmp`, and
+`/dev/shm` caps are deducted from that same budget. This avoids reliance on
+rootless Docker's unsupported overlay `--storage-opt` while preserving a hard
+bound on writable build storage.
 
 Use a dedicated SSH key with access only to this rootless builder account. In the
 repository's ignored `deployment/ci-builder-ssh/` directory, provide an OpenSSH

@@ -32,6 +32,7 @@ pub struct CheckRunDetails {
     pub build_log: String,
     pub preview_hostnames: Vec<String>,
     pub expires_at: Option<String>,
+    pub details_url: Option<String>,
 }
 impl CheckRunDetails {
     pub fn validate(&self) -> Result<(), CheckRunError> {
@@ -40,6 +41,22 @@ impl CheckRunDetails {
             return Err(CheckRunError::Invalid(
                 "invalid repository or hostname count".into(),
             ));
+        }
+        if let Some(details_url) = self.details_url.as_deref() {
+            let url = reqwest::Url::parse(details_url).map_err(|error| {
+                CheckRunError::Invalid(format!("invalid Check Run details URL: {error}"))
+            })?;
+            if url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(CheckRunError::Invalid(
+                    "Check Run details URL must be an HTTPS link without credentials or fragments"
+                        .into(),
+                ));
+            }
         }
         if self
             .failure_message
@@ -100,6 +117,7 @@ pub trait CheckRunClient: Send + Sync {
 pub struct GitHubCheckRunClient {
     client: Client,
     api_base_url: String,
+    details_base_url: Option<String>,
     token: String,
 }
 impl GitHubCheckRunClient {
@@ -111,13 +129,51 @@ impl GitHubCheckRunClient {
         Ok(Self {
             client,
             api_base_url: "https://api.github.com".into(),
+            details_base_url: None,
             token,
         })
     }
+    pub fn with_details_base_url(
+        mut self,
+        value: impl Into<String>,
+    ) -> Result<Self, CheckRunError> {
+        let value = value.into();
+        let url = reqwest::Url::parse(&value).map_err(|error| {
+            CheckRunError::Invalid(format!("invalid Check Run details URL: {error}"))
+        })?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(CheckRunError::Invalid(
+                "Check Run details base must be an HTTPS URL without credentials, query, or fragment".into(),
+            ));
+        }
+        self.details_base_url = Some(value.trim_end_matches('/').to_owned());
+        Ok(self)
+    }
+
     pub fn with_api_base_url(mut self, value: impl Into<String>) -> Self {
         self.api_base_url = value.into().trim_end_matches('/').into();
         self
     }
+    fn payload(&self, details: &CheckRunDetails) -> CheckRunPayload {
+        let mut payload = payload(details);
+        if payload.details_url.is_none()
+            && let Some(base) = self.details_base_url.as_deref()
+            && let Some(hostname) = details
+                .preview_hostnames
+                .iter()
+                .find(|hostname| hostname.starts_with("commit-"))
+        {
+            payload.details_url = Some(format!("{base}/{hostname}"));
+        }
+        payload
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method, format!("{}{}", self.api_base_url, path))
@@ -219,7 +275,7 @@ fn payload(details: &CheckRunDetails) -> CheckRunPayload {
         head_sha: details.commit_sha.clone(),
         status,
         conclusion,
-        details_url: None,
+        details_url: details.details_url.clone(),
         output: CheckRunOutput {
             title: "Pumpkin CI build".into(),
             summary,
@@ -275,7 +331,7 @@ impl CheckRunClient for GitHubCheckRunClient {
                 reqwest::Method::POST,
                 &format!("/repos/{owner}/{name}/check-runs"),
             )
-            .json(&payload(details))
+            .json(&self.payload(details))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -334,7 +390,7 @@ impl CheckRunClient for GitHubCheckRunClient {
                 reqwest::Method::PATCH,
                 &format!("/repos/{owner}/{name}/check-runs/{}", id.0),
             )
-            .json(&payload(details))
+            .json(&self.payload(details))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -348,6 +404,42 @@ impl CheckRunClient for GitHubCheckRunClient {
 mod tests {
     use super::*;
     #[test]
+    fn check_run_details_link_uses_only_the_public_commit_status_page() {
+        let client = GitHubCheckRunClient::new(Client::new(), "fixture-token")
+            .unwrap()
+            .with_details_base_url("https://panel.example.test/ci/previews")
+            .unwrap();
+        let details = CheckRunDetails {
+            commit_sha: "a".repeat(40),
+            stage: CiBuildStage::Queued,
+            repository: "kurbis-host/Pumpkin".into(),
+            artifact_digest: None,
+            failure_stage: None,
+            failure_message: None,
+            build_log: String::new(),
+            preview_hostnames: vec![
+                "commit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pumpkin.kurbis.host".into(),
+                "branch-feature-123456789abc.pumpkin.kurbis.host".into(),
+            ],
+            expires_at: None,
+            details_url: None,
+        };
+        let payload = client.payload(&details);
+        assert_eq!(
+            payload.details_url.as_deref(),
+            Some(
+                "https://panel.example.test/ci/previews/commit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pumpkin.kurbis.host"
+            )
+        );
+        assert!(
+            client
+                .clone()
+                .with_details_base_url("http://panel.example.test")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn check_run_escapes_untrusted_build_diagnostics_as_plain_text() {
         let details = CheckRunDetails {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -359,6 +451,7 @@ mod tests {
             build_log: "![x](https://evil.example)".into(),
             preview_hostnames: Vec::new(),
             expires_at: None,
+            details_url: None,
         };
         let payload = payload(&details);
         assert!(!payload.output.summary.contains("https://evil.example"));
@@ -379,6 +472,7 @@ mod tests {
             build_log: String::new(),
             preview_hostnames: vec![],
             expires_at: None,
+            details_url: None,
         };
         let p = payload(&details);
         assert_eq!(p.status, CheckRunStatus::Completed);

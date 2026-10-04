@@ -41,20 +41,29 @@ async fn main() -> Result<()> {
             std::sync::Arc::new(github_polling),
             ci_config.github_pat.clone(),
         )?;
-        let check_runs =
-            std::sync::Arc::new(GitHubCheckRunClient::new(client, ci_config.github_pat)?);
+        let public_status_base_url = format!(
+            "{}/ci/previews",
+            config.public_base_url.trim_end_matches('/')
+        );
+        let check_runs = std::sync::Arc::new(
+            GitHubCheckRunClient::new(client, ci_config.github_pat)?
+                .with_details_base_url(public_status_base_url.clone())?,
+        );
         let artifacts =
             std::sync::Arc::new(ObjectArtifactCache::new(pool.clone(), object_store.clone()));
-        let pipeline = std::sync::Arc::new(docker_pipeline(
-            CiPreviewRepository::new(pool.clone()),
-            std::sync::Arc::new(source.clone()),
-            artifacts.clone(),
-            ci_config.builder_image.clone(),
-            ci_config.builder_docker_host.clone(),
-            ci_config.toolchain_version.clone(),
-            ci_config.plugin_source.clone(),
-            Some(check_runs.clone()),
-        )?);
+        let pipeline = std::sync::Arc::new(
+            docker_pipeline(
+                CiPreviewRepository::new(pool.clone()),
+                std::sync::Arc::new(source.clone()),
+                artifacts.clone(),
+                ci_config.builder_image.clone(),
+                ci_config.builder_docker_host.clone(),
+                ci_config.toolchain_version.clone(),
+                ci_config.plugin_source.clone(),
+                Some(check_runs.clone()),
+            )?
+            .with_public_status_base_url(public_status_base_url.clone()),
+        );
         ci_build_coordinator = Some(pipeline.clone());
         let expiry_repository = ci_repository.clone();
         let runtime_repository = CiPreviewRuntimeRepository::new(pool.clone());
@@ -92,6 +101,7 @@ async fn main() -> Result<()> {
                     patch_fingerprint: ci_config.patch_fingerprint.clone(),
                     toolchain_version: ci_config.toolchain_version.clone(),
                     target_architecture: ci_config.target_architecture.clone(),
+                    public_status_base_url: Some(public_status_base_url),
                 })
                 .with_builder(pipeline)
                 .run_forever(

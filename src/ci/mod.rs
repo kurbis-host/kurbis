@@ -11,8 +11,8 @@ pub mod source_control;
 
 pub use domain::{
     BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CiBuild, CiBuildStage, CiHostname, CiPreview,
-    CiPreviewState, CiRefKind, InvalidCiValue, POLL_INTERVAL_SECONDS, normalize_root_domain,
-    parse_pr_number, slugify_branch, validate_commit_sha,
+    CiPreviewState, CiPublicPreviewStatus, CiRefKind, InvalidCiValue, POLL_INTERVAL_SECONDS,
+    normalize_root_domain, parse_pr_number, slugify_branch, validate_commit_sha,
 };
 pub use execution::{
     CheckedInPumpkinPatcher, DockerRootlessBuildRuntime, GitHubExactSource,

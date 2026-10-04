@@ -519,6 +519,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/ci/previews/{preview_id}/players", get(ci_runtime_public::players))
         .route("/internal/ci/previews/{preview_id}/commands", post(ci_runtime_public::command))
         .route("/internal/ci/previews/status/{hostname}", get(ci::status))
+        .route("/public/ci/previews/{hostname}", get(ci::public_status))
         .route("/internal/ci/previews/admit", post(ci::admit))
         .route(
             "/internal/minecraft-login-links",

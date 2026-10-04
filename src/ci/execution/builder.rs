@@ -1,18 +1,13 @@
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::Context;
-use flate2::{Compression, write::GzEncoder};
-use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
     sync::Semaphore,
     time::{timeout, timeout as tokio_timeout},
 };
@@ -27,7 +22,6 @@ use super::archive::{MAX_ARTIFACT_BYTES, pack_source_archive};
 
 const MAX_BUILD_LOG_BYTES: usize = 512 * 1024;
 const MAX_FAILURE_LOG_BYTES: usize = 8 * 1024;
-const MAX_PLUGIN_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const BUILD_SCRIPT: &str = r#"
 set -eu
 actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
@@ -35,20 +29,20 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
     echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
     exit 78
 }
-mkdir -p /work/source /work/plugin /work/out /work/tmp /work/cargo
+mkdir -p /work/source /work/plugin /work/out /work/tmp
 export TMPDIR=/work/tmp
-export CARGO_HOME=/work/cargo
-cp -a /usr/local/cargo/registry /work/cargo/registry
-if [ -d /usr/local/cargo/git ]; then cp -a /usr/local/cargo/git /work/cargo/git; fi
+# The image cache is immutable and already contains every locked offline input.
+# Avoid duplicating several GiB into the memory-backed workspace.
+export CARGO_HOME=/usr/local/cargo
 # Only bounded archives created by trusted control-plane preprocessing and the
 # checked-in plugin packer reach this offline extraction step.
 tar -xzf /input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
 tar -xzf /input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 cd /work/source
-cargo build --locked --offline --release --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo build --locked --offline --release --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
 # Source-controlled build scripts may leave background processes behind.
@@ -172,11 +166,7 @@ impl DockerRootlessBuildRuntime {
                     "builder inputs leave no quota for build workspace".into(),
                 )
             })?;
-        let workspace_options = if allow_workspace_exec {
-            "rw,nosuid,nodev"
-        } else {
-            "rw,noexec,nosuid,nodev"
-        };
+        let workspace_options = workspace_tmpfs_options(allow_workspace_exec);
         let mut create = docker_command(&self.docker_host);
         create.arg("create").arg("--pull=never");
         if let Some(target) = target {
@@ -551,8 +541,11 @@ impl DockerRootlessBuildRuntime {
                     "KURBIS_EXPECTED_RUSTC",
                     "KURBIS_RUST_TARGET",
                     "CARGO_NET_OFFLINE",
+                    "CARGO_BUILD_JOBS",
+                    "CARGO_PROFILE_RELEASE_LTO",
+                    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
                 ],
-                &[&self.expected_rustc, target, "true"],
+                &[&self.expected_rustc, target, "true", "1", "false", "16"],
                 source_archive.len().saturating_add(plugin_archive.len()),
                 true,
             )
@@ -855,351 +848,11 @@ where
     }
 }
 
-fn default_build_limits() -> SandboxLimits {
-    SandboxLimits {
-        memory_bytes: 8 * 1024 * 1024 * 1024,
-        cpu_millis: 2000,
-        pid_limit: 512,
-        disk_bytes: 5 * 1024 * 1024 * 1024,
-        process_timeout: Duration::from_secs(60 * 60),
-    }
-}
-
-pub fn toolchain_identity(image: &str, rustc_release: &str) -> anyhow::Result<String> {
-    let (name, digest) = image
-        .rsplit_once("@sha256:")
-        .context("builder image must be pinned by sha256 digest")?;
-    anyhow::ensure!(
-        !name.is_empty()
-            && digest.len() == 64
-            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && !image.chars().any(char::is_whitespace),
-        "builder image must be pinned by a valid sha256 digest"
-    );
-    anyhow::ensure!(
-        valid_rustc_release(rustc_release),
-        "invalid expected Rust release"
-    );
-    Ok(format!("rustc-{rustc_release}@sha256:{digest}"))
-}
-
-fn rustc_release_from_identity(image: &str, identity: &str) -> anyhow::Result<String> {
-    let (prefix, image_digest) = identity
-        .split_once("@sha256:")
-        .context("CI toolchain identity must include the builder image digest")?;
-    let release = prefix
-        .strip_prefix("rustc-")
-        .context("CI toolchain identity must include an exact rustc release")?;
-    anyhow::ensure!(
-        valid_rustc_release(release),
-        "invalid expected Rust release"
-    );
-    let (_, expected_digest) = image
-        .rsplit_once("@sha256:")
-        .context("builder image must be pinned by sha256 digest")?;
-    anyhow::ensure!(
-        image_digest.eq_ignore_ascii_case(expected_digest),
-        "CI toolchain identity is for a different builder image"
-    );
-    Ok(release.to_owned())
-}
-
-fn valid_rustc_release(release: &str) -> bool {
-    let parts = release.split('.').collect::<Vec<_>>();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-fn docker_command(docker_host: &str) -> Command {
-    let mut command = Command::new("docker");
-    command.args(["--host", docker_host]);
-    command
-}
-
-fn docker_platform(target: &str) -> Result<&'static str, BuildPipelineError> {
-    match target {
-        "x86_64-unknown-linux-gnu" => Ok("linux/amd64"),
-        "aarch64-unknown-linux-gnu" => Ok("linux/arm64"),
-        _ => Err(BuildPipelineError::Compile(format!(
-            "unsupported native Linux target {target}"
-        ))),
-    }
-}
-
-fn accessible_directory(path: &Path, label: &str) -> Result<PathBuf, BuildPipelineError> {
-    let path = fs::canonicalize(path).map_err(|error| {
-        BuildPipelineError::Sandbox(format!("invalid {label} directory: {error}"))
-    })?;
-    if !path.is_dir() {
-        return Err(BuildPipelineError::Sandbox(format!(
-            "{label} is not a directory"
-        )));
-    }
-    Ok(path)
-}
-
-fn validate_plugin_source(path: &Path) -> Result<(), BuildPipelineError> {
-    let root = fs::canonicalize(path).map_err(|error| {
-        BuildPipelineError::Sandbox(format!("invalid trusted plugin source: {error}"))
-    })?;
-    if !root.join("Cargo.toml").is_file()
-        || !root.join("Cargo.lock").is_file()
-        || !root.join("src").is_dir()
-        || !root
-            .join("Cargo.toml")
-            .to_string_lossy()
-            .ends_with("plugins/kurbis-control/Cargo.toml")
-    {
-        return Err(BuildPipelineError::Sandbox(
-            "trusted plugin source must be the checked-in plugins/kurbis-control package".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn plugin_build_context(source: &Path) -> Result<tempfile::TempDir, BuildPipelineError> {
-    let source = fs::canonicalize(source).map_err(|error| {
-        BuildPipelineError::Compile(format!("resolve trusted plugin source: {error}"))
-    })?;
-    validate_plugin_source(&source)?;
-    let context = tempfile::Builder::new()
-        .prefix("kurbis-ci-plugin-")
-        .tempdir()
-        .map_err(|error| {
-            BuildPipelineError::Compile(format!("create plugin build context: {error}"))
-        })?;
-    let mut total = 0u64;
-    for name in ["Cargo.toml", "Cargo.lock", "src", "build.rs"] {
-        let from = source.join(name);
-        if !from.exists() {
-            continue;
-        }
-        copy_trusted_tree(&from, &context.path().join(name), &mut total)?;
-    }
-    if total > MAX_PLUGIN_SOURCE_BYTES {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin source exceeds its size limit".into(),
-        ));
-    }
-    Ok(context)
-}
-
-fn copy_trusted_tree(from: &Path, to: &Path, total: &mut u64) -> Result<(), BuildPipelineError> {
-    let metadata = fs::symlink_metadata(from).map_err(|error| {
-        BuildPipelineError::Compile(format!("inspect plugin build input: {error}"))
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin build input contains a symlink".into(),
-        ));
-    }
-    if metadata.is_dir() {
-        fs::create_dir_all(to).map_err(|error| {
-            BuildPipelineError::Compile(format!("copy plugin directory: {error}"))
-        })?;
-        for entry in fs::read_dir(from).map_err(|error| {
-            BuildPipelineError::Compile(format!("read plugin directory: {error}"))
-        })? {
-            let entry = entry.map_err(|error| BuildPipelineError::Compile(error.to_string()))?;
-            copy_trusted_tree(&entry.path(), &to.join(entry.file_name()), total)?;
-        }
-    } else if metadata.is_file() {
-        *total = total.checked_add(metadata.len()).ok_or_else(|| {
-            BuildPipelineError::Compile("trusted plugin source size overflow".into())
-        })?;
-        if *total > MAX_PLUGIN_SOURCE_BYTES {
-            return Err(BuildPipelineError::Compile(
-                "trusted plugin source exceeds its size limit".into(),
-            ));
-        }
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                BuildPipelineError::Compile(format!("create plugin directory: {error}"))
-            })?;
-        }
-        fs::copy(from, to).map_err(|error| {
-            BuildPipelineError::Compile(format!("copy trusted plugin file: {error}"))
-        })?;
-    } else {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin build input contains a special file".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn rust_target(architecture: &str) -> Result<&'static str, BuildPipelineError> {
-    match architecture {
-        "x86_64-linux" | "x86_64-unknown-linux-gnu" => Ok("x86_64-unknown-linux-gnu"),
-        "aarch64-linux" | "aarch64-unknown-linux-gnu" => Ok("aarch64-unknown-linux-gnu"),
-        _ => Err(BuildPipelineError::Compile(format!(
-            "unsupported native Linux build architecture {architecture}"
-        ))),
-    }
-}
-
-fn validate_pumpkin_binary(path: &Path, architecture: &str) -> Result<(), BuildPipelineError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        BuildPipelineError::Package(format!("Pumpkin build output is missing: {error}"))
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
-        return Err(BuildPipelineError::Package(
-            "Pumpkin output is not a regular non-empty file".into(),
-        ));
-    }
-    if metadata.len() > MAX_ARTIFACT_BYTES as u64 {
-        return Err(BuildPipelineError::Package(
-            "Pumpkin output exceeds the artifact size limit".into(),
-        ));
-    }
-    let mut file = fs::File::open(path)
-        .map_err(|error| BuildPipelineError::Package(format!("read Pumpkin output: {error}")))?;
-    let mut header = [0u8; 20];
-    file.read_exact(&mut header).map_err(|error| {
-        BuildPipelineError::Package(format!("Pumpkin output is truncated: {error}"))
-    })?;
-    let machine = u16::from_le_bytes([header[18], header[19]]);
-    let expected = match architecture {
-        "x86_64-linux" | "x86_64-unknown-linux-gnu" => 62,
-        "aarch64-linux" | "aarch64-unknown-linux-gnu" => 183,
-        _ => {
-            return Err(BuildPipelineError::Package(
-                "unsupported native Linux target".into(),
-            ));
-        }
-    };
-    if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 || machine != expected {
-        return Err(BuildPipelineError::Package(
-            "Pumpkin output is not a 64-bit little-endian ELF for the requested architecture"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_wasm_plugin(path: &Path) -> Result<(), BuildPipelineError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        BuildPipelineError::Package(format!("Kurbis control plugin is missing: {error}"))
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() < 8 {
-        return Err(BuildPipelineError::Package(
-            "Kurbis control output is not a valid WebAssembly file".into(),
-        ));
-    }
-    let mut file = fs::File::open(path).map_err(|error| {
-        BuildPipelineError::Package(format!("read Kurbis control plugin: {error}"))
-    })?;
-    let mut header = [0u8; 4];
-    file.read_exact(&mut header).map_err(|error| {
-        BuildPipelineError::Package(format!("Kurbis control plugin is truncated: {error}"))
-    })?;
-    if header != *b"\0asm" {
-        return Err(BuildPipelineError::Package(
-            "Kurbis control output has an invalid Wasm header".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct ArtifactMetadata<'a> {
-    format_version: u32,
-    repository: &'a str,
-    commit_sha: &'a str,
-    patch_fingerprint: &'a str,
-    toolchain_version: &'a str,
-    target_architecture: &'a str,
-}
-
-fn package_artifact(
-    binary: &Path,
-    plugin: &Path,
-    build_output: &Path,
-    key: &BuildKey,
-    build_log: &str,
-) -> Result<Vec<u8>, BuildPipelineError> {
-    let metadata = ArtifactMetadata {
-        format_version: 1,
-        repository: &key.repository,
-        commit_sha: &key.commit_sha,
-        patch_fingerprint: &key.patch_fingerprint,
-        toolchain_version: &key.toolchain_version,
-        target_architecture: &key.target_architecture,
-    };
-    let metadata = serde_json::to_vec(&metadata).map_err(|error| {
-        BuildPipelineError::Package(format!("serialize artifact metadata: {error}"))
-    })?;
-    let mut output = Vec::new();
-    let encoder = GzEncoder::new(&mut output, Compression::default());
-    let mut tar = tar::Builder::new(encoder);
-    tar.mode(tar::HeaderMode::Deterministic);
-    for (name, path, bytes) in [
-        ("pumpkin", Some(binary), None),
-        ("kurbis-control.wasm", Some(plugin), None),
-        ("metadata.json", None, Some(metadata.as_slice())),
-        ("BUILD.log", None, Some(build_log.as_bytes())),
-        (
-            "LICENSE",
-            None,
-            Some(include_bytes!("../../../runtime/pumpkin/LICENSE").as_slice()),
-        ),
-        (
-            "REVISION",
-            None,
-            Some(include_bytes!("../../../runtime/pumpkin/REVISION").as_slice()),
-        ),
-    ] {
-        let size = match (path, bytes) {
-            (Some(path), _) => fs::metadata(path)
-                .map_err(|error| {
-                    BuildPipelineError::Package(format!("inspect artifact {name}: {error}"))
-                })?
-                .len(),
-            (_, Some(bytes)) => bytes.len() as u64,
-            _ => 0,
-        };
-        let mut header = tar::Header::new_gnu();
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(0);
-        header.set_mode(if name == "pumpkin" { 0o755 } else { 0o644 });
-        header.set_size(size);
-        header.set_cksum();
-        let result = if let Some(path) = path {
-            tar.append_data(
-                &mut header,
-                name,
-                fs::File::open(path).map_err(|error| {
-                    BuildPipelineError::Package(format!("open artifact {name}: {error}"))
-                })?,
-            )
-        } else {
-            tar.append_data(&mut header, name, bytes.unwrap_or_default())
-        };
-        result.map_err(|error| {
-            BuildPipelineError::Package(format!("package artifact {name}: {error}"))
-        })?;
-    }
-    let encoder = tar
-        .into_inner()
-        .map_err(|error| BuildPipelineError::Package(format!("finish artifact tar: {error}")))?;
-    encoder
-        .finish()
-        .map_err(|error| BuildPipelineError::Package(format!("finish artifact gzip: {error}")))?;
-    if output.is_empty() || output.len() > MAX_ARTIFACT_BYTES {
-        return Err(BuildPipelineError::Package(
-            "packaged artifact exceeds its size limit".into(),
-        ));
-    }
-    let _ = build_output;
-    Ok(output)
-}
+mod artifact;
+mod support;
+use artifact::*;
+pub use support::toolchain_identity;
+use support::*;
 
 fn tail(value: &str, limit: usize) -> String {
     let mut start = value.len().saturating_sub(limit);
@@ -1235,137 +888,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use tempfile::tempdir;
-
-    #[derive(Clone)]
-    struct StubBuildRuntime {
-        toolchain: String,
-        report: BuildProcessReport,
-    }
-    #[async_trait]
-    impl RootlessBuildRuntime for StubBuildRuntime {
-        fn toolchain_version(&self) -> &str {
-            &self.toolchain
-        }
-        async fn verify_sandbox(&self, _: SandboxLimits) -> Result<(), BuildPipelineError> {
-            Ok(())
-        }
-        async fn compile(
-            &self,
-            _: &[u8],
-            _: &[u8],
-            out: &Path,
-            _: &str,
-            _: SandboxLimits,
-        ) -> Result<BuildProcessReport, BuildPipelineError> {
-            fs::write(out.join("pumpkin"), fake_elf(62)).unwrap();
-            fs::write(out.join("kurbis-control.wasm"), b"\0asm\x01\0\0\0code").unwrap();
-            Ok(self.report.clone())
-        }
-    }
-
-    fn fake_elf(machine: u16) -> Vec<u8> {
-        let mut bytes = vec![0; 64];
-        bytes[..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn builder_identity_binds_compiler_and_target_to_the_exact_image_digest() {
-        let image = format!("registry.example/ci/rust@sha256:{}", "f".repeat(64));
-        let identity = toolchain_identity(&image, "1.98.1").unwrap();
-        assert_eq!(identity, format!("rustc-1.98.1@sha256:{}", "f".repeat(64)));
-        assert!(toolchain_identity("rust:1.98", "1.98.1").is_err());
-        assert!(
-            rustc_release_from_identity("registry.example/ci/rust@sha256:abc", &identity).is_err()
-        );
-        assert_eq!(
-            docker_platform("x86_64-unknown-linux-gnu").unwrap(),
-            "linux/amd64"
-        );
-        assert_eq!(
-            docker_platform("aarch64-unknown-linux-gnu").unwrap(),
-            "linux/arm64"
-        );
-        assert!(docker_platform("aarch64-apple-darwin").is_err());
-    }
-
-    #[test]
-    fn target_mapping_rejects_non_linux_and_unknown_architectures() {
-        assert_eq!(
-            rust_target("x86_64-linux").unwrap(),
-            "x86_64-unknown-linux-gnu"
-        );
-        assert_eq!(
-            rust_target("aarch64-linux").unwrap(),
-            "aarch64-unknown-linux-gnu"
-        );
-        assert!(rust_target("aarch64-darwin").is_err());
-        assert!(rust_target("mips-linux").is_err());
-    }
-
-    #[tokio::test]
-    async fn controlled_builder_rejects_a_toolchain_cache_key_mismatch() {
-        let root = tempdir().unwrap();
-        let plugin = root.path().join("plugins/kurbis-control");
-        fs::create_dir_all(plugin.join("src")).unwrap();
-        fs::write(
-            plugin.join("Cargo.toml"),
-            "[package]\nname='kurbis-control'\n",
-        )
-        .unwrap();
-        fs::write(plugin.join("Cargo.lock"), "version = 4\n").unwrap();
-        let runtime = Arc::new(StubBuildRuntime {
-            toolchain: "rust-1.98@sha256:test".into(),
-            report: BuildProcessReport::default(),
-        });
-        let builder = RustPumpkinBuilder::new(runtime, &plugin).unwrap();
-        let key = BuildKey {
-            repository: "kurbis-host/Pumpkin".into(),
-            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-            patch_fingerprint: "b".repeat(64),
-            toolchain_version: "native".into(),
-            target_architecture: "x86_64-linux".into(),
-        };
-        assert!(
-            builder
-                .compile_and_package(Vec::new(), &key)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("toolchain identity")
-        );
-    }
-
-    #[tokio::test]
-    async fn package_contains_only_validated_runtime_files_and_metadata() {
-        let root = tempdir().unwrap();
-        let binary = root.path().join("pumpkin");
-        let plugin = root.path().join("plugin.wasm");
-        fs::write(&binary, fake_elf(62)).unwrap();
-        fs::write(&plugin, b"\0asm\x01\0\0\0code").unwrap();
-        let key = BuildKey {
-            repository: "kurbis-host/Pumpkin".into(),
-            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-            patch_fingerprint: "b".repeat(64),
-            toolchain_version: "rust-1.98@sha256:abc".into(),
-            target_architecture: "x86_64-linux".into(),
-        };
-        validate_pumpkin_binary(&binary, "x86_64-linux").unwrap();
-        validate_wasm_plugin(&plugin).unwrap();
-        let artifact = package_artifact(&binary, &plugin, root.path(), &key, "cargo ok\n").unwrap();
-        assert!(artifact.starts_with(&[0x1f, 0x8b]));
-        assert!(artifact.len() < MAX_ARTIFACT_BYTES);
-    }
-
-    #[test]
-    fn executable_log_capture_is_bounded_to_the_tail() {
-        assert_eq!(tail(&"x".repeat(20), 8), "x".repeat(8));
-    }
-}
+mod tests;

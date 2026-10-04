@@ -264,3 +264,25 @@ Build local hoster binaries with `cargo build --bins`. Native workers use the lo
 To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks Java 26.3 login, save/shutdown, and player activity. The native lifecycle harness also exercises Java waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
 
 For faster development on this Mac or Linux, use [native host execution](runtime/pumpkin/NATIVE.md). Build with `tools/build_pumpkin_native.sh` and select `WORKER_RUNTIME=native`; the shared lifecycle and snapshot system works without Docker. Native development mode has no hard memory or filesystem isolation.
+
+## Pumpkin pull-request and branch previews
+
+Set `CI_GITHUB_PAT` to enable the optional CI poller. It creates GitHub Check
+Runs for the exact pull-request heads observed by a completed poll, builds the
+checked-in Pumpkin patch with the pinned rootless builder image, and publishes
+isolated previews below `pumpkin.kurbis.host` (the CI hostname suffix is
+currently fixed in the service and is separate from `ROOT_DOMAIN`). Configure DNS
+and TLS for that suffix before enabling previews. `CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless
+Docker daemon over restricted SSH; never give the control plane a host Docker
+socket. The builder uses preloaded dependencies and compiles offline in a
+network-disabled, resource-bounded task container; repository Dockerfiles are
+not used.
+
+Branch previews start as a lobby and build lazily on first join. A new observed
+branch head replaces the stable branch alias only after the new build is ready
+and any prior runtime generation has stopped. Deleted branches expire their
+stable alias and enter generation-fenced runtime cleanup. Closing a pull request
+does not currently expire its preview. GitHub polling cannot promise a separate
+build for every intermediate push: a commit superseded between successful polls
+may never be observed or built. The Check Run details link is a read-only status
+page and does not expose build logs, runtime capabilities, or controls.

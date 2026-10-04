@@ -3,7 +3,8 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,47 @@ pub struct PreviewAdmissionRequest {
 pub struct PreviewAdmissionResponse {
     pub preview: Option<CiPreview>,
     pub state: CiPreviewState,
+}
+
+/// Public, read-only preview status projection used by GitHub Check Run links.
+/// It intentionally omits build logs, failure details, capabilities, and runtime
+/// assignment data; those remain on actor-authenticated internal routes.
+pub(super) async fn public_status(
+    State(state): State<Arc<AppState>>,
+    Path(hostname): Path<String>,
+) -> Result<Response, ApiError> {
+    if crate::routing::ci_subdomain_from_hostname(&hostname, crate::ci::CI_ROOT_DOMAIN).is_none() {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "ci_preview_not_found",
+            "preview status is unavailable",
+        ));
+    }
+    let repository = CiPreviewRepository::new(state.pool.clone());
+    let preview = repository
+        .lookup_preview(&hostname)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::NOT_FOUND,
+                "ci_preview_not_found",
+                "preview status is unavailable",
+            )
+        })?;
+    let mut response = Json(crate::ci::CiPublicPreviewStatus {
+        hostname: preview.alias.value,
+        commit_sha: preview.commit_sha,
+        kind: preview.alias.kind,
+        state: preview.state,
+        expires_at: preview.expires_at,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 pub(super) async fn status(
