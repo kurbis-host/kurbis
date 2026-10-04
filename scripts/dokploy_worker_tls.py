@@ -33,7 +33,7 @@ def verify_bedrock_tls_assets(host_directory:str,root_domain:str,*,error_cls=Run
     cert=tls_dir/"fullchain.pem";key=tls_dir/"privkey.pem"
     for path in (cert,key):
         if path.is_symlink() or not path.is_file():raise error_cls("configured Bedrock TLS certificate/key file is missing or unsafe")
-    gateway_ids=run_command(["docker","ps","-q","--filter",f"label=com.docker.compose.project={project}",
+    gateway_ids=run_command(["docker","ps","--no-trunc","-q","--filter",f"label=com.docker.compose.project={project}",
                      "--filter","label=com.docker.compose.service=gateway"]).splitlines()
     if len(gateway_ids)!=1 or not re.fullmatch(r"[0-9a-f]{64}",gateway_ids[0]):
         raise error_cls("cannot verify TLS access using the unique running gateway container")

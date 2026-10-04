@@ -754,9 +754,12 @@ class RolloutTests(unittest.TestCase):
             key=tls/"privkey.pem";key.write_text("private-key fixture");key.chmod(0o644)
             gateway_id="a"*64
             inspected=json.dumps([{"Mounts":[{"Destination":"/run/kurbis-tls","Source":str(tls),"RW":False}]}])
-            with patch.object(sync,"run",side_effect=[gateway_id,inspected]):
+            with patch.object(sync,"run",side_effect=[gateway_id,inspected]) as run_command:
                 with self.assertRaisesRegex(sync.Error,"must not be accessible to other"):
                     sync.verify_bedrock_tls_assets(str(tls),"example.test",error_cls=sync.Error,run_command=sync.run,project=sync.PROJECT)
+            ps_args=run_command.call_args_list[0].args[0]
+            self.assertIn("--no-trunc",ps_args)
+            self.assertIn("-q",ps_args)
 
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is needed to render the production Compose fixture")
     def test_rendered_production_compose_has_required_read_only_bedrock_tls_and_ports(self):
