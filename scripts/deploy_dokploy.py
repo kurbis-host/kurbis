@@ -104,6 +104,16 @@ def api(endpoint: str, params: dict, *, post: bool = False) -> object:
     return result.get("json", result)
 
 
+def validate_compose_execution(info: dict) -> None:
+    # Dokploy documents only docker-compose mode as supporting Compose `build:`;
+    # Stack mode does not support builds. Its `command` field replaces Dokploy's
+    # default command, so only an unset override is safe for this build-based release.
+    if info.get("composeType") != "docker-compose":
+        raise DeploymentError("Dokploy target must use the documented docker-compose mode")
+    if "command" not in info or info.get("command") not in (None, ""):
+        raise DeploymentError("Dokploy custom Compose command is not allowed; the default build-enabled command is required")
+
+
 def compose_info() -> dict:
     info = api("compose.one", {"composeId": COMPOSE_ID})
     if not isinstance(info, dict) or info.get("composeId") != COMPOSE_ID or info.get("appName") != PROJECT:
@@ -113,6 +123,7 @@ def compose_info() -> dict:
         raise DeploymentError("Dokploy Git repository or Compose path differs from Kurbis production")
     if not isinstance(info.get("env"), str) or info.get("environment", {}).get("name") != "production":
         raise DeploymentError("Kurbis production Dokploy environment is unavailable")
+    validate_compose_execution(info)
     return info
 
 

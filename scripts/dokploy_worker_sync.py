@@ -55,6 +55,15 @@ def root_only() -> None:
         raise Error("respond5 release verification requires root")
 
 
+def run_bytes(args: Sequence[str], *, input_bytes: bytes | None = None, cwd: Path | None = None) -> bytes:
+    """Run a command without decoding or trimming output (required for Git -z records)."""
+    p = subprocess.run(list(args), input=input_bytes, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if p.returncode:
+        detail = p.stderr.decode("utf-8", "replace").strip() or p.stdout.decode("utf-8", "replace").strip()
+        raise Error(f"{args[0]} failed: {detail}")
+    return p.stdout
+
+
 def valid_sha(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40}", value))
 
@@ -221,17 +230,18 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
     root_only(); require_lock(token); identity(); validate_expected_manifest(expected)
     if not valid_sha(revision): raise Error("invalid release SHA")
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir(): raise Error("invalid Dokploy checkout")
-    status = run(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
-    validate_checkout_status(status.encode(), allow_overrides=True)
+    status = run_bytes(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status, allow_overrides=True)
     CHECKOUT_BACKUP.mkdir(mode=0o700, exist_ok=True)
     if CHECKOUT_BACKUP.is_symlink() or CHECKOUT_BACKUP.stat().st_uid != 0 or stat.S_IMODE(CHECKOUT_BACKUP.stat().st_mode) != 0o700:
         raise Error("checkout backup directory ownership/mode invalid")
     backup = CHECKOUT_BACKUP / token
     if backup.exists(): raise Error("checkout backup already exists")
     backup.mkdir(mode=0o700)
-    changed = run(["git","-C",str(CHECKOUT),"diff","--name-only","-z","HEAD"]).split("\0")
+    changed = run_bytes(["git","-C",str(CHECKOUT),"diff","--name-only","-z","HEAD"]).split(b"\0")
     manifest=[]
-    for relative in filter(None, changed):
+    for raw_relative in filter(None, changed):
+        relative = raw_relative.decode("utf-8", "surrogateescape")
         path=CHECKOUT/relative
         if not path.is_file() or path.is_symlink() or Path(relative).is_absolute() or ".." in Path(relative).parts: raise Error(f"unsafe override: {relative}")
         m=path.stat(); content=path.read_bytes(); manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing")})
@@ -240,8 +250,8 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
     run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
     if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"] ) != revision: raise Error("immutable release tag SHA mismatch")
     run(["git","-C",str(CHECKOUT),"reset","--hard",revision]); run(["git","-C",str(CHECKOUT),"clean","-fdx","-e",".env"])
-    status = run(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
-    validate_checkout_status(status.encode(), allow_overrides=False)
+    status = run_bytes(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status, allow_overrides=False)
     tracked = set(run(["git", "-C", str(CHECKOUT), "ls-tree", "-r", "--name-only", revision]).splitlines())
     if tracked != set(expected): raise Error("release source manifest does not cover every tracked input")
     for path, blob in expected.items():
@@ -564,8 +574,8 @@ def rollback_worker(token: str) -> dict[str, str]:
 def verify_build_context(checkout:Path,revision:str,expected:dict[str,str])->None:
     if run(["git","-C",str(checkout),"rev-parse","HEAD"])!=revision:raise Error("Dokploy checkout HEAD differs from release SHA")
     validate_expected_manifest(expected)
-    status=run(["git","-C",str(checkout),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
-    validate_checkout_status(status.encode(), allow_overrides=False)
+    status=run_bytes(["git","-C",str(checkout),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
+    validate_checkout_status(status, allow_overrides=False)
     tracked=set(run(["git","-C",str(checkout),"ls-tree","-r","--name-only",revision]).splitlines())
     if tracked!=set(expected):raise Error("expected manifest does not cover all tracked build inputs")
     for path,blob in expected.items():

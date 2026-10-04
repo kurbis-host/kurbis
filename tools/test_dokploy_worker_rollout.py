@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -30,6 +31,56 @@ class RolloutTests(unittest.TestCase):
     def test_no_mutable_cargo_target_cache_mounts(self):
         for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
             self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
+
+    def test_run_bytes_preserves_git_nul_records_and_leading_status_spaces(self):
+        output = sync.run_bytes(["python3", "-c", "import sys; sys.stdout.buffer.write(bytes([32,77,32,99,111,109,112,111,115,101,46,121,97,109,108,0,33,33,32,46,101,110,118,0]))"])
+        self.assertEqual(output, b" M compose.yaml\0!! .env\0")
+        sync.validate_checkout_status(output, allow_overrides=True)
+
+    def test_stage_preserves_allowed_compose_override_with_nul_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            backup_root = root / "backup"
+            checkout.mkdir()
+            backup_root.mkdir(mode=0o700)
+            bare = root / "origin.git"
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Rollout Test"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.email", "rollout@example.invalid"], check=True)
+            (checkout / ".gitignore").write_text(".env\n", encoding="utf-8")
+            (checkout / "compose.yaml").write_text("services: {app: {image: app:old}}\n", encoding="utf-8")
+            (checkout / "web").mkdir()
+            (checkout / "web/tsconfig.json").write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "add", ".gitignore", "compose.yaml", "web/tsconfig.json"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "release fixture"], check=True)
+            revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            tag = f"kurbis-release-{revision}"
+            subprocess.run(["git", "-C", str(checkout), "tag", tag, revision], check=True)
+            subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(bare)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "push", "-q", "origin", f"refs/tags/{tag}"], check=True)
+            expected = {path: subprocess.check_output(["git", "-C", str(checkout), "rev-parse", f"HEAD:{path}"], text=True).strip()
+                        for path in (".gitignore", "compose.yaml", "web/tsconfig.json")}
+            override = "services: {app: {image: app:operator-override}}\n"
+            (checkout / "compose.yaml").write_text(override, encoding="utf-8")
+            (checkout / ".env").write_text("PRESERVE_ME=1\n", encoding="utf-8")
+            original_stat = Path.stat
+            def stat_with_root_backup_owner(path, *args, **kwargs):
+                if path == backup_root:
+                    return type("RootOwnedDirectoryStat", (), {"st_uid": 0, "st_mode": stat.S_IFDIR | 0o700})()
+                return original_stat(path, *args, **kwargs)
+            token = "a" * 32
+            with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "CHECKOUT_BACKUP", backup_root), \
+                 patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "identity", return_value="worker-id"), \
+                 patch.object(Path, "stat", stat_with_root_backup_owner):
+                result = sync.stage(revision, token, expected)
+            self.assertEqual(result, {"status": "staged", "revision": revision})
+            self.assertEqual((checkout / "compose.yaml").read_text(encoding="utf-8"), "services: {app: {image: app:old}}\n")
+            self.assertEqual((checkout / ".env").read_text(encoding="utf-8"), "PRESERVE_ME=1\n")
+            manifest = json.loads((backup_root / token / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest[0]["path"], "compose.yaml")
+            self.assertEqual(base64.b64decode(manifest[0]["content"]).decode(), override)
 
     def test_checkout_status_allows_only_explicit_env_and_reviewed_overrides(self):
         sync.validate_checkout_status(b"!! .env\0 M compose.yaml\0", allow_overrides=True)
@@ -109,7 +160,7 @@ class RolloutTests(unittest.TestCase):
                 if "compose" in args and "config" in args:
                     return json.dumps(config)
                 raise AssertionError(args)
-            with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run):
+            with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"):
                 sync.verify_build_context(checkout, revision, expected)
                 config["services"]["waiting-pumpkin"]["build"]["target"] = "host-control"
                 with self.assertRaises(sync.Error):
@@ -270,11 +321,26 @@ class RolloutTests(unittest.TestCase):
         ), self.assertRaises(sync.Error):
             sync.mark(json.dumps(receipt), "a" * 32)
 
+    def test_compose_info_rejects_stack_mode_and_custom_commands(self):
+        base = {"composeId": deploy.COMPOSE_ID, "appName": deploy.PROJECT, "sourceType": "github",
+                "owner": "kurbis-host", "repository": "kurbis", "branch": "main", "composePath": "./compose.yaml",
+                "environment": {"name": "production"}, "composeType": "docker-compose", "command": None,
+                "env": "", "autoDeploy": False}
+        for update in ({"composeType": "docker-stack"}, {"command": "docker compose up -d"}, {"command": "docker compose up -d --build"}, {"command": "absent"}):
+            value = {**base, **update}
+            if update == {"command": "absent"}:
+                value.pop("command")
+            with self.subTest(update=update), patch.object(deploy, "api", return_value=value), self.assertRaises(deploy.DeploymentError):
+                deploy.compose_info()
+        with patch.object(deploy, "api", return_value=base):
+            self.assertEqual(deploy.compose_info()["composeType"], "docker-compose")
+
     def test_compose_source_and_auto_deploy_policy_persist(self):
         state = {
             "composeId": deploy.COMPOSE_ID, "appName": deploy.PROJECT, "sourceType": "github",
             "owner": "kurbis-host", "repository": "kurbis", "branch": "main",
             "composePath": "./compose.yaml", "environment": {"name": "production"},
+            "composeType": "docker-compose", "command": None,
             "env": "KEEP=this-value\nBUILD_REVISION=old\n", "autoDeploy": True,
         }
         calls = []
