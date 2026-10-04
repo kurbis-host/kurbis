@@ -137,6 +137,39 @@ class LegacyBaselineTests(unittest.TestCase):
             with patch.object(legacy,"CHECKOUT",checkout),self.assertRaisesRegex(legacy.BaselineError,"main history|immutable release tag"):
                 legacy.verify_attested_candidate_source("b"*40,expected)
 
+    def test_candidate_tag_is_fetched_before_ancestry_check_on_fresh_main_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);bare=root/"origin.git";author=root/"author";checkout=root/"checkout"
+            subprocess.run(["git","init","--bare","-q",str(bare)],check=True)
+            subprocess.run(["git","-c","init.defaultBranch=main","init","-q",str(author)],check=True)
+            subprocess.run(["git","-C",str(author),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(author),"config","user.email","test@example.invalid"],check=True)
+            (author/".gitignore").write_text(".env\n",encoding="utf-8")
+            (author/"compose.yaml").write_text("services: {}\n",encoding="utf-8")
+            (author/"src").mkdir();(author/"src/app.rs").write_text("fn main() {}\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(author),"add",".gitignore","compose.yaml","src/app.rs"],check=True)
+            subprocess.run(["git","-C",str(author),"commit","-qm","base"],check=True)
+            subprocess.run(["git","-C",str(author),"remote","add","origin",str(bare)],check=True)
+            subprocess.run(["git","-C",str(author),"push","-q","origin","main"],check=True)
+            checkout_head=subprocess.check_output(["git","-C",str(author),"rev-parse","HEAD"],text=True).strip()
+            (author/"compose.yaml").write_text("services: {release: {}}\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(author),"add","compose.yaml"],check=True)
+            subprocess.run(["git","-C",str(author),"commit","-qm","candidate"],check=True)
+            candidate=subprocess.check_output(["git","-C",str(author),"rev-parse","HEAD"],text=True).strip()
+            tag=f"kurbis-release-{candidate}"
+            subprocess.run(["git","-C",str(author),"tag",tag,candidate],check=True)
+            subprocess.run(["git","-C",str(author),"push","-q","origin",f"refs/tags/{tag}"],check=True)
+            expected={path:subprocess.check_output(["git","-C",str(author),"rev-parse",f"{candidate}:{path}"],text=True).strip()
+                      for path in (".gitignore","compose.yaml","src/app.rs")}
+            subprocess.run(["git","clone","-q","--branch","main","--single-branch",str(bare),str(checkout)],check=True)
+            (checkout/".env").write_text("BUILD_REVISION=old\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(checkout),"tag","-d",tag],stdout=subprocess.DEVNULL,check=True)
+            self.assertNotEqual(subprocess.run(["git","-C",str(checkout),"rev-parse",f"refs/tags/{tag}"],
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False).returncode,0)
+            with patch.object(legacy,"CHECKOUT",checkout):
+                self.assertEqual(legacy.verify_attested_candidate_source(candidate,expected),checkout_head)
+            self.assertEqual(subprocess.check_output(["git","-C",str(checkout),"rev-parse",f"refs/tags/{tag}^{{commit}}"],text=True).strip(),candidate)
+
     def test_existing_legacy_attestation_revalidates_exact_refreshed_release_without_rewriting_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);audit=root/"legacy-baseline.json"

@@ -110,10 +110,8 @@ def verify_attested_candidate_source(candidate_revision: str, expected_sources: 
         raise BaselineError("refreshed Dokploy release checkout is unsafe")
     branch=run_text(["git","-C",str(CHECKOUT),"branch","--show-current"])
     checkout_head=run_text(["git","-C",str(CHECKOUT),"rev-parse","HEAD"])
-    ancestry=subprocess.run(["git","-C",str(CHECKOUT),"merge-base","--is-ancestor",checkout_head,candidate_revision],
-                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
-    if branch!="main" or ancestry.returncode!=0:
-        raise BaselineError("Dokploy checkout must be clean main history at or before the exact requested release")
+    if branch!="main":
+        raise BaselineError("Dokploy checkout must be on the configured main source branch")
     tag=f"kurbis-release-{candidate_revision}"
     resolved=subprocess.run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"],
         stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,check=False)
@@ -124,6 +122,10 @@ def verify_attested_candidate_source(candidate_revision: str, expected_sources: 
             stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,check=False)
     if resolved.returncode or resolved.stdout.strip()!=candidate_revision:
         raise BaselineError("refreshed Dokploy checkout lacks the exact immutable release tag")
+    ancestry=subprocess.run(["git","-C",str(CHECKOUT),"merge-base","--is-ancestor",checkout_head,candidate_revision],
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+    if ancestry.returncode!=0:
+        raise BaselineError("Dokploy checkout HEAD is not an ancestor of the exact requested release")
     tracked=set(run_text(["git","-C",str(CHECKOUT),"ls-tree","-r","--name-only",candidate_revision]).splitlines())
     if tracked!=set(expected_sources):
         raise BaselineError("refreshed release manifest does not cover the exact tracked source tree")
