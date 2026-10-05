@@ -220,6 +220,8 @@ def start_gateway(
     root,
     waiting_java_port,
     waiting_bedrock_port,
+    gateway_java_port,
+    bedrock_public_port,
     api_port,
     secret,
     bedrock_certificate,
@@ -231,7 +233,7 @@ def start_gateway(
     logs,
     waiting_container,
 ):
-    java, bedrock = free_port(), free_port()
+    java, bedrock = gateway_java_port, bedrock_public_port
     waiting_root = root / "waiting"
     waiting_root.mkdir()
     (waiting_root / "run").mkdir()
@@ -283,7 +285,8 @@ enabled = false
             return False
 
     wait_for(ready, "actual waiting Pumpkin host-control readiness")
-    launch("gateway", {**common, "JAVA_LISTEN": f"127.0.0.1:{java}", "BEDROCK_LISTEN": f"127.0.0.1:{bedrock}",
+    launch("gateway", {**common, "JAVA_LISTEN": f"0.0.0.0:{java}", "JAVA_PUBLIC_PORT": str(java), "BEDROCK_LISTEN": f"0.0.0.0:{bedrock}",
+        "BEDROCK_PUBLIC_IP": "127.0.0.1",
         "BEDROCK_PUBLIC_PORT": str(bedrock),
         "BEDROCK_TLS_CERT_FILE": str(bedrock_certificate),
         "BEDROCK_TLS_KEY_FILE": str(bedrock_private_key),

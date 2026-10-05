@@ -25,7 +25,10 @@ use crate::{
     worker::runtime::settings::render_pumpkin_config,
     worker::{
         control_plane::WorkerControl,
-        ingress::{GatewayIngressPolicy, PublishedWorkloadPorts, docker_publish_binding},
+        ingress::{
+            GatewayIngressPolicy, PublishedWorkloadPorts, cleanup_ingress_through,
+            ensure_runtime_ingress,
+        },
         sandbox::{
             DockerSandbox, ensure_rootless_volume_owner, scoped_ci_preview_capability,
             scoped_runtime_token, validate_quota_volume,
@@ -47,6 +50,8 @@ pub struct CiPreviewWorker {
     worker_address: IpAddr,
     signal_address: IpAddr,
     gateway_address: IpAddr,
+    gateway_bedrock_ip: std::net::Ipv4Addr,
+    gateway_bedrock_port: u16,
     sandbox: DockerSandbox,
     runtime_api_proxy_image: String,
     runtime_api_proxy_upstream: String,
@@ -65,6 +70,8 @@ impl CiPreviewWorker {
         worker_address: IpAddr,
         signal_address: IpAddr,
         gateway_address: IpAddr,
+        gateway_bedrock_ip: std::net::Ipv4Addr,
+        gateway_bedrock_port: u16,
         storage_mode: StorageMode,
         runtime_api_proxy_image: String,
         runtime_api_proxy_upstream: String,
@@ -83,6 +90,8 @@ impl CiPreviewWorker {
             worker_address,
             signal_address,
             gateway_address,
+            gateway_bedrock_ip,
+            gateway_bedrock_port,
             sandbox: DockerSandbox,
             runtime_api_proxy_image,
             runtime_api_proxy_upstream,
@@ -105,7 +114,7 @@ impl CiPreviewWorker {
             let result = match placement.state {
                 CiRuntimeState::Starting => self.start(&placement).await,
                 CiRuntimeState::Stopping => self.stop(&placement, true).await,
-                CiRuntimeState::Deleting => self.stop(&placement, false).await.and_then(|_| Ok(())),
+                CiRuntimeState::Deleting => self.stop(&placement, false).await.map(|_| ()),
                 CiRuntimeState::Running => self.observe(&placement).await,
                 CiRuntimeState::Stopped => Ok(()),
             };
@@ -117,13 +126,14 @@ impl CiPreviewWorker {
         // Retained idle worlds appear as `stopped` assignments above. A world
         // transferred to another worker after a durable snapshot no longer does;
         // clean its old local quota volume if this worker later comes back.
-        for preview_id in self.storage.managed_server_ids().await? {
-            if assigned.contains(&preview_id) {
-                continue;
-            }
-            let generation = self.container_label_generation(preview_id).await?;
-            self.remove_stale(preview_id, generation.unwrap_or(1))
-                .await?;
+        let mut managed = self.storage.managed_server_ids().await?;
+        managed.extend(owned_runtime_directory_ids(&self.runtime_root)?);
+        for preview_id in orphaned_ci_preview_ids(managed, &assigned) {
+            // With no current assignment this local UUID is an orphan. The
+            // container may already be gone while later-generation relays,
+            // networks, or nftables rules remain, so cleanup must inspect and
+            // remove every validated generation rather than guessing generation 1.
+            self.remove_all_orphan_resources(preview_id).await?;
             self.storage.remove(preview_id).await?;
             remove_owned_runtime_dir(&self.runtime_root, preview_id)?;
             tracing::info!(%preview_id, "removed orphaned worker-local CI preview world");
@@ -154,6 +164,7 @@ impl CiPreviewWorker {
         if self.image.trim().is_empty() || self.worker_key.len() < 32 {
             bail!("CI runtime needs a configured image and strong worker key");
         }
+        let needs_bootstrap_snapshot = !placement.world_initialized;
         let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
         let capability = scoped_ci_preview_capability(
             &self.worker_key,
@@ -164,6 +175,14 @@ impl CiPreviewWorker {
             .ci_runtime_register_capability(placement, &capability)
             .await?;
         if self.container_generation(placement.preview_id).await? == Some(placement.generation) {
+            if needs_bootstrap_snapshot {
+                bail!(
+                    "refusing to admit a running CI process without its durable world-write fence"
+                );
+            }
+            // Release an interrupted app/container barrier before relay
+            // health checks can wait on the paused game process.
+            self.recover_snapshot_barrier(placement).await?;
             let network = crate::worker::sandbox::workload_network_name(
                 placement.preview_id,
                 placement.generation,
@@ -186,15 +205,6 @@ impl CiPreviewWorker {
             )
             .await?;
             let container = container_name(placement.preview_id);
-            self.sandbox
-                .verify_isolated_network(
-                    &network,
-                    &[
-                        container,
-                        crate::runtime_api_proxy::container_name(placement.preview_id),
-                    ],
-                )
-                .await?;
             let published_ports = PublishedWorkloadPorts {
                 java_tcp: SocketAddr::new(self.worker_address, u16::try_from(placement.java_port)?),
                 bedrock_udp: SocketAddr::new(
@@ -209,10 +219,20 @@ impl CiPreviewWorker {
             // Host firewall state is volatile across worker restarts. Reinstall
             // the exact generation policy before admitting an already-running
             // container back into the routing plane.
-            ingress
-                .install(placement.preview_id, placement.generation, published_ports)
-                .await?;
-            return self.wait_for_java(placement).await;
+            self.ensure_ingress_relay(
+                placement.preview_id,
+                placement.generation,
+                &network,
+                &container,
+                &[
+                    container.clone(),
+                    crate::runtime_api_proxy::container_name(placement.preview_id),
+                ],
+                published_ports,
+            )
+            .await?;
+            self.wait_for_java(placement).await?;
+            return Ok(());
         }
         self.remove_stale(placement.preview_id, placement.generation)
             .await?;
@@ -221,6 +241,11 @@ impl CiPreviewWorker {
             .await
             .context("verify rootless preview runtime limits")?;
         ingress.verify_host_policy().await?;
+        let local_world_exists = self
+            .storage
+            .managed_server_ids()
+            .await?
+            .contains(&placement.preview_id);
         let world = self.storage.ensure(placement.preview_id).await?;
         validate_quota_volume(&world, CI_RUNTIME_DISK_BYTES as u64)
             .await
@@ -233,12 +258,14 @@ impl CiPreviewWorker {
         write_runtime_owner(&runtime_dir, placement.preview_id)?;
         ensure_rootless_volume_owner(&runtime_dir, daemon_uid, daemon_gid).await?;
         let snapshot_path = runtime_dir.join("world-snapshot.tar.gz");
-        if self
+        let restored_snapshot = self
             .control_plane
             .ci_world_snapshot_download(placement, &snapshot_path, CI_RUNTIME_DISK_BYTES as u64)
-            .await?
-            .is_some()
-        {
+            .await?;
+        if placement.world_initialized && restored_snapshot.is_none() && !local_world_exists {
+            bail!("initialized CI world has no verified durable snapshot or retained local volume");
+        }
+        if let Some(_snapshot_metadata) = restored_snapshot {
             // The local volume may belong to a different host after CI failover.
             // Replace it only after the authenticated shared snapshot is fully
             // downloaded and its size/checksum have been verified.
@@ -268,8 +295,8 @@ impl CiPreviewWorker {
             "0.0.0.0:19132"
                 .parse()
                 .expect("valid internal NetherNet endpoint"),
-            self.worker_address,
-            placement.bedrock_port as u16,
+            IpAddr::V4(self.gateway_bedrock_ip),
+            self.gateway_bedrock_port,
         );
         write_world_file(
             &world,
@@ -340,34 +367,6 @@ impl CiPreviewWorker {
                 u16::try_from(placement.signal_port)?,
             ),
         };
-        let java = docker_publish_binding(
-            published_ports.java_tcp.ip(),
-            published_ports.java_tcp.port(),
-            25565,
-            "tcp",
-        )?;
-        let java_health = docker_publish_binding(
-            if published_ports.java_tcp.is_ipv4() {
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            } else {
-                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-            },
-            published_ports.java_tcp.port(),
-            25565,
-            "tcp",
-        )?;
-        let bedrock = docker_publish_binding(
-            published_ports.bedrock_udp.ip(),
-            published_ports.bedrock_udp.port(),
-            19132,
-            "udp",
-        )?;
-        let signal = docker_publish_binding(
-            published_ports.bedrock_signal_tcp.ip(),
-            published_ports.bedrock_signal_tcp.port(),
-            19132,
-            "tcp",
-        )?;
         let world_mount = format!(
             "type=bind,source={},target=/server,bind-propagation=rprivate",
             world.display()
@@ -410,14 +409,6 @@ impl CiPreviewWorker {
             runtime_environment[0].clone(),
             "--env".into(),
             runtime_environment[1].clone(),
-            "--publish".into(),
-            java,
-            "--publish".into(),
-            java_health,
-            "--publish".into(),
-            bedrock,
-            "--publish".into(),
-            signal,
             "--mount".into(),
             world_mount,
             "--mount".into(),
@@ -431,6 +422,14 @@ impl CiPreviewWorker {
         ingress
             .install(placement.preview_id, placement.generation, published_ports)
             .await?;
+        // Persist the world-write fence before the Pumpkin process can start
+        // generating or mutating world state. A worker crash at any later boot
+        // point now requires a verified checkpoint instead of a cold replacement.
+        if needs_bootstrap_snapshot {
+            self.control_plane
+                .ci_runtime_world_initialized(placement)
+                .await?;
+        }
         let output = timeout(
             Duration::from_secs(30),
             Command::new("docker")
@@ -450,9 +449,47 @@ impl CiPreviewWorker {
             );
         }
         self.sandbox
-            .verify_isolated_network(&network, &[container, proxy_name])
+            .verify_isolated_network(&network, &[container.clone(), proxy_name.clone()])
             .await?;
-        self.wait_for_java(placement).await
+        self.ensure_ingress_relay(
+            placement.preview_id,
+            placement.generation,
+            &network,
+            &container,
+            &[container.clone(), proxy_name.clone()],
+            published_ports,
+        )
+        .await?;
+        self.wait_for_java(placement).await?;
+        if needs_bootstrap_snapshot {
+            self.publish_quiescent_snapshot(placement, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_ingress_relay(
+        &self,
+        preview_id: Uuid,
+        generation: i64,
+        internal_network: &str,
+        backend_container: &str,
+        internal_peers: &[String],
+        ports: PublishedWorkloadPorts,
+    ) -> Result<()> {
+        let policy = GatewayIngressPolicy::new(self.gateway_address)?;
+        ensure_runtime_ingress(
+            &policy,
+            &self.sandbox,
+            &self.runtime_api_proxy_image,
+            preview_id,
+            generation,
+            internal_network,
+            backend_container,
+            internal_peers,
+            ports,
+        )
+        .await
+        .context("ensure generation-scoped Gateway-only CI preview ingress")
     }
 
     async fn wait_for_java(&self, placement: &CiRuntimePlacement) -> Result<()> {
@@ -488,27 +525,13 @@ impl CiPreviewWorker {
             self.control_plane.ci_runtime_lost(placement).await?;
             return Ok(());
         }
+        self.recover_snapshot_barrier(placement).await?;
         if self
             .control_plane
             .ci_world_snapshot_requested(placement)
             .await?
         {
-            let capability = fs::read_to_string(
-                self.runtime_dir(placement.preview_id)
-                    .join("runtime.capability"),
-            )?;
-            let socket = self
-                .storage
-                .path(placement.preview_id)
-                .join("run/host-control.sock");
-            PumpkinControl::new(capability.trim().to_owned())
-                .save(&socket)
-                .await
-                .context("save CI world before requested snapshot")?;
-            self.persist_world_snapshot(placement).await?;
-            self.control_plane
-                .ci_world_snapshot_complete(placement)
-                .await?;
+            self.publish_quiescent_snapshot(placement, true).await?;
         }
         let capability = fs::read_to_string(
             self.runtime_dir(placement.preview_id)
@@ -540,7 +563,6 @@ impl CiPreviewWorker {
     async fn stop(&self, placement: &CiRuntimePlacement, retain_world: bool) -> Result<()> {
         if retain_world {
             self.graceful_stop(placement).await?;
-            self.persist_world_snapshot(placement).await?;
             self.control_plane.ci_runtime_stopped(placement).await?;
         } else {
             self.force_stop(placement).await?;
@@ -552,26 +574,35 @@ impl CiPreviewWorker {
     }
 
     async fn graceful_stop(&self, placement: &CiRuntimePlacement) -> Result<()> {
+        let capability = fs::read_to_string(
+            self.runtime_dir(placement.preview_id)
+                .join("runtime.capability"),
+        )?;
+        let control = PumpkinControl::new(capability.trim().to_owned());
+        let socket = self
+            .storage
+            .path(placement.preview_id)
+            .join("run/host-control.sock");
         if self.container_generation(placement.preview_id).await? == Some(placement.generation) {
-            let capability = fs::read_to_string(
-                self.runtime_dir(placement.preview_id)
-                    .join("runtime.capability"),
-            )?;
-            let socket = self
-                .storage
-                .path(placement.preview_id)
-                .join("run/host-control.sock");
-            let control = PumpkinControl::new(capability.trim().to_owned());
-            // Save explicitly before shutdown so the persistent world is durable
-            // before the DB releases ports and active-resource reservation.
-            control
-                .save(&socket)
+            self.recover_snapshot_barrier(placement).await?;
+            let mut boundary = WorkerSnapshotBoundary {
+                worker: self,
+                placement,
+                control: control.clone(),
+                socket: socket.clone(),
+            };
+            boundary
+                .begin_application_barrier()
                 .await
-                .context("save CI world before idle stop")?;
-            control
-                .shutdown(&socket)
-                .await
-                .context("gracefully stop CI Pumpkin")?;
+                .context("establish durable application barrier before idle stop")?;
+            if let Err(shutdown_error) = control.shutdown(&socket).await {
+                if let Err(release_error) = boundary.end_application_barrier().await {
+                    return Err(shutdown_error).context(format!(
+                        "shutdown CI Pumpkin after quiescent save; barrier release failed: {release_error:#}"
+                    ));
+                }
+                return Err(shutdown_error).context("shutdown CI Pumpkin after quiescent save");
+            }
             timeout(Duration::from_secs(60), async {
                 loop {
                     if self
@@ -587,18 +618,180 @@ impl CiPreviewWorker {
             })
             .await
             .context("CI Pumpkin did not stop within 60 seconds")??;
+            // Shutdown completed all final world writes; with the process gone,
+            // this archive is a point-in-time checkpoint of the stopped world.
+            self.persist_world_snapshot(placement).await?;
+            self.clear_snapshot_barrier_marker(placement)?;
+        } else {
+            // If the process disappeared during the stop, never archive its
+            // potentially partial local write set. Restore the last verified
+            // shared checkpoint or leave the stop claim retryable.
+            let runtime_dir = self.runtime_dir(placement.preview_id);
+            let snapshot_path = runtime_dir.join("idle-recovery.tar.gz");
+            let Some(_) = self
+                .control_plane
+                .ci_world_snapshot_download(placement, &snapshot_path, CI_RUNTIME_DISK_BYTES as u64)
+                .await?
+            else {
+                bail!("CI runtime exited before a durable idle-stop checkpoint existed");
+            };
+            let world = self.storage.path(placement.preview_id);
+            self.storage.reset(placement.preview_id).await?;
+            let (daemon_uid, daemon_gid) = self.sandbox.rootless_daemon_identity().await?;
+            unpack_world_snapshot(
+                &snapshot_path,
+                &world,
+                CI_RUNTIME_DISK_BYTES as u64,
+                daemon_uid,
+                daemon_gid,
+            )?;
+            fs::remove_file(snapshot_path)?;
+            self.clear_snapshot_barrier_marker(placement)?;
         }
         self.remove_stopped_container(placement.preview_id).await?;
         crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
             placement.preview_id,
         ))
         .await?;
+        let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
+        cleanup_ingress_through(&ingress, placement.preview_id, placement.generation).await?;
         self.sandbox
             .remove_isolated_networks(placement.preview_id)
             .await?;
-        GatewayIngressPolicy::new(self.gateway_address)?
-            .remove_server(placement.preview_id)
+        Ok(())
+    }
+
+    async fn publish_quiescent_snapshot(
+        &self,
+        placement: &CiRuntimePlacement,
+        complete_request: bool,
+    ) -> Result<()> {
+        let capability = fs::read_to_string(
+            self.runtime_dir(placement.preview_id)
+                .join("runtime.capability"),
+        )?;
+        let control = PumpkinControl::new(capability.trim().to_owned());
+        let socket = self
+            .storage
+            .path(placement.preview_id)
+            .join("run/host-control.sock");
+        let mut boundary = WorkerSnapshotBoundary {
+            worker: self,
+            placement,
+            control,
+            socket,
+        };
+        publish_at_quiescent_boundary(&mut boundary).await?;
+        if complete_request {
+            self.control_plane
+                .ci_world_snapshot_complete(placement)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn recover_snapshot_barrier(&self, placement: &CiRuntimePlacement) -> Result<()> {
+        let marker = self
+            .runtime_dir(placement.preview_id)
+            .join("snapshot-barrier-active");
+        if !marker.exists() {
+            return Ok(());
+        }
+        let marker_generation = self.read_snapshot_barrier_marker(placement)?;
+        if marker_generation.as_deref() != Some(placement.generation.to_string().as_str()) {
+            bail!("snapshot barrier marker belongs to a different CI runtime generation");
+        }
+        let name = container_name(placement.preview_id);
+        let capability = fs::read_to_string(
+            self.runtime_dir(placement.preview_id)
+                .join("runtime.capability"),
+        )?;
+        let socket = self
+            .storage
+            .path(placement.preview_id)
+            .join("run/host-control.sock");
+        let control = PumpkinControl::new(capability.trim().to_owned());
+        recover_interrupted_boundary(self.ensure_container_unpaused(&name), async move {
+            control
+                .end_snapshot_barrier(&socket)
+                .await
+                .context("release interrupted Pumpkin application barrier")?;
+            self.clear_snapshot_barrier_marker(placement)?;
+            Ok(())
+        })
+        .await
+    }
+
+    fn read_snapshot_barrier_marker(
+        &self,
+        placement: &CiRuntimePlacement,
+    ) -> Result<Option<String>> {
+        let marker = self
+            .runtime_dir(placement.preview_id)
+            .join("snapshot-barrier-active");
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("CI snapshot barrier marker is not a regular managed file");
+        }
+        let bytes = read_managed_artifact(&marker, 64)?;
+        Ok(Some(
+            String::from_utf8(bytes).context("CI snapshot barrier marker is not UTF-8")?,
+        ))
+    }
+
+    fn clear_snapshot_barrier_marker(&self, placement: &CiRuntimePlacement) -> Result<()> {
+        let Some(generation) = self.read_snapshot_barrier_marker(placement)? else {
+            return Ok(());
+        };
+        if generation.trim() != placement.generation.to_string() {
+            bail!("refusing to clear another CI generation's snapshot barrier marker");
+        }
+        fs::remove_file(
+            self.runtime_dir(placement.preview_id)
+                .join("snapshot-barrier-active"),
+        )?;
+        Ok(())
+    }
+
+    async fn ensure_container_unpaused(&self, name: &str) -> Result<()> {
+        let inspect = Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Paused}}", name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .await?;
+        if !inspect.status.success() {
+            if String::from_utf8_lossy(&inspect.stderr).contains("No such object")
+                || String::from_utf8_lossy(&inspect.stderr).contains("No such container")
+            {
+                return Ok(());
+            }
+            bail!(
+                "failed to inspect paused CI runtime {name}: {}",
+                String::from_utf8_lossy(&inspect.stderr).trim()
+            );
+        }
+        if String::from_utf8_lossy(&inspect.stdout).trim() != "true" {
+            return Ok(());
+        }
+        let output = Command::new("docker")
+            .args(["unpause", name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "failed to unpause CI runtime {name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 
@@ -620,13 +813,12 @@ impl CiPreviewWorker {
         if let Some(generation) = self
             .container_label_generation(placement.preview_id)
             .await?
+            && generation != placement.generation
         {
-            if generation != placement.generation {
-                bail!(
-                    "refusing to stop CI preview generation {generation} with stale assignment {}",
-                    placement.generation
-                );
-            }
+            bail!(
+                "refusing to stop CI preview generation {generation} with stale assignment {}",
+                placement.generation
+            );
         }
         let output = Command::new("docker")
             .args(["rm", "--force", &name])
@@ -647,14 +839,10 @@ impl CiPreviewWorker {
             placement.preview_id,
         ))
         .await?;
+        let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
+        cleanup_ingress_through(&ingress, placement.preview_id, placement.generation).await?;
         self.sandbox
             .remove_isolated_network(placement.preview_id, placement.generation)
-            .await?;
-        // Firewall rules are generation-tagged and retained when container
-        // removal fails. Remove them only after Docker confirms teardown, so a
-        // failed start or expiry cannot leak a port lease or leave open access.
-        GatewayIngressPolicy::new(self.gateway_address)?
-            .remove_server(placement.preview_id)
             .await?;
         Ok(())
     }
@@ -677,6 +865,14 @@ impl CiPreviewWorker {
             "failed to remove stopped CI runtime {name}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+
+    async fn remove_all_orphan_resources(&self, preview_id: Uuid) -> Result<()> {
+        // The caller established that this preview has no assignment on this
+        // worker. Resource enumeration remains ownership-fenced by the UUID's
+        // labels, while the maximal bound deliberately covers stale generations
+        // whose main runtime container has already disappeared.
+        self.remove_stale(preview_id, i64::MAX).await
     }
 
     async fn remove_stale(&self, preview_id: Uuid, target_generation: i64) -> Result<()> {
@@ -714,13 +910,9 @@ impl CiPreviewWorker {
             preview_id,
         ))
         .await?;
+        let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
+        cleanup_ingress_through(&ingress, preview_id, target_generation).await?;
         self.sandbox.remove_isolated_networks(preview_id).await?;
-        // A crashed worker may have lost the container but left firewall state.
-        // Clear only this preview's uniquely tagged rules before installing a
-        // new generation or allowing worker reconciliation to continue.
-        GatewayIngressPolicy::new(self.gateway_address)?
-            .remove_server(preview_id)
-            .await?;
         Ok(())
     }
 
@@ -752,12 +944,16 @@ impl CiPreviewWorker {
         {
             bail!("container name collision: runtime is not owned by this CI preview");
         }
-        labels
+        let generation = labels
             .get("kurbis.generation")
             .and_then(serde_json::Value::as_str)
-            .map(str::parse::<i64>)
-            .transpose()
-            .context("invalid CI runtime generation label")
+            .context("CI runtime generation label is missing")?
+            .parse::<i64>()
+            .context("invalid CI runtime generation label")?;
+        if generation <= 0 {
+            bail!("CI runtime generation label must be positive");
+        }
+        Ok(Some(generation))
     }
 
     async fn container_generation(&self, preview_id: Uuid) -> Result<Option<i64>> {
@@ -796,14 +992,168 @@ impl CiPreviewWorker {
     }
 }
 
+fn owned_runtime_directory_ids(root: &std::path::Path) -> Result<HashSet<Uuid>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error).context("enumerate managed CI runtime directories"),
+    };
+    let mut ids = HashSet::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(preview_id) = Uuid::parse_str(name) else {
+            continue;
+        };
+        if preview_id.to_string() != name {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let owner_path = entry.path().join(".ci-preview-owner");
+        match fs::symlink_metadata(&owner_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect managed CI owner marker"),
+        }
+        let owner = read_managed_artifact(&owner_path, 64)?;
+        if owner == preview_id.to_string().as_bytes() {
+            ids.insert(preview_id);
+        }
+    }
+    Ok(ids)
+}
+
+fn orphaned_ci_preview_ids(managed: HashSet<Uuid>, assigned: &HashSet<Uuid>) -> Vec<Uuid> {
+    let mut orphaned = managed
+        .into_iter()
+        .filter(|preview_id| !assigned.contains(preview_id))
+        .collect::<Vec<_>>();
+    orphaned.sort_unstable();
+    orphaned
+}
+
+struct WorkerSnapshotBoundary<'a> {
+    worker: &'a CiPreviewWorker,
+    placement: &'a CiRuntimePlacement,
+    control: PumpkinControl,
+    socket: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SnapshotBarrier for WorkerSnapshotBoundary<'_> {
+    async fn begin_application_barrier(&mut self) -> Result<()> {
+        let marker = self
+            .worker
+            .runtime_dir(self.placement.preview_id)
+            .join("snapshot-barrier-active");
+        fs::write(&marker, self.placement.generation.to_string())?;
+        self.control
+            .begin_snapshot_barrier(&self.socket)
+            .await
+            .context("establish Pumpkin snapshot quiescence barrier")
+            .map_err(|error| {
+                error.context("snapshot barrier marker retained for crash recovery")
+            })?;
+        Ok(())
+    }
+
+    async fn pause_runtime_container(&mut self) -> Result<()> {
+        let name = container_name(self.placement.preview_id);
+        let output = Command::new("docker")
+            .args(["pause", &name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "failed to pause CI Pumpkin for snapshot: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn archive_and_publish(&mut self) -> Result<()> {
+        self.worker.persist_world_snapshot(self.placement).await
+    }
+
+    async fn unpause_runtime_container(&mut self) -> Result<()> {
+        self.worker
+            .ensure_container_unpaused(&container_name(self.placement.preview_id))
+            .await
+    }
+
+    async fn end_application_barrier(&mut self) -> Result<()> {
+        self.control
+            .end_snapshot_barrier(&self.socket)
+            .await
+            .context("release Pumpkin snapshot barrier")?;
+        self.worker.clear_snapshot_barrier_marker(self.placement)
+    }
+}
+
 mod helpers;
+mod snapshot_barrier;
 mod world_snapshot;
 use helpers::*;
+use snapshot_barrier::{
+    SnapshotBarrier, publish_at_quiescent_boundary, recover_interrupted_boundary,
+};
 use world_snapshot::{pack_world, unpack_world_snapshot};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_worker_reconciliation_selects_only_unassigned_ci_volumes() {
+        let assigned = HashSet::from([Uuid::from_u128(1), Uuid::from_u128(3)]);
+        let managed = HashSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]);
+        assert_eq!(
+            orphaned_ci_preview_ids(managed, &assigned),
+            vec![Uuid::from_u128(2)],
+        );
+    }
+    #[test]
+    fn orphan_discovery_includes_only_owned_runtime_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let owned_id = Uuid::new_v4();
+        let unowned_id = Uuid::new_v4();
+        let owned = root.path().join(owned_id.to_string());
+        let unowned = root.path().join(unowned_id.to_string());
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&unowned).unwrap();
+        write_runtime_owner(&owned, owned_id).unwrap();
+        fs::write(
+            unowned.join("runtime.capability"),
+            "not an ownership marker",
+        )
+        .unwrap();
+
+        let retained_storage_id = Uuid::new_v4();
+        let assigned_id = Uuid::new_v4();
+        let runtime_dirs = owned_runtime_directory_ids(root.path()).unwrap();
+        assert_eq!(runtime_dirs, HashSet::from([owned_id]));
+
+        let mut managed = HashSet::from([retained_storage_id, assigned_id]);
+        managed.extend(runtime_dirs);
+        let mut expected = vec![retained_storage_id, owned_id];
+        expected.sort_unstable();
+        assert_eq!(
+            orphaned_ci_preview_ids(managed, &HashSet::from([assigned_id])),
+            expected,
+            "owned worker metadata joins volume discovery while unowned directories and assigned worlds are never reclaimed"
+        );
+    }
+
     #[test]
     fn ci_container_name_is_separate_from_account_runtime() {
         assert!(container_name(Uuid::nil()).starts_with("kurbis-ci-"));
@@ -832,7 +1182,7 @@ mod readiness_tests {
             stream.read_exact(&mut handshake).await.unwrap();
             let mut cursor = 0;
             assert_eq!(read_varint(&handshake, &mut cursor).unwrap(), 0);
-            assert_eq!(read_varint(&handshake, &mut cursor).unwrap(), -1);
+            assert_eq!(read_varint(&handshake, &mut cursor).unwrap(), 777);
             let host_len = read_varint(&handshake, &mut cursor).unwrap() as usize;
             assert_eq!(&handshake[cursor..cursor + host_len], b"ci-preview");
 

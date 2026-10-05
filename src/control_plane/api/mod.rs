@@ -44,6 +44,7 @@ mod console;
 mod console_commands;
 mod events;
 mod exports;
+mod github_webhook;
 mod internal;
 mod logs;
 mod openapi;
@@ -94,6 +95,7 @@ pub fn openapi_document() -> aide::openapi::OpenApi {
 pub struct AppState {
     pub pool: PgPool,
     pub ci_build_coordinator: Option<Arc<dyn crate::ci::BuildCoordinator>>,
+    pub ci_build_identity: Option<crate::ci::CiBuildIdentity>,
     pub lifecycle: Lifecycle,
     pub config: ControlPlaneConfig,
     pub http: Client,
@@ -515,6 +517,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             get(internal::ci_bedrock_signal_target),
         )
         .route("/internal/admission", post(internal::admit))
+        .route("/webhooks/github", post(github_webhook::ingest))
         .route("/internal/ci/previews/{preview_id}", get(ci_runtime_public::status).patch(ci_runtime_public::update_settings))
         .route("/internal/ci/previews/{preview_id}/players", get(ci_runtime_public::players))
         .route("/internal/ci/previews/{preview_id}/commands", post(ci_runtime_public::command))
@@ -543,6 +546,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         )
         .route("/internal/worker/control/ci/runtimes", get(worker_ci::assignments))
         .route("/internal/worker/control/ci/runtimes/{preview_id}/capability", post(worker_ci::capability))
+        .route("/internal/worker/control/ci/runtimes/{preview_id}/world-initialized", post(worker_ci::world_initialized))
         .route("/internal/worker/control/ci/runtimes/{preview_id}/started", post(worker_ci::started))
         .route("/internal/worker/control/ci/runtimes/{preview_id}/start-failed", post(worker_ci::start_failed))
         .route("/internal/worker/control/ci/runtimes/{preview_id}/stopped", post(worker_ci::stopped))

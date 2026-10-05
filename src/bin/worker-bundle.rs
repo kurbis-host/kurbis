@@ -38,6 +38,8 @@ struct WorkerRecord {
     address: String,
     signal_address: String,
     gateway_address: Option<String>,
+    gateway_bedrock_ip: Option<String>,
+    gateway_bedrock_port: Option<u16>,
     control_plane_url: String,
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
@@ -104,6 +106,46 @@ fn worker_from_env(id: Uuid) -> Result<WorkerRecord> {
         }
         Err(error) => return Err(error).context("WORKER_GATEWAY_ADDRESS must be valid UTF-8"),
     };
+    let public_bedrock_ip = env::var("WORKER_GATEWAY_BEDROCK_IP").or_else(|error| match error {
+        env::VarError::NotPresent => env::var("BEDROCK_PUBLIC_IP"),
+        error => Err(error),
+    });
+    let public_bedrock_port =
+        env::var("WORKER_GATEWAY_BEDROCK_PORT").or_else(|error| match error {
+            env::VarError::NotPresent => env::var("BEDROCK_PUBLIC_PORT"),
+            error => Err(error),
+        });
+    let (gateway_bedrock_ip, gateway_bedrock_port) = match (public_bedrock_ip, public_bedrock_port)
+    {
+        (Ok(address), Ok(port)) => {
+            let address: std::net::Ipv4Addr = address
+                .parse()
+                .context("WORKER_GATEWAY_BEDROCK_IP must be IPv4")?;
+            ensure!(
+                !address.is_unspecified(),
+                "WORKER_GATEWAY_BEDROCK_IP must be concrete"
+            );
+            let port = port
+                .parse::<u16>()
+                .context("WORKER_GATEWAY_BEDROCK_PORT must be a valid port")?;
+            ensure!(
+                port > 1024,
+                "WORKER_GATEWAY_BEDROCK_PORT must be an unprivileged port"
+            );
+            (Some(address.to_string()), Some(port))
+        }
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) if runtime == "native" => {
+            (None, None)
+        }
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => {
+            bail!(
+                "WORKER_GATEWAY_BEDROCK_IP and WORKER_GATEWAY_BEDROCK_PORT are required for Docker workloads"
+            )
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(error).context("WORKER_GATEWAY_BEDROCK_IP/PORT must be valid UTF-8");
+        }
+    };
     let control_plane_url = required_env("WORKER_CONTROL_PLANE_URL")?;
     let worker = WorkerRecord {
         id,
@@ -111,6 +153,8 @@ fn worker_from_env(id: Uuid) -> Result<WorkerRecord> {
         address: required_env("WORKER_ADDRESS")?,
         signal_address,
         gateway_address,
+        gateway_bedrock_ip,
+        gateway_bedrock_port,
         runtime_api_proxy_upstream: env::var("WORKER_RUNTIME_API_PROXY_UPSTREAM")
             .unwrap_or_else(|_| control_plane_url.clone()),
         runtime_api_proxy_egress_network: env::var("WORKER_RUNTIME_API_EGRESS_NETWORK")
@@ -310,6 +354,13 @@ fn write_bundle(
         contents.push_str(&format!(
             "export WORKER_GATEWAY_ADDRESS={}\n",
             shell_quote(address)
+        ));
+    }
+    if let (Some(address), Some(port)) = (&worker.gateway_bedrock_ip, worker.gateway_bedrock_port) {
+        contents.push_str(&format!(
+            "export WORKER_GATEWAY_BEDROCK_IP={}\nexport WORKER_GATEWAY_BEDROCK_PORT={}\n",
+            shell_quote(address),
+            port
         ));
     }
     if let Some(binary) = &worker.pumpkin_binary {

@@ -105,6 +105,7 @@ where
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_check_run(
         &self,
         build_id: Uuid,

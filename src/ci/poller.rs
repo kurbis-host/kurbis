@@ -171,21 +171,157 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             // poller replica was unavailable.
             let admitted_branch = source_ref.kind == SourceRefKind::Branch
                 && stable_preview.state != crate::ci::CiPreviewState::Lobby;
-            if eager_pr || admitted_branch {
-                if let Some(builder) = self.builder.as_ref() {
-                    let request = crate::ci::BuildRequest {
+            if eager_pr {
+                self.ensure_pr_head_build(
+                    &source_ref,
+                    &repository_name,
+                    &source_ref.commit_sha,
+                    &commit_alias,
+                    &stable_alias,
+                )
+                .await?;
+            } else if admitted_branch && let Some(builder) = self.builder.as_ref() {
+                builder
+                    .ensure_build(crate::ci::BuildRequest {
                         key: key.clone(),
                         source_repository: source_ref.source_repository.clone(),
                         source_archive: Vec::new(),
-                    };
-                    builder
-                        .ensure_build(request)
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
+            }
+        }
+        self.reconcile_check_runs().await?;
+        Ok(())
+    }
+
+    /// Process queued signed PR lifecycle events without expanding a head into
+    /// its ancestors. Each delivery represents exactly one requested PR head.
+    pub async fn drain_github_webhooks_once(&self) -> Result<()> {
+        for delivery in self.repository.claim_github_pr_deliveries(16).await? {
+            let delivery_id = delivery.delivery_id;
+            let claim_token = delivery.claim_token;
+            let repository = self.repository.clone();
+            let renewal = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    match repository
+                        .renew_github_pr_delivery_claim(delivery_id, claim_token)
                         .await
-                        .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
+                    {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(delivery_id = %delivery_id, ?error, "failed to renew GitHub PR delivery lease")
+                        }
+                    }
+                }
+            });
+            let result = self.process_github_pr_delivery(&delivery).await;
+            renewal.abort();
+            match result {
+                Ok(()) => {
+                    self.repository
+                        .complete_github_pr_delivery(delivery_id, claim_token)
+                        .await?;
+                }
+                Err(error) => {
+                    self.repository
+                        .retry_github_pr_delivery(delivery_id, claim_token, &error.to_string())
+                        .await?;
+                    tracing::warn!(delivery_id = %delivery_id, ?error, "GitHub PR delivery will retry");
                 }
             }
         }
         self.reconcile_check_runs().await?;
+        Ok(())
+    }
+
+    async fn process_github_pr_delivery(
+        &self,
+        delivery: &crate::ci::ClaimedCiGitHubPrDelivery,
+    ) -> Result<()> {
+        let commit_alias = CiHostname::for_ref(
+            CiRefKind::Commit,
+            &delivery.head_sha,
+            &self.config.root_domain,
+        )?;
+        let stable_alias = CiHostname::for_ref(
+            CiRefKind::PullRequest,
+            &format!("pr-{}", delivery.pull_request_number),
+            &self.config.root_domain,
+        )?;
+        let source_ref = crate::ci::SourceRef {
+            kind: SourceRefKind::PullRequest,
+            name: format!("pr-{}", delivery.pull_request_number),
+            number: Some(delivery.pull_request_number),
+            commit_sha: delivery.head_sha.clone(),
+            source_repository: Some(delivery.source_repository.clone()),
+            closed: false,
+            deleted: false,
+            updated_at: Some(chrono::Utc::now()),
+        };
+        self.ensure_pr_head_build(
+            &source_ref,
+            &delivery.repository,
+            &delivery.head_sha,
+            &commit_alias,
+            &stable_alias,
+        )
+        .await
+    }
+
+    async fn ensure_pr_head_build(
+        &self,
+        source_ref: &crate::ci::SourceRef,
+        repository: &str,
+        commit_sha: &str,
+        commit_alias: &CiHostname,
+        stable_alias: &CiHostname,
+    ) -> Result<()> {
+        let key = BuildKey::new(
+            repository,
+            commit_sha,
+            &self.config.patch_fingerprint,
+            &self.config.toolchain_version,
+            &self.config.target_architecture,
+        )?;
+        let (build, _) = self.repository.ensure_build(&key).await?;
+        self.repository
+            .ensure_preview(
+                repository,
+                commit_sha,
+                CiRefKind::Commit,
+                None,
+                commit_alias,
+                build.id,
+            )
+            .await?;
+        if let Some(check_runs) = self.check_runs.as_ref()
+            && self.repository.check_run_id(build.id).await?.is_none()
+        {
+            let mut head = source_ref.clone();
+            head.commit_sha = commit_sha.to_owned();
+            self.ensure_check_run(
+                check_runs.as_ref(),
+                build.id,
+                &head,
+                repository,
+                commit_alias,
+                stable_alias,
+            )
+            .await?;
+        }
+        if let Some(builder) = self.builder.as_ref() {
+            builder
+                .ensure_build(crate::ci::BuildRequest {
+                    key,
+                    source_repository: source_ref.source_repository.clone(),
+                    source_archive: Vec::new(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("PR head build failed: {error}"))?;
+        }
         Ok(())
     }
 

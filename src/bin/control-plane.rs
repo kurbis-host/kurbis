@@ -3,15 +3,18 @@ use std::sync::Arc;
 use anyhow::Result;
 use kurbis_hoster::{
     ci::{
-        ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiPoller, CiPollerConfig,
-        CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient, GitHubExactSource,
-        GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, docker_pipeline,
+        ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiBuildIdentity, CiPoller,
+        CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient,
+        GitHubExactSource, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
+        docker_pipeline,
     },
     config::{CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::{
         api::{AppState, router, spawn_queue_drain},
         lifecycle::Lifecycle,
-        maintenance::{WorkerMaintenance, spawn_worker_maintenance},
+        maintenance::{
+            WorkerMaintenance, cleanup_stale_ci_preview_deletions, spawn_worker_maintenance,
+        },
     },
     db, init_tracing,
 };
@@ -27,6 +30,7 @@ async fn main() -> Result<()> {
     spawn_queue_drain(lifecycle.clone());
     spawn_worker_maintenance(WorkerMaintenance::new(pool.clone(), object_store.clone()));
     let mut ci_build_coordinator: Option<Arc<dyn BuildCoordinator>> = None;
+    let mut ci_build_identity: Option<CiBuildIdentity> = None;
     if let Some(ci_config) = CiConfig::from_env()? {
         let ci_repository = CiPreviewRepository::new(pool.clone());
         let watched = ci_repository
@@ -65,9 +69,16 @@ async fn main() -> Result<()> {
             .with_public_status_base_url(public_status_base_url.clone()),
         );
         ci_build_coordinator = Some(pipeline.clone());
+        ci_build_identity = Some(CiBuildIdentity {
+            repository: ci_config.repository.clone(),
+            patch_fingerprint: ci_config.patch_fingerprint.clone(),
+            toolchain_version: ci_config.toolchain_version.clone(),
+            target_architecture: ci_config.target_architecture.clone(),
+        });
         let expiry_repository = ci_repository.clone();
         let runtime_repository = CiPreviewRuntimeRepository::new(pool.clone());
         let artifact_cache = ObjectArtifactCache::new(pool.clone(), object_store.clone());
+        let ci_runtime_object_store = object_store.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -81,6 +92,18 @@ async fn main() -> Result<()> {
                 // generation-fenced world deletion during their next reconcile.
                 if let Err(error) = runtime_repository.claim_expired(now, 128).await {
                     tracing::error!(?error, "failed to queue expired CI runtime cleanup");
+                }
+                if let Err(error) = cleanup_stale_ci_preview_deletions(
+                    &runtime_repository,
+                    ci_runtime_object_store.clone(),
+                    128,
+                )
+                .await
+                {
+                    tracing::error!(
+                        ?error,
+                        "failed to reclaim expired CI worlds from stale workers"
+                    );
                 }
                 // Rehome checkpointed runtimes before the idle claimant can
                 // transition a stale worker's placement to `stopping`.
@@ -101,27 +124,38 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tokio::spawn(
-            CiPoller::new(ci_repository, std::sync::Arc::new(source))
-                .with_check_runs(check_runs)
-                .with_config(CiPollerConfig {
-                    root_domain: kurbis_hoster::ci::CI_ROOT_DOMAIN.into(),
-                    patch_fingerprint: ci_config.patch_fingerprint.clone(),
-                    toolchain_version: ci_config.toolchain_version.clone(),
-                    target_architecture: ci_config.target_architecture.clone(),
-                    public_status_base_url: Some(public_status_base_url),
-                })
-                .with_builder(pipeline)
-                .run_forever(
-                    watched.id,
-                    std::time::Duration::from_secs(POLL_INTERVAL_SECONDS),
-                ),
-        );
+        let ci_poller = CiPoller::new(ci_repository, std::sync::Arc::new(source))
+            .with_check_runs(check_runs)
+            .with_config(CiPollerConfig {
+                root_domain: kurbis_hoster::ci::CI_ROOT_DOMAIN.into(),
+                patch_fingerprint: ci_config.patch_fingerprint.clone(),
+                toolchain_version: ci_config.toolchain_version.clone(),
+                target_architecture: ci_config.target_architecture.clone(),
+                public_status_base_url: Some(public_status_base_url),
+            })
+            .with_builder(pipeline);
+        let webhook_poller = ci_poller.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = webhook_poller.drain_github_webhooks_once().await {
+                    tracing::error!(
+                        ?error,
+                        "failed to process queued GitHub PR webhook deliveries"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        tokio::spawn(ci_poller.run_forever(
+            watched.id,
+            std::time::Duration::from_secs(POLL_INTERVAL_SECONDS),
+        ));
     }
     let listen = config.listen;
     let state = Arc::new(AppState {
         pool,
         ci_build_coordinator,
+        ci_build_identity,
         lifecycle,
         config,
         object_store,

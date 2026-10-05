@@ -22,6 +22,24 @@ impl CommonConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneConfig {
     pub common: CommonConfig,
@@ -29,6 +47,7 @@ pub struct ControlPlaneConfig {
     pub public_base_url: String,
     pub root_domain: String,
     pub internal_token: String,
+    pub ci_github_webhook_secret: Option<SecretString>,
     pub oauth: OAuthConfig,
 }
 
@@ -291,12 +310,32 @@ impl ControlPlaneConfig {
     }
 
     pub fn from_env() -> Result<Self> {
+        let github_pat_enabled = env::var("CI_GITHUB_PAT")
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false);
+        let ci_github_webhook_secret = match env::var("CI_GITHUB_WEBHOOK_SECRET") {
+            Ok(secret)
+                if (32..=512).contains(&secret.len())
+                    && secret.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) =>
+            {
+                Some(SecretString::new(secret))
+            }
+            Ok(_) => bail!("CI_GITHUB_WEBHOOK_SECRET must contain 32 to 512 visible ASCII bytes"),
+            Err(env::VarError::NotPresent) if !github_pat_enabled => None,
+            Err(env::VarError::NotPresent) => {
+                bail!("CI_GITHUB_WEBHOOK_SECRET is required when CI_GITHUB_PAT enables Pumpkin CI")
+            }
+            Err(error) => {
+                return Err(error).context("CI_GITHUB_WEBHOOK_SECRET must be valid UTF-8");
+            }
+        };
         Ok(Self {
             common: CommonConfig::from_env()?,
             listen: value("CONTROL_PLANE_LISTEN", "0.0.0.0:8080").parse()?,
             public_base_url: required("PUBLIC_BASE_URL")?,
             root_domain: required("ROOT_DOMAIN")?,
             internal_token: required("INTERNAL_TOKEN")?,
+            ci_github_webhook_secret,
             oauth: OAuthConfig {
                 google: oauth_provider(
                     "GOOGLE_OAUTH",
@@ -324,6 +363,8 @@ pub struct WorkerConfig {
     pub address: String,
     pub signal_address: IpAddr,
     pub gateway_address: Option<IpAddr>,
+    pub gateway_bedrock_ip: Option<std::net::Ipv4Addr>,
+    pub gateway_bedrock_port: Option<u16>,
     pub root: PathBuf,
     pub storage_mode: StorageMode,
     pub runtime: RuntimeConfig,
@@ -383,6 +424,44 @@ impl WorkerConfig {
             }
             Err(error) => return Err(error).context("WORKER_GATEWAY_ADDRESS must be UTF-8"),
         };
+        let (gateway_bedrock_ip, gateway_bedrock_port) = match (
+            env::var("WORKER_GATEWAY_BEDROCK_IP"),
+            env::var("WORKER_GATEWAY_BEDROCK_PORT"),
+        ) {
+            (Ok(address), Ok(port)) => {
+                let address: std::net::Ipv4Addr = address
+                    .parse()
+                    .context("WORKER_GATEWAY_BEDROCK_IP must be IPv4")?;
+                ensure!(
+                    crate::model::is_gateway_source_address(&address.to_string()),
+                    "WORKER_GATEWAY_BEDROCK_IP must be a concrete unicast Gateway public IPv4 address"
+                );
+                let port = port
+                    .parse::<u16>()
+                    .context("WORKER_GATEWAY_BEDROCK_PORT must be a valid port")?;
+                ensure!(
+                    port > 1024,
+                    "WORKER_GATEWAY_BEDROCK_PORT must be an unprivileged port"
+                );
+                (Some(address), Some(port))
+            }
+            (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) if native => {
+                (None, None)
+            }
+            (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => {
+                bail!(
+                    "Docker workloads require WORKER_GATEWAY_BEDROCK_IP and WORKER_GATEWAY_BEDROCK_PORT"
+                )
+            }
+            (Err(env::VarError::NotPresent), _) | (_, Err(env::VarError::NotPresent)) => {
+                bail!(
+                    "WORKER_GATEWAY_BEDROCK_IP and WORKER_GATEWAY_BEDROCK_PORT must be configured together"
+                )
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                return Err(error).context("WORKER_GATEWAY_BEDROCK_IP/PORT must be valid UTF-8");
+            }
+        };
         let control_plane_url = required("CONTROL_PLANE_URL")?;
         let runtime_api_proxy_upstream =
             value("WORKER_RUNTIME_API_PROXY_UPSTREAM", &control_plane_url);
@@ -434,6 +513,8 @@ impl WorkerConfig {
             address: worker_address,
             signal_address,
             gateway_address,
+            gateway_bedrock_ip,
+            gateway_bedrock_port,
             root,
             storage_mode: StorageMode::from_env(native)?,
             runtime,
@@ -527,7 +608,9 @@ impl StorageMode {
 pub struct GatewayConfig {
     pub common: CommonConfig,
     pub java_listen: SocketAddr,
+    pub java_public_port: u16,
     pub bedrock_listen: SocketAddr,
+    pub bedrock_public_address: std::net::Ipv4Addr,
     pub bedrock_public_port: u16,
     pub bedrock_tls_certificate: PathBuf,
     pub bedrock_tls_private_key: PathBuf,
@@ -545,17 +628,33 @@ pub struct GatewayConfig {
 
 impl GatewayConfig {
     pub fn from_env() -> Result<Self> {
+        let java_public_port = value("JAVA_PUBLIC_PORT", "25565")
+            .parse::<u16>()
+            .context("invalid JAVA_PUBLIC_PORT")?;
+        anyhow::ensure!(
+            java_public_port > 1024,
+            "JAVA_PUBLIC_PORT must be an unprivileged port"
+        );
         let bedrock_public_port: u16 = required("BEDROCK_PUBLIC_PORT")?
             .parse()
             .context("invalid BEDROCK_PUBLIC_PORT")?;
         anyhow::ensure!(
-            bedrock_public_port != 0,
-            "BEDROCK_PUBLIC_PORT must be non-zero"
+            bedrock_public_port > 1024,
+            "BEDROCK_PUBLIC_PORT must be an unprivileged non-zero port"
+        );
+        let bedrock_public_address: std::net::Ipv4Addr = required("BEDROCK_PUBLIC_IP")?
+            .parse()
+            .context("BEDROCK_PUBLIC_IP must be IPv4")?;
+        anyhow::ensure!(
+            !bedrock_public_address.is_unspecified(),
+            "BEDROCK_PUBLIC_IP must be a concrete public IPv4 address"
         );
         Ok(Self {
             common: CommonConfig::from_env()?,
             java_listen: value("JAVA_LISTEN", "0.0.0.0:25565").parse()?,
+            java_public_port,
             bedrock_listen: value("BEDROCK_LISTEN", "0.0.0.0:19132").parse()?,
+            bedrock_public_address,
             bedrock_public_port,
             bedrock_tls_certificate: PathBuf::from(required("BEDROCK_TLS_CERT_FILE")?),
             bedrock_tls_private_key: PathBuf::from(required("BEDROCK_TLS_KEY_FILE")?),

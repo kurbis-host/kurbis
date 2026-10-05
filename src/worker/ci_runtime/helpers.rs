@@ -81,7 +81,7 @@ pub(super) fn unpack_artifact(bytes: &[u8], target: &Path) -> Result<ArtifactMet
             .create_new(true)
             .mode(if name == "pumpkin" { 0o755 } else { 0o644 })
             .open(output)?;
-        let mut copy = (&mut entry).take(limit as u64 + 1);
+        let mut copy = (&mut entry).take(limit + 1);
         let mut content = Vec::new();
         copy.read_to_end(&mut content)?;
         if content.len() as u64 != entry_size {
@@ -124,11 +124,11 @@ pub(super) fn read_managed_artifact(source: &Path, limit: u64) -> Result<Vec<u8>
 }
 
 pub(super) fn open_directory(path: &Path) -> Result<fs::File> {
-    Ok(OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .with_context(|| format!("open non-symlink CI world directory {}", path.display()))?)
+        .with_context(|| format!("open non-symlink CI world directory {}", path.display()))
 }
 
 pub(super) fn ensure_child_directory(
@@ -253,15 +253,21 @@ pub(super) fn write_secret(path: &Path, value: &str) -> Result<()> {
 }
 
 pub(super) fn write_runtime_owner(runtime_dir: &Path, preview_id: Uuid) -> Result<()> {
-    let root = open_directory(runtime_dir)?;
-    atomic_write_at(
-        &root,
-        ".ci-preview-owner",
-        preview_id.to_string().as_bytes(),
-        0o600,
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
-    )
+    // Keep the marker creation atomic and reject a pre-existing symlink. The
+    // owner marker is created exactly once for a newly provisioned runtime;
+    // using the path-based O_NOFOLLOW path here also works on macOS, where
+    // renameat through a read-only directory descriptor is not reliable.
+    let marker = runtime_dir.join(".ci-preview-owner");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&marker)
+        .with_context(|| format!("create managed CI owner marker at {}", marker.display()))?;
+    file.write_all(preview_id.to_string().as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 pub(super) fn remove_owned_runtime_dir(allowed_root: &Path, preview_id: Uuid) -> Result<()> {
@@ -307,7 +313,7 @@ pub(super) async fn java_status_probe(address: SocketAddr) -> Result<()> {
     let host = "ci-preview";
     let mut handshake = Vec::new();
     write_varint(0, &mut handshake);
-    write_varint(-1, &mut handshake);
+    write_varint(777, &mut handshake);
     write_varint(host.len() as i32, &mut handshake);
     handshake.extend_from_slice(host.as_bytes());
     handshake.extend_from_slice(&25565u16.to_be_bytes());
@@ -323,7 +329,7 @@ pub(super) async fn java_status_probe(address: SocketAddr) -> Result<()> {
     frame.extend(packet);
     stream.write_all(&frame).await?;
     let size = read_varint_async(&mut stream).await?;
-    if !(1..=8192).contains(&size) {
+    if !(1..=65_536).contains(&size) {
         bail!("invalid Minecraft status frame");
     }
     let mut response = vec![0; size as usize];

@@ -20,6 +20,7 @@ pub const ROOTLESS_BUILD_LIMITS: SandboxLimits = SandboxLimits {
 /// Construct the complete host-owned rootless Docker pipeline. The returned pipeline
 /// never reads a fetched Dockerfile; source retrieval, patching, and compilation
 /// are all explicit trusted-host components.
+#[allow(clippy::too_many_arguments)]
 pub fn docker_pipeline<S, A>(
     repository: CiPreviewRepository,
     source: Arc<S>,
@@ -43,6 +44,7 @@ where
     A: ArtifactCache + 'static,
 {
     let runtime = Arc::new(DockerRootlessBuildRuntime::new(
+        repository.pool(),
         builder_image,
         builder_docker_host,
         toolchain_version,

@@ -10,12 +10,16 @@ Build and push this host-owned image from the repository root on a trusted Linux
 builder. Pin `RUST_TOOLCHAIN` to the exact Rust release that the image must use:
 
 ```sh
-docker buildx build \
+KURBIS_BUILD_MEMORY_BYTES=10737418240 \
+KURBIS_BUILD_SYSTEM_RESERVE_BYTES=4294967296 \
+KURBIS_BUILD_OUTPUT_MODE=push \
+tools/docker_build_with_limits.sh \
+  --platform linux/amd64 \
   --build-arg RUST_TOOLCHAIN=1.98.1 \
   --build-arg PUMPKIN_REVISION="$(cat runtime/pumpkin/REVISION)" \
-  -f runtime/ci/builder.Dockerfile \
-  -t registry.example/kurbis/pumpkin-ci-builder:1.98.1 \
-  --push .
+  --file runtime/ci/builder.Dockerfile \
+  --tag registry.example/kurbis/pumpkin-ci-builder:1.98.1 \
+  .
 ```
 
 Take the resulting manifest digest from the registry and configure the control
@@ -47,15 +51,38 @@ daemon. Provision the dedicated builder host with enough disk for the pinned too
 image and rootless Docker data root. Per-build source, target, and temporary scratch
 are volatile bounded tmpfs mounts. The pre-seeded Cargo package/git cache remains
 in the immutable image and is read-only to workloads; only the image and bounded
-Docker logs persist on the host. Compilation is serialized, with a 10 GiB
-memory cap and a 90-minute process timeout, release LTO disabled, and 16 codegen units. Provision the dedicated
-builder with at least 16 GiB RAM so its host and Docker daemon retain headroom. The Kurbis
-startup probe rejects builders whose cgroup v2, user namespace, CPU/memory/PID
-controls, no-egress policy, read-only image root, or bounded workspace tmpfs do
-not pass disposable workload tests. Builder workspaces use a per-container
-tmpfs cap sized to the configured build disk budget; input, `/tmp`, and
-`/dev/shm` caps are deducted from that same budget. This avoids reliance on
-rootless Docker's unsupported overlay `--storage-opt` while preserving a hard
+Docker logs persist on the host.
+
+Every CI patch/compile phase, across control-plane processes and coordinated jobs,
+first takes one session-scoped PostgreSQL advisory lock. The coordinator also samples
+`MemAvailable` on the builder host (not the control-plane machine) and starts a build
+only when the requested container memory plus a fixed 4 GiB system/runtime reserve
+fits in current headroom. Admission waits at most 10 minutes and then fails closed
+with the last measured host-memory figures; it never raises the configured container
+limit to work around low headroom. If a coordinator is cancelled or crashes, its
+PostgreSQL session releases the lock. The next owner reclaims only CI build containers
+carrying Kurbis's build label before admission. A dropped lease also schedules
+immediate removal of its lease-owned containers.
+
+The Rust compiler runs with one Cargo job and each rootless task container has a hard
+10 GiB memory cap, an equal memory+swap cap (zero swap allowance), 2 CPU, 512 PIDs,
+a 90-minute process timeout, read-only root, no network, and bounded tmpfs scratch.
+Release LTO is disabled and release codegen units are forced to one to avoid
+intra-crate codegen fan-out on top of the single Cargo job. Container failure diagnostics
+include Docker's `OOMKilled` state plus cgroup-v2 `memory.max`, `memory.swap.max`,
+`memory.current`, `memory.peak`, and `memory.events`, so a cgroup OOM can be
+separated from a host-memory admission deferral. Startup also runs a disposable
+32 MiB pressure probe and requires the cgroup `oom_kill` counter to increase under
+controlled pressure; a successful limit-shaped Docker command without an observed
+kernel enforcement event is not accepted.
+
+Provision the dedicated builder with at least 16 GiB RAM so its host and Docker
+daemon retain headroom. The Kurbis startup probe rejects builders whose cgroup v2,
+user namespace, CPU/memory/PID controls, no-egress policy, read-only image root, or
+bounded workspace tmpfs do not pass disposable workload tests. Builder workspaces
+use a per-container tmpfs cap sized to the configured build disk budget; input,
+`/tmp`, and `/dev/shm` caps are deducted from that same budget. This avoids reliance
+on rootless Docker's unsupported overlay `--storage-opt` while preserving a hard
 bound on writable build storage.
 
 Use a dedicated SSH key with access only to this rootless builder account. In the

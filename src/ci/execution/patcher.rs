@@ -9,6 +9,8 @@ use super::archive::{
 use crate::ci::BuildPipelineError;
 
 const HOST_CONTROL_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/host-control.patch");
+const SNAPSHOT_BARRIER_PATCH: &[u8] =
+    include_bytes!("../../../runtime/pumpkin/snapshot-barrier.patch");
 const NETHERNET_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/nethernet-gateway.patch");
 const HOST_CONTROL_RS: &[u8] = include_bytes!("../../../runtime/pumpkin/host_control.rs");
 const PUMPKIN_REVISION: &[u8] = include_bytes!("../../../runtime/pumpkin/REVISION");
@@ -28,6 +30,7 @@ pub fn checked_in_patch_fingerprint() -> String {
     for (name, bytes) in [
         ("pumpkin-revision", PUMPKIN_REVISION),
         ("host-control.patch", HOST_CONTROL_PATCH),
+        ("snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH),
         ("nethernet-gateway.patch", NETHERNET_PATCH),
         ("host_control.rs", HOST_CONTROL_RS),
         ("trusted-plugin/Cargo.toml", PLUGIN_0),
@@ -132,6 +135,13 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
             )));
         }
         Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH, false).await?;
+        Self::apply_patch(
+            root,
+            "snapshot-barrier.patch",
+            SNAPSHOT_BARRIER_PATCH,
+            false,
+        )
+        .await?;
         Self::apply_patch(root, "nethernet-gateway.patch", NETHERNET_PATCH, true).await?;
 
         let host_control = root.join("crates/pumpkin/src/net/host_control.rs");

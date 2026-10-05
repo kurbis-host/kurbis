@@ -1,4 +1,5 @@
 use super::*;
+use bytes::Bytes;
 
 struct IdempotentCheckRuns {
     id: i64,
@@ -67,6 +68,9 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
     let fetches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = std::sync::Arc::new(PullRequestFixtureSource {
         fetches: fetches.clone(),
+        head_sha: std::sync::Arc::new(std::sync::RwLock::new(
+            "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+        )),
     });
     let components = std::sync::Arc::new(TestBuildComponents::default());
     let check_run_id = (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
@@ -110,7 +114,8 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
                 process_timeout: std::time::Duration::from_secs(3600),
             },
         )
-        .with_check_runs(check_runs.clone()),
+        .with_check_runs(check_runs.clone())
+        .with_root_domain(root_domain.clone()),
     );
     let poller = CiPoller::new(repository.clone(), source)
         .with_config(CiPollerConfig {
@@ -364,6 +369,13 @@ async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_st
 
 #[tokio::test]
 async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_closed_prs() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use kurbis_hoster::control_plane::{
+        api::router, maintenance::finish_claimed_stale_ci_preview_deletion,
+    };
+    use object_store::{ObjectStore, PutPayload, memory::InMemory, path::Path as StorePath};
+    use std::sync::Arc;
+
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
@@ -449,12 +461,24 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
     )
     .bind(watched.id)
     .bind(&sha)
-    .bind(&repository_name)
+    .bind(repository_name.clone())
     .execute(&pool)
     .await
     .unwrap();
 
     let worker_id = Uuid::new_v4();
+    let worker_token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let worker_lease = Uuid::new_v4();
+    let snapshot_store = Arc::new(InMemory::new());
+    let snapshot_bytes = Bytes::from_static(b"branch-world-snapshot-before-worker-loss");
+    let snapshot_key = format!("ci-previews/{}/worlds/1-test.tar.gz", branch.id);
+    snapshot_store
+        .put(
+            &StorePath::parse(&snapshot_key).unwrap(),
+            PutPayload::from_bytes(snapshot_bytes.clone()),
+        )
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO workers(id,name,address,signal_address,total_memory_bytes,total_disk_bytes,total_cpu_millis,
              heartbeat_at,draining,port_min,port_max,runtime_architecture,supports_ci_previews)
@@ -466,6 +490,26 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO worker_credentials(worker_id,api_token_hash,lease_id,lease_expires_at)
+         VALUES($1,$2,$3,now()+interval '1 hour')",
+    )
+    .bind(worker_id)
+    .bind(blake3::hash(worker_token.as_bytes()).as_bytes().to_vec())
+    .bind(worker_lease)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workers SET reserved_memory_bytes=$2,reserved_disk_bytes=$3,reserved_cpu_millis=$4 WHERE id=$1",
+    )
+    .bind(worker_id)
+    .bind(kurbis_hoster::ci::CI_RUNTIME_MEMORY_BYTES)
+    .bind(kurbis_hoster::ci::CI_RUNTIME_DISK_BYTES)
+    .bind(kurbis_hoster::ci::CI_RUNTIME_CPU_MILLIS)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("UPDATE ci_preview_aliases SET state='running', runtime_generation=1 WHERE id=$1")
         .bind(branch.id)
         .execute(&pool)
@@ -474,13 +518,24 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
     let lease_token = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO ci_runtime_placements
-         (preview_id,worker_id,generation,lease_token,java_port,bedrock_port,signal_port,state,active,capability_hash)
-         VALUES($1,$2,1,$3,28000,28001,28002,'running',true,$4)",
+         (preview_id,worker_id,generation,lease_token,java_port,bedrock_port,signal_port,state,active,capacity_reserved,world_initialized,capability_hash)
+         VALUES($1,$2,1,$3,28000,28001,28002,'running',true,true,true,$4)",
     )
     .bind(branch.id)
     .bind(worker_id)
     .bind(lease_token)
     .bind([3u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ci_world_snapshots(preview_id,object_key,size_bytes,checksum,source_generation)
+         VALUES($1,$2,$3,$4,1)",
+    )
+    .bind(branch.id)
+    .bind(&snapshot_key)
+    .bind(snapshot_bytes.len() as i64)
+    .bind(blake3::hash(&snapshot_bytes).to_hex().to_string())
     .execute(&pool)
     .await
     .unwrap();
@@ -532,14 +587,111 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
             .await
             .unwrap();
     assert_eq!(runtime_state, "deleting");
-
-    sqlx::query("DELETE FROM ci_runtime_placements WHERE preview_id=$1")
-        .bind(branch.id)
+    sqlx::query("UPDATE workers SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1")
+        .bind(worker_id)
         .execute(&pool)
         .await
         .unwrap();
+
+    let runtime_repository = kurbis_hoster::ci::CiPreviewRuntimeRepository::new(pool.clone());
+    let stale_claim = runtime_repository.claim_stale_expired(16).await.unwrap();
+    assert_eq!(stale_claim.len(), 1);
+    assert_eq!(stale_claim[0].placement.preview_id, branch.id);
+    assert_eq!(stale_claim[0].placement.lease_token, lease_token);
+
+    let app = router(common::api_state(
+        pool.clone(),
+        "ci-branch-delete-secret",
+        snapshot_store.clone(),
+    ));
+    let stale_deleted_ack = Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(format!(
+            "/internal/worker/control/ci/runtimes/{}/deleted",
+            branch.id
+        ))
+        .header("authorization", format!("Bearer {worker_token}"))
+        .header("x-worker-lease", worker_lease.to_string())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"generation":1,"lease_token":lease_token}).to_string(),
+        ))
+        .unwrap();
+    let stale_delete_response = app.clone().oneshot(stale_deleted_ack).await.unwrap();
+    if stale_delete_response.status() != StatusCode::CONFLICT {
+        let (parts, body) = stale_delete_response.into_parts();
+        panic!(
+            "stale delete response {}: {}",
+            parts.status,
+            String::from_utf8_lossy(&to_bytes(body, 4096).await.unwrap())
+        );
+    }
+    finish_claimed_stale_ci_preview_deletion(
+        &runtime_repository,
+        snapshot_store.clone(),
+        &stale_claim[0],
+    )
+    .await
+    .unwrap();
+    assert!(
+        snapshot_store
+            .get(&StorePath::parse(&snapshot_key).unwrap())
+            .await
+            .is_err(),
+        "control-plane cleanup removes the shared world checkpoint"
+    );
+    assert!(
+        runtime_repository
+            .current(branch.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .lookup_preview_by_id(branch.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (reserved_memory, reserved_disk, reserved_cpu): (i64, i64, i64) = sqlx::query_as(
+        "SELECT reserved_memory_bytes,reserved_disk_bytes,reserved_cpu_millis FROM workers WHERE id=$1",
+    )
+    .bind(worker_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((reserved_memory, reserved_disk, reserved_cpu), (0, 0, 0));
+
+    let app = router(common::api_state(
+        pool.clone(),
+        "ci-branch-delete-secret",
+        snapshot_store.clone(),
+    ));
+    let stale_delete_ack = Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(format!(
+            "/internal/worker/control/ci/runtimes/{}/deleted",
+            branch.id
+        ))
+        .header("authorization", format!("Bearer {worker_token}"))
+        .header("x-worker-lease", worker_lease.to_string())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"generation":1,"lease_token":lease_token}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(stale_delete_ack).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
     sqlx::query("DELETE FROM ci_preview_aliases WHERE id=$1")
         .bind(pr.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM worker_credentials WHERE worker_id=$1")
+        .bind(worker_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -735,5 +887,577 @@ async fn expired_build_lease_fences_every_late_stage_log_and_artifact_write() {
     assert_eq!(build.stage, CiBuildStage::Fetching);
     assert!(!build.build_log.contains("stale output"));
     assert!(build.artifact_digest.is_none());
+    pool.close().await;
+}
+
+fn signed_github_request(
+    delivery_id: Uuid,
+    event_name: &str,
+    body: Vec<u8>,
+    secret: &str,
+    corrupt_signature: bool,
+) -> Request<Body> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(&body);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let signature = if corrupt_signature {
+        let mut corrupt = signature.into_bytes();
+        corrupt[0] = if corrupt[0] == b'0' { b'1' } else { b'0' };
+        format!("sha256={}", String::from_utf8(corrupt).unwrap())
+    } else {
+        format!("sha256={signature}")
+    };
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("x-github-delivery", delivery_id.to_string())
+        .header("x-github-event", event_name)
+        .header("x-hub-signature-256", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn github_webhook_requires_signature_and_persists_delivery_idempotently() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::control_plane::api::router;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let watched = repository
+        .register_repository("kurbis-host/Pumpkin", "main")
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ci_github_webhook_deliveries WHERE repository_id=$1")
+        .bind(watched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = common::api_state(
+        pool.clone(),
+        "webhook-internal-token",
+        Arc::new(InMemory::new()),
+    );
+    let app = router(state);
+    let secret = "test-webhook-secret";
+    let delivery_id = Uuid::new_v4();
+    let body = serde_json::json!({
+        "action": "synchronize",
+        "repository": {"full_name": "kurbis-host/Pumpkin"},
+        "pull_request": {
+            "number": 314,
+            "base": {
+                "sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "repo": {"full_name": "kurbis-host/Pumpkin"}
+            },
+            "head": {
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": {"full_name": "contributor/Pumpkin"}
+            }
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let first = app
+        .clone()
+        .oneshot(signed_github_request(
+            delivery_id,
+            "pull_request",
+            body.clone(),
+            secret,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let duplicate = app
+        .clone()
+        .oneshot(signed_github_request(
+            delivery_id,
+            "pull_request",
+            body.clone(),
+            secret,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+
+    let bad_signature_id = Uuid::new_v4();
+    let bad_signature = app
+        .clone()
+        .oneshot(signed_github_request(
+            bad_signature_id,
+            "pull_request",
+            body.clone(),
+            secret,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_signature.status(), StatusCode::UNAUTHORIZED);
+
+    let mut conflict_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    conflict_payload["pull_request"]["head"]["sha"] =
+        "1123456789abcdef0123456789abcdef01234567".into();
+    let conflict = app
+        .clone()
+        .oneshot(signed_github_request(
+            delivery_id,
+            "pull_request",
+            conflict_payload.to_string().into_bytes(),
+            secret,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let unrelated = app
+        .clone()
+        .oneshot(signed_github_request(
+            Uuid::new_v4(),
+            "ping",
+            b"{}".to_vec(),
+            secret,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unrelated.status(), StatusCode::NO_CONTENT);
+
+    let oversized = app
+        .oneshot(signed_github_request(
+            Uuid::new_v4(),
+            "pull_request",
+            vec![b'x'; 1024 * 1024 + 1],
+            secret,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_github_webhook_deliveries WHERE repository_id = $1",
+    )
+    .bind(watched.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored, 1,
+        "duplicate, forged, conflicting, unrelated and oversized requests cannot create extra jobs"
+    );
+    sqlx::query("DELETE FROM ci_github_webhook_deliveries WHERE delivery_id = $1")
+        .bind(delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pr_updates_build_only_requested_heads_and_late_events_never_roll_back_alias() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
+    use kurbis_hoster::control_plane::api::router;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = "kurbis-host/Pumpkin";
+    let watched = repository
+        .register_repository(repository_name, "main")
+        .await
+        .unwrap();
+    let unique_sha = || format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
+    let first_head = unique_sha();
+    let second_head = unique_sha();
+    let event_only_head = unique_sha();
+    let ancestry_only = unique_sha();
+    let head_sha = Arc::new(std::sync::RwLock::new(first_head.clone()));
+    let fetches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = Arc::new(PullRequestFixtureSource {
+        fetches: fetches.clone(),
+        head_sha: head_sha.clone(),
+    });
+    let components = Arc::new(TestBuildComponents::default());
+    let check_runs = Arc::new(IdempotentCheckRuns {
+        id: (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64,
+        create_count: std::sync::atomic::AtomicUsize::new(0),
+        update_stages: std::sync::Mutex::new(Vec::new()),
+    });
+    let root_domain = unique_ci_root_domain();
+    let builder = Arc::new(
+        ControlledBuildPipeline::new(
+            repository.clone(),
+            source.clone(),
+            components.clone(),
+            components.clone(),
+            Arc::new(TestArtifactCache),
+            SandboxLimits {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                cpu_millis: 1000,
+                pid_limit: 512,
+                disk_bytes: 5 * 1024 * 1024 * 1024,
+                process_timeout: std::time::Duration::from_secs(3600),
+            },
+        )
+        .with_check_runs(check_runs.clone())
+        .with_root_domain(root_domain.clone()),
+    );
+    let poller = CiPoller::new(repository.clone(), source)
+        .with_config(CiPollerConfig {
+            root_domain: root_domain.clone(),
+            patch_fingerprint: "patch-v1".into(),
+            toolchain_version: "test-toolchain".into(),
+            target_architecture: "x86_64-linux".into(),
+            public_status_base_url: Some("https://panel.example.test/ci/previews".into()),
+        })
+        .with_check_runs(check_runs.clone())
+        .with_builder(builder.clone());
+
+    // Opening a PR with several ancestors compiles only its current head.
+    poller.poll_once(watched.id).await.unwrap();
+    let key_for = |sha: &str| {
+        BuildKey::new(
+            repository_name,
+            sha,
+            "patch-v1",
+            "test-toolchain",
+            "x86_64-linux",
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        repository
+            .ensure_build(&key_for(&first_head))
+            .await
+            .unwrap()
+            .0
+            .stage,
+        CiBuildStage::Ready
+    );
+    poller.poll_once(watched.id).await.unwrap();
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "repeated observation of the same opened PR head reuses the cache"
+    );
+    for sha in [&second_head, &event_only_head, &ancestry_only] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ci_builds WHERE repository=$1 AND commit_sha=$2",
+        )
+        .bind(repository_name)
+        .bind(sha)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "non-requested commit {sha} stays unbuilt");
+    }
+
+    // A synchronize update creates exactly one additional head cache entry.
+    *head_sha.write().unwrap() = second_head.clone();
+    poller.poll_once(watched.id).await.unwrap();
+    assert_eq!(
+        repository
+            .ensure_build(&key_for(&second_head))
+            .await
+            .unwrap()
+            .0
+            .stage,
+        CiBuildStage::Ready
+    );
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+
+    let mut state = common::api_state(
+        pool.clone(),
+        "pr-head-event-token",
+        Arc::new(InMemory::new()),
+    );
+    let app_state = Arc::get_mut(&mut state).unwrap();
+    app_state.ci_build_coordinator = Some(builder);
+    app_state.ci_build_identity = Some(kurbis_hoster::ci::CiBuildIdentity {
+        repository: repository_name.to_owned(),
+        patch_fingerprint: "patch-v1".into(),
+        toolchain_version: "test-toolchain".into(),
+        target_architecture: "x86_64-linux".into(),
+    });
+    let app = router(state);
+    let secret = "test-webhook-secret";
+    let base_sha = ancestry_only.as_str();
+    let mut delivery_ids = Vec::new();
+    let events = [
+        ("opened", first_head.as_str()),        // replay/cache hit
+        ("synchronize", second_head.as_str()),  // replay/cache hit
+        ("reopened", event_only_head.as_str()), // event arrives before 60s poll
+        ("synchronize", second_head.as_str()),  // out-of-order older push
+    ];
+    for (action, sha) in events {
+        let delivery_id = Uuid::new_v4();
+        let body = serde_json::json!({
+            "action": action,
+            "repository": {"full_name": "kurbis-host/Pumpkin"},
+            "pull_request": {
+                "number": 314,
+                "base": {"sha": base_sha, "repo": {"full_name": "kurbis-host/Pumpkin"}},
+                "head": {"sha": sha, "repo": {"full_name": "contributor/Pumpkin"}}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let response = app
+            .clone()
+            .oneshot(signed_github_request(
+                delivery_id,
+                "pull_request",
+                body.clone(),
+                secret,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        delivery_ids.push(delivery_id);
+        if action == "reopened" {
+            let replay = app
+                .clone()
+                .oneshot(signed_github_request(
+                    delivery_id,
+                    "pull_request",
+                    body,
+                    secret,
+                    false,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        }
+    }
+    poller.drain_github_webhooks_once().await.unwrap();
+    assert_eq!(
+        repository
+            .ensure_build(&key_for(&event_only_head))
+            .await
+            .unwrap()
+            .0
+            .stage,
+        CiBuildStage::Ready
+    );
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "each distinct opened/updated/reopened head builds once; ancestors and duplicate/out-of-order deliveries do not compile"
+    );
+    assert_eq!(
+        check_runs
+            .create_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "each distinct PR head has one Check Run"
+    );
+    for sha in [&ancestry_only] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ci_builds WHERE repository=$1 AND commit_sha=$2",
+        )
+        .bind(repository_name)
+        .bind(sha)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "PR base commit remains on-demand only");
+    }
+
+    // A delivery for a newer head can precede poll observation; the stable
+    // alias moves only after the poll confirms that head is authoritative.
+    *head_sha.write().unwrap() = event_only_head.clone();
+    poller.poll_once(watched.id).await.unwrap();
+    let stable = CiHostname::for_ref(CiRefKind::PullRequest, "pr-314", &root_domain).unwrap();
+    assert_eq!(
+        repository
+            .lookup_preview(&stable.value)
+            .await
+            .unwrap()
+            .unwrap()
+            .commit_sha,
+        event_only_head
+    );
+    let fetched = fetches.lock().unwrap().clone();
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|(_, sha)| sha.as_str())
+            .collect::<std::collections::HashSet<_>>(),
+        [
+            first_head.as_str(),
+            second_head.as_str(),
+            event_only_head.as_str()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        fetched
+            .iter()
+            .all(|(repo, _)| repo == "contributor/Pumpkin")
+    );
+    let processed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_github_webhook_deliveries WHERE repository_id=$1 AND processed_at IS NOT NULL",
+    ).bind(watched.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(processed, delivery_ids.len() as i64);
+    sqlx::query("DELETE FROM ci_github_webhook_deliveries WHERE repository_id=$1")
+        .bind(watched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn arbitrary_full_commit_alias_is_created_and_built_only_after_join_admission() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiBuildIdentity, ControlledBuildPipeline, SandboxLimits};
+    use kurbis_hoster::control_plane::api::router;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    repository
+        .register_repository("kurbis-host/Pumpkin", "main")
+        .await
+        .unwrap();
+    let requested_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
+    let key = BuildKey::new(
+        "kurbis-host/Pumpkin",
+        &requested_sha,
+        "patch-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ci_builds WHERE repository=$1 AND commit_sha=$2")
+            .bind(&key.repository)
+            .bind(&key.commit_sha)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        before, 0,
+        "arbitrary valid commit hostnames are not eagerly compiled"
+    );
+
+    let fetches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = Arc::new(PullRequestFixtureSource {
+        fetches: fetches.clone(),
+        head_sha: Arc::new(std::sync::RwLock::new(requested_sha.to_owned())),
+    });
+    let components = Arc::new(TestBuildComponents::default());
+    let builder = Arc::new(ControlledBuildPipeline::new(
+        repository.clone(),
+        source,
+        components.clone(),
+        components.clone(),
+        Arc::new(TestArtifactCache),
+        SandboxLimits {
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_millis: 1000,
+            pid_limit: 512,
+            disk_bytes: 5 * 1024 * 1024 * 1024,
+            process_timeout: std::time::Duration::from_secs(3600),
+        },
+    ));
+    let mut state = common::api_state(
+        pool.clone(),
+        "on-demand-ci-internal-token",
+        Arc::new(InMemory::new()),
+    );
+    let app_state = Arc::get_mut(&mut state).unwrap();
+    app_state.ci_build_coordinator = Some(builder);
+    app_state.ci_build_identity = Some(CiBuildIdentity {
+        repository: "kurbis-host/Pumpkin".into(),
+        patch_fingerprint: "patch-v1".into(),
+        toolchain_version: "test-toolchain".into(),
+        target_architecture: "x86_64-linux".into(),
+    });
+    let app = router(state);
+    let hostname = CiHostname::for_ref(
+        CiRefKind::Commit,
+        &requested_sha,
+        kurbis_hoster::ci::CI_ROOT_DOMAIN,
+    )
+    .unwrap();
+    let admission = || {
+        Request::builder()
+            .method("POST")
+            .uri("/internal/ci/previews/admit")
+            .header("authorization", "Bearer on-demand-ci-internal-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"hostname": hostname.value}).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(admission()).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let build = repository.ensure_build(&key).await.unwrap().0;
+            if matches!(build.stage, CiBuildStage::Ready | CiBuildStage::Failed) {
+                break build;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("on-demand build completes");
+    assert_eq!(ready.stage, CiBuildStage::Ready);
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fetches.lock().unwrap().as_slice(),
+        &[("kurbis-host/Pumpkin".into(), requested_sha)]
+    );
+    assert_eq!(
+        app.oneshot(admission()).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "repeated demand for an immutable SHA reuses the cache"
+    );
     pool.close().await;
 }

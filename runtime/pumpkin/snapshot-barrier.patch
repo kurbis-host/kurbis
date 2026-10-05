@@ -1,0 +1,293 @@
+diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
+index ec4d762..5a518e5 100644
+--- a/crates/pumpkin/src/lib.rs
++++ b/crates/pumpkin/src/lib.rs
+@@ -605,6 +605,7 @@ impl PumpkinServer {
+                                      world
+                                          .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
+                                          .await;
++                                     server_clone.finish_player_admission();
+
+                                      if let ClientPlatform::Java(client) = player.client.as_ref() {
+                                          client.progress_player_packets(&player, &server_clone).await;
+@@ -613,6 +614,7 @@ impl PumpkinServer {
+                                          client.close();
+                                          client.await_tasks().await;
+                                      }
++                                     let _snapshot_activity = server_clone.begin_snapshot_activity().await;
+                                      player.remove().await;
+                                      server_clone.remove_player(&player);
+                                     if let Err(e) = server_clone
+@@ -716,9 +718,11 @@ impl PumpkinServer {
+                         Some(config),
+                     ) {
+                         client.set_player(player.clone());
++                        server.finish_player_admission();
+                         client.progress_player_packets(&player).await;
+                         client.close().await;
+                         client.await_tasks().await;
++                        let _snapshot_activity = server.begin_snapshot_activity().await;
+                         player.remove().await;
+                         server.remove_player(&player);
+                         if let Err(error) = server.player_data_storage.handle_player_leave(&player)
+diff --git a/crates/pumpkin/src/net/bedrock/play/chat_command.rs b/crates/pumpkin/src/net/bedrock/play/chat_command.rs
+index d31683b..f594142 100644
+--- a/crates/pumpkin/src/net/bedrock/play/chat_command.rs
++++ b/crates/pumpkin/src/net/bedrock/play/chat_command.rs
+@@ -8,6 +8,7 @@ impl BedrockClient {
+         server: &Arc<Server>,
+         packet: SCommandRequest<'_>,
+     ) {
++        let _snapshot_activity = server.begin_snapshot_activity().await;
+         player.update_last_action_time();
+         if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
+             return;
+diff --git a/crates/pumpkin/src/net/bedrock/play/chat_message.rs b/crates/pumpkin/src/net/bedrock/play/chat_message.rs
+index d32485e..13060f0 100644
+--- a/crates/pumpkin/src/net/bedrock/play/chat_message.rs
++++ b/crates/pumpkin/src/net/bedrock/play/chat_message.rs
+@@ -8,6 +8,7 @@ impl BedrockClient {
+         player: &Arc<Player>,
+         packet: SText<'_>,
+     ) {
++        let _snapshot_activity = server.begin_snapshot_activity().await;
+         player.update_last_action_time();
+         if player.check_chat_spam(server, crate::entity::player::SpamType::Chat) {
+             return;
+diff --git a/crates/pumpkin/src/net/bedrock/play/player_action.rs b/crates/pumpkin/src/net/bedrock/play/player_action.rs
+index c7cf353..4c17fbb 100644
+--- a/crates/pumpkin/src/net/bedrock/play/player_action.rs
++++ b/crates/pumpkin/src/net/bedrock/play/player_action.rs
+@@ -240,7 +240,11 @@ impl BedrockClient {
+                     || player.living_entity.health.load() <= 0.0 =>
+             {
+                 let player_c = player.clone();
++                let Some(server_c) = player.world().server.upgrade() else {
++                    return;
++                };
+                 player.spawn_task(async move {
++                    let _snapshot_activity = server_c.begin_snapshot_activity().await;
+                     player_c.world().respawn_player(&player_c, false).await;
+                 });
+             }
+diff --git a/crates/pumpkin/src/net/java/play/chat_command.rs b/crates/pumpkin/src/net/java/play/chat_command.rs
+index a274019..5cefc45 100644
+--- a/crates/pumpkin/src/net/java/play/chat_command.rs
++++ b/crates/pumpkin/src/net/java/play/chat_command.rs
+@@ -8,6 +8,7 @@ impl JavaClient {
+         server: &Arc<Server>,
+         command: &SChatCommand<'_>,
+     ) {
++        let _snapshot_activity = server.begin_snapshot_activity().await;
+         player.update_last_action_time();
+         if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
+             return;
+diff --git a/crates/pumpkin/src/net/java/play/chat_message.rs b/crates/pumpkin/src/net/java/play/chat_message.rs
+index 6536ce6..aa97976 100644
+--- a/crates/pumpkin/src/net/java/play/chat_message.rs
++++ b/crates/pumpkin/src/net/java/play/chat_message.rs
+@@ -9,6 +9,7 @@ impl JavaClient {
+         player: &Arc<Player>,
+         chat_message: SChatMessage<'_>,
+     ) {
++        let _snapshot_activity = server.begin_snapshot_activity().await;
+         player.update_last_action_time();
+
+         if let Some(command) = chat_message.message.strip_prefix('/') {
+diff --git a/crates/pumpkin/src/net/java/play/client_command.rs b/crates/pumpkin/src/net/java/play/client_command.rs
+index afdb65c..28fde8c 100644
+--- a/crates/pumpkin/src/net/java/play/client_command.rs
++++ b/crates/pumpkin/src/net/java/play/client_command.rs
+@@ -16,7 +16,9 @@ impl JavaClient {
+                 let Some(server) = player.world().server.upgrade() else {
+                     return;
+                 };
++                let server_c = server.clone();
+                 server.spawn_task(async move {
++                    let _snapshot_activity = server_c.begin_snapshot_activity().await;
+                     player_c
+                         .world()
+                         .clone()
+diff --git a/crates/pumpkin/src/server/mod.rs b/crates/pumpkin/src/server/mod.rs
+index 8a12a10..3d48571 100644
+--- a/crates/pumpkin/src/server/mod.rs
++++ b/crates/pumpkin/src/server/mod.rs
+@@ -44,9 +44,10 @@ use rsa::RsaPublicKey;
+ use std::fs;
+ use std::net::IpAddr;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64};
++use std::sync::Mutex as StdMutex;
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize};
+ use std::{future::Future, sync::atomic::Ordering, time::Duration};
+-use tokio::sync::OnceCell;
++use tokio::sync::{OnceCell, watch};
+ use tokio::task::JoinHandle;
+ use tokio_util::task::TaskTracker;
+
+@@ -67,6 +68,14 @@ use crate::data::advancement_data::AdvancementManager;
+ use crate::server::scheduler::TaskScheduler;
+
+ /// Represents a Minecraft server instance.
++pub struct SnapshotActivityGuard(Arc<AtomicUsize>);
++
++impl Drop for SnapshotActivityGuard {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
+ pub struct Server {
+     pub basic_config: BasicConfiguration,
+     pub advanced_config: AdvancedConfiguration,
+@@ -103,6 +112,16 @@ pub struct Server {
+     container_id: AtomicU32,
+     /// Changes for every successful player join and leave, including brief sessions.
+     pub player_activity_revision: AtomicU64,
++    /// Serializes tick, join admission, and barrier activation.
++    pub snapshot_tick_gate: Arc<StdMutex<()>>,
++    /// When set, no game tick or player join may mutate the world.
++    pub snapshot_barrier_active: AtomicBool,
++    /// In-flight player joins between insertion and initial spawn setup.
++    pub snapshot_player_admissions: AtomicUsize,
++    /// Async world-affecting handlers that must drain before a checkpoint.
++    pub snapshot_mutations: Arc<AtomicUsize>,
++    /// Wakes blocked world handlers when snapshot publication completes.
++    pub snapshot_barrier_state: watch::Sender<bool>,
+     pub recipe_manager: Arc<recipe::RecipeManager>,
+     pub datapack_manager: Arc<crate::data::datapack::DatapackManager>,
+     pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
+@@ -287,6 +306,11 @@ impl Server {
+             permission_manager,
+             container_id: 0.into(),
+             player_activity_revision: AtomicU64::new(0),
++            snapshot_tick_gate: Arc::new(StdMutex::new(())),
++            snapshot_barrier_active: AtomicBool::new(false),
++            snapshot_player_admissions: AtomicUsize::new(0),
++            snapshot_mutations: Arc::new(AtomicUsize::new(0)),
++            snapshot_barrier_state: watch::channel(false).0,
+             recipe_manager: Arc::new(recipe::RecipeManager::new()),
+             datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
+             enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
+@@ -615,6 +639,78 @@ impl Server {
+         Ok(())
+     }
+
++    /// Stop simulation and admissions, drain in-flight work, then durably save
++    /// all mutable world and player data before the worker archives the volume.
++    pub async fn begin_snapshot_barrier(self: &Arc<Self>) -> Result<(), String> {
++        let server = self.clone();
++        tokio::task::spawn_blocking(move || {
++            let _gate = server
++                .snapshot_tick_gate
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if server.snapshot_barrier_active.swap(true, Ordering::AcqRel) {
++                return Err("A world snapshot barrier is already active".to_owned());
++            }
++            server.snapshot_barrier_state.send_replace(true);
++            Ok(())
++        })
++        .await
++        .map_err(|error| format!("Failed to activate world snapshot barrier: {error}"))??;
++
++        let drain_and_save = async {
++            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++            while self.snapshot_player_admissions.load(Ordering::Acquire) != 0
++                || self.snapshot_mutations.load(Ordering::Acquire) != 0
++            {
++                if tokio::time::Instant::now() >= deadline {
++                    return Err("Timed out draining player setup and world mutations".to_owned());
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++            self.save_all().await
++        }
++        .await;
++        if let Err(error) = drain_and_save {
++            self.end_snapshot_barrier();
++            return Err(error);
++        }
++        Ok(())
++    }
++
++    /// Acquire a lease for work that can mutate world/player state outside tick().
++    pub async fn begin_snapshot_activity(self: &Arc<Self>) -> SnapshotActivityGuard {
++        loop {
++            let mut barrier_state = self.snapshot_barrier_state.subscribe();
++            {
++                let _gate = self
++                    .snapshot_tick_gate
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner);
++                if !self.snapshot_barrier_active.load(Ordering::Acquire) {
++                    self.snapshot_mutations.fetch_add(1, Ordering::AcqRel);
++                    return SnapshotActivityGuard(self.snapshot_mutations.clone());
++                }
++            }
++            if *barrier_state.borrow() {
++                let _ = barrier_state.changed().await;
++            }
++        }
++    }
++
++    pub fn finish_player_admission(&self) {
++        self.snapshot_player_admissions
++            .fetch_sub(1, Ordering::AcqRel);
++    }
++
++    pub fn end_snapshot_barrier(&self) {
++        let _gate = self
++            .snapshot_tick_gate
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        self.snapshot_barrier_active.store(false, Ordering::Release);
++        self.snapshot_barrier_state.send_replace(false);
++    }
++
+     /// Adds a new player to the server.
+     ///
+     /// This function takes an `Arc<Client>` representing the connected client and performs the following actions:
+@@ -646,6 +742,20 @@ impl Server {
+         profile: GameProfile,
+         config: Option<PlayerConfig>,
+     ) -> Option<(Arc<Player>, Arc<World>)> {
++        let _admission_gate = self
++            .snapshot_tick_gate
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if self.snapshot_barrier_active.load(Ordering::Acquire) {
++            match client.as_ref() {
++                ClientPlatform::Java(java) => java.close(),
++                ClientPlatform::Bedrock(bedrock) => bedrock.try_kick(
++                    DisconnectReason::Unknown,
++                    "Server is checkpointing; please reconnect".to_owned(),
++                ),
++            }
++            return None;
++        }
+         let gamemode = self
+             .defaultgamemode
+             .lock()
+@@ -706,6 +816,7 @@ impl Server {
+             'after: {
+                 player.screen_handler_sync_handler.store_player(player.clone());
+                 world.add_player(&player).is_ok().then(|| {
++                    self.snapshot_player_admissions.fetch_add(1, Ordering::AcqRel);
+                     self.player_activity_revision
+                         .fetch_add(1, Ordering::Release);
+                     {
+@@ -1109,6 +1220,13 @@ impl Server {
+     /// Main server tick method. This now handles both player/network ticking (which always runs)
+     /// and world/game logic ticking (which is affected by freeze state).
+     pub fn tick(self: &Arc<Self>) {
++        let _tick_gate = self
++            .snapshot_tick_gate
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if self.snapshot_barrier_active.load(Ordering::Acquire) {
++            return;
++        }
+         if self.tick_rate_manager.runs_normally() || self.tick_rate_manager.is_sprinting() {
+             self.tick_worlds();
+             // Always run player and network ticking, even when game is frozen

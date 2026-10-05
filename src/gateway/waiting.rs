@@ -307,24 +307,23 @@ async fn handle_ci_player(
 
     if let Some(target) = target.as_ref()
         && target.state == CiPreviewState::Running
+        && let Some((host, port)) = ci_transfer_target(config, player, target)
     {
-        if let Some((host, port)) = ci_transfer_target(config, player, target) {
-            control
-                .transfer(&config.waiting_control_socket, player.id, &host, port)
-                .await?;
-            state.transfer_sent = true;
-            tracing::info!(
-                player_id = %player.id,
-                player_name = %player.name,
-                edition = ?player.edition,
-                %host,
-                port,
-                preview = %target.preview_id,
-                generation = target.runtime_generation,
-                "transferred waiting player to running CI preview"
-            );
-            return Ok(());
-        }
+        control
+            .transfer(&config.waiting_control_socket, player.id, &host, port)
+            .await?;
+        state.transfer_sent = true;
+        tracing::info!(
+            player_id = %player.id,
+            player_name = %player.name,
+            edition = ?player.edition,
+            %host,
+            port,
+            preview = %target.preview_id,
+            generation = target.runtime_generation,
+            "transferred waiting player to running CI preview"
+        );
+        return Ok(());
     }
 
     match preview_state {
@@ -365,10 +364,7 @@ fn ci_transfer_target(
     target: &CiRouteTarget,
 ) -> Option<(String, u16)> {
     match player.edition {
-        PlayerEdition::Java => Some((
-            target.worker_address.as_deref()?.to_owned(),
-            u16::try_from(target.java_port?).ok()?,
-        )),
+        PlayerEdition::Java => Some((target.hostname.clone(), config.java_public_port)),
         PlayerEdition::Bedrock => Some((target.hostname.clone(), config.bedrock_public_port)),
     }
 }
@@ -469,8 +465,8 @@ fn transfer_target(
 ) -> Option<(String, u16)> {
     match edition {
         PlayerEdition::Java => Some((
-            target.worker_address.as_deref()?.to_owned(),
-            target.java_port?,
+            format!("{}.{}", target.subdomain, config.root_domain),
+            config.java_public_port,
         )),
         PlayerEdition::Bedrock => Some((
             format!("s-{}.{}", target.server_id, config.root_domain),
@@ -570,8 +566,10 @@ mod tests {
                 database_url: String::new(),
             },
             java_listen: "127.0.0.1:0".parse().unwrap(),
+            java_public_port: 25565,
             bedrock_listen: "127.0.0.1:0".parse().unwrap(),
             bedrock_public_port: 19132,
+            bedrock_public_address: "127.0.0.1".parse().unwrap(),
             bedrock_tls_certificate: "/unused/test-cert.pem".into(),
             bedrock_tls_private_key: "/unused/test-key.pem".into(),
             waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
@@ -635,14 +633,16 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_transfer_uses_gateway_alias_while_java_stays_direct_to_worker() {
+    fn bedrock_and_java_transfers_use_the_shared_gateway_addresses() {
         let config = GatewayConfig {
             common: crate::config::CommonConfig {
                 database_url: String::new(),
             },
             java_listen: "127.0.0.1:25565".parse().unwrap(),
+            java_public_port: 25565,
             bedrock_listen: "127.0.0.1:19132".parse().unwrap(),
             bedrock_public_port: 19132,
+            bedrock_public_address: "127.0.0.1".parse().unwrap(),
             bedrock_tls_certificate: "/unused/test-cert.pem".into(),
             bedrock_tls_private_key: "/unused/test-key.pem".into(),
             waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
@@ -659,7 +659,7 @@ mod tests {
         let target = online_target();
         assert_eq!(
             transfer_target(&config, &target, PlayerEdition::Java),
-            Some(("203.0.113.10".into(), 25570))
+            Some((format!("{}.mc.example.test", target.subdomain), 25565))
         );
         assert_eq!(
             transfer_target(&config, &target, PlayerEdition::Bedrock),

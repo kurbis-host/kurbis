@@ -51,12 +51,18 @@ cleanup() {
     docker image rm "$verification_image" "$offline_verification_image" "$offline_image" "$pumpkin_image" "$release_image" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
-docker build -f runtime/Dockerfile -t "$release_image" .
-docker build -f runtime/pumpkin/Dockerfile -t "$pumpkin_image" .
-docker build -f runtime/verification/offline-pumpkin/Dockerfile \
-    --build-arg "PUMPKIN_BASE_IMAGE=$pumpkin_image" -t "$offline_image" .
+"$root/tools/docker_build_with_limits.sh" \
+    --file runtime/Dockerfile --tag "$release_image" .
+"$root/tools/docker_build_with_limits.sh" \
+    --file runtime/pumpkin/Dockerfile --tag "$pumpkin_image" .
+"$root/tools/docker_build_with_limits.sh" \
+    --file runtime/verification/offline-pumpkin/Dockerfile \
+    --build-arg "PUMPKIN_BASE_IMAGE=$pumpkin_image" \
+    --tag "$offline_image" .
 docker tag "$offline_image" "$offline_verification_image"
-docker build -f runtime/verification/Dockerfile -t "$verification_image" .
+KURBIS_BUILD_MEMORY_BYTES=4294967296 \
+    "$root/tools/docker_build_with_limits.sh" \
+    --file runtime/verification/Dockerfile --tag "$verification_image" .
 # An isolated inner daemon keeps worker bind paths and quota mounts in one Linux
 # namespace. No host Docker socket, existing image store, or user volume is mounted.
 docker create --name "$name" --privileged --cgroupns=host --memory=6g --memory-swap=6g --cpus=2 --interactive --env "PUMPKIN_IMAGE=$offline_verification_image" --mount "type=bind,src=$output,dst=/results" "$verification_image" > /dev/null

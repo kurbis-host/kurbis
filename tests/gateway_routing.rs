@@ -83,8 +83,10 @@ fn gateway_config(control_plane_url: String, internal_token: String) -> GatewayC
     GatewayConfig {
         common: CommonConfig { database_url },
         java_listen: "127.0.0.1:0".parse().unwrap(),
+        java_public_port: 25565,
         bedrock_listen: "127.0.0.1:0".parse().unwrap(),
         bedrock_public_port: 19132,
+        bedrock_public_address: "127.0.0.1".parse().unwrap(),
         bedrock_tls_certificate: PathBuf::new(),
         bedrock_tls_private_key: PathBuf::new(),
         waiting_java_address: "127.0.0.1:25566".parse().unwrap(),

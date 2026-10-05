@@ -58,6 +58,9 @@ fn docker_policy_sets_isolation_and_hard_limits_without_host_mounts() {
         )
         .unwrap();
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let memory_limit = args.iter().position(|arg| *arg == "--memory").unwrap();
+    let swap_limit = args.iter().position(|arg| *arg == "--memory-swap").unwrap();
+    assert_eq!(args[memory_limit + 1], args[swap_limit + 1]);
     for required in [
         "--network",
         "workload-net",

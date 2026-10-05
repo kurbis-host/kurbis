@@ -91,6 +91,7 @@ struct ProxyState {
 /// Start a capability-bound proxy attached to exactly one runtime network and
 /// the configured egress network. The workload itself is never attached to the
 /// egress network.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_container(
     image: &str,
     name: &str,
@@ -1081,6 +1082,7 @@ fn valid_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn hex_decode_32(value: &str) -> Result<[u8; 32]> {
     ensure!(value.len() == 64, "capability hash must be 32-byte hex");
     let mut bytes = [0_u8; 32];

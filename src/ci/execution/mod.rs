@@ -1,5 +1,6 @@
 //! Trusted host-side preparation and isolated compilation for untrusted Pumpkin commits.
 
+mod admission;
 mod archive;
 mod builder;
 mod patcher;

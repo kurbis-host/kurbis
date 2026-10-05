@@ -57,6 +57,20 @@ impl WorkerControl {
         .await
     }
 
+    pub async fn ci_runtime_world_initialized(&self, placement: &CiRuntimePlacement) -> Result<()> {
+        self.post_no_content(
+            &format!(
+                "/internal/worker/control/ci/runtimes/{}/world-initialized",
+                placement.preview_id
+            ),
+            &Fence {
+                generation: placement.generation,
+                lease_token: placement.lease_token,
+            },
+        )
+        .await
+    }
+
     pub async fn ci_runtime_started(&self, placement: &CiRuntimePlacement) -> Result<()> {
         self.post_no_content(
             &format!(

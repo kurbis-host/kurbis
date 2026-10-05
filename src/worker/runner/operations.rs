@@ -9,10 +9,10 @@ impl WorkerRunner {
     pub(super) async fn run_operations(&mut self) -> Result<()> {
         loop {
             self.reconcile_failed_starts().await?;
-            if let Some(ci_runtime) = &self.ci_runtime {
-                if let Err(error) = ci_runtime.reconcile().await {
-                    tracing::error!(?error, "CI preview worker reconciliation failed");
-                }
+            if let Some(ci_runtime) = &self.ci_runtime
+                && let Err(error) = ci_runtime.reconcile().await
+            {
+                tracing::error!(?error, "CI preview worker reconciliation failed");
             }
             if let Some(op) = self.control_plane.claim_operation().await?
                 && let Err(error) = self.execute_operation(&op).await

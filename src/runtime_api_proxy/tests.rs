@@ -245,10 +245,10 @@ fn proxy_egress_requires_ipv4_bridge_and_remote_https() {
         "Internal": true,
         "EnableIPv6": false,
     });
-    assert_eq!(validate_egress_network_metadata(&internal).unwrap(), true);
+    assert!(validate_egress_network_metadata(&internal).unwrap());
     let mut external = internal;
     external["Internal"] = serde_json::Value::Bool(false);
-    assert_eq!(validate_egress_network_metadata(&external).unwrap(), false);
+    assert!(!validate_egress_network_metadata(&external).unwrap());
     assert!(validate_upstream_url("https://control.example", false).is_ok());
     assert!(validate_upstream_url("http://control.example", true).is_err());
     for invalid in [

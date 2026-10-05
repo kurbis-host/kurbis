@@ -41,6 +41,7 @@ pub enum RuntimeLease {
     NoWorker,
     AlreadyRunning(CiRuntimePlacement),
     Starting(CiRuntimePlacement),
+    Stopping(CiRuntimePlacement),
     Claimed(CiRuntimePlacement),
 }
 
@@ -143,11 +144,10 @@ where
             self.previews.ensure_lazy_branch_build(preview.id).await?;
             return Ok(CiPreviewState::Queued);
         }
-        if preview.state == CiPreviewState::Running {
-            self.runtimes.touch_player_activity(preview.id).await?;
-            return Ok(CiPreviewState::Running);
-        }
-        if preview.state != CiPreviewState::Ready {
+        if !matches!(
+            preview.state,
+            CiPreviewState::Ready | CiPreviewState::Running | CiPreviewState::Stopping
+        ) {
             return Ok(preview.state);
         }
 
@@ -157,7 +157,11 @@ where
             .claim_start(preview.id, &capability.digest())
             .await?;
         match lease {
-            RuntimeLease::NoWorker => Ok(CiPreviewState::Ready),
+            RuntimeLease::NoWorker => Ok(if preview.state == CiPreviewState::Stopping {
+                CiPreviewState::Stopping
+            } else {
+                CiPreviewState::Ready
+            }),
             RuntimeLease::AlreadyRunning(placement) => {
                 self.runtimes
                     .touch_player_activity(placement.preview_id)
@@ -165,6 +169,7 @@ where
                 Ok(CiPreviewState::Running)
             }
             RuntimeLease::Starting(_) => Ok(CiPreviewState::Booting),
+            RuntimeLease::Stopping(_) => Ok(CiPreviewState::Stopping),
             RuntimeLease::Claimed(placement) => {
                 if capability.generation() != placement.generation {
                     anyhow::bail!("CI runtime capability generation does not match placement");

@@ -6,9 +6,10 @@ use std::{
     time::Duration,
 };
 
+use sqlx::PgPool;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
+    process::Child,
     time::{timeout, timeout as tokio_timeout},
 };
 use uuid::Uuid;
@@ -18,7 +19,10 @@ use crate::{
     worker::sandbox::{DockerSandbox, WorkloadLimits},
 };
 
-use super::archive::{MAX_ARTIFACT_BYTES, pack_source_archive};
+use super::{
+    admission::{BuildAdmissionLease, DockerBuildAdmission, parse_cgroup_memory_events},
+    archive::{MAX_ARTIFACT_BYTES, pack_source_archive},
+};
 
 const MAX_BUILD_LOG_BYTES: usize = 512 * 1024;
 const MAX_FAILURE_LOG_BYTES: usize = 8 * 1024;
@@ -34,6 +38,7 @@ export TMPDIR=/work/tmp
 # The image cache is immutable and already contains every locked offline input.
 # Avoid duplicating several GiB into the memory-backed workspace.
 export CARGO_HOME=/usr/local/cargo
+export CARGO_BUILD_JOBS=1
 # Only bounded archives created by trusted control-plane preprocessing and the
 # checked-in plugin packer reach this offline extraction step.
 tar -xzf /input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
@@ -45,6 +50,8 @@ cd /work/plugin
 cargo build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
+printf "builder_cgroup_memory\n"
+for file in memory.max memory.swap.max memory.current memory.peak memory.events; do printf "%s=" "$file"; cat "/sys/fs/cgroup/$file" | tr "\n" " "; printf "\n"; done
 # Source-controlled build scripts may leave background processes behind.
 # Kill every task process except this exec and PID 1 before the output copy.
 kill -TERM -1 2>/dev/null || true
@@ -88,10 +95,11 @@ pub struct DockerRootlessBuildRuntime {
     toolchain_version: String,
     expected_rustc: String,
     sandbox: DockerSandbox,
-    build_slots: Arc<Semaphore>,
+    admission: DockerBuildAdmission,
 }
 impl DockerRootlessBuildRuntime {
     pub fn new(
+        pool: PgPool,
         image: impl Into<String>,
         docker_host: impl Into<String>,
         toolchain_version: impl Into<String>,
@@ -104,15 +112,12 @@ impl DockerRootlessBuildRuntime {
         let expected_rustc = rustc_release_from_identity(&image, &toolchain_version)
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         Ok(Self {
+            admission: DockerBuildAdmission::new(pool, image.clone(), docker_host.clone()),
             image,
             docker_host,
             toolchain_version,
             expected_rustc,
             sandbox: DockerSandbox,
-            // A compile uses a 10 GiB memory limit and bounded tmpfs-backed workspace. Keep one
-            // host build active per control-plane process to avoid aggregate
-            // memory overcommit from concurrent PR and branch requests.
-            build_slots: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -128,6 +133,7 @@ impl DockerRootlessBuildRuntime {
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_task_container(
         &self,
         name: &str,
@@ -137,6 +143,7 @@ impl DockerRootlessBuildRuntime {
         env_values: &[&str],
         input_bytes: usize,
         allow_workspace_exec: bool,
+        admission: &BuildAdmissionLease,
     ) -> Result<(), BuildPipelineError> {
         if env_names.len() != env_values.len() {
             return Err(BuildPipelineError::Sandbox(
@@ -177,6 +184,8 @@ impl DockerRootlessBuildRuntime {
             .arg(name)
             .args(security)
             .args(["--log-driver", "none"])
+            .args(["--label", "kurbis.ci.build=true"])
+            .args(["--label", &format!("kurbis.ci.build.lease={}", admission.token())])
             .args([
             "--tmpfs",
             &format!(
@@ -308,6 +317,7 @@ impl DockerRootlessBuildRuntime {
         name: &str,
         script: &str,
         process_timeout: Duration,
+        admission: &BuildAdmissionLease,
     ) -> Result<(std::process::ExitStatus, BuildProcessReport), BuildPipelineError> {
         let mut child = docker_command(&self.docker_host)
             .args(["exec", name, "/bin/sh", "-ec", script])
@@ -329,16 +339,24 @@ impl DockerRootlessBuildRuntime {
             .ok_or_else(|| BuildPipelineError::Sandbox("builder stderr was not captured".into()))?;
         let stdout_reader = tokio::spawn(read_capped(stdout, MAX_BUILD_LOG_BYTES / 2));
         let stderr_reader = tokio::spawn(read_capped(stderr, MAX_BUILD_LOG_BYTES / 2));
-        let status = match timeout(process_timeout, child.wait()).await {
-            Ok(status) => status.map_err(|error| {
-                BuildPipelineError::Compile(format!("builder process failed: {error}"))
-            })?,
+        let status = match timeout(
+            process_timeout,
+            wait_for_admission_owned_child(&mut child, admission),
+        )
+        .await
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                self.remove_container(name).await;
+                return Err(error);
+            }
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = timeout(Duration::from_secs(5), child.wait()).await;
+                let diagnostics = self.container_memory_diagnostics(name).await;
                 self.remove_container(name).await;
                 return Err(BuildPipelineError::Compile(format!(
-                    "controlled build exceeded its {} second limit",
+                    "controlled build exceeded its {} second limit; {diagnostics}",
                     process_timeout.as_secs()
                 )));
             }
@@ -523,9 +541,11 @@ impl DockerRootlessBuildRuntime {
             ));
         }
         let output_dir = accessible_directory(output_dir, "artifact output")?;
-        let _build_slot = self.build_slots.acquire().await.map_err(|error| {
-            BuildPipelineError::Compile(format!("builder admission closed: {error}"))
-        })?;
+        let admission = self
+            .admission
+            .acquire(limits.memory_bytes)
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         if output_dir.to_string_lossy().contains(',') {
             return Err(BuildPipelineError::Sandbox(
                 "CI artifact output path may not contain Docker mount separators".into(),
@@ -545,14 +565,19 @@ impl DockerRootlessBuildRuntime {
                     "CARGO_PROFILE_RELEASE_LTO",
                     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
                 ],
-                &[&self.expected_rustc, target, "true", "1", "false", "16"],
+                &[&self.expected_rustc, target, "true", "1", "false", "1"],
                 source_archive.len().saturating_add(plugin_archive.len()),
                 true,
+                &admission,
             )
             .await
         {
             self.remove_container(&name).await;
             return Err(error);
+        }
+        if let Err(error) = admission.assert_alive() {
+            self.remove_container(&name).await;
+            return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
         if let Err(error) = self.start_task_container(&name).await {
             self.remove_container(&name).await;
@@ -571,14 +596,15 @@ impl DockerRootlessBuildRuntime {
             }
         }
         let (status, report) = match self
-            .run_task_container(&name, BUILD_SCRIPT, process_timeout)
+            .run_task_container(&name, BUILD_SCRIPT, process_timeout, &admission)
             .await
         {
             Ok((status, report)) if status.success() => (status, report),
             Ok((status, report)) => {
+                let diagnostics = self.container_memory_diagnostics(&name).await;
                 self.remove_container(&name).await;
                 return Err(BuildPipelineError::Compile(format!(
-                    "sandboxed Pumpkin build failed ({status})\n{}",
+                    "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
                     tail(&report.bounded_log(), MAX_FAILURE_LOG_BYTES)
                 )));
             }
@@ -587,6 +613,10 @@ impl DockerRootlessBuildRuntime {
                 return Err(error);
             }
         };
+        if let Err(error) = admission.assert_alive() {
+            self.remove_container(&name).await;
+            return Err(BuildPipelineError::Sandbox(error.to_string()));
+        }
         let max_artifact = u64::try_from(MAX_ARTIFACT_BYTES)
             .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
         let copy_results = async {
@@ -609,8 +639,68 @@ impl DockerRootlessBuildRuntime {
         .await;
         self.remove_container(&name).await;
         copy_results?;
+        admission.release().await;
         let _ = status;
         Ok(report)
+    }
+
+    async fn container_memory_diagnostics(&self, name: &str) -> String {
+        let inspect = timeout(
+            Duration::from_secs(15),
+            docker_command(&self.docker_host)
+                .args([
+                    "inspect",
+                    "--format",
+                    "status={{.State.Status}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} error={{.State.Error}}",
+                    name,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let state = match inspect {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            }
+            _ => "docker_state=unavailable".into(),
+        };
+
+        let cgroup = timeout(
+            Duration::from_secs(15),
+            docker_command(&self.docker_host)
+                .args([
+                    "exec",
+                    name,
+                    "/bin/sh",
+                    "-ec",
+                    "for file in memory.max memory.swap.max memory.current memory.peak; do printf '%s=' \"$file\"; cat /sys/fs/cgroup/$file 2>/dev/null | tr '\\n' ' '; printf '\\n'; done; printf 'memory.events='; cat /sys/fs/cgroup/memory.events 2>/dev/null | tr '\\n' ' '; printf '\\n'",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let mut events = match cgroup {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            }
+            _ => "cgroup_memory_diagnostics=unavailable".into(),
+        };
+        if let Some(raw_events) = events
+            .lines()
+            .find_map(|line| line.strip_prefix("memory.events="))
+        {
+            let classification = parse_cgroup_memory_events(raw_events)
+                .map(|events| events.classify())
+                .unwrap_or("invalid_cgroup_memory_events");
+            events.push_str(&format!("; pressure_classification={classification}"));
+        }
+        format!("{state}; {events}")
     }
 
     async fn remove_container(&self, name: &str) {
@@ -625,6 +715,29 @@ impl DockerRootlessBuildRuntime {
                 .status(),
         )
         .await;
+    }
+}
+
+async fn wait_for_admission_owned_child(
+    child: &mut Child,
+    admission: &BuildAdmissionLease,
+) -> Result<std::process::ExitStatus, BuildPipelineError> {
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            result = child.wait() => {
+                return result.map_err(|error| {
+                    BuildPipelineError::Compile(format!("builder process failed: {error}"))
+                });
+            }
+            _ = heartbeat.tick() => {
+                if let Err(error) = admission.assert_alive() {
+                    let _ = child.start_kill();
+                    let _ = timeout(Duration::from_secs(5), child.wait()).await;
+                    return Err(BuildPipelineError::Sandbox(error.to_string()));
+                }
+            }
+        }
     }
 }
 
@@ -644,9 +757,11 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             ));
         }
         let limits = Self::workload_limits(crate::ci::ROOTLESS_BUILD_LIMITS)?;
-        let _build_slot = self.build_slots.acquire().await.map_err(|error| {
-            BuildPipelineError::Patch(format!("builder admission closed: {error}"))
-        })?;
+        let admission = self
+            .admission
+            .acquire(limits.memory_bytes)
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let name = format!("kurbis-ci-prepare-{}", Uuid::new_v4().simple());
         let script = "set -eu; mkdir -p /work/tmp; export TMPDIR=/work/tmp; /usr/local/bin/ci-source-preparer /input/source.tar.gz /work/patched-source.tar.gz \"$KURBIS_EXPECTED_PATCH_FINGERPRINT\"";
         if let Err(error) = self
@@ -658,11 +773,16 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
                 &[fingerprint],
                 source_archive.len(),
                 false,
+                &admission,
             )
             .await
         {
             self.remove_container(&name).await;
             return Err(BuildPipelineError::Patch(error.to_string()));
+        }
+        if let Err(error) = admission.assert_alive() {
+            self.remove_container(&name).await;
+            return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
         if let Err(error) = self.start_task_container(&name).await {
             self.remove_container(&name).await;
@@ -676,14 +796,15 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             return Err(BuildPipelineError::Patch(error.to_string()));
         }
         let result = self
-            .run_task_container(&name, script, Duration::from_secs(15 * 60))
+            .run_task_container(&name, script, Duration::from_secs(15 * 60), &admission)
             .await;
         let (status, report) = match result {
             Ok((status, report)) if status.success() => (status, report),
             Ok((status, report)) => {
+                let diagnostics = self.container_memory_diagnostics(&name).await;
                 self.remove_container(&name).await;
                 return Err(BuildPipelineError::Patch(format!(
-                    "rootless Pumpkin patch workload failed ({status}): {}",
+                    "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
                     tail(&report.bounded_log(), MAX_FAILURE_LOG_BYTES)
                 )));
             }
@@ -692,6 +813,10 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
                 return Err(BuildPipelineError::Patch(error.to_string()));
             }
         };
+        if let Err(error) = admission.assert_alive() {
+            self.remove_container(&name).await;
+            return Err(BuildPipelineError::Sandbox(error.to_string()));
+        }
         let directory = tempfile::Builder::new()
             .prefix("kurbis-ci-patched-source-")
             .tempdir()
@@ -707,6 +832,7 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             .await;
         self.remove_container(&name).await;
         copied.map_err(|error| BuildPipelineError::Patch(error.to_string()))?;
+        admission.release().await;
         let metadata = fs::symlink_metadata(&output).map_err(|error| {
             BuildPipelineError::Patch(format!("inspect patched source archive: {error}"))
         })?;
@@ -733,7 +859,13 @@ impl RootlessBuildRuntime for DockerRootlessBuildRuntime {
 
     async fn verify_sandbox(&self, limits: SandboxLimits) -> Result<(), BuildPipelineError> {
         let limits = Self::workload_limits(limits)?;
-        self.sandbox
+        let admission = self
+            .admission
+            .acquire(limits.memory_bytes)
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let result = self
+            .sandbox
             .verify_builder_with_limits_at(
                 &self.image,
                 limits,
@@ -741,7 +873,9 @@ impl RootlessBuildRuntime for DockerRootlessBuildRuntime {
                 std::env::consts::ARCH,
             )
             .await
-            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()));
+        admission.release().await;
+        result
     }
 
     async fn compile(

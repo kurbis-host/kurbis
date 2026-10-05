@@ -30,15 +30,19 @@ pub use checks::{
 };
 pub use execution::{BuildProcessReport, RootlessBuildRuntime};
 pub use poller::{CiPoller, CiPollerConfig};
-pub use repository::{CheckRunReconciliation, CiPreviewRepository, CiRefRecord, WatchedRepository};
+pub use repository::{
+    CheckRunReconciliation, CiGitHubPrDelivery, CiGitHubPrDeliveryResult, CiPreviewRepository,
+    CiRefRecord, ClaimedCiGitHubPrDelivery, WatchedRepository,
+};
 pub use runtime::{
     CI_RUNTIME_CPU_MILLIS, CI_RUNTIME_DISK_BYTES, CI_RUNTIME_IDLE_SECONDS, CI_RUNTIME_MEMORY_BYTES,
     CiPreviewRuntimeCoordinator, CiPreviewRuntimeHost, CiPreviewRuntimeRepository, CiRuntimeError,
-    CiRuntimePlacement, CiRuntimeState, ExpiredCiRuntime, RuntimeCapability, RuntimeLease,
+    CiRuntimePlacement, CiRuntimeState, CiWorldSnapshotGarbageClaim, ExpiredCiRuntime,
+    RuntimeCapability, RuntimeLease,
 };
 pub use services::{
-    ArtifactCache, BuildCoordinator, BuildOutput, BuildRequest, CiGatewayAdmission, CiServiceError,
-    ControlledBuildOutput, ObjectArtifactCache, SandboxLimits, UntrustedWorkloadRuntime,
-    validate_workload_limits,
+    ArtifactCache, BuildCoordinator, BuildOutput, BuildRequest, CiBuildIdentity,
+    CiGatewayAdmission, CiServiceError, ControlledBuildOutput, ObjectArtifactCache, SandboxLimits,
+    UntrustedWorkloadRuntime, validate_workload_limits,
 };
 pub use source_control::GitHubSourceControl;

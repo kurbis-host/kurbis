@@ -13,6 +13,9 @@ const NFT_TABLE: &str = "kurbis_workload_ingress";
 const NFT_CHAIN: &str = "gateway_only";
 const NFT_TIMEOUT: Duration = Duration::from_secs(10);
 
+mod relay;
+pub use relay::{cleanup_ingress_through, ensure_runtime_ingress};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedWorkloadPorts {
     pub java_tcp: SocketAddr,
@@ -54,32 +57,82 @@ impl GatewayIngressPolicy {
         {
             return Ok(());
         }
-        self.remove_server(server_id).await?;
+        self.remove_generation(server_id, generation).await?;
         let mut script = String::new();
-        for (protocol, socket) in [
-            ("tcp", ports.java_tcp),
-            ("udp", ports.bedrock_udp),
-            ("tcp", ports.bedrock_signal_tcp),
-        ] {
-            let prefix = rule_prefix(server_id, generation, protocol, socket.port());
-            let allow = self.rule(protocol, socket, &prefix, true);
-            let drop = self.rule(protocol, socket, &prefix, false);
+        for (protocol, socket, allowed_source) in ingress_bindings(self.gateway_address, ports) {
+            let prefix = rule_prefix(server_id, generation, protocol, socket);
+            let allow = self.rule_from(protocol, socket, &prefix, allowed_source, true);
+            let drop = self.rule_from(protocol, socket, &prefix, allowed_source, false);
             script.push_str(&format!("add rule inet {NFT_TABLE} {NFT_CHAIN} {allow}\nadd rule inet {NFT_TABLE} {NFT_CHAIN} {drop}\n"));
         }
         self.nft_batch(&script).await?;
         if let Err(error) = self.verify_rules(server_id, generation, ports).await {
-            self.remove_server(server_id).await?;
+            self.remove_generation(server_id, generation).await?;
             return Err(error).context("verify installed Gateway-only ingress rules");
         }
         Ok(())
     }
 
-    /// Remove only rules carrying this server's unique comment prefix. A stale
-    /// generation cannot remove rules belonging to another server.
-    pub async fn remove_server(&self, server_id: Uuid) -> Result<()> {
+    /// Remove generation-tagged host admission rules without allowing a stale
+    /// worker to erase a newer generation's policy.
+    pub async fn remove_generations_through(
+        &self,
+        server_id: Uuid,
+        max_generation: i64,
+    ) -> Result<()> {
+        if max_generation <= 0 {
+            bail!("ingress policy cleanup requires a positive generation");
+        }
         self.ensure_chain().await?;
         let rules = self.list_rules().await?;
-        let prefix = format!("kurbis:{server_id}:");
+        let server_prefix = format!("kurbis:{server_id}:");
+        let mut handles = Vec::new();
+        for rule in &rules {
+            let Some(comment) = rule.get("comment").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(suffix) = comment.strip_prefix(&server_prefix) else {
+                continue;
+            };
+            let Some(generation) = suffix
+                .split(':')
+                .next()
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                bail!("refusing to remove malformed Gateway ingress rule {comment}");
+            };
+            if generation > max_generation {
+                bail!("refusing stale Gateway ingress cleanup of newer generation {generation}");
+            }
+            if generation > 0
+                && let Some(handle) = rule.get("handle").and_then(Value::as_u64)
+            {
+                handles.push(handle);
+            }
+        }
+        handles.sort_unstable_by(|left, right| right.cmp(left));
+        for handle in handles {
+            self.nft([
+                "delete",
+                "rule",
+                "inet",
+                NFT_TABLE,
+                NFT_CHAIN,
+                "handle",
+                &handle.to_string(),
+            ])
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn remove_generation(&self, server_id: Uuid, generation: i64) -> Result<()> {
+        if generation <= 0 {
+            bail!("ingress policy cleanup requires a positive generation");
+        }
+        self.ensure_chain().await?;
+        let rules = self.list_rules().await?;
+        let prefix = format!("kurbis:{server_id}:{generation}:");
         let mut handles = rules
             .iter()
             .filter(|rule| {
@@ -147,6 +200,17 @@ impl GatewayIngressPolicy {
     }
 
     fn rule(&self, protocol: &str, socket: SocketAddr, prefix: &str, allow: bool) -> String {
+        self.rule_from(protocol, socket, prefix, self.gateway_address, allow)
+    }
+
+    fn rule_from(
+        &self,
+        protocol: &str,
+        socket: SocketAddr,
+        prefix: &str,
+        allowed_source: IpAddr,
+        allow: bool,
+    ) -> String {
         let (source_field, destination_field) = if socket.is_ipv4() {
             ("ip saddr", "ip daddr")
         } else {
@@ -155,10 +219,10 @@ impl GatewayIngressPolicy {
         let verdict = if allow { "accept" } else { "drop" };
         let label = if allow { "allow" } else { "drop" };
         let source = if allow {
-            if socket.is_ipv4() != self.gateway_address.is_ipv4() {
+            if socket.is_ipv4() != allowed_source.is_ipv4() {
                 return String::new();
             }
-            format!("{source_field} {} ", self.gateway_address)
+            format!("{source_field} {} ", allowed_source)
         } else {
             String::new()
         };
@@ -192,10 +256,7 @@ impl GatewayIngressPolicy {
             .await?;
         } else {
             let chain = chain?;
-            if !chain.contains("hook input")
-                || !chain.contains("priority -5")
-                || !chain.contains("policy accept")
-            {
+            if !valid_input_chain_declaration(&chain) {
                 bail!(
                     "existing workload ingress chain has an unexpected hook, priority, or policy"
                 );
@@ -211,33 +272,29 @@ impl GatewayIngressPolicy {
         ports: PublishedWorkloadPorts,
     ) -> Result<()> {
         let rules = self.list_rules().await?;
-        for (protocol, socket) in [
-            ("tcp", ports.java_tcp),
-            ("udp", ports.bedrock_udp),
-            ("tcp", ports.bedrock_signal_tcp),
-        ] {
-            let prefix = rule_prefix(server_id, generation, protocol, socket.port());
+        for (protocol, socket, allowed_source) in ingress_bindings(self.gateway_address, ports) {
+            let prefix = rule_prefix(server_id, generation, protocol, socket);
             let allow = find_verified_rule(
                 &rules,
                 &format!("{prefix}:allow"),
-                self.gateway_address,
+                allowed_source,
                 protocol,
                 socket,
                 true,
             )
             .context(format!(
-                "Gateway source allow rule {prefix} is missing or has been altered"
+                "configured source allow rule {prefix} is missing or has been altered"
             ))?;
             let drop = find_verified_rule(
                 &rules,
                 &format!("{prefix}:drop"),
-                self.gateway_address,
+                allowed_source,
                 protocol,
                 socket,
                 false,
             )
             .context(format!(
-                "non-Gateway drop rule {prefix} is missing or has been altered"
+                "non-allowed source drop rule {prefix} is missing or has been altered"
             ))?;
             if allow >= drop {
                 bail!("Gateway ingress allow rule must precede the port drop rule for {prefix}");
@@ -313,6 +370,15 @@ impl GatewayIngressPolicy {
     }
 }
 
+fn valid_input_chain_declaration(chain: &str) -> bool {
+    let priority_is_minus_five =
+        chain.contains("priority -5") || chain.contains("priority filter - 5");
+    chain.contains("type filter")
+        && chain.contains("hook input")
+        && priority_is_minus_five
+        && chain.contains("policy accept")
+}
+
 fn validate_published_ports(gateway_address: IpAddr, ports: PublishedWorkloadPorts) -> Result<()> {
     let bindings = [
         ("tcp", ports.java_tcp),
@@ -368,6 +434,9 @@ fn find_verified_rule(
             let Some(condition) = expression.get("match") else {
                 continue;
             };
+            if condition.get("op").and_then(Value::as_str) != Some("==") {
+                continue;
+            }
             let Some(left) = condition.get("left") else {
                 continue;
             };
@@ -377,10 +446,8 @@ fn find_verified_rule(
             let Some(field) = payload.get("field").and_then(Value::as_str) else {
                 continue;
             };
-            if !allow && matches!(field, "saddr" | "daddr") {
-                if field == "saddr" {
-                    unexpected_source_match = true;
-                }
+            if !allow && field == "saddr" {
+                unexpected_source_match = true;
             }
             let payload_protocol = payload.get("protocol").and_then(Value::as_str)?;
             let right = condition.get("right")?;
@@ -433,13 +500,60 @@ pub fn docker_publish_binding(
     Ok(format!("{address}:{host_port}:{container_port}/{protocol}"))
 }
 
-fn rule_prefix(server_id: Uuid, generation: i64, protocol: &str, port: u16) -> String {
-    format!("kurbis:{server_id}:{generation}:{protocol}:{port}")
+fn ingress_bindings(
+    gateway_address: IpAddr,
+    ports: PublishedWorkloadPorts,
+) -> Vec<(&'static str, SocketAddr, IpAddr)> {
+    let mut bindings = vec![
+        ("tcp", ports.java_tcp, gateway_address),
+        ("udp", ports.bedrock_udp, gateway_address),
+        ("tcp", ports.bedrock_signal_tcp, gateway_address),
+    ];
+    let loopback = if ports.java_tcp.is_ipv4() {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    };
+    if ports.java_tcp.ip() != loopback {
+        bindings.push((
+            "tcp",
+            SocketAddr::new(loopback, ports.java_tcp.port()),
+            loopback,
+        ));
+    }
+    bindings
+}
+
+fn rule_prefix(server_id: Uuid, generation: i64, protocol: &str, socket: SocketAddr) -> String {
+    format!(
+        "kurbis:{server_id}:{generation}:{protocol}:{}:{}",
+        socket.ip(),
+        socket.port()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_hook_accepts_equivalent_nft_priority_renderings_only() {
+        assert!(valid_input_chain_declaration(
+            "chain gateway_only { type filter hook input priority filter - 5; policy accept; }"
+        ));
+        assert!(valid_input_chain_declaration(
+            "chain gateway_only { type filter hook input priority -5; policy accept; }"
+        ));
+        assert!(!valid_input_chain_declaration(
+            "chain gateway_only { type filter hook input priority filter; policy accept; }"
+        ));
+        assert!(!valid_input_chain_declaration(
+            "chain gateway_only { type filter hook output priority filter - 5; policy accept; }"
+        ));
+        assert!(!valid_input_chain_declaration(
+            "chain gateway_only { type filter hook input priority filter - 5; policy drop; }"
+        ));
+    }
 
     #[test]
     fn verified_ingress_rejects_a_tampered_rule_even_when_comment_remains() {
@@ -514,12 +628,12 @@ mod tests {
         let policy = GatewayIngressPolicy::new("10.9.0.2".parse().unwrap()).unwrap();
         let id = Uuid::new_v4();
         let socket = "10.9.0.4:23123".parse().unwrap();
-        let allow = policy.rule("tcp", socket, &rule_prefix(id, 7, "tcp", 23123), true);
-        let drop = policy.rule("tcp", socket, &rule_prefix(id, 7, "tcp", 23123), false);
+        let allow = policy.rule("tcp", socket, &rule_prefix(id, 7, "tcp", socket), true);
+        let drop = policy.rule("tcp", socket, &rule_prefix(id, 7, "tcp", socket), false);
         assert!(allow.contains("ip saddr 10.9.0.2 ip daddr 10.9.0.4 tcp dport 23123 accept"));
         assert!(drop.contains("ip daddr 10.9.0.4 tcp dport 23123 drop"));
         assert!(!drop.contains("ip saddr"));
-        assert!(rule_prefix(id, 7, "tcp", 23123).starts_with(&format!("kurbis:{id}:7:")));
+        assert!(rule_prefix(id, 7, "tcp", socket).starts_with(&format!("kurbis:{id}:7:")));
         assert_eq!(
             docker_publish_binding("10.9.0.4".parse().unwrap(), 23123, 25565, "tcp").unwrap(),
             "10.9.0.4:23123:25565/tcp"

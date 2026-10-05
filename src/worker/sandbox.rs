@@ -42,6 +42,20 @@ written=$(stat -c %s /work/kurbis-quota-probe)
 [ "$written" -ge 62914560 ]
 "#;
 
+const MEMORY_PRESSURE_PROBE_SCRIPT: &str = r#"
+set -eu
+[ "$(cat /sys/fs/cgroup/memory.max)" = 33554432 ]
+[ "$(cat /sys/fs/cgroup/memory.swap.max)" = 0 ]
+before=$(awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory.events)
+if dd if=/dev/zero of=/dev/shm/kurbis-memory-pressure bs=1M count=64 conv=fsync status=none 2>/dev/null; then
+    echo "memory pressure escaped the 32 MiB cgroup limit" >&2
+    exit 90
+fi
+after=$(awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory.events)
+[ -n "$before" ] && [ -n "$after" ] && [ "$after" -gt "$before" ]
+echo "MEMORY_OOM_KILL_PROBE_PASSED before=$before after=$after"
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkloadLimits {
     pub memory_bytes: u64,
@@ -159,7 +173,8 @@ impl DockerSandbox {
             bail!("CI builder architecture mismatch: expected {expected}, got {actual}");
         }
         self.verify_enforcement(image, limits, 0, 0, Some(docker_host))
-            .await
+            .await?;
+        verify_buildkit_resource_enforcement(image, Some(docker_host)).await
     }
 
     async fn verify_enforcement(
@@ -242,7 +257,93 @@ impl DockerSandbox {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        self.verify_tmpfs_quota(image, docker_host).await
+        self.verify_tmpfs_quota(image, docker_host).await?;
+        self.verify_memory_limit_enforcement(image, docker_host)
+            .await
+    }
+
+    async fn verify_memory_limit_enforcement(
+        &self,
+        image: &str,
+        docker_host: Option<&str>,
+    ) -> Result<()> {
+        const MEMORY: &str = "33554432";
+        let name = format!("kurbis-memory-probe-{}", Uuid::new_v4().simple());
+        let output = timeout(
+            DOCKER_COMMAND_TIMEOUT,
+            docker_command(docker_host)
+                .args([
+                    "run",
+                    "--name",
+                    &name,
+                    "--pull=never",
+                    "--network=none",
+                    "--memory",
+                    MEMORY,
+                    "--memory-swap",
+                    MEMORY,
+                    "--cpu-period",
+                    "100000",
+                    "--cpu-quota",
+                    "10000",
+                    "--pids-limit",
+                    "16",
+                    "--user",
+                    "0:0",
+                    "--read-only",
+                    "--shm-size",
+                    "64m",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,nodev,size=4m",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "--cap-drop",
+                    "ALL",
+                    "--entrypoint",
+                    "/bin/sh",
+                    image,
+                    "-ec",
+                    MEMORY_PRESSURE_PROBE_SCRIPT,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let output = match output {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let _ = remove_probe_container(docker_host, &name).await;
+                return Err(error).context("run cgroup memory pressure probe");
+            }
+            Err(_) => {
+                let _ = remove_probe_container(docker_host, &name).await;
+                bail!("cgroup memory pressure probe timed out");
+            }
+        };
+        let oom_killed = docker_output_at(
+            docker_host,
+            ["inspect", "--format", "{{.State.OOMKilled}}", &name],
+        )
+        .await
+        .unwrap_or_default();
+        let _ = remove_probe_container(docker_host, &name).await;
+        let output_text = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && output_text.contains("MEMORY_OOM_KILL_PROBE_PASSED") {
+            return Ok(());
+        }
+        if oom_killed.trim() == "true" {
+            return Ok(());
+        }
+        bail!(
+            "rootless Docker did not enforce the 32 MiB/no-swap memory limit ({}; OOMKilled={}): {}{}",
+            output.status,
+            oom_killed.trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            output_text
+        )
     }
 
     async fn verify_tmpfs_quota(&self, image: &str, docker_host: Option<&str>) -> Result<()> {
@@ -835,6 +936,143 @@ fn validate_docker_host(value: &str) -> Result<()> {
         bail!("CI builder Docker host must be ssh://user@host[:port]");
     }
     Ok(())
+}
+
+async fn verify_buildkit_resource_enforcement(
+    image: &str,
+    docker_host: Option<&str>,
+) -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("kurbis-buildkit-cgroup-probe-")
+        .tempdir()
+        .context("create BuildKit resource probe context")?;
+    let name = format!("kurbis-buildkit-probe-{}", Uuid::new_v4().simple());
+    let dockerfile = r#"ARG PROBE_IMAGE
+FROM ${PROBE_IMAGE}
+ARG EXPECTED_MEMORY_BYTES
+ARG EXPECTED_CPU_MILLIS
+RUN set -eu; \
+    memory=$(cat /sys/fs/cgroup/memory.max); test "$memory" -gt 0; test "$memory" -le "$EXPECTED_MEMORY_BYTES"; \
+    test "$(cat /sys/fs/cgroup/memory.swap.max)" -eq 0; \
+    read -r quota period < /sys/fs/cgroup/cpu.max; test "$quota" -gt 0; test "$period" -gt 0; \
+    test $((quota * 1000)) -le $((period * EXPECTED_CPU_MILLIS)); \
+    before=$(awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory.events); \
+    if dd if=/dev/zero of=/dev/shm/kurbis-buildkit-memory-probe bs=1M count=128 conv=fsync status=none 2>/dev/null; then \
+        echo "BuildKit memory cap did not stop cgroup pressure" >&2; exit 90; \
+    fi; \
+    after=$(awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory.events); \
+    test -n "$before"; test -n "$after"; test "$after" -gt "$before"; \
+    echo "BUILDKIT_CGROUP_LIMITS_PASSED memory=$memory swap=$(cat /sys/fs/cgroup/memory.swap.max) cpu=$quota/$period oom_kill=$before->$after"
+"#;
+    tokio::fs::write(directory.path().join("Dockerfile"), dockerfile)
+        .await
+        .context("write BuildKit resource probe Dockerfile")?;
+
+    let memory = "33554432";
+    let quota = "25000";
+    let period = "100000";
+    let mut command = docker_command(docker_host);
+    let output = timeout(
+        DOCKER_COMMAND_TIMEOUT,
+        command
+            .args([
+                "buildx",
+                "build",
+                "--pull=false",
+                "--no-cache",
+                "--network=none",
+                "--shm-size",
+                "64m",
+                "--resource",
+                &format!("memory={memory}"),
+                "--resource",
+                &format!("memory-swap={memory}"),
+                "--resource",
+                &format!("cpu-period={period}"),
+                "--resource",
+                &format!("cpu-quota={quota}"),
+                "--build-arg",
+                &format!("PROBE_IMAGE={image}"),
+                "--build-arg",
+                &format!("EXPECTED_MEMORY_BYTES={memory}"),
+                "--build-arg",
+                "EXPECTED_CPU_MILLIS=250",
+                "--tag",
+                &name,
+                "--load",
+                directory
+                    .path()
+                    .to_str()
+                    .context("BuildKit probe path is not UTF-8")?,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("BuildKit cgroup resource probe timed out")??;
+    let _ = remove_probe_image(docker_host, &name).await;
+    if !output.status.success() {
+        bail!(
+            "Docker BuildKit did not prove per-RUN memory/swap/CPU enforcement; upgrade or configure the selected BuildKit builder before running builds ({}): {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let log = String::from_utf8_lossy(&output.stdout);
+    if !log.contains("BUILDKIT_CGROUP_LIMITS_PASSED") {
+        bail!("Docker BuildKit resource probe completed without its cgroup enforcement marker");
+    }
+    Ok(())
+}
+
+async fn remove_probe_image(docker_host: Option<&str>, image: &str) -> Result<()> {
+    let output = timeout(
+        DOCKER_COMMAND_TIMEOUT,
+        docker_command(docker_host)
+            .args(["image", "rm", image])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("remove BuildKit resource probe image timed out")??;
+    if output.status.success() || is_docker_not_found(&output.stderr) {
+        Ok(())
+    } else {
+        bail!(
+            "remove BuildKit resource probe image: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+async fn remove_probe_container(docker_host: Option<&str>, name: &str) -> Result<()> {
+    let output = timeout(
+        DOCKER_COMMAND_TIMEOUT,
+        docker_command(docker_host)
+            .args(["rm", "--force", name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("remove cgroup memory pressure probe timed out")??;
+    if output.status.success() || is_docker_not_found(&output.stderr) {
+        Ok(())
+    } else {
+        bail!(
+            "remove cgroup memory pressure probe: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
 }
 
 fn docker_command(docker_host: Option<&str>) -> Command {

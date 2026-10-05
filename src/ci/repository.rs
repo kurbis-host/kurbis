@@ -9,8 +9,10 @@ use super::domain::{
     CiRefKind, validate_commit_sha,
 };
 
+mod github_webhook;
 mod polling;
 mod rows;
+pub use github_webhook::{CiGitHubPrDelivery, CiGitHubPrDeliveryResult, ClaimedCiGitHubPrDelivery};
 use rows::*;
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,10 @@ pub struct CiPreviewRepository {
 impl CiPreviewRepository {
     pub const fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn pool(&self) -> PgPool {
+        self.pool.clone()
     }
 
     pub async fn ensure_build(&self, key: &BuildKey) -> Result<(CiBuild, bool)> {
@@ -615,6 +621,13 @@ impl CiPreviewRepository {
     ) -> Result<CiPreview> {
         validate_commit_sha(commit_sha).map_err(|error| anyhow::anyhow!(error))?;
         let mut tx = self.pool.begin().await?;
+        // PostgreSQL row locks do not lock a missing hostname. Serialize the
+        // first insert for each canonical alias so overlapping repository
+        // pollers do not race into the unique hostname constraint.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&alias.value)
+            .execute(&mut *tx)
+            .await?;
         let existing = sqlx::query_as::<_, CiPreviewRow>(
             "SELECT id, repository, commit_sha, kind, hostname, build_id, state,
                     runtime_generation, NULL::text AS failure_message, ''::text AS build_log, expires_at FROM ci_preview_aliases

@@ -10,6 +10,7 @@ pub mod routing;
 pub mod runtime_api_proxy;
 pub mod snapshot;
 pub mod worker;
+pub mod workload_ingress;
 
 pub fn init_tracing(default_filter: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

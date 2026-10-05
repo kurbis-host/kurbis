@@ -10,7 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ci::{
-    CiPreview, CiPreviewRepository, CiPreviewRuntimeRepository, CiPreviewState, RuntimeLease,
+    BuildKey, BuildRequest, CiHostname, CiPreview, CiPreviewRepository, CiPreviewRuntimeRepository,
+    CiPreviewState, CiRefKind, RuntimeLease,
 };
 
 use super::{ApiError, AppState, internal::require_internal};
@@ -69,6 +70,82 @@ pub(super) async fn public_status(
     Ok(response)
 }
 
+async fn ensure_commit_preview_on_demand(
+    state: &AppState,
+    repository: &CiPreviewRepository,
+    hostname: &str,
+    existing: Option<CiPreview>,
+) -> Result<Option<CiPreview>, ApiError> {
+    let Some(identity) = state.ci_build_identity.as_ref() else {
+        return Ok(existing);
+    };
+    let Some(builder) = state.ci_build_coordinator.as_ref() else {
+        return Ok(existing);
+    };
+    let root_domain = crate::ci::CI_ROOT_DOMAIN;
+    let normalized_host = hostname.trim_end_matches('.').to_ascii_lowercase();
+    let Some(label) = normalized_host
+        .strip_suffix(&format!(".{root_domain}"))
+        .and_then(|host| host.strip_prefix("commit-"))
+    else {
+        return Ok(existing);
+    };
+    let alias = match CiHostname::for_ref(CiRefKind::Commit, label, root_domain) {
+        Ok(alias) if alias.value == normalized_host => alias,
+        _ => return Ok(existing),
+    };
+    let key = BuildKey::new(
+        &identity.repository,
+        label,
+        &identity.patch_fingerprint,
+        &identity.toolchain_version,
+        &identity.target_architecture,
+    )
+    .map_err(|error| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_ci_commit",
+            error.to_string(),
+        )
+    })?;
+    let (build, _) = repository
+        .ensure_build(&key)
+        .await
+        .map_err(ApiError::from)?;
+    let preview = match existing {
+        Some(preview) => preview,
+        None => repository
+            .ensure_preview(
+                &identity.repository,
+                label,
+                CiRefKind::Commit,
+                None,
+                &alias,
+                build.id,
+            )
+            .await
+            .map_err(ApiError::from)?,
+    };
+    if !matches!(
+        build.stage,
+        crate::ci::CiBuildStage::Ready | crate::ci::CiBuildStage::Failed
+    ) {
+        let builder = builder.clone();
+        let request = BuildRequest {
+            key,
+            source_repository: Some(identity.repository.clone()),
+            source_archive: Vec::new(),
+        };
+        let build_id = build.id;
+        tokio::spawn(async move {
+            if let Err(error) = builder.ensure_build(request).await {
+                tracing::error!(build_id = %build_id, ?error, "on-demand immutable CI commit build failed");
+            }
+        });
+    }
+    Ok(Some(preview))
+}
+
 pub(super) async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -106,10 +183,20 @@ pub(super) async fn admit(
         ));
     }
     let repository = CiPreviewRepository::new(state.pool.clone());
-    let preview = repository
+    let existing = repository
         .lookup_preview(&request.hostname)
         .await
         .map_err(ApiError::from)?;
+    let is_commit_alias = existing
+        .as_ref()
+        .is_some_and(|preview| preview.alias.kind == CiRefKind::Commit);
+    let preview = if existing.is_none() || is_commit_alias {
+        ensure_commit_preview_on_demand(&state, &repository, &request.hostname, existing.clone())
+            .await?
+            .or(existing)
+    } else {
+        existing
+    };
     let Some(preview) = preview else {
         return Err(ApiError::with_code(
             StatusCode::NOT_FOUND,
@@ -141,7 +228,10 @@ pub(super) async fn admit(
     };
     if matches!(
         preview.state,
-        CiPreviewState::Ready | CiPreviewState::Running
+        CiPreviewState::Ready
+            | CiPreviewState::Booting
+            | CiPreviewState::Running
+            | CiPreviewState::Stopping
     ) {
         let runtimes = CiPreviewRuntimeRepository::new(state.pool.clone());
         let capability_hash = blake3::hash(&rand::random::<[u8; 32]>());
@@ -156,10 +246,15 @@ pub(super) async fn admit(
             RuntimeLease::AlreadyRunning(_) => {
                 preview.state = CiPreviewState::Running;
             }
+            RuntimeLease::Stopping(_) => {
+                preview.state = CiPreviewState::Stopping;
+            }
             RuntimeLease::NoWorker => {
                 // A build can be ready without a live worker or free capacity.
                 // Never project an unverified stale placement as running.
-                preview.state = CiPreviewState::Ready;
+                if preview.state != CiPreviewState::Stopping {
+                    preview.state = CiPreviewState::Ready;
+                }
             }
         }
     }

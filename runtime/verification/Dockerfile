@@ -5,13 +5,13 @@ RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY tools/protocol/verify.mjs tools/protocol/verify_java_263.py ./
 
 FROM rust:1.98-bookworm AS hoster
-ENV CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0
+ENV CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=1 CARGO_PROFILE_DEV_DEBUG=0
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target \
-    cargo build --locked --bins && mkdir /artifacts && \
+    cargo build --jobs 1 --locked --bins && mkdir /artifacts && \
     cp target/debug/control-plane target/debug/gateway target/debug/worker target/debug/worker-bundle target/debug/api-openapi target/debug/runtime-api-proxy /artifacts/
 FROM docker:28-dind AS docker
 
