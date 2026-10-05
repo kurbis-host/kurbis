@@ -9,9 +9,18 @@ use anyhow::{Context, Result, bail, ensure};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommonConfig {
     pub database_url: String,
+}
+
+impl fmt::Debug for CommonConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommonConfig")
+            .field("database_url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl CommonConfig {
@@ -40,7 +49,7 @@ impl fmt::Debug for SecretString {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlPlaneConfig {
     pub common: CommonConfig,
     pub listen: SocketAddr,
@@ -51,6 +60,22 @@ pub struct ControlPlaneConfig {
     pub ci_github_webhook_enabled: bool,
     pub ci_github_webhook_secret: Option<SecretString>,
     pub oauth: OAuthConfig,
+}
+
+impl fmt::Debug for ControlPlaneConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneConfig")
+            .field("common", &self.common)
+            .field("listen", &self.listen)
+            .field("public_base_url", &self.public_base_url)
+            .field("root_domain", &self.root_domain)
+            .field("internal_token", &"[REDACTED]")
+            .field("ci_github_webhook_enabled", &self.ci_github_webhook_enabled)
+            .field("ci_github_webhook_secret", &self.ci_github_webhook_secret)
+            .field("oauth", &self.oauth)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -621,7 +646,7 @@ impl StorageMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     pub common: CommonConfig,
     pub java_listen: SocketAddr,
@@ -641,6 +666,35 @@ pub struct GatewayConfig {
     pub root_domain: String,
     pub wake_timeout: Duration,
     pub allow_offline_waiting_for_tests: bool,
+}
+
+impl fmt::Debug for GatewayConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayConfig")
+            .field("common", &self.common)
+            .field("java_listen", &self.java_listen)
+            .field("java_public_port", &self.java_public_port)
+            .field("bedrock_listen", &self.bedrock_listen)
+            .field("bedrock_public_address", &self.bedrock_public_address)
+            .field("bedrock_public_port", &self.bedrock_public_port)
+            .field("bedrock_tls_certificate", &self.bedrock_tls_certificate)
+            .field("bedrock_tls_private_key", &self.bedrock_tls_private_key)
+            .field("waiting_java_address", &self.waiting_java_address)
+            .field("waiting_bedrock_address", &self.waiting_bedrock_address)
+            .field("waiting_signal_address", &self.waiting_signal_address)
+            .field("waiting_control_socket", &self.waiting_control_socket)
+            .field("waiting_control_token", &"[REDACTED]")
+            .field("control_plane_url", &self.control_plane_url)
+            .field("internal_token", &"[REDACTED]")
+            .field("root_domain", &self.root_domain)
+            .field("wake_timeout", &self.wake_timeout)
+            .field(
+                "allow_offline_waiting_for_tests",
+                &self.allow_offline_waiting_for_tests,
+            )
+            .finish()
+    }
 }
 
 impl GatewayConfig {
@@ -693,7 +747,7 @@ impl GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ObjectStoreConfig {
     Local {
         root: PathBuf,
@@ -706,6 +760,32 @@ pub enum ObjectStoreConfig {
         secret_key: String,
         allow_http: bool,
     },
+}
+
+impl fmt::Debug for ObjectStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { root } => formatter
+                .debug_struct("ObjectStoreConfig::Local")
+                .field("root", root)
+                .finish(),
+            Self::S3 {
+                bucket,
+                region,
+                endpoint,
+                allow_http,
+                ..
+            } => formatter
+                .debug_struct("ObjectStoreConfig::S3")
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field("access_key", &"[REDACTED]")
+                .field("secret_key", &"[REDACTED]")
+                .field("allow_http", allow_http)
+                .finish(),
+        }
+    }
 }
 
 impl ObjectStoreConfig {
@@ -793,7 +873,9 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{https_public_base_url, parse_bool};
+    use super::{
+        CommonConfig, GatewayConfig, ObjectStoreConfig, https_public_base_url, parse_bool,
+    };
 
     #[test]
     fn parse_bool_accepts_explicit_values_and_rejects_ambiguous_values() {
@@ -804,6 +886,53 @@ mod tests {
             assert!(!parse_bool("KURBIS_TEST_BOOL", value).unwrap());
         }
         assert!(parse_bool("KURBIS_TEST_BOOL", "maybe").is_err());
+    }
+
+    #[test]
+    fn debug_output_redacts_database_and_service_credentials() {
+        let common = CommonConfig {
+            database_url: "postgres://alice:super-secret@db.example/melon".into(),
+        };
+        let common_debug = format!("{common:?}");
+        assert!(!common_debug.contains("super-secret"));
+        assert!(common_debug.contains("REDACTED"));
+
+        let gateway = GatewayConfig {
+            common,
+            java_listen: "127.0.0.1:25565".parse().unwrap(),
+            java_public_port: 25565,
+            bedrock_listen: "127.0.0.1:19132".parse().unwrap(),
+            bedrock_public_address: "198.51.100.10".parse().unwrap(),
+            bedrock_public_port: 19132,
+            bedrock_tls_certificate: "/run/cert.pem".into(),
+            bedrock_tls_private_key: "/run/key.pem".into(),
+            waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
+            waiting_control_socket: "/run/gateway.sock".into(),
+            waiting_control_token: "gateway-secret".into(),
+            control_plane_url: "https://control.example.test".into(),
+            internal_token: "internal-secret".into(),
+            root_domain: "example.test".into(),
+            wake_timeout: std::time::Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        };
+        let gateway_debug = format!("{gateway:?}");
+        assert!(!gateway_debug.contains("gateway-secret"));
+        assert!(!gateway_debug.contains("internal-secret"));
+        assert!(!gateway_debug.contains("super-secret"));
+
+        let object_store = ObjectStoreConfig::S3 {
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key: "access-secret".into(),
+            secret_key: "object-secret".into(),
+            allow_http: false,
+        };
+        let object_store_debug = format!("{object_store:?}");
+        assert!(!object_store_debug.contains("access-secret"));
+        assert!(!object_store_debug.contains("object-secret"));
     }
 
     #[test]

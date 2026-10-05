@@ -441,7 +441,6 @@ impl BuildAdmissionLease {
         if let Err(error) = self.cleaner.remove_lease(&self.lease_token).await {
             tracing::warn!(
                 backend_pid = self.backend_pid,
-                lease = %self.lease_token,
                 ?error,
                 "failed to remove lease-owned CI containers before releasing admission lock"
             );
@@ -473,13 +472,12 @@ impl Drop for BuildAdmissionLease {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     if let Err(error) = cleaner.remove_lease(&token).await {
-                        tracing::warn!(lease = %token, ?error, "failed to remove cancelled CI build containers");
+                        tracing::warn!(?error, "failed to remove cancelled CI build containers");
                     }
                 });
             }
             tracing::info!(
                 backend_pid = self.backend_pid,
-                lease = %self.lease_token,
                 requested_memory_bytes = self.requested_memory_bytes,
                 "dropped CI build admission lease; PostgreSQL session and lease-owned containers are being released"
             );
