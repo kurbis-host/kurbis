@@ -17,9 +17,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use sqlx::{PgPool, Postgres, pool::PoolConnection};
+use sqlx::{Connection, PgConnection, PgPool};
 use thiserror::Error;
-use tokio::{process::Command, task::JoinHandle, time::timeout};
+use tokio::{process::Command, sync::oneshot, task::JoinHandle, time::timeout};
 use uuid::Uuid;
 
 const DEFAULT_SYSTEM_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -30,6 +30,7 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const LEASE_STALE_AFTER: Duration = Duration::from_secs(45);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
+const DB_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum BuildAdmissionError {
@@ -218,12 +219,26 @@ impl BuildAdmissionCoordinator {
                     detail,
                 });
             }
-            let mut connection = self.pool.acquire().await.map_err(|error| {
+            // Advisory locks require a session that remains pinned for the
+            // lease lifetime. Connect directly instead of borrowing the
+            // application pool: CI_BUILD_CONCURRENCY may be 64 while the
+            // request pool is intentionally much smaller.
+            let connection_options = self.pool.connect_options();
+            let mut connection = timeout(
+                DB_OPERATION_TIMEOUT,
+                PgConnection::connect_with(connection_options.as_ref()),
+            )
+            .await
+            .map_err(|_| BuildAdmissionError::Timeout {
+                seconds: DB_OPERATION_TIMEOUT.as_secs(),
+                detail: "connect PostgreSQL build-admission session timed out".into(),
+            })?
+            .map_err(|error| {
                 BuildAdmissionError::Unavailable(format!(
-                    "acquire PostgreSQL build-admission session: {error}"
+                    "connect PostgreSQL build-admission session: {error}"
                 ))
             })?;
-            connection.close_on_drop();
+            configure_connection(&mut connection).await?;
             if !try_advisory_lock(&mut connection, global_key).await? {
                 drop(connection);
                 tokio::time::sleep(self.lock_poll_interval).await;
@@ -245,7 +260,7 @@ impl BuildAdmissionCoordinator {
                 .bind(&self.builder_identity)
                 .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
                 .bind(LEASE_STALE_AFTER.as_secs() as i32)
-                .fetch_optional(&mut *connection)
+                .fetch_optional(&mut connection)
                 .await
                 .map_err(|error| {
                     BuildAdmissionError::Unavailable(format!(
@@ -267,7 +282,7 @@ impl BuildAdmissionCoordinator {
                     .bind(&self.builder_identity)
                     .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
                     .bind(token)
-                    .execute(&mut *connection)
+                    .execute(&mut connection)
                     .await
                     .map_err(|error| {
                         BuildAdmissionError::Unavailable(format!(
@@ -283,7 +298,7 @@ impl BuildAdmissionCoordinator {
                 )
                 .bind(&self.builder_identity)
                 .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
-                .fetch_one(&mut *connection)
+                .fetch_one(&mut connection)
                 .await
                 .map_err(|error| {
                     BuildAdmissionError::Unavailable(format!(
@@ -308,7 +323,7 @@ impl BuildAdmissionCoordinator {
                   WHERE builder_identity = $1",
             )
             .bind(&self.builder_identity)
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut connection)
             .await
             .map_err(|error| {
                 BuildAdmissionError::Unavailable(format!(
@@ -346,7 +361,7 @@ impl BuildAdmissionCoordinator {
             }
 
             let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *connection)
+                .fetch_one(&mut connection)
                 .await
                 .map_err(|error| {
                     BuildAdmissionError::Unavailable(format!(
@@ -366,7 +381,7 @@ impl BuildAdmissionCoordinator {
             .bind(i64::try_from(requested_memory_bytes).map_err(|_| {
                 BuildAdmissionError::Unavailable("build memory reservation overflow".into())
             })?)
-            .execute(&mut *connection)
+            .execute(&mut connection)
             .await
             .map_err(|error| {
                 BuildAdmissionError::Unavailable(format!("record build-admission lease: {error}"))
@@ -471,7 +486,6 @@ impl AbandonedBuildCleaner for DockerAbandonedBuildCleaner {
 }
 
 pub(super) struct BuildAdmissionLease {
-    connection: Option<PoolConnection<Postgres>>,
     pool: PgPool,
     cleaner: Arc<dyn AbandonedBuildCleaner>,
     builder_identity: String,
@@ -483,12 +497,13 @@ pub(super) struct BuildAdmissionLease {
     requested_memory_bytes: u64,
     lost: Arc<AtomicBool>,
     heartbeat: Option<JoinHandle<()>>,
+    heartbeat_stop: Option<oneshot::Sender<()>>,
     released: bool,
 }
 impl BuildAdmissionLease {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        connection: PoolConnection<Postgres>,
+        connection: PgConnection,
         pool: PgPool,
         cleaner: Arc<dyn AbandonedBuildCleaner>,
         builder_identity: String,
@@ -501,8 +516,9 @@ impl BuildAdmissionLease {
         heartbeat_interval: Duration,
     ) -> Self {
         let lost = Arc::new(AtomicBool::new(false));
+        let (heartbeat_stop, stop_signal) = oneshot::channel();
         let heartbeat = Some(start_heartbeat(
-            pool.clone(),
+            connection,
             builder_identity.clone(),
             slot,
             slot_key,
@@ -510,9 +526,9 @@ impl BuildAdmissionLease {
             lease_token,
             lost.clone(),
             heartbeat_interval,
+            stop_signal,
         ));
         Self {
-            connection: Some(connection),
             pool,
             cleaner,
             builder_identity,
@@ -524,6 +540,7 @@ impl BuildAdmissionLease {
             requested_memory_bytes,
             lost,
             heartbeat,
+            heartbeat_stop: Some(heartbeat_stop),
             released: false,
         }
     }
@@ -548,8 +565,11 @@ impl BuildAdmissionLease {
 
     pub(super) async fn release(mut self) {
         self.released = true;
+        if let Some(stop) = self.heartbeat_stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
+            let _ = heartbeat.await;
         }
         let cleanup_succeeded = match self.cleaner.remove_lease(&self.token()).await {
             Ok(()) => true,
@@ -568,15 +588,20 @@ impl BuildAdmissionLease {
         };
         if cleanup_succeeded {
             let token = self.lease_token;
-            if let Err(error) = sqlx::query(
-                "DELETE FROM ci_build_admission_leases
-                 WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+            if let Err(error) = timeout(
+                DB_OPERATION_TIMEOUT,
+                sqlx::query(
+                    "DELETE FROM ci_build_admission_leases
+                     WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+                )
+                .bind(&self.builder_identity)
+                .bind(i16::try_from(self.slot).expect("u16 concurrency fits i16"))
+                .bind(token)
+                .execute(&self.pool),
             )
-            .bind(&self.builder_identity)
-            .bind(i16::try_from(self.slot).expect("u16 concurrency fits i16"))
-            .bind(token)
-            .execute(&self.pool)
             .await
+            .map_err(|_| "delete build-admission lease row timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()))
             {
                 tracing::warn!(
                     backend_pid = self.backend_pid,
@@ -585,24 +610,20 @@ impl BuildAdmissionLease {
                 );
             }
         }
-        if let Some(connection) = self.connection.take()
-            && let Err(error) = unlock_and_close(connection, self.slot_key).await
-        {
-            tracing::warn!(
-                backend_pid = self.backend_pid,
-                requested_memory_bytes = self.requested_memory_bytes,
-                ?error,
-                "failed to explicitly release PostgreSQL build-admission slot; closing its dedicated session"
-            );
-        }
+        tracing::debug!(
+            backend_pid = self.backend_pid,
+            requested_memory_bytes = self.requested_memory_bytes,
+            slot_key = self.slot_key,
+            "released PostgreSQL build-admission slot"
+        );
     }
 }
 impl Drop for BuildAdmissionLease {
     fn drop(&mut self) {
+        self.heartbeat_stop.take();
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
-        self.connection.take();
         if !self.released {
             let cleaner = self.cleaner.clone();
             let token = self.token();
@@ -649,8 +670,9 @@ impl Drop for BuildAdmissionLease {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_heartbeat(
-    pool: PgPool,
+    mut connection: PgConnection,
     builder_identity: String,
     slot: u16,
     slot_key: i64,
@@ -658,55 +680,84 @@ fn start_heartbeat(
     lease_token: Uuid,
     lost: Arc<AtomicBool>,
     interval: Duration,
+    mut stop_signal: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
-            let slot_owned = advisory_lock_owned(&pool, backend_pid, slot_key).await;
-            let row_updated = sqlx::query(
-                "UPDATE ci_build_admission_leases
-                 SET heartbeat_at = now()
-                 WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
-            )
-            .bind(&builder_identity)
-            .bind(i16::try_from(slot).expect("u16 concurrency fits i16"))
-            .bind(lease_token)
-            .execute(&pool)
-            .await
-            .map(|result| result.rows_affected() == 1);
-            match (slot_owned, row_updated) {
-                (Ok(true), Ok(true)) => {}
-                (Ok(false), _) | (_, Ok(false)) => {
-                    lost.store(true, Ordering::Release);
-                    tracing::error!(
-                        backend_pid,
-                        slot,
-                        "CI builder lost its PostgreSQL admission slot"
-                    );
-                    break;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    let updated = timeout(
+                        DB_OPERATION_TIMEOUT,
+                        sqlx::query(
+                            "UPDATE ci_build_admission_leases
+                             SET heartbeat_at = now()
+                             WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+                        )
+                        .bind(&builder_identity)
+                        .bind(i16::try_from(slot).expect("u16 concurrency fits i16"))
+                        .bind(lease_token)
+                        .execute(&mut connection),
+                    )
+                    .await
+                    .map_err(|_| "heartbeat update timed out".to_owned())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    .map(|result| result.rows_affected() == 1);
+                    match updated {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            lost.store(true, Ordering::Release);
+                            tracing::error!(backend_pid, slot, "CI builder lease row was fenced");
+                            break;
+                        }
+                        Err(error) => {
+                            lost.store(true, Ordering::Release);
+                            tracing::error!(backend_pid, slot, ?error, "CI builder admission heartbeat failed");
+                            break;
+                        }
+                    }
                 }
-                (Err(error), _) | (_, Err(error)) => {
-                    lost.store(true, Ordering::Release);
-                    tracing::error!(
-                        backend_pid,
-                        slot,
-                        ?error,
-                        "CI builder admission heartbeat failed"
-                    );
+                _ = &mut stop_signal => {
                     break;
                 }
             }
         }
+        if let Err(error) = unlock_and_close(connection, slot_key).await {
+            lost.store(true, Ordering::Release);
+            tracing::warn!(
+                backend_pid,
+                slot,
+                ?error,
+                "failed to close PostgreSQL build-admission heartbeat session"
+            );
+        }
     })
 }
 
+async fn configure_connection(connection: &mut PgConnection) -> Result<(), BuildAdmissionError> {
+    timeout(
+        DB_OPERATION_TIMEOUT,
+        sqlx::query("SET statement_timeout = '5000ms'").execute(&mut *connection),
+    )
+    .await
+    .map_err(|_| BuildAdmissionError::Timeout {
+        seconds: DB_OPERATION_TIMEOUT.as_secs(),
+        detail: "configure PostgreSQL build-admission statement timeout timed out".into(),
+    })?
+    .map_err(|error| {
+        BuildAdmissionError::Unavailable(format!(
+            "configure PostgreSQL build-admission statement timeout: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 async fn try_advisory_lock(
-    connection: &mut PoolConnection<Postgres>,
+    connection: &mut PgConnection,
     key: i64,
 ) -> Result<bool, BuildAdmissionError> {
     sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(key)
-        .fetch_one(&mut **connection)
+        .fetch_one(&mut *connection)
         .await
         .map_err(|error| {
             BuildAdmissionError::Unavailable(format!(
@@ -716,12 +767,12 @@ async fn try_advisory_lock(
 }
 
 async fn unlock_advisory(
-    connection: &mut PoolConnection<Postgres>,
+    connection: &mut PgConnection,
     key: i64,
 ) -> Result<(), BuildAdmissionError> {
     let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
         .bind(key)
-        .fetch_one(&mut **connection)
+        .fetch_one(&mut *connection)
         .await
         .map_err(|error| {
             BuildAdmissionError::Unavailable(format!(
@@ -737,36 +788,12 @@ async fn unlock_advisory(
     }
 }
 
-async fn unlock_and_close(
-    mut connection: PoolConnection<Postgres>,
-    slot_key: i64,
-) -> Result<(), sqlx::Error> {
+async fn unlock_and_close(mut connection: PgConnection, slot_key: i64) -> Result<(), sqlx::Error> {
     let _unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
         .bind(slot_key)
-        .fetch_one(&mut *connection)
+        .fetch_one(&mut connection)
         .await?;
     connection.close().await
-}
-
-async fn advisory_lock_owned(
-    pool: &PgPool,
-    backend_pid: i32,
-    key: i64,
-) -> Result<bool, sqlx::Error> {
-    let classid = (key as u64 >> 32) as i64;
-    let objid = (key as u64 & u64::from(u32::MAX)) as i64;
-    sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM pg_locks
-            WHERE locktype = 'advisory' AND pid = $1 AND granted
-              AND classid = $2::oid AND objid = $3::oid AND objsubid = 1
-        )",
-    )
-    .bind(backend_pid)
-    .bind(classid)
-    .bind(objid)
-    .fetch_one(pool)
-    .await
 }
 
 fn advisory_key(builder_identity: &str, slot: u32) -> i64 {
@@ -1193,6 +1220,28 @@ mod tests {
             .expect("distinct builder identity is admitted independently");
         docker_lease.release().await;
         bubblewrap_lease.release().await;
+
+        // Admission sessions are direct PostgreSQL connections rather than
+        // borrowed application-pool slots, so the configured upper bound does
+        // not starve the control-plane pool when an operator selects 64 slots.
+        let high_concurrency = coordinator(
+            pool.clone(),
+            "bubblewrap:test-host:high-concurrency",
+            64,
+            cleaner.clone(),
+        );
+        let mut leases = Vec::with_capacity(64);
+        for _ in 0..64 {
+            leases.push(
+                high_concurrency
+                    .acquire(1024)
+                    .await
+                    .expect("all configured high-concurrency slots are independently admitted"),
+            );
+        }
+        for lease in leases {
+            lease.release().await;
+        }
         database.cleanup().await;
     }
 }

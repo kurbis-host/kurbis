@@ -42,7 +42,6 @@ const BUILD_SCRIPT: &str = r#"
 set -eu
 umask 077
 ulimit -n 4096 2>/dev/null || true
-ulimit -f "$KURBIS_FILE_LIMIT_BLOCKS" 2>/dev/null || true
 mkdir -p /work/source /work/plugin /work/out /work/tmp /work/home
 export HOME=/work/home
 export TMPDIR=/work/tmp
@@ -70,33 +69,24 @@ cd /work/plugin
 cargo build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
-# These are diagnostics, not quota claims. The namespace-only backend has no
-# hard cgroup memory/CPU/PID enforcement.
+# /work is an operator-provisioned tmpfs with explicit size and inode limits.
+# The host-side preflight rejects ordinary directories before untrusted input.
 printf 'bubblewrap_guarantee=%s\n' "$KURBIS_BWRAP_GUARANTEE"
 printf 'cgroup_delegation=%s\n' "$KURBIS_CGROUP_DELEGATION"
-for path in /work /work/source /work/target /work/plugin-target /work/tmp /work/out; do
-  printf 'df=%s ' "$path"; df -P -B1 "$path" 2>/dev/null || true
-done
-inodes=$(find /work -xdev -mindepth 1 -printf '.' 2>/dev/null | wc -c)
-[ "$inodes" -le "$KURBIS_MAX_INODES" ]
-printf 'workspace_inodes=%s\n' "$inodes"
-bytes=$(du -sx -B1 /work 2>/dev/null | awk 'NR == 1 { print $1 }')
-[ -n "$bytes" ] && [ "$bytes" -le "$KURBIS_DISK_BYTES" ]
-printf 'workspace_bytes=%s\n' "$bytes"
+printf 'workspace_boundary=operator_tmpfs_explicit_size_and_inodes\n'
 "#;
 
 const PATCH_SCRIPT: &str = r#"
 set -eu
 umask 077
 ulimit -n 4096 2>/dev/null || true
-ulimit -f "$KURBIS_FILE_LIMIT_BLOCKS" 2>/dev/null || true
 mkdir -p /work/home /work/tmp
 export HOME=/work/home
 export TMPDIR=/work/tmp
 # ci-source-preparer is a trusted, checked-in binary. It performs archive
 # extraction and checked-in git patching entirely inside this sandbox.
-/work/.ci-source-preparer /work/input/source.tar.gz /work/patched-source.tar.gz "$KURBIS_EXPECTED_PATCH_FINGERPRINT"
-size=$(stat -c %s /work/patched-source.tar.gz)
+/work/.ci-source-preparer /work/input/source.tar.gz /work/out/patched-source.tar.gz "$KURBIS_EXPECTED_PATCH_FINGERPRINT"
+size=$(stat -c %s /work/out/patched-source.tar.gz)
 test "$size" -gt 0
 test "$size" -le "$KURBIS_MAX_SOURCE_BYTES"
 "#;
@@ -171,14 +161,16 @@ impl BubblewrapBuildRuntime {
             ));
         }
         let bwrap_version = bubblewrap_version(&bwrap)?;
+        let bwrap_digest = executable_digest(&bwrap)?;
         let rootfs_manifest = manifest_digest(&rootfs)?;
         let toolchain_manifest = manifest_digest(&toolchain)?;
+        let source_preparer_digest = executable_digest(&source_preparer)?;
         let toolchain_version = toolchain_version.into();
         if toolchain_version.trim().is_empty() {
             return Err(sandbox_error("toolchain identity cannot be empty"));
         }
         let identity = format!(
-            "{BUBBLEWRAP_GUARANTEE};bwrap={bwrap_version};rootfs={rootfs_manifest};toolchain={toolchain_manifest};rust={toolchain_version}"
+            "{BUBBLEWRAP_GUARANTEE};bwrap={bwrap_version};bwrap_sha256={bwrap_digest};rootfs={rootfs_manifest};toolchain={toolchain_manifest};source_preparer_sha256={source_preparer_digest};rust={toolchain_version}"
         );
         Ok(Self {
             bwrap,
@@ -249,8 +241,16 @@ impl BubblewrapBuildRuntime {
     /// Run namespace and network invariants before accepting untrusted input.
     /// Missing cgroup delegation is reported but is not an error: this backend
     /// is explicitly namespace-only.
-    pub async fn preflight(&self) -> Result<BubblewrapPreflight, BuildPipelineError> {
-        let workspace = self.create_workspace("preflight", None)?;
+    async fn preflight_with_token(
+        &self,
+        lease_token: Option<&str>,
+        lease: Option<&mut super::admission::BuildAdmissionLease>,
+    ) -> Result<BubblewrapPreflight, BuildPipelineError> {
+        verify_workspace_tmpfs(&self.workspace_root, None)?;
+        if let Some(token) = lease_token {
+            self.cleanup_lease_workspace(token).await?;
+        }
+        let workspace = self.create_workspace("preflight", lease_token)?;
         let script = r#"
 set -eu
 [ "$(id -u)" = 0 ]
@@ -279,7 +279,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             }
         };
         let result = self
-            .run_sandbox(&workspace, script, &namespace_env, COMMAND_TIMEOUT)
+            .run_sandbox(&workspace, script, &namespace_env, COMMAND_TIMEOUT, lease)
             .await;
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         let (_, report) = result?;
@@ -295,6 +295,22 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             cgroup_delegation: Self::cgroup_delegation(),
             guarantee: BUBBLEWRAP_GUARANTEE,
         })
+    }
+
+    pub async fn preflight(&self) -> Result<BubblewrapPreflight, BuildPipelineError> {
+        self.preflight_with_token(None, None).await
+    }
+
+    async fn cleanup_lease_workspace(&self, lease_token: &str) -> Result<(), BuildPipelineError> {
+        let cleaner = BubblewrapWorkspaceCleaner {
+            root: self.workspace_root.clone(),
+        };
+        <BubblewrapWorkspaceCleaner as super::admission::AbandonedBuildCleaner>::remove_lease(
+            &cleaner,
+            lease_token,
+        )
+        .await
+        .map_err(|error| sandbox_error(error.to_string()))
     }
 
     fn create_workspace(
@@ -390,6 +406,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
         script: &str,
         envs: &[(&str, String)],
         process_timeout: Duration,
+        mut lease: Option<&mut super::admission::BuildAdmissionLease>,
     ) -> Result<(ExitStatus, BuildProcessReport), BuildPipelineError> {
         let mut child = self
             .command(workspace, script, envs)
@@ -407,23 +424,40 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             .stderr
             .take()
             .ok_or_else(|| sandbox_error("bubblewrap stderr was not captured"))?;
+        let root_pid = child.id();
         let stdout_task = tokio::spawn(read_capped(stdout, MAX_LOG_BYTES / 2));
         let stderr_task = tokio::spawn(read_capped(stderr, MAX_LOG_BYTES / 2));
-        let status = match timeout(process_timeout, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => return Err(sandbox_io("wait for bubblewrap sandbox", error)),
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = timeout(Duration::from_secs(5), child.wait()).await;
+        let started = tokio::time::Instant::now();
+        let status = loop {
+            let remaining = process_timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                terminate_process_tree(&mut child).await?;
                 return Err(BuildPipelineError::transient(
                     crate::ci::CiBuildStage::Compiling,
                     format!(
-                        "bubblewrap build exceeded its {} second timeout; descendants were signalled via --die-with-parent",
+                        "bubblewrap build exceeded its {} second timeout; all descendants were terminated and awaited",
                         process_timeout.as_secs()
                     ),
                 ));
             }
+            tokio::select! {
+                result = child.wait() => {
+                    break result.map_err(|error| sandbox_io("wait for bubblewrap sandbox", error))?;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1).min(remaining)) => {
+                    if let Some(lease) = lease.as_deref_mut()
+                        && lease.assert_alive().is_err()
+                    {
+                        terminate_process_tree(&mut child).await?;
+                        return Err(BuildPipelineError::transient(
+                            crate::ci::CiBuildStage::Compiling,
+                            "bubblewrap build admission lease was fenced; workload was terminated",
+                        ));
+                    }
+                }
+            }
         };
+        terminate_descendants(root_pid).await?;
         let stdout = stdout_task
             .await
             .map_err(|error| sandbox_error(format!("read bubblewrap stdout: {error}")))?
@@ -435,6 +469,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
         Ok((status, BuildProcessReport { stdout, stderr }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_compile(
         &self,
         source_archive: &[u8],
@@ -443,6 +478,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
         target: &str,
         limits: SandboxLimits,
         lease_token: &str,
+        lease: &mut super::admission::BuildAdmissionLease,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
         validate_limits(limits)?;
         if source_archive.is_empty() || source_archive.len() > MAX_COMPRESSED_SOURCE_BYTES {
@@ -456,7 +492,8 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             ));
         }
         let output_dir = canonical_output_directory(output_dir)?;
-        ensure_workspace_capacity(&self.workspace_root, limits.disk_bytes)?;
+        verify_workspace_tmpfs(&self.workspace_root, Some(limits.disk_bytes))?;
+        self.cleanup_lease_workspace(lease_token).await?;
         let workspace = self.create_workspace("compile", Some(lease_token))?;
         let result = async {
             tokio::fs::write(workspace.join("input/source.tar.gz"), source_archive)
@@ -465,14 +502,9 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             tokio::fs::write(workspace.join("input/plugin.tar.gz"), plugin_archive)
                 .await
                 .map_err(|error| sandbox_io("write plugin archive to private workspace", error))?;
-            let file_limit_blocks = limits.disk_bytes / 512;
-            let max_inodes = (limits.disk_bytes / 4096).max(1024);
             let envs = [
                 ("KURBIS_RUST_TARGET", target.to_owned()),
                 ("KURBIS_EXPECTED_RUSTC", self.rustc_version.clone()),
-                ("KURBIS_FILE_LIMIT_BLOCKS", file_limit_blocks.to_string()),
-                ("KURBIS_DISK_BYTES", limits.disk_bytes.to_string()),
-                ("KURBIS_MAX_INODES", max_inodes.to_string()),
                 ("KURBIS_BWRAP_GUARANTEE", BUBBLEWRAP_GUARANTEE.to_owned()),
                 (
                     "KURBIS_CGROUP_DELEGATION",
@@ -480,7 +512,13 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
                 ),
             ];
             let (status, report) = self
-                .run_sandbox(&workspace, BUILD_SCRIPT, &envs, limits.process_timeout)
+                .run_sandbox(
+                    &workspace,
+                    BUILD_SCRIPT,
+                    &envs,
+                    limits.process_timeout,
+                    Some(lease),
+                )
                 .await?;
             if !status.success() {
                 return Err(BuildPipelineError::process_failure(
@@ -535,7 +573,7 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
         let admission = self.admission.as_ref().ok_or_else(|| {
             sandbox_error("bubblewrap backend requires configured cross-process build admission")
         })?;
-        let lease = admission
+        let mut lease = admission
             .acquire(limits.memory_bytes)
             .await
             .map_err(|error| sandbox_error(error.to_string()))?;
@@ -544,7 +582,8 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
             lease
                 .assert_alive()
                 .map_err(|error| sandbox_error(error.to_string()))?;
-            self.preflight().await?;
+            self.preflight_with_token(Some(&token), Some(&mut lease))
+                .await?;
             self.run_compile(
                 source_archive,
                 plugin_archive,
@@ -552,6 +591,7 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
                 target,
                 limits,
                 &token,
+                &mut lease,
             )
             .await
         }
@@ -579,15 +619,16 @@ impl PatchApplier for BubblewrapBuildRuntime {
         let admission = self.admission.as_ref().ok_or_else(|| {
             sandbox_error("bubblewrap backend requires configured cross-process build admission")
         })?;
-        let lease = admission
+        let mut lease = admission
             .acquire(crate::ci::execution::production::ROOTLESS_BUILD_LIMITS.memory_bytes)
             .await
             .map_err(|error| sandbox_error(error.to_string()))?;
         let token = lease.token();
-        ensure_workspace_capacity(
+        verify_workspace_tmpfs(
             &self.workspace_root,
-            crate::ci::execution::production::ROOTLESS_BUILD_LIMITS.disk_bytes,
+            Some(crate::ci::execution::production::ROOTLESS_BUILD_LIMITS.disk_bytes),
         )?;
+        self.cleanup_lease_workspace(&token).await?;
         let workspace = match self.create_workspace("patch", Some(&token)) {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -599,16 +640,11 @@ impl PatchApplier for BubblewrapBuildRuntime {
             tokio::fs::write(workspace.join("input/source.tar.gz"), source_archive)
                 .await
                 .map_err(|error| sandbox_io("write source archive to private workspace", error))?;
-            let patch_disk_bytes = 5_u64 * 1024 * 1024 * 1024;
             let envs = [
                 ("KURBIS_EXPECTED_PATCH_FINGERPRINT", fingerprint.to_owned()),
                 (
                     "KURBIS_MAX_SOURCE_BYTES",
                     MAX_COMPRESSED_SOURCE_BYTES.to_string(),
-                ),
-                (
-                    "KURBIS_FILE_LIMIT_BLOCKS",
-                    (patch_disk_bytes / 512).to_string(),
                 ),
             ];
             let (status, report) = self
@@ -617,6 +653,7 @@ impl PatchApplier for BubblewrapBuildRuntime {
                     PATCH_SCRIPT,
                     &envs,
                     Duration::from_secs(15 * 60),
+                    Some(&mut lease),
                 )
                 .await?;
             if !status.success() {
@@ -630,7 +667,7 @@ impl PatchApplier for BubblewrapBuildRuntime {
                     ),
                 ));
             }
-            let output = workspace.join("patched-source.tar.gz");
+            let output = workspace.join("out/patched-source.tar.gz");
             let metadata = fs::symlink_metadata(&output)
                 .map_err(|error| sandbox_io("inspect patched source archive", error))?;
             if !metadata.is_file()
@@ -700,8 +737,23 @@ impl super::admission::AbandonedBuildCleaner for BubblewrapWorkspaceCleaner {
         })? {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("kurbis-bwrap-") || !name.ends_with(lease_token) {
+            let expected_suffixes = [
+                format!("kurbis-bwrap-preflight-{lease_token}"),
+                format!("kurbis-bwrap-compile-{lease_token}"),
+                format!("kurbis-bwrap-patch-{lease_token}"),
+            ];
+            if !expected_suffixes.iter().any(|expected| expected == &name) {
                 continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                super::admission::BuildAdmissionError::Unavailable(format!(
+                    "inspect bubblewrap workspace: {error}"
+                ))
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(super::admission::BuildAdmissionError::Unavailable(
+                    "bubblewrap workspace cleanup encountered a non-directory entry".into(),
+                ));
             }
             let resolved = fs::canonicalize(&path).map_err(|error| {
                 super::admission::BuildAdmissionError::Unavailable(format!(
@@ -726,10 +778,12 @@ impl super::admission::AbandonedBuildCleaner for BubblewrapWorkspaceCleaner {
 fn ensure_linux() -> Result<(), BuildPipelineError> {
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(sandbox_error("bubblewrap builds require a Linux worker"));
+        Err(sandbox_error("bubblewrap builds require a Linux worker"))
     }
     #[cfg(target_os = "linux")]
-    Ok(())
+    {
+        Ok(())
+    }
 }
 
 fn reject_symlink_input(path: &Path, label: &str) -> Result<(), BuildPipelineError> {
@@ -794,8 +848,9 @@ fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
         ));
     }
     if !path.exists() {
-        fs::create_dir_all(path)
-            .map_err(|error| sandbox_io("create bubblewrap workspace root", error))?;
+        return Err(sandbox_error(
+            "bubblewrap workspace root must be pre-created on a bounded tmpfs mount",
+        ));
     }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -821,7 +876,104 @@ fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
     }
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .map_err(|error| sandbox_io("protect bubblewrap workspace root", error))?;
+    verify_workspace_tmpfs(&path, None)?;
     Ok(path)
+}
+
+fn verify_workspace_tmpfs(
+    path: &Path,
+    required_size: Option<u64>,
+) -> Result<(), BuildPipelineError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, required_size);
+        Err(sandbox_error(
+            "bubblewrap workspace requires a Linux tmpfs mount",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mounts = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|error| sandbox_io("read workspace mount table", error))?;
+        let Some((size, inodes)) = mountinfo_tmpfs_limits(&mounts, path) else {
+            return Err(sandbox_error(
+                "bubblewrap workspace root must be an explicit tmpfs mount with non-zero size and nr_inodes options",
+            ));
+        };
+        if let Some(required_size) = required_size
+            && size != required_size
+        {
+            return Err(sandbox_error(format!(
+                "bubblewrap workspace tmpfs size {size} does not match required build budget {required_size}"
+            )));
+        }
+        if inodes == 0 {
+            return Err(sandbox_error(
+                "bubblewrap workspace tmpfs must set a non-zero nr_inodes limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mountinfo_tmpfs_limits(mountinfo: &str, path: &Path) -> Option<(u64, u64)> {
+    let expected = path.to_string_lossy();
+    mountinfo.lines().find_map(|line| {
+        let (mount_fields, filesystem_fields) = line.split_once(" - ")?;
+        let fields = mount_fields.split_ascii_whitespace().collect::<Vec<_>>();
+        let mount_point = fields.get(4).copied()?;
+        let filesystem = filesystem_fields
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        if filesystem.first().copied()? != "tmpfs" || decode_mountinfo_path(mount_point) != expected
+        {
+            return None;
+        }
+        let options = filesystem.get(2..)?;
+        let size = mount_option(options, "size").and_then(parse_mount_size)?;
+        let inodes = mount_option(options, "nr_inodes").and_then(parse_mount_size)?;
+        Some((size, inodes))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn mount_option<'a>(options: &[&'a str], key: &str) -> Option<&'a str> {
+    options
+        .iter()
+        .flat_map(|option| option.split(','))
+        .find_map(|option| option.strip_prefix(&format!("{key}=")))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mount_size(value: &str) -> Option<u64> {
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    number.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && let Ok(octal) = u8::from_str_radix(&value[index + 1..index + 4], 8)
+        {
+            decoded.push(char::from(octal));
+            index += 4;
+            continue;
+        }
+        decoded.push(char::from(bytes[index]));
+        index += 1;
+    }
+    decoded
 }
 
 fn is_public_tmp(path: &Path) -> bool {
@@ -921,6 +1073,17 @@ fn manifest_digest(root: &Path) -> Result<String, BuildPipelineError> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn executable_digest(path: &Path) -> Result<String, BuildPipelineError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| sandbox_io("inspect executable identity", error))?;
+    let content = file_content_digest(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&metadata.len().to_be_bytes());
+    hasher.update(&(metadata.mode() & 0o7777).to_be_bytes());
+    hasher.update(content.as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn file_content_digest(path: &Path) -> Result<String, BuildPipelineError> {
     let mut file =
         fs::File::open(path).map_err(|error| sandbox_io("open immutable manifest file", error))?;
@@ -941,7 +1104,7 @@ fn file_content_digest(path: &Path) -> Result<String, BuildPipelineError> {
 fn detect_cgroup_delegation() -> CgroupDelegation {
     #[cfg(not(target_os = "linux"))]
     {
-        return CgroupDelegation::Unavailable;
+        CgroupDelegation::Unavailable
     }
     #[cfg(target_os = "linux")]
     {
@@ -967,47 +1130,6 @@ fn detect_cgroup_delegation() -> CgroupDelegation {
             CgroupDelegation::Missing
         }
     }
-}
-
-fn ensure_workspace_capacity(root: &Path, requested_bytes: u64) -> Result<(), BuildPipelineError> {
-    let available = fs2_available_bytes(root)?;
-    if available < requested_bytes {
-        return Err(BuildPipelineError::transient(
-            crate::ci::CiBuildStage::Compiling,
-            format!(
-                "private bubblewrap workspace has {available} bytes available, below the {requested_bytes} byte build budget"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn fs2_available_bytes(root: &Path) -> Result<u64, BuildPipelineError> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-    let path = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| sandbox_error("bubblewrap workspace path contains a NUL byte"))?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: statvfs writes one initialized value for a valid path.
-    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if result != 0 {
-        return Err(sandbox_io(
-            "inspect bubblewrap workspace capacity",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: statvfs returned success, therefore stats is initialized.
-    let stats = unsafe { stats.assume_init() };
-    (stats.f_bavail as u64)
-        .checked_mul(stats.f_frsize as u64)
-        .ok_or_else(|| sandbox_error("bubblewrap workspace capacity overflow"))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fs2_available_bytes(_root: &Path) -> Result<u64, BuildPipelineError> {
-    Err(sandbox_error(
-        "bubblewrap workspace capacity requires Linux",
-    ))
 }
 
 fn validate_limits(limits: SandboxLimits) -> Result<(), BuildPipelineError> {
@@ -1038,7 +1160,7 @@ fn copy_regular_file(
             "bubblewrap artifact is not a bounded regular file",
         ));
     }
-    let mut input = fs::OpenOptions::new()
+    let input = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(source)
@@ -1049,8 +1171,20 @@ fn copy_regular_file(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(destination)
         .map_err(|error| sandbox_io("create bubblewrap artifact", error))?;
-    std::io::copy(&mut input, &mut output)
-        .map_err(|error| sandbox_io("copy bubblewrap artifact", error))?;
+    let copied = std::io::copy(&mut input.take(maximum as u64 + 1), &mut output);
+    let copied = match copied {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            return Err(sandbox_io("copy bubblewrap artifact", error));
+        }
+    };
+    if copied == 0 || copied > maximum as u64 {
+        let _ = fs::remove_file(destination);
+        return Err(permanent(
+            "bubblewrap artifact exceeded its bounded copy limit",
+        ));
+    }
     output
         .sync_all()
         .map_err(|error| sandbox_io("sync bubblewrap artifact", error))?;
@@ -1058,7 +1192,13 @@ fn copy_regular_file(
 }
 
 fn tail(value: &str, limit: usize) -> String {
-    let start = value.len().saturating_sub(limit);
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut start = value.len().saturating_sub(limit);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
     value[start..].to_owned()
 }
 
@@ -1099,6 +1239,102 @@ where
     Ok(String::from_utf8_lossy(&captured).into_owned())
 }
 
+async fn terminate_process_tree(
+    child: &mut tokio::process::Child,
+) -> Result<(), BuildPipelineError> {
+    let Some(root_pid) = child.id() else {
+        let _ = child.wait().await;
+        return Ok(());
+    };
+    signal_process_tree(root_pid, libc::SIGTERM);
+    let _ = timeout(Duration::from_secs(3), child.wait())
+        .await
+        .map_err(|_| sandbox_error("bubblewrap termination timed out after SIGTERM"))?
+        .map_err(|error| sandbox_io("wait for terminated bubblewrap sandbox", error))?;
+    // The root process may have exited cleanly while a malicious descendant
+    // ignored SIGTERM. Escalate the entire still-visible tree before waiting.
+    signal_process_tree(root_pid, libc::SIGKILL);
+    wait_for_descendants(root_pid).await
+}
+
+async fn terminate_descendants(root_pid: Option<u32>) -> Result<(), BuildPipelineError> {
+    let Some(root_pid) = root_pid else {
+        return Ok(());
+    };
+    let descendants = descendant_pids(root_pid);
+    if descendants.is_empty() {
+        return Ok(());
+    }
+    signal_process_group(root_pid, libc::SIGTERM);
+    for pid in descendants.iter().rev() {
+        signal_pid(*pid, libc::SIGTERM);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    signal_process_group(root_pid, libc::SIGKILL);
+    for pid in descendant_pids(root_pid).into_iter().rev() {
+        signal_pid(pid, libc::SIGKILL);
+    }
+    wait_for_descendants(root_pid).await
+}
+
+fn signal_process_group(root_pid: u32, signal: libc::c_int) {
+    // bwrap's --new-session makes its PID the process-group leader. Signalling
+    // the negative PID also reaches descendants after the leader exits.
+    // SAFETY: the group id came from Child::id and is positive.
+    let _ = unsafe { libc::kill(-(root_pid as libc::pid_t), signal) };
+}
+
+fn signal_process_tree(root_pid: u32, signal: libc::c_int) {
+    for pid in descendant_pids(root_pid).into_iter().rev() {
+        signal_pid(pid, signal);
+    }
+    signal_pid(root_pid, signal);
+}
+
+fn signal_pid(pid: u32, signal: libc::c_int) {
+    // SAFETY: kill only receives a pid read from /proc or Child::id and a
+    // constant signal. ESRCH is expected while a descendant exits.
+    let _ = unsafe { libc::kill(pid as libc::pid_t, signal) };
+}
+
+fn descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut pending = vec![root_pid];
+    while let Some(parent) = pending.pop() {
+        let path = format!("/proc/{parent}/task/{parent}/children");
+        let Ok(children) = fs::read_to_string(path) else {
+            continue;
+        };
+        for child in children
+            .split_ascii_whitespace()
+            .filter_map(|pid| pid.parse().ok())
+        {
+            descendants.push(child);
+            pending.push(child);
+        }
+    }
+    descendants
+}
+
+async fn wait_for_descendants(root_pid: u32) -> Result<(), BuildPipelineError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let descendants = descendant_pids(root_pid);
+        if descendants.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            for pid in descendants {
+                signal_pid(pid, libc::SIGKILL);
+            }
+            return Err(sandbox_error(
+                "bubblewrap descendants did not exit before cleanup deadline",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 trait ReportExt {
     fn bounded(&self) -> String;
 }
@@ -1137,6 +1373,20 @@ mod tests {
         assert!(!is_public_tmp(Path::new("/home/user/.cache/kurbis")));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_requires_explicit_tmpfs_size_and_inode_limits() {
+        let path = Path::new("/home/ci/workspace");
+        let bounded =
+            "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw,size=5G,nr_inodes=131072";
+        assert_eq!(
+            mountinfo_tmpfs_limits(bounded, path),
+            Some((5 * 1024 * 1024 * 1024, 131072))
+        );
+        let unbounded = "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw";
+        assert_eq!(mountinfo_tmpfs_limits(unbounded, path), None);
+    }
+
     #[test]
     fn manifest_changes_when_tree_metadata_changes() {
         let root = tempfile::tempdir().unwrap();
@@ -1158,5 +1408,28 @@ mod tests {
     fn private_workspace_root_rejects_non_home_paths() {
         let root = tempfile::tempdir().unwrap();
         assert!(private_workspace_root(root.path()).is_err());
+    }
+
+    #[test]
+    fn log_tail_never_splits_utf8_code_points() {
+        let log = "prefix-😀-中-尾";
+        let tailed = tail(log, 7);
+        assert!(std::str::from_utf8(tailed.as_bytes()).is_ok());
+        assert!(log.ends_with(&tailed));
+    }
+
+    #[test]
+    fn executable_identity_includes_content_and_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("helper");
+        fs::write(&executable, b"one").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let first = executable_digest(&executable).unwrap();
+        fs::write(&executable, b"two").unwrap();
+        let second = executable_digest(&executable).unwrap();
+        assert_ne!(first, second);
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let third = executable_digest(&executable).unwrap();
+        assert_ne!(second, third);
     }
 }

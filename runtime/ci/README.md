@@ -137,6 +137,10 @@ worker world, port leases, and resource reservations.
 contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a
 Linux worker with private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately
 reported as `bubblewrap_namespace_only`: it does not claim cgroup CPU, memory,
-or PID enforcement, and there is no automatic Docker fallback. Both backends
-use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process PostgreSQL slot
-admission; each slot reserves its requested memory plus host system headroom.
+or PID enforcement, and there is no automatic Docker fallback. Each workload
+must pass a real kernel-enforced, size-bounded `/work` tmpfs mount; if the
+configured Bubblewrap cannot create that mount, preflight fails closed. The backend does not set an independent per-build inode quota; the operator
+tmpfs mount must declare a non-zero `nr_inodes=` ceiling. Build input/output files remain separately bounded and are
+copied with counted reads. Both backends use `CI_BUILD_CONCURRENCY` (bounded to
+1-64) for cross-process PostgreSQL slot admission; each slot reserves its
+requested memory plus host system headroom.
