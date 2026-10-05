@@ -300,6 +300,7 @@ repository webhook for the default polling-only deployment.
 `CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless Docker daemon over
 restricted SSH; never give the control plane a host Docker socket. Repository
 Dockerfiles are not used.
+The builder selection is explicit and fail-closed: do not replace this endpoint with `ssh://root@host`, the rootful `/var/run/docker.sock`, Podman, or a direct bubblewrap/user-namespace process. A namespace-only fallback cannot prove the cgroup CPU, memory, PID, and disk limits required for untrusted pull-request source. See [`verification/live-20261005/lxhalle-no-root-alternatives.md`](verification/live-20261005/lxhalle-no-root-alternatives.md) for the October 5, 2026 lxhalle probe and the currently viable remote-rootless route.
 
 Branch previews remain lobbies and build lazily on first join. A full immutable
 `commit-<sha>` hostname also builds lazily when a player joins; repeat joins use
