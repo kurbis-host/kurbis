@@ -78,6 +78,18 @@ impl fmt::Debug for ControlPlaneConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CiBuilderBackend {
+    Docker,
+    Bubblewrap {
+        executable: PathBuf,
+        rootfs: PathBuf,
+        toolchain: PathBuf,
+        workspace_root: PathBuf,
+        source_preparer: PathBuf,
+    },
+}
+
 #[derive(Clone)]
 pub struct CiConfig {
     pub github_pat: String,
@@ -88,6 +100,9 @@ pub struct CiConfig {
     pub target_architecture: String,
     pub builder_image: String,
     pub builder_docker_host: String,
+    pub builder_backend: CiBuilderBackend,
+    /// Maximum number of concurrent build slots per concrete builder identity.
+    pub build_concurrency: u16,
     pub plugin_source: PathBuf,
 }
 
@@ -112,21 +127,50 @@ impl CiConfig {
             "CI_REPOSITORY is fixed to kurbis-host/Pumpkin"
         );
         let patch_fingerprint = checked_in_ci_patch_fingerprint()?;
-        let builder_image = required("CI_BUILDER_IMAGE")?;
-        let builder_docker_host = required("CI_BUILDER_DOCKER_HOST")?;
-        validate_ci_builder_docker_host(&builder_docker_host)?;
-        let configured_rustc = required("CI_TOOLCHAIN_VERSION")?;
-        ensure!(
-            configured_rustc.len() <= 32
-                && configured_rustc.split('.').count() == 3
-                && configured_rustc
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
-            "CI_TOOLCHAIN_VERSION must be an exact Rust release such as 1.98.1"
-        );
-        let toolchain_version =
-            crate::ci::execution::toolchain_identity(&builder_image, &configured_rustc)
-                .context("CI_BUILDER_IMAGE must be digest-pinned and match CI_TOOLCHAIN_VERSION")?;
+        let backend = value("CI_BUILDER_BACKEND", "docker");
+        let (builder_backend, builder_image, builder_docker_host, toolchain_version) = match backend
+            .as_str()
+        {
+            "docker" => {
+                let builder_image = required("CI_BUILDER_IMAGE")?;
+                let builder_docker_host = required("CI_BUILDER_DOCKER_HOST")?;
+                validate_ci_builder_docker_host(&builder_docker_host)?;
+                let configured_rustc = exact_ci_rust_release()?;
+                let toolchain_version =
+                    crate::ci::execution::toolchain_identity(&builder_image, &configured_rustc)
+                        .context(
+                            "CI_BUILDER_IMAGE must be digest-pinned and match CI_TOOLCHAIN_VERSION",
+                        )?;
+                (
+                    CiBuilderBackend::Docker,
+                    builder_image,
+                    builder_docker_host,
+                    toolchain_version,
+                )
+            }
+            "bubblewrap" => {
+                let configured_rustc = exact_ci_rust_release()?;
+                let executable = required_path("CI_BUBBLEWRAP_PATH")?;
+                let rootfs = required_path("CI_BUBBLEWRAP_ROOTFS")?;
+                let toolchain = required_path("CI_BUBBLEWRAP_TOOLCHAIN")?;
+                let workspace_root = required_path("CI_BUBBLEWRAP_WORKSPACE")?;
+                let source_preparer = required_path("CI_BUBBLEWRAP_SOURCE_PREPARER")?;
+                (
+                    CiBuilderBackend::Bubblewrap {
+                        executable,
+                        rootfs,
+                        toolchain,
+                        workspace_root,
+                        source_preparer,
+                    },
+                    String::new(),
+                    String::new(),
+                    configured_rustc,
+                )
+            }
+            other => bail!("CI_BUILDER_BACKEND must be docker or bubblewrap, got {other:?}"),
+        };
+        let build_concurrency = ci_build_concurrency_from_env()?;
         let target_architecture = native_linux_target_architecture()?;
         let plugin_source = PathBuf::from(value("CI_PLUGIN_SOURCE", "plugins/kurbis-control"));
         let plugin_source = if plugin_source.is_absolute() {
@@ -148,6 +192,8 @@ impl CiConfig {
             target_architecture,
             builder_image,
             builder_docker_host,
+            builder_backend,
+            build_concurrency,
             plugin_source,
         }))
     }
@@ -165,9 +211,35 @@ impl fmt::Debug for CiConfig {
             .field("target_architecture", &self.target_architecture)
             .field("builder_image", &self.builder_image)
             .field("builder_docker_host", &self.builder_docker_host)
+            .field("builder_backend", &self.builder_backend)
+            .field("build_concurrency", &self.build_concurrency)
             .field("plugin_source", &self.plugin_source)
             .finish()
     }
+}
+
+pub fn ci_build_concurrency_from_env() -> Result<u16> {
+    crate::ci::execution::parse_build_concurrency(env::var("CI_BUILD_CONCURRENCY").ok().as_deref())
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn exact_ci_rust_release() -> Result<String> {
+    let configured_rustc = required("CI_TOOLCHAIN_VERSION")?;
+    ensure!(
+        configured_rustc.len() <= 32
+            && configured_rustc.split('.').count() == 3
+            && configured_rustc
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "CI_TOOLCHAIN_VERSION must be an exact Rust release such as 1.98.1"
+    );
+    Ok(configured_rustc)
+}
+
+fn required_path(name: &str) -> Result<PathBuf> {
+    let value = required(name)?;
+    ensure!(!value.contains('\0'), "{name} must not contain NUL bytes");
+    Ok(PathBuf::from(value))
 }
 
 pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {

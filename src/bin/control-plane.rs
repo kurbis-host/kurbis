@@ -6,9 +6,9 @@ use kurbis_hoster::{
         ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiBuildIdentity, CiPoller,
         CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient,
         GitHubExactSource, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
-        docker_pipeline,
+        bubblewrap_pipeline, docker_pipeline,
     },
-    config::{CiConfig, ControlPlaneConfig, ObjectStoreConfig},
+    config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::{
         api::{AppState, router, spawn_queue_drain},
         lifecycle::Lifecycle,
@@ -55,24 +55,56 @@ async fn main() -> Result<()> {
         );
         let artifacts =
             std::sync::Arc::new(ObjectArtifactCache::new(pool.clone(), object_store.clone()));
-        let pipeline = std::sync::Arc::new(
-            docker_pipeline(
-                CiPreviewRepository::new(pool.clone()),
-                std::sync::Arc::new(source.clone()),
-                artifacts.clone(),
-                ci_config.builder_image.clone(),
-                ci_config.builder_docker_host.clone(),
-                ci_config.toolchain_version.clone(),
-                ci_config.plugin_source.clone(),
-                Some(check_runs.clone()),
-            )?
-            .with_public_status_base_url(public_status_base_url.clone()),
-        );
+        let (pipeline, effective_toolchain_version): (Arc<dyn BuildCoordinator>, String) =
+            match &ci_config.builder_backend {
+                CiBuilderBackend::Docker => {
+                    let pipeline = docker_pipeline(
+                        CiPreviewRepository::new(pool.clone()),
+                        Arc::new(source.clone()),
+                        artifacts.clone(),
+                        ci_config.builder_image.clone(),
+                        ci_config.builder_docker_host.clone(),
+                        ci_config.toolchain_version.clone(),
+                        ci_config.plugin_source.clone(),
+                        Some(check_runs.clone()),
+                    )?
+                    .with_public_status_base_url(public_status_base_url.clone());
+                    (Arc::new(pipeline), ci_config.toolchain_version.clone())
+                }
+                CiBuilderBackend::Bubblewrap {
+                    executable,
+                    rootfs,
+                    toolchain,
+                    workspace_root,
+                    source_preparer,
+                } => {
+                    let (pipeline, identity) = bubblewrap_pipeline(
+                        CiPreviewRepository::new(pool.clone()),
+                        Arc::new(source.clone()),
+                        artifacts.clone(),
+                        executable.clone(),
+                        rootfs.clone(),
+                        toolchain.clone(),
+                        workspace_root.clone(),
+                        source_preparer.clone(),
+                        ci_config.toolchain_version.clone(),
+                        ci_config.plugin_source.clone(),
+                        ci_config.build_concurrency,
+                        Some(check_runs.clone()),
+                    )?;
+                    (
+                        Arc::new(
+                            pipeline.with_public_status_base_url(public_status_base_url.clone()),
+                        ),
+                        identity,
+                    )
+                }
+            };
         ci_build_coordinator = Some(pipeline.clone());
         ci_build_identity = Some(CiBuildIdentity {
             repository: ci_config.repository.clone(),
             patch_fingerprint: ci_config.patch_fingerprint.clone(),
-            toolchain_version: ci_config.toolchain_version.clone(),
+            toolchain_version: effective_toolchain_version.clone(),
             target_architecture: ci_config.target_architecture.clone(),
         });
         let expiry_repository = ci_repository.clone();
@@ -129,7 +161,7 @@ async fn main() -> Result<()> {
             .with_config(CiPollerConfig {
                 root_domain: kurbis_hoster::ci::CI_ROOT_DOMAIN.into(),
                 patch_fingerprint: ci_config.patch_fingerprint.clone(),
-                toolchain_version: ci_config.toolchain_version.clone(),
+                toolchain_version: effective_toolchain_version,
                 target_architecture: ci_config.target_architecture.clone(),
                 public_status_base_url: Some(public_status_base_url),
             })

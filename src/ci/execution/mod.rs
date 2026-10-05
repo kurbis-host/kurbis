@@ -62,14 +62,20 @@ pub(super) fn private_tempdir(prefix: &str) -> io::Result<TempDir> {
 
 mod admission;
 mod archive;
+mod bubblewrap;
 mod builder;
 mod patcher;
 mod production;
 mod source;
 
+pub(crate) use admission::parse_build_concurrency;
+
 pub use archive::{
     ArchiveError, MAX_ARTIFACT_BYTES, MAX_COMPRESSED_SOURCE_BYTES, MAX_EXPANDED_SOURCE_BYTES,
     MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES, pack_source_archive, unpack_source_archive,
+};
+pub use bubblewrap::{
+    BUBBLEWRAP_GUARANTEE, BubblewrapBuildRuntime, BubblewrapPreflight, CgroupDelegation,
 };
 pub use builder::{
     BuildProcessReport, DockerRootlessBuildRuntime, RootlessBuildRuntime, RustPumpkinBuilder,
@@ -78,4 +84,4 @@ pub use builder::{
 pub use patcher::{CheckedInPumpkinPatcher, checked_in_patch_fingerprint};
 pub use source::GitHubExactSource;
 
-pub use production::{ROOTLESS_BUILD_LIMITS, docker_pipeline};
+pub use production::{ROOTLESS_BUILD_LIMITS, bubblewrap_pipeline, docker_pipeline};

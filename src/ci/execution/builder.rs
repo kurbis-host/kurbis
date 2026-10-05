@@ -124,8 +124,13 @@ impl DockerRootlessBuildRuntime {
         let toolchain_version = toolchain_version.into();
         let expected_rustc = rustc_release_from_identity(&image, &toolchain_version)
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let concurrency = crate::config::ci_build_concurrency_from_env()
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let admission = DockerBuildAdmission::new(pool, image.clone(), docker_host.clone())
+            .with_concurrency(usize::from(concurrency))
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         Ok(Self {
-            admission: DockerBuildAdmission::new(pool, image.clone(), docker_host.clone()),
+            admission,
             image,
             docker_host,
             toolchain_version,
@@ -198,6 +203,7 @@ impl DockerRootlessBuildRuntime {
             .args(security)
             .args(["--log-driver", "none"])
             .args(["--label", "kurbis.ci.build=true"])
+            .args(["--label", &format!("kurbis.ci.build.builder={}", admission.builder_label())])
             .args(["--label", &format!("kurbis.ci.build.lease={}", admission.token())])
             .args([
             "--tmpfs",

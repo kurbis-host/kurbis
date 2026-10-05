@@ -22,12 +22,13 @@ use thiserror::Error;
 use tokio::{process::Command, task::JoinHandle, time::timeout};
 use uuid::Uuid;
 
-const BUILD_LOCK_CLASS: i32 = 724_517;
-const BUILD_LOCK_OBJECT: i32 = 0;
-const ABANDONED_BUILD_FILTER: &str = "label=kurbis.ci.build=true";
 const DEFAULT_SYSTEM_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_BUILD_CONCURRENCY: u16 = 2;
+const MIN_BUILD_CONCURRENCY: u16 = 1;
+const MAX_BUILD_CONCURRENCY: u16 = 64;
 const LOCK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const LEASE_STALE_AFTER: Duration = Duration::from_secs(45);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
@@ -40,6 +41,27 @@ pub enum BuildAdmissionError {
     Fenced(String),
 }
 
+/// Parse the shared build concurrency setting at a process boundary.
+///
+/// The range is intentionally bounded: a typo must not turn one builder into
+/// an unbounded fork bomb, while operators can still use multiple slots on a
+/// larger host. Missing configuration keeps a bounded two-slot default.
+pub(crate) fn parse_build_concurrency(value: Option<&str>) -> Result<u16, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_BUILD_CONCURRENCY);
+    };
+    let parsed = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("CI_BUILD_CONCURRENCY must be an integer from {MIN_BUILD_CONCURRENCY} to {MAX_BUILD_CONCURRENCY}"))?;
+    if !(MIN_BUILD_CONCURRENCY..=MAX_BUILD_CONCURRENCY).contains(&parsed) {
+        return Err(format!(
+            "CI_BUILD_CONCURRENCY must be from {MIN_BUILD_CONCURRENCY} to {MAX_BUILD_CONCURRENCY}"
+        ));
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostMemorySnapshot {
     pub total_bytes: u64,
@@ -48,16 +70,18 @@ pub(super) struct HostMemorySnapshot {
     pub swap_free_bytes: u64,
 }
 impl HostMemorySnapshot {
-    pub(super) fn required_bytes(self, requested_bytes: u64, reserve_bytes: u64) -> Option<u64> {
-        requested_bytes.checked_add(reserve_bytes)
-    }
-
-    pub(super) fn can_admit(self, requested_bytes: u64, reserve_bytes: u64) -> bool {
+    pub(super) fn can_admit_with_reserved(
+        self,
+        requested_bytes: u64,
+        reserve_bytes: u64,
+        reserved_bytes: u64,
+    ) -> bool {
         self.total_bytes > 0
             && self.available_bytes > 0
             && self.available_bytes <= self.total_bytes
-            && self
-                .required_bytes(requested_bytes, reserve_bytes)
+            && reserved_bytes
+                .checked_add(requested_bytes)
+                .and_then(|required| required.checked_add(reserve_bytes))
                 .is_some_and(|required| self.available_bytes >= required)
     }
 }
@@ -69,45 +93,85 @@ pub(super) trait HostMemoryProbe: Send + Sync {
 
 #[async_trait]
 pub(super) trait AbandonedBuildCleaner: Send + Sync {
-    async fn remove_abandoned(&self) -> Result<(), BuildAdmissionError>;
+    /// Remove resources owned by a stale lease. The token is unique across
+    /// builders, so a reclaim can never remove another live builder's work.
     async fn remove_lease(&self, lease_token: &str) -> Result<(), BuildAdmissionError>;
 }
 
+/// Database-backed, cross-process admission for one physical builder.
+///
+/// A builder identity has `concurrency` independently fenced slots. A global
+/// per-identity advisory lock serializes the short claim transaction so the
+/// memory sum cannot race between processes. Each held slot has its own
+/// session-scoped advisory lock (crash-safe) and a heartbeat row (fencing and
+/// stale resource cleanup). This is deliberately generic so Docker and the
+/// future Bubblewrap backend share the same coordinator rather than silently
+/// creating per-process semaphores.
 #[derive(Clone)]
-pub(super) struct DockerBuildAdmission {
+pub(super) struct BuildAdmissionCoordinator {
     pool: PgPool,
+    builder_identity: String,
+    builder_label: String,
     memory_probe: Arc<dyn HostMemoryProbe>,
     cleaner: Arc<dyn AbandonedBuildCleaner>,
     system_reserve_bytes: u64,
+    concurrency: u16,
     lock_poll_interval: Duration,
     heartbeat_interval: Duration,
     wait_timeout: Duration,
 }
-impl DockerBuildAdmission {
+
+/// Compatibility name for the current Docker backend. New backends should
+/// construct `BuildAdmissionCoordinator::for_builder` directly.
+pub(super) type DockerBuildAdmission = BuildAdmissionCoordinator;
+
+impl BuildAdmissionCoordinator {
     pub fn new(pool: PgPool, image: impl Into<String>, docker_host: impl Into<String>) -> Self {
         let image = image.into();
         let docker_host = docker_host.into();
+        let builder_identity = format!("docker:{docker_host}:{image}");
+        Self::for_builder(
+            pool,
+            builder_identity,
+            Arc::new(DockerHostMemoryProbe::new(image, docker_host.clone())),
+            Arc::new(DockerAbandonedBuildCleaner::new(docker_host)),
+        )
+    }
+
+    pub(super) fn for_builder(
+        pool: PgPool,
+        builder_identity: impl Into<String>,
+        memory_probe: Arc<dyn HostMemoryProbe>,
+        cleaner: Arc<dyn AbandonedBuildCleaner>,
+    ) -> Self {
+        let builder_identity = builder_identity.into();
+        let builder_label = blake3::hash(builder_identity.as_bytes())
+            .to_hex()
+            .to_string();
         Self {
             pool,
-            memory_probe: Arc::new(DockerHostMemoryProbe::new(image, docker_host.clone())),
-            cleaner: Arc::new(DockerAbandonedBuildCleaner::new(docker_host)),
+            builder_identity,
+            builder_label,
+            memory_probe,
+            cleaner,
             system_reserve_bytes: DEFAULT_SYSTEM_RESERVE_BYTES,
+            concurrency: DEFAULT_BUILD_CONCURRENCY,
             lock_poll_interval: LOCK_POLL_INTERVAL,
             heartbeat_interval: LOCK_HEARTBEAT_INTERVAL,
             wait_timeout: Duration::from_secs(10 * 60),
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn with_memory_probe(mut self, probe: Arc<dyn HostMemoryProbe>) -> Self {
-        self.memory_probe = probe;
-        self
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_cleaner(mut self, cleaner: Arc<dyn AbandonedBuildCleaner>) -> Self {
-        self.cleaner = cleaner;
-        self
+    pub fn with_concurrency(mut self, concurrency: usize) -> Result<Self, BuildAdmissionError> {
+        if !(usize::from(MIN_BUILD_CONCURRENCY)..=usize::from(MAX_BUILD_CONCURRENCY))
+            .contains(&concurrency)
+        {
+            return Err(BuildAdmissionError::Unavailable(format!(
+                "build concurrency must be between {MIN_BUILD_CONCURRENCY} and {MAX_BUILD_CONCURRENCY}"
+            )));
+        }
+        self.concurrency = u16::try_from(concurrency).expect("validated build concurrency");
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -132,15 +196,15 @@ impl DockerBuildAdmission {
                 "build memory and host reserve must be non-zero".into(),
             ));
         }
-
         let deadline = tokio::time::Instant::now() + self.wait_timeout;
         let mut last_snapshot = None;
+        let global_key = advisory_key(&self.builder_identity, u32::MAX);
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let detail = last_snapshot
                     .map(|snapshot: HostMemorySnapshot| {
                         format!(
-                            "available={} MiB of {} MiB; build requires {} MiB plus {} MiB reserved for system/runtime; swap free={} MiB",
+                            "available={} MiB of {} MiB; build requires {} MiB plus {} MiB reserved for system/runtime and active slots; swap free={} MiB",
                             snapshot.available_bytes / 1024 / 1024,
                             snapshot.total_bytes / 1024 / 1024,
                             requested_memory_bytes / 1024 / 1024,
@@ -154,26 +218,129 @@ impl DockerBuildAdmission {
                     detail,
                 });
             }
-
             let mut connection = self.pool.acquire().await.map_err(|error| {
                 BuildAdmissionError::Unavailable(format!(
                     "acquire PostgreSQL build-admission session: {error}"
                 ))
             })?;
-            // Never return an advisory-lock session to the shared application pool.
             connection.close_on_drop();
-            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
-                .bind(BUILD_LOCK_CLASS)
-                .bind(BUILD_LOCK_OBJECT)
+            if !try_advisory_lock(&mut connection, global_key).await? {
+                drop(connection);
+                tokio::time::sleep(self.lock_poll_interval).await;
+                continue;
+            }
+
+            let mut selected = None;
+            for slot in 0..self.concurrency {
+                let slot_key = advisory_key(&self.builder_identity, u32::from(slot));
+                if !try_advisory_lock(&mut connection, slot_key).await? {
+                    continue;
+                }
+                let stale_token = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT lease_token
+                       FROM ci_build_admission_leases
+                      WHERE builder_identity = $1 AND slot = $2
+                        AND heartbeat_at < now() - make_interval(secs => $3)",
+                )
+                .bind(&self.builder_identity)
+                .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
+                .bind(LEASE_STALE_AFTER.as_secs() as i32)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| {
+                    BuildAdmissionError::Unavailable(format!(
+                        "inspect stale build-admission lease: {error}"
+                    ))
+                })?;
+                if let Some(token) = stale_token {
+                    // Keep the row until external resources are reclaimed. If
+                    // Docker or the bubblewrap workspace is temporarily
+                    // unavailable, retaining the fenced row lets the next
+                    // claimant retry cleanup instead of leaking an orphan.
+                    self.cleaner
+                        .remove_lease(&token.simple().to_string())
+                        .await?;
+                    sqlx::query(
+                        "DELETE FROM ci_build_admission_leases
+                         WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+                    )
+                    .bind(&self.builder_identity)
+                    .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
+                    .bind(token)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| {
+                        BuildAdmissionError::Unavailable(format!(
+                            "fence stale build-admission lease: {error}"
+                        ))
+                    })?;
+                }
+                let occupied: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM ci_build_admission_leases
+                        WHERE builder_identity = $1 AND slot = $2
+                    )",
+                )
+                .bind(&self.builder_identity)
+                .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
                 .fetch_one(&mut *connection)
                 .await
                 .map_err(|error| {
                     BuildAdmissionError::Unavailable(format!(
-                        "acquire PostgreSQL build-admission lock: {error}"
+                        "inspect build-admission slot: {error}"
                     ))
                 })?;
-            if !acquired {
-                drop(connection);
+                if !occupied {
+                    selected = Some((slot, slot_key));
+                    break;
+                }
+                let _ = unlock_advisory(&mut connection, slot_key).await;
+            }
+            let Some((slot, slot_key)) = selected else {
+                let _ = unlock_and_close(connection, global_key).await;
+                tokio::time::sleep(self.lock_poll_interval).await;
+                continue;
+            };
+
+            let reserved_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(requested_memory_bytes), 0)::bigint
+                   FROM ci_build_admission_leases
+                  WHERE builder_identity = $1",
+            )
+            .bind(&self.builder_identity)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| {
+                BuildAdmissionError::Unavailable(format!(
+                    "read active build memory reservations: {error}"
+                ))
+            })?;
+            let reserved_bytes = u64::try_from(reserved_bytes).map_err(|_| {
+                BuildAdmissionError::Unavailable("active build memory reservation overflow".into())
+            })?;
+            let snapshot = match self.memory_probe.snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = unlock_advisory(&mut connection, global_key).await;
+                    let _ = unlock_and_close(connection, slot_key).await;
+                    return Err(error);
+                }
+            };
+            if !snapshot.can_admit_with_reserved(
+                requested_memory_bytes,
+                self.system_reserve_bytes,
+                reserved_bytes,
+            ) {
+                last_snapshot = Some(snapshot);
+                let _ = unlock_advisory(&mut connection, global_key).await;
+                let _ = unlock_and_close(connection, slot_key).await;
+                tracing::warn!(
+                    requested_memory_bytes,
+                    reserved_memory_bytes = reserved_bytes,
+                    available_memory_bytes = snapshot.available_bytes,
+                    system_reserve_bytes = self.system_reserve_bytes,
+                    "deferring CI build because host memory headroom is insufficient"
+                );
                 tokio::time::sleep(self.lock_poll_interval).await;
                 continue;
             }
@@ -186,62 +353,48 @@ impl DockerBuildAdmission {
                         "identify PostgreSQL build-admission session: {error}"
                     ))
                 })?;
-
-            // A prior process can die while Docker keeps its container alive.
-            // The global session lock proves there is no current Kurbis builder
-            // owner, so reclaim only containers carrying the dedicated label.
-            if let Err(error) = self.cleaner.remove_abandoned().await {
-                let _ = unlock_and_close(connection).await;
-                return Err(error);
-            }
-
-            match self.memory_probe.snapshot().await {
-                Ok(snapshot)
-                    if snapshot.can_admit(requested_memory_bytes, self.system_reserve_bytes) =>
-                {
-                    tracing::info!(
-                        requested_memory_bytes,
-                        total_memory_bytes = snapshot.total_bytes,
-                        available_memory_bytes = snapshot.available_bytes,
-                        swap_total_bytes = snapshot.swap_total_bytes,
-                        swap_free_bytes = snapshot.swap_free_bytes,
-                        system_reserve_bytes = self.system_reserve_bytes,
-                        backend_pid,
-                        "admitted host-wide CI build"
-                    );
-                    return Ok(BuildAdmissionLease::new(
-                        connection,
-                        self.pool.clone(),
-                        self.cleaner.clone(),
-                        backend_pid,
-                        Uuid::new_v4().simple().to_string(),
-                        requested_memory_bytes,
-                        self.heartbeat_interval,
-                    ));
-                }
-                Ok(snapshot) => {
-                    last_snapshot = Some(snapshot);
-                    tracing::warn!(
-                        requested_memory_bytes,
-                        total_memory_bytes = snapshot.total_bytes,
-                        available_memory_bytes = snapshot.available_bytes,
-                        swap_total_bytes = snapshot.swap_total_bytes,
-                        swap_free_bytes = snapshot.swap_free_bytes,
-                        system_reserve_bytes = self.system_reserve_bytes,
-                        "deferring CI build because host memory headroom is insufficient"
-                    );
-                }
-                Err(error) => {
-                    let _ = unlock_and_close(connection).await;
-                    return Err(error);
-                }
-            }
-            unlock_and_close(connection).await.map_err(|error| {
-                BuildAdmissionError::Unavailable(format!(
-                    "release build-admission lock after memory deferral: {error}"
-                ))
+            let token = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO ci_build_admission_leases
+                 (builder_identity, slot, lease_token, owner_pid, requested_memory_bytes)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&self.builder_identity)
+            .bind(i16::try_from(slot).expect("bounded concurrency fits i16"))
+            .bind(token)
+            .bind(backend_pid)
+            .bind(i64::try_from(requested_memory_bytes).map_err(|_| {
+                BuildAdmissionError::Unavailable("build memory reservation overflow".into())
+            })?)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                BuildAdmissionError::Unavailable(format!("record build-admission lease: {error}"))
             })?;
-            tokio::time::sleep(self.lock_poll_interval).await;
+            unlock_advisory(&mut connection, global_key).await?;
+            tracing::info!(
+                requested_memory_bytes,
+                reserved_memory_bytes = reserved_bytes,
+                available_memory_bytes = snapshot.available_bytes,
+                concurrency = self.concurrency,
+                slot,
+                backend_pid,
+                builder_identity = %self.builder_identity,
+                "admitted host-wide CI build slot"
+            );
+            return Ok(BuildAdmissionLease::new(
+                connection,
+                self.pool.clone(),
+                self.cleaner.clone(),
+                self.builder_identity.clone(),
+                self.builder_label.clone(),
+                slot,
+                slot_key,
+                backend_pid,
+                token,
+                requested_memory_bytes,
+                self.heartbeat_interval,
+            ));
         }
     }
 }
@@ -256,69 +409,6 @@ impl DockerAbandonedBuildCleaner {
 }
 #[async_trait]
 impl AbandonedBuildCleaner for DockerAbandonedBuildCleaner {
-    async fn remove_abandoned(&self) -> Result<(), BuildAdmissionError> {
-        let output = docker_command(&self.docker_host)
-            .args(["ps", "-aq", "--filter", ABANDONED_BUILD_FILTER])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
-        let output = timeout(DOCKER_TIMEOUT, output)
-            .await
-            .map_err(|_| {
-                BuildAdmissionError::Unavailable(
-                    "list abandoned CI build containers timed out".into(),
-                )
-            })?
-            .map_err(|error| {
-                BuildAdmissionError::Unavailable(format!(
-                    "list abandoned CI build containers: {error}"
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(BuildAdmissionError::Unavailable(format!(
-                "list abandoned CI build containers failed: {}",
-                bounded_stderr(&output.stderr)
-            )));
-        }
-        let ids = String::from_utf8_lossy(&output.stdout)
-            .split_ascii_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let output = docker_command(&self.docker_host)
-            .args(["rm", "--force"])
-            .args(&ids)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
-        let output = timeout(DOCKER_TIMEOUT, output)
-            .await
-            .map_err(|_| {
-                BuildAdmissionError::Unavailable(
-                    "remove abandoned CI build containers timed out".into(),
-                )
-            })?
-            .map_err(|error| {
-                BuildAdmissionError::Unavailable(format!(
-                    "remove abandoned CI build containers: {error}"
-                ))
-            })?;
-        if output.status.success() || is_missing(&output.stderr) {
-            Ok(())
-        } else {
-            Err(BuildAdmissionError::Unavailable(format!(
-                "remove abandoned CI build containers failed: {}",
-                bounded_stderr(&output.stderr)
-            )))
-        }
-    }
-
     async fn remove_lease(&self, lease_token: &str) -> Result<(), BuildAdmissionError> {
         let output = docker_command(&self.docker_host)
             .args([
@@ -382,34 +472,53 @@ impl AbandonedBuildCleaner for DockerAbandonedBuildCleaner {
 
 pub(super) struct BuildAdmissionLease {
     connection: Option<PoolConnection<Postgres>>,
+    pool: PgPool,
     cleaner: Arc<dyn AbandonedBuildCleaner>,
+    builder_identity: String,
+    builder_label: String,
+    slot: u16,
+    slot_key: i64,
     backend_pid: i32,
-    lease_token: String,
+    lease_token: Uuid,
     requested_memory_bytes: u64,
     lost: Arc<AtomicBool>,
     heartbeat: Option<JoinHandle<()>>,
     released: bool,
 }
 impl BuildAdmissionLease {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         connection: PoolConnection<Postgres>,
         pool: PgPool,
         cleaner: Arc<dyn AbandonedBuildCleaner>,
+        builder_identity: String,
+        builder_label: String,
+        slot: u16,
+        slot_key: i64,
         backend_pid: i32,
-        lease_token: String,
+        lease_token: Uuid,
         requested_memory_bytes: u64,
         heartbeat_interval: Duration,
     ) -> Self {
         let lost = Arc::new(AtomicBool::new(false));
         let heartbeat = Some(start_heartbeat(
             pool.clone(),
+            builder_identity.clone(),
+            slot,
+            slot_key,
             backend_pid,
+            lease_token,
             lost.clone(),
             heartbeat_interval,
         ));
         Self {
             connection: Some(connection),
+            pool,
             cleaner,
+            builder_identity,
+            builder_label,
+            slot,
+            slot_key,
             backend_pid,
             lease_token,
             requested_memory_bytes,
@@ -419,15 +528,19 @@ impl BuildAdmissionLease {
         }
     }
 
-    pub(super) fn token(&self) -> &str {
-        &self.lease_token
+    pub(super) fn token(&self) -> String {
+        self.lease_token.simple().to_string()
+    }
+
+    pub(super) fn builder_label(&self) -> &str {
+        &self.builder_label
     }
 
     pub(super) fn assert_alive(&self) -> Result<(), BuildAdmissionError> {
         if self.lost.load(Ordering::Acquire) {
             return Err(BuildAdmissionError::Fenced(format!(
-                "PostgreSQL build-admission session {} no longer owns the advisory lock",
-                self.backend_pid
+                "PostgreSQL build-admission slot {} for builder {} is no longer owned",
+                self.slot, self.builder_identity
             )));
         }
         Ok(())
@@ -438,21 +551,48 @@ impl BuildAdmissionLease {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
-        if let Err(error) = self.cleaner.remove_lease(&self.lease_token).await {
-            tracing::warn!(
-                backend_pid = self.backend_pid,
-                ?error,
-                "failed to remove lease-owned CI containers before releasing admission lock"
-            );
+        let cleanup_succeeded = match self.cleaner.remove_lease(&self.token()).await {
+            Ok(()) => true,
+            Err(error) => {
+                // Do not delete a lease whose external resources could not be
+                // reclaimed. The dedicated advisory session is still released
+                // below; the heartbeat row then acts as a retryable stale
+                // fence instead of silently losing ownership information.
+                tracing::warn!(
+                    backend_pid = self.backend_pid,
+                    ?error,
+                    "failed to remove lease-owned CI resources; retaining lease row for stale cleanup"
+                );
+                false
+            }
+        };
+        if cleanup_succeeded {
+            let token = self.lease_token;
+            if let Err(error) = sqlx::query(
+                "DELETE FROM ci_build_admission_leases
+                 WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+            )
+            .bind(&self.builder_identity)
+            .bind(i16::try_from(self.slot).expect("u16 concurrency fits i16"))
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            {
+                tracing::warn!(
+                    backend_pid = self.backend_pid,
+                    ?error,
+                    "failed to delete build-admission lease row; stale cleanup will retry"
+                );
+            }
         }
         if let Some(connection) = self.connection.take()
-            && let Err(error) = unlock_and_close(connection).await
+            && let Err(error) = unlock_and_close(connection, self.slot_key).await
         {
             tracing::warn!(
                 backend_pid = self.backend_pid,
                 requested_memory_bytes = self.requested_memory_bytes,
                 ?error,
-                "failed to explicitly release PostgreSQL build-admission lock; closing its dedicated session"
+                "failed to explicitly release PostgreSQL build-admission slot; closing its dedicated session"
             );
         }
     }
@@ -462,24 +602,48 @@ impl Drop for BuildAdmissionLease {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
-        // close_on_drop is set before the session lock is acquired. A cancelled
-        // task therefore closes the dedicated DB session instead of returning a
-        // still-locked connection to the shared pool.
         self.connection.take();
         if !self.released {
             let cleaner = self.cleaner.clone();
-            let token = self.lease_token.clone();
+            let token = self.token();
+            let pool = self.pool.clone();
+            let identity = self.builder_identity.clone();
+            let slot = self.slot;
+            let lease_token = self.lease_token;
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
-                    if let Err(error) = cleaner.remove_lease(&token).await {
-                        tracing::warn!(?error, "failed to remove cancelled CI build containers");
+                    let cleanup_succeeded = match cleaner.remove_lease(&token).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "failed to remove cancelled CI build resources; retaining stale lease row"
+                            );
+                            false
+                        }
+                    };
+                    if cleanup_succeeded
+                        && let Err(error) = sqlx::query(
+                            "DELETE FROM ci_build_admission_leases
+                             WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
+                        )
+                        .bind(identity)
+                        .bind(i16::try_from(slot).expect("u16 concurrency fits i16"))
+                        .bind(lease_token)
+                        .execute(&pool)
+                        .await
+                    {
+                        tracing::warn!(
+                            ?error,
+                            "failed to delete cancelled CI build-admission lease row; stale cleanup will retry"
+                        );
                     }
                 });
             }
             tracing::info!(
                 backend_pid = self.backend_pid,
                 requested_memory_bytes = self.requested_memory_bytes,
-                "dropped CI build admission lease; PostgreSQL session and lease-owned containers are being released"
+                "dropped CI build admission lease; PostgreSQL slot and lease resources are being released"
             );
         }
     }
@@ -487,35 +651,48 @@ impl Drop for BuildAdmissionLease {
 
 fn start_heartbeat(
     pool: PgPool,
+    builder_identity: String,
+    slot: u16,
+    slot_key: i64,
     backend_pid: i32,
+    lease_token: Uuid,
     lost: Arc<AtomicBool>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            let owns_lock = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pg_locks
-                    WHERE locktype = 'advisory' AND pid = $1 AND granted
-                      AND classid = $2::oid AND objid = $3::oid AND objsubid = 2
-                )",
+            let slot_owned = advisory_lock_owned(&pool, backend_pid, slot_key).await;
+            let row_updated = sqlx::query(
+                "UPDATE ci_build_admission_leases
+                 SET heartbeat_at = now()
+                 WHERE builder_identity = $1 AND slot = $2 AND lease_token = $3",
             )
-            .bind(backend_pid)
-            .bind(BUILD_LOCK_CLASS)
-            .bind(BUILD_LOCK_OBJECT)
-            .fetch_one(&pool)
-            .await;
-            match owns_lock {
-                Ok(true) => {}
-                Ok(false) => {
+            .bind(&builder_identity)
+            .bind(i16::try_from(slot).expect("u16 concurrency fits i16"))
+            .bind(lease_token)
+            .execute(&pool)
+            .await
+            .map(|result| result.rows_affected() == 1);
+            match (slot_owned, row_updated) {
+                (Ok(true), Ok(true)) => {}
+                (Ok(false), _) | (_, Ok(false)) => {
                     lost.store(true, Ordering::Release);
-                    tracing::error!(backend_pid, "CI builder lost its PostgreSQL admission lock");
+                    tracing::error!(
+                        backend_pid,
+                        slot,
+                        "CI builder lost its PostgreSQL admission slot"
+                    );
                     break;
                 }
-                Err(error) => {
+                (Err(error), _) | (_, Err(error)) => {
                     lost.store(true, Ordering::Release);
-                    tracing::error!(backend_pid, ?error, "CI builder admission heartbeat failed");
+                    tracing::error!(
+                        backend_pid,
+                        slot,
+                        ?error,
+                        "CI builder admission heartbeat failed"
+                    );
                     break;
                 }
             }
@@ -523,13 +700,84 @@ fn start_heartbeat(
     })
 }
 
-async fn unlock_and_close(mut connection: PoolConnection<Postgres>) -> Result<(), sqlx::Error> {
-    let _unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
-        .bind(BUILD_LOCK_CLASS)
-        .bind(BUILD_LOCK_OBJECT)
+async fn try_advisory_lock(
+    connection: &mut PoolConnection<Postgres>,
+    key: i64,
+) -> Result<bool, BuildAdmissionError> {
+    sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut **connection)
+        .await
+        .map_err(|error| {
+            BuildAdmissionError::Unavailable(format!(
+                "acquire PostgreSQL build-admission lock: {error}"
+            ))
+        })
+}
+
+async fn unlock_advisory(
+    connection: &mut PoolConnection<Postgres>,
+    key: i64,
+) -> Result<(), BuildAdmissionError> {
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(&mut **connection)
+        .await
+        .map_err(|error| {
+            BuildAdmissionError::Unavailable(format!(
+                "release PostgreSQL build-admission lock: {error}"
+            ))
+        })?;
+    if unlocked {
+        Ok(())
+    } else {
+        Err(BuildAdmissionError::Fenced(
+            "PostgreSQL advisory lock was not held".into(),
+        ))
+    }
+}
+
+async fn unlock_and_close(
+    mut connection: PoolConnection<Postgres>,
+    slot_key: i64,
+) -> Result<(), sqlx::Error> {
+    let _unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(slot_key)
         .fetch_one(&mut *connection)
         .await?;
     connection.close().await
+}
+
+async fn advisory_lock_owned(
+    pool: &PgPool,
+    backend_pid: i32,
+    key: i64,
+) -> Result<bool, sqlx::Error> {
+    let classid = (key as u64 >> 32) as i64;
+    let objid = (key as u64 & u64::from(u32::MAX)) as i64;
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM pg_locks
+            WHERE locktype = 'advisory' AND pid = $1 AND granted
+              AND classid = $2::oid AND objid = $3::oid AND objsubid = 1
+        )",
+    )
+    .bind(backend_pid)
+    .bind(classid)
+    .bind(objid)
+    .fetch_one(pool)
+    .await
+}
+
+fn advisory_key(builder_identity: &str, slot: u32) -> i64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kurbis-ci-build-admission-v2\0");
+    hasher.update(builder_identity.as_bytes());
+    hasher.update(&slot.to_be_bytes());
+    let bytes = hasher.finalize().as_bytes()[..8]
+        .try_into()
+        .expect("blake3 digest has at least eight bytes");
+    i64::from_be_bytes(bytes) & i64::MAX
 }
 
 struct DockerHostMemoryProbe {
@@ -600,7 +848,7 @@ fn docker_command(docker_host: &str) -> Command {
     command
 }
 
-fn parse_meminfo(contents: &str) -> Result<HostMemorySnapshot, &'static str> {
+pub(super) fn parse_meminfo(contents: &str) -> Result<HostMemorySnapshot, &'static str> {
     let mut values = HashMap::new();
     for line in contents.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -689,7 +937,18 @@ fn is_missing(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::{str::FromStr, sync::Mutex};
+
+    #[test]
+    fn configured_build_concurrency_is_bounded_and_defaults_to_two_slots() {
+        assert_eq!(parse_build_concurrency(None).unwrap(), 2);
+        assert_eq!(parse_build_concurrency(Some("1")).unwrap(), 1);
+        assert_eq!(parse_build_concurrency(Some("64")).unwrap(), 64);
+        assert!(parse_build_concurrency(Some("0")).is_err());
+        assert!(parse_build_concurrency(Some("65")).is_err());
+        assert!(parse_build_concurrency(Some("many")).is_err());
+    }
 
     #[test]
     fn host_admission_includes_build_and_system_headroom() {
@@ -699,13 +958,21 @@ mod tests {
             swap_total_bytes: 0,
             swap_free_bytes: 0,
         };
-        assert!(!snapshot.can_admit(10 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024));
+        assert!(!snapshot.can_admit_with_reserved(
+            10 * 1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+            0
+        ));
         let safe_snapshot = HostMemorySnapshot {
             available_bytes: 15 * 1024 * 1024 * 1024,
             ..snapshot
         };
-        assert!(safe_snapshot.can_admit(10 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024));
-        assert!(!safe_snapshot.can_admit(u64::MAX, 4 * 1024 * 1024 * 1024));
+        assert!(safe_snapshot.can_admit_with_reserved(
+            10 * 1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+            0
+        ));
+        assert!(!safe_snapshot.can_admit_with_reserved(u64::MAX, 4 * 1024 * 1024 * 1024, 0));
     }
 
     #[test]
@@ -742,62 +1009,190 @@ mod tests {
             })
         }
     }
-    struct NoAbandonedBuilds;
+
+    #[derive(Clone)]
+    struct RecordingCleaner {
+        tokens: Arc<Mutex<Vec<String>>>,
+    }
+
     #[async_trait]
-    impl AbandonedBuildCleaner for NoAbandonedBuilds {
-        async fn remove_abandoned(&self) -> Result<(), BuildAdmissionError> {
-            Ok(())
-        }
-        async fn remove_lease(&self, _: &str) -> Result<(), BuildAdmissionError> {
+    impl AbandonedBuildCleaner for RecordingCleaner {
+        async fn remove_lease(&self, lease_token: &str) -> Result<(), BuildAdmissionError> {
+            self.tokens
+                .lock()
+                .expect("recording cleaner mutex is not poisoned")
+                .push(lease_token.to_owned());
             Ok(())
         }
     }
 
-    #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL; exercises real PostgreSQL session locks"]
-    async fn independent_postgres_sessions_serialize_and_cancel_releases_lock() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
-        let pool_a = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap();
-        let pool_b = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap();
-        let make = |pool| {
-            DockerBuildAdmission::new(
-                pool,
-                "unused-builder@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "ssh://unused@builder.invalid",
+    struct DisposableAdmissionDatabase {
+        pool: PgPool,
+        admin: PgPool,
+        name: String,
+    }
+
+    impl DisposableAdmissionDatabase {
+        async fn create() -> Self {
+            let url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must point to disposable local PostgreSQL");
+            let options = PgConnectOptions::from_str(&url).expect("valid TEST_DATABASE_URL");
+            let admin = PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(options.clone().database("postgres"))
+                .await
+                .expect("connect to local PostgreSQL admin database");
+            let name = format!("kurbis_admission_{}", Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE DATABASE {name}"))
+                .execute(&admin)
+                .await
+                .expect("create disposable admission database");
+            let pool = PgPoolOptions::new()
+                .max_connections(8)
+                .connect_with(options.database(&name))
+                .await
+                .expect("connect to disposable admission database");
+            crate::db::migrate(&pool)
+                .await
+                .expect("apply canonical schema to disposable admission database");
+            Self { pool, admin, name }
+        }
+
+        async fn cleanup(self) {
+            self.pool.close().await;
+            sqlx::query(
+                "SELECT pg_terminate_backend(pid)
+                   FROM pg_stat_activity
+                  WHERE datname = $1 AND pid <> pg_backend_pid()",
             )
-            .with_memory_probe(Arc::new(HealthyHost))
-            .with_cleaner(Arc::new(NoAbandonedBuilds))
-            .with_timing(Duration::from_millis(10), Duration::from_millis(25), Duration::from_millis(160))
-        };
-        let first = make(pool_a.clone());
-        let second = make(pool_b.clone());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let owner = tokio::spawn(async move {
-            let _lease = first.acquire(1024).await.unwrap();
-            tx.send(()).unwrap();
-            std::future::pending::<()>().await;
+            .bind(&self.name)
+            .execute(&self.admin)
+            .await
+            .expect("terminate remaining disposable database sessions");
+            sqlx::query(&format!("DROP DATABASE {}", self.name))
+                .execute(&self.admin)
+                .await
+                .expect("drop disposable admission database");
+            self.admin.close().await;
+        }
+    }
+
+    fn coordinator(
+        pool: PgPool,
+        identity: &'static str,
+        concurrency: usize,
+        cleaner: Arc<dyn AbandonedBuildCleaner>,
+    ) -> BuildAdmissionCoordinator {
+        BuildAdmissionCoordinator::for_builder(pool, identity, Arc::new(HealthyHost), cleaner)
+            .with_concurrency(concurrency)
+            .expect("valid test concurrency")
+            .with_timing(
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(180),
+            )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL; uses disposable PostgreSQL admission database"]
+    async fn postgres_admission_enforces_slots_cancellation_stale_fencing_and_identity_scope() {
+        let database = DisposableAdmissionDatabase::create().await;
+        let pool = database.pool.clone();
+        let cleaner_tokens = Arc::new(Mutex::new(Vec::new()));
+        let cleaner: Arc<dyn AbandonedBuildCleaner> = Arc::new(RecordingCleaner {
+            tokens: cleaner_tokens.clone(),
         });
-        rx.await.unwrap();
+
+        let first = coordinator(pool.clone(), "docker:test-host:image-a", 2, cleaner.clone());
+        let second = coordinator(pool.clone(), "docker:test-host:image-a", 2, cleaner.clone());
+        let third = coordinator(pool.clone(), "docker:test-host:image-a", 2, cleaner.clone());
+        let lease_a = first.acquire(1024).await.expect("first slot is admitted");
+        let lease_b = second.acquire(1024).await.expect("second slot is admitted");
         assert!(matches!(
-            second.acquire(1024).await,
+            third.acquire(1024).await,
             Err(BuildAdmissionError::Timeout { .. })
         ));
-        owner.abort();
-        let _ = owner.await;
-        let recovered = tokio::time::timeout(Duration::from_secs(3), second.acquire(1024))
-            .await
-            .unwrap()
-            .unwrap();
+        lease_a.release().await;
+        lease_b.release().await;
+
+        let cancelling = coordinator(
+            pool.clone(),
+            "docker:test-host:cancellation",
+            1,
+            cleaner.clone(),
+        );
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let lease = cancelling.acquire(1024).await.expect("cancellation lease");
+            ready_tx.send(()).expect("signal admitted lease");
+            std::future::pending::<()>().await;
+            lease
+        });
+        ready_rx.await.expect("receive cancellation admission");
+        task.abort();
+        let _ = task.await;
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(3),
+            coordinator(
+                pool.clone(),
+                "docker:test-host:cancellation",
+                1,
+                cleaner.clone(),
+            )
+            .acquire(1024),
+        )
+        .await
+        .expect("cancellation releases the slot")
+        .expect("slot after cancellation is admitted");
         recovered.release().await;
-        pool_a.close().await;
-        pool_b.close().await;
+
+        let stale_identity = "bubblewrap:test-host:stale";
+        let stale_token = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ci_build_admission_leases
+             (builder_identity, slot, lease_token, owner_pid, requested_memory_bytes, heartbeat_at)
+             VALUES ($1, 0, $2, 999999, 1024, now() - interval '1 hour')",
+        )
+        .bind(stale_identity)
+        .bind(stale_token)
+        .execute(&pool)
+        .await
+        .expect("insert stale admission row");
+        let stale_reclaimed = coordinator(pool.clone(), stale_identity, 1, cleaner.clone())
+            .acquire(1024)
+            .await
+            .expect("stale slot is reclaimed");
+        stale_reclaimed.release().await;
+        assert!(
+            cleaner_tokens
+                .lock()
+                .expect("recording cleaner mutex is not poisoned")
+                .iter()
+                .any(|token| token == &stale_token.simple().to_string())
+        );
+
+        let docker_identity = coordinator(
+            pool.clone(),
+            "docker:test-host:identity-a",
+            1,
+            cleaner.clone(),
+        );
+        let bubblewrap_identity = coordinator(
+            pool.clone(),
+            "bubblewrap:test-host:identity-b",
+            1,
+            cleaner.clone(),
+        );
+        let docker_lease = docker_identity
+            .acquire(1024)
+            .await
+            .expect("first builder identity is admitted");
+        let bubblewrap_lease = bubblewrap_identity
+            .acquire(1024)
+            .await
+            .expect("distinct builder identity is admitted independently");
+        docker_lease.release().await;
+        bubblewrap_lease.release().await;
+        database.cleanup().await;
     }
 }

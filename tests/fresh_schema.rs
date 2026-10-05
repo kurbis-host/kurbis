@@ -48,8 +48,8 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
             .await?;
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, bounded Check Run tombstone, reservation accounting, stale recovery, durable snapshot-GC, webhook-delivery, bounded build-retry, and runtime bootstrap barrier migrations"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, bounded Check Run tombstone, reservation accounting, stale recovery, durable snapshot-GC, webhook-delivery, bounded build-retry, runtime bootstrap barrier, and cross-process build-admission slot migrations"
     );
 
     let snapshot_gc_table: bool = sqlx::query_scalar(

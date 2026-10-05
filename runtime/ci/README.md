@@ -130,3 +130,13 @@ reconciliation. If no checkpoint exists, the system fails closed rather than
 silently starting an empty world on a different host. Expired-preview cleanup
 removes the checkpoint object and metadata along with the generation-fenced
 worker world, port leases, and resource reservations.
+
+## Builder backend and concurrency
+
+`CI_BUILDER_BACKEND=docker` is the default and keeps the rootless Docker
+contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a
+Linux worker with private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately
+reported as `bubblewrap_namespace_only`: it does not claim cgroup CPU, memory,
+or PID enforcement, and there is no automatic Docker fallback. Both backends
+use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process PostgreSQL slot
+admission; each slot reserves its requested memory plus host system headroom.

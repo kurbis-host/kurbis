@@ -10,6 +10,7 @@ from pathlib import Path
 
 from run_bounded_build import (
     GIB,
+    parse_concurrency,
     parse_meminfo,
     private_build_temp_root,
     private_build_tempdir,
@@ -18,6 +19,14 @@ from run_bounded_build import (
 
 
 class BuildMemoryGuardTests(unittest.TestCase):
+    def test_concurrency_config_defaults_and_rejects_invalid_environment_values(self):
+        self.assertEqual(parse_concurrency(None), 2)
+        self.assertEqual(parse_concurrency("1"), 1)
+        self.assertEqual(parse_concurrency("64"), 64)
+        for invalid in ("", "  ", "0", "65", "many"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                parse_concurrency(invalid)
+
     def test_linux_memory_units_and_bad_values(self):
         total, available = parse_meminfo(
             "MemTotal: 16384 kB\nMemAvailable: 8192 kB\nSwapTotal: 0 kB\n"
@@ -79,6 +88,8 @@ update(-1)
                 "1",
                 "--wait-seconds",
                 "3",
+                "--concurrency",
+                "1",
                 "--lock-file",
                 str(root / "host.lock"),
                 "--",
@@ -113,6 +124,8 @@ update(-1)
                 "1",
                 "--wait-seconds",
                 "5",
+                "--concurrency",
+                "1",
                 "--lock-file",
                 str(lock),
                 "--",
@@ -137,6 +150,7 @@ update(-1)
                     reserve_bytes=1,
                     wait_seconds=1,
                     path=lock,
+                    concurrency=1,
                     memory_probe=lambda: (8 * GIB, 7 * GIB),
                 )
             except TimeoutError as error:
@@ -164,6 +178,8 @@ update(-1)
                 "--memory-bytes",
                 "1",
                 "--reserve-bytes",
+                "1",
+                "--concurrency",
                 "1",
                 "--lock-file",
                 str(lock),
@@ -198,6 +214,78 @@ update(-1)
             else:
                 self.fail("signal forwarding left the build subprocess running")
 
+
+    def test_configured_slots_admit_n_and_block_n_plus_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = root / "events"
+            counter_lock = root / "counter.lock"
+            code = r"""
+import fcntl, pathlib, sys, time
+lock_path = sys.argv[1]
+events = pathlib.Path(sys.argv[2])
+def update(delta):
+    with open(lock_path, 'a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current, maximum = map(int, events.read_text().split()) if events.exists() else (0, 0)
+        current += delta
+        maximum = max(maximum, current)
+        events.write_text(f'{current} {maximum}')
+        fcntl.flock(lock, fcntl.LOCK_UN)
+update(1)
+time.sleep(.6)
+update(-1)
+"""
+            command = [
+                sys.executable, str(Path(__file__).with_name("run_bounded_build.py")),
+                "--memory-bytes", "1", "--reserve-bytes", "1", "--wait-seconds", "3",
+                "--concurrency", "2", "--lock-file", str(root / "host.lock"), "--",
+                sys.executable, "-c", code, str(counter_lock), str(events),
+            ]
+            first = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            second = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if events.exists() and events.read_text().startswith("2 "):
+                    break
+                time.sleep(.02)
+            self.assertTrue(events.exists(), "slot holders never started")
+            self.assertTrue(events.read_text().startswith("2 "), events.read_text())
+            started = time.monotonic()
+            third = subprocess.run(command, capture_output=True, text=True)
+            elapsed = time.monotonic() - started
+            self.assertEqual(third.returncode, 0, third.stderr)
+            self.assertGreaterEqual(elapsed, .45, "N+1 build bypassed the configured slot pool")
+            first_output = first.communicate(timeout=8)
+            second_output = second.communicate(timeout=8)
+            self.assertEqual(first.returncode, 0, first_output)
+            self.assertEqual(second.returncode, 0, second_output)
+            self.assertEqual(events.read_text(), "0 2")
+
+    def test_builder_identities_have_independent_slot_pools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = [
+                sys.executable, str(Path(__file__).with_name("run_bounded_build.py")),
+                "--memory-bytes", "1", "--reserve-bytes", "1", "--wait-seconds", "3",
+                "--concurrency", "1", "--lock-file", str(root / "host.lock"),
+                "--", sys.executable, "-c", "import time; time.sleep(.3)",
+            ]
+            first = subprocess.Popen([*command[:command.index("--")], "--builder-identity", "builder-a", *command[command.index("--"):]])
+            second = subprocess.Popen([*command[:command.index("--")], "--builder-identity", "builder-b", *command[command.index("--"):]])
+            self.assertEqual(first.wait(timeout=5), 0)
+            self.assertEqual(second.wait(timeout=5), 0)
+
+    def test_invalid_concurrency_environment_fails_closed(self):
+        environment = os.environ.copy()
+        environment["CI_BUILD_CONCURRENCY"] = "0"
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("run_bounded_build.py")),
+             "--memory-bytes", "1", "--", sys.executable, "-c", "pass"],
+            env=environment, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("CI_BUILD_CONCURRENCY", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()
