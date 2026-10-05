@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::StreamExt;
 use object_store::{MultipartUpload, ObjectStore, path::Path as ObjectPath};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,9 @@ use crate::{
 };
 
 use super::{ApiError, AppState, worker_auth};
+
+mod transfer;
+use transfer::body_with_reauthorization;
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -302,7 +305,7 @@ pub(super) async fn artifact(
     if !(1..=max_artifact_bytes).contains(&size_bytes) {
         return Err(invalid_ci_assignment());
     }
-    let path = object_store::path::Path::parse(object_key).map_err(|_| invalid_ci_assignment())?;
+    let path = ObjectPath::parse(&object_key).map_err(|_| invalid_ci_assignment())?;
     let object = state
         .object_store
         .get(&path)
@@ -311,67 +314,45 @@ pub(super) async fn artifact(
     if object.meta.size != size_bytes as u64 {
         return Err(invalid_ci_assignment());
     }
-    let expected_size = size_bytes as u64;
-    let expected_digest = digest;
-    let digest_header = expected_digest.clone();
-    let stream_digest = expected_digest.clone();
-    let stream = futures::stream::unfold(
-        (object.into_stream(), blake3::Hasher::new(), 0_u64, false),
-        move |(mut source, mut hasher, total, finished)| {
-            let expected_digest = stream_digest.clone();
-            async move {
-                if finished {
-                    return None;
-                }
-                match source.next().await {
-                    Some(Ok(chunk)) => {
-                        let next_total = total.saturating_add(chunk.len() as u64);
-                        if next_total > expected_size {
-                            return Some((
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "CI artifact exceeded its declared size",
-                                )),
-                                (source, hasher, next_total, true),
-                            ));
-                        }
-                        hasher.update(&chunk);
-                        Some((
-                            Ok::<Bytes, std::io::Error>(chunk),
-                            (source, hasher, next_total, false),
-                        ))
-                    }
-                    Some(Err(error)) => Some((
-                        Err(std::io::Error::other(error.to_string())),
-                        (source, hasher, total, true),
-                    )),
-                    None => {
-                        if total != expected_size
-                            || hasher.finalize().to_hex().as_str() != expected_digest
-                        {
-                            Some((
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "CI artifact failed size or digest verification",
-                                )),
-                                (source, blake3::Hasher::new(), total, true),
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-        },
+
+    let expected_key = object_key.clone();
+    let expected_digest = digest.clone();
+    let authorize_state = state.clone();
+    let authorize_headers = headers.clone();
+    let authorize = move || {
+        let state = authorize_state.clone();
+        let headers = authorize_headers.clone();
+        let expected_key = expected_key.clone();
+        let expected_digest = expected_digest.clone();
+        async move {
+            transfer::artifact_authorization_fence(transfer::ArtifactDownloadAuthorization {
+                state: &state,
+                headers: &headers,
+                preview_id,
+                worker_id,
+                generation,
+                lease_token,
+                expected_key: &expected_key,
+                expected_size: size_bytes,
+                expected_digest: &expected_digest,
+            })
+            .await
+        }
+    };
+    let body = body_with_reauthorization(
+        object.into_stream(),
+        size_bytes as u64,
+        digest.clone(),
+        authorize,
     );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/gzip")
         .header(header::CONTENT_LENGTH, size_bytes)
-        .header("x-ci-artifact-digest", digest_header)
+        .header("x-ci-artifact-digest", digest)
         .header(header::CACHE_CONTROL, "private, no-store")
         .header("x-content-type-options", "nosniff")
-        .body(Body::from_stream(stream))
+        .body(body)
         .map_err(|_| invalid_ci_assignment())
 }
 
@@ -440,14 +421,46 @@ pub(super) async fn world_snapshot(
             };
             let path =
                 ObjectPath::parse(&snapshot.object_key).map_err(|_| invalid_ci_assignment())?;
+            let expected_size =
+                u64::try_from(snapshot.size_bytes).map_err(|_| invalid_ci_assignment())?;
+            if !(1..=CI_RUNTIME_DISK_BYTES as u64).contains(&expected_size) {
+                return Err(invalid_ci_assignment());
+            }
             let object = state
                 .object_store
                 .get(&path)
                 .await
                 .map_err(|_| invalid_ci_assignment())?;
-            if object.meta.size as i64 != snapshot.size_bytes {
+            if object.meta.size != expected_size {
                 return Err(invalid_ci_assignment());
             }
+
+            let expected_snapshot = snapshot.clone();
+            let authorize_state = state.clone();
+            let authorize_headers = headers.clone();
+            let authorize = move || {
+                let state = authorize_state.clone();
+                let headers = authorize_headers.clone();
+                let expected_snapshot = expected_snapshot.clone();
+                async move {
+                    transfer::world_snapshot_authorization_fence(
+                        &state,
+                        &headers,
+                        preview_id,
+                        worker_id,
+                        generation,
+                        lease_token,
+                        &expected_snapshot,
+                    )
+                    .await
+                }
+            };
+            let body = body_with_reauthorization(
+                object.into_stream(),
+                expected_size,
+                snapshot.checksum.clone(),
+                authorize,
+            );
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/gzip")
@@ -455,7 +468,7 @@ pub(super) async fn world_snapshot(
                 .header("x-ci-world-snapshot-checksum", &snapshot.checksum)
                 .header(header::CACHE_CONTROL, "private, no-store")
                 .header("x-content-type-options", "nosniff")
-                .body(Body::from_stream(object.into_stream()))
+                .body(body)
                 .map_err(|_| invalid_ci_assignment())
         }
         axum::http::Method::PUT => {

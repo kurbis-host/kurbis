@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 mod rows;
@@ -912,6 +912,37 @@ impl CiPreviewRuntimeRepository {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Locks the exact assignment and artifact metadata while one response chunk
+    /// is released. Assignment rotation, alias expiry refresh, or artifact
+    /// cleanup cannot commit until the caller releases the transfer guard.
+    pub(crate) async fn lock_artifact_download(
+        tx: &mut Transaction<'_, Postgres>,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<Option<(String, i64, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT artifact.object_key, artifact.size_bytes, artifact.digest
+             FROM ci_runtime_placements runtime
+             JOIN ci_preview_aliases alias ON alias.id = runtime.preview_id
+             JOIN ci_builds build ON build.id = alias.build_id
+             JOIN ci_artifacts artifact ON artifact.digest = build.artifact_digest
+             WHERE runtime.preview_id = $1 AND runtime.worker_id = $2
+               AND runtime.generation = $3 AND runtime.lease_token = $4
+               AND runtime.state = 'starting' AND NOT runtime.active
+               AND alias.expires_at > now() AND build.expires_at > now()
+               AND artifact.expires_at > now()
+             FOR SHARE OF runtime, alias, build, artifact",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_optional(&mut **tx)
+        .await?)
+    }
+
     pub async fn artifact_object_key(
         &self,
         preview_id: Uuid,
@@ -1158,6 +1189,37 @@ impl CiPreviewRuntimeRepository {
         .bind(generation)
         .bind(lease_token)
         .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Locks the assignment and snapshot record through delivery of one body
+    /// chunk so a stop, reassignment, or snapshot replacement cannot race the
+    /// authorization check and chunk release.
+    pub(crate) async fn lock_world_snapshot_download(
+        tx: &mut Transaction<'_, Postgres>,
+        preview_id: Uuid,
+        worker_id: Uuid,
+        generation: i64,
+        lease_token: Uuid,
+    ) -> Result<Option<CiWorldSnapshot>> {
+        Ok(sqlx::query_as::<_, CiWorldSnapshot>(
+            "SELECT snapshot.object_key, snapshot.size_bytes, snapshot.checksum,
+                    snapshot.source_generation
+             FROM ci_runtime_placements runtime
+             JOIN ci_preview_aliases alias ON alias.id = runtime.preview_id
+             JOIN ci_world_snapshots snapshot ON snapshot.preview_id = runtime.preview_id
+             WHERE runtime.preview_id = $1 AND runtime.worker_id = $2
+               AND runtime.generation = $3 AND runtime.lease_token = $4
+               AND ((runtime.state = 'starting' AND NOT runtime.active)
+                    OR (runtime.state = 'stopping' AND runtime.active))
+               AND alias.expires_at > now()
+             FOR SHARE OF runtime, alias, snapshot",
+        )
+        .bind(preview_id)
+        .bind(worker_id)
+        .bind(generation)
+        .bind(lease_token)
+        .fetch_optional(&mut **tx)
         .await?)
     }
 

@@ -303,3 +303,5 @@ impl kurbis_hoster::ci::CheckRunClient for TestCheckRuns {
 mod bootstrap_recovery;
 #[path = "ci_preview/runtime.rs"]
 mod runtime;
+#[path = "ci_preview/streaming.rs"]
+mod streaming;
