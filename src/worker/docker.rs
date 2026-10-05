@@ -140,14 +140,13 @@ impl ServerRuntime for DockerRuntime {
         let api_capability =
             api_capability.context("managed plugin capability is required for Docker runtime")?;
         let name = container_name(server_id);
-        let proxy_name = runtime_api_proxy::container_name(server_id);
+        let proxy_name = runtime_api_proxy::container_name(server_id, placement.generation);
         match self.running_generation(&name).await? {
             Some(generation) if generation == placement.generation => {
                 let network = crate::worker::sandbox::workload_network_name(server_id, generation);
-                runtime_api_proxy::remove_container(&proxy_name).await?;
+                runtime_api_proxy::remove_container(server_id, placement.generation).await?;
                 runtime_api_proxy::start_container(
                     &self.runtime_api_proxy_image,
-                    &proxy_name,
                     "server",
                     server_id,
                     generation,
@@ -181,7 +180,7 @@ impl ServerRuntime for DockerRuntime {
             None => {}
         }
         self.remove_stopped(&name).await?;
-        runtime_api_proxy::remove_container(&proxy_name).await?;
+        runtime_api_proxy::remove_containers_through(server_id, placement.generation).await?;
         cleanup_ingress_through(&self.ingress, server_id, placement.generation).await?;
         self.sandbox.remove_isolated_networks(server_id).await?;
         self.sandbox
@@ -254,7 +253,6 @@ impl ServerRuntime for DockerRuntime {
             .await?;
         if let Err(error) = runtime_api_proxy::start_container(
             &self.runtime_api_proxy_image,
-            &proxy_name,
             "server",
             server_id,
             placement.generation,
@@ -367,11 +365,10 @@ impl ServerRuntime for DockerRuntime {
         let generation = self.running_generation(&container_name(server_id)).await?;
         if generation.is_none() {
             remove_control_socket_alias(server_id).await?;
-            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
-                .await?;
             let max_generation = read_runtime_generation(&self.root, server_id)
                 .await?
                 .unwrap_or(1);
+            runtime_api_proxy::remove_containers_through(server_id, max_generation).await?;
             cleanup_ingress_through(&self.ingress, server_id, max_generation).await?;
             self.sandbox.remove_isolated_networks(server_id).await?;
             remove_runtime_generation(&self.root, server_id).await?;
@@ -410,11 +407,10 @@ impl ServerRuntime for DockerRuntime {
             || String::from_utf8_lossy(&output.stderr).contains("No such container")
         {
             remove_control_socket_alias(server_id).await?;
-            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
-                .await?;
             let max_generation = read_runtime_generation(&self.root, server_id)
                 .await?
                 .unwrap_or(1);
+            runtime_api_proxy::remove_containers_through(server_id, max_generation).await?;
             cleanup_ingress_through(&self.ingress, server_id, max_generation).await?;
             self.sandbox.remove_isolated_networks(server_id).await?;
             remove_runtime_generation(&self.root, server_id).await?;

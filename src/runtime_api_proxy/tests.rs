@@ -9,6 +9,45 @@ fn id() -> Uuid {
     Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()
 }
 
+fn proxy_labels(scoped_id: Uuid, generation: i64) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({
+        "kurbis.runtime_api_proxy": scoped_id.to_string(),
+        "kurbis.generation": generation.to_string(),
+    })
+    .as_object()
+    .unwrap()
+    .clone()
+}
+
+#[test]
+fn stale_proxy_cleanup_cannot_address_or_remove_a_newer_generation() {
+    let scoped_id = id();
+    let old_name = container_name(scoped_id, 7);
+    let current_name = container_name(scoped_id, 8);
+    let current_labels = proxy_labels(scoped_id, 8);
+
+    assert_ne!(old_name, current_name);
+    assert!(verify_exact_proxy_generation(&current_labels, scoped_id, 7).is_err());
+    assert_eq!(
+        proxy_generation_within_fence(&current_labels, scoped_id, 7).unwrap(),
+        None,
+        "an old assignment's cleanup fence must skip a newer proxy"
+    );
+    assert_eq!(
+        proxy_generation_within_fence(&current_labels, scoped_id, 8).unwrap(),
+        Some(8)
+    );
+}
+
+#[test]
+fn proxy_cleanup_requires_matching_owner_and_positive_generation_labels() {
+    let scoped_id = id();
+    assert!(verify_exact_proxy_generation(&proxy_labels(scoped_id, 1), scoped_id, 1).is_ok());
+    assert!(verify_exact_proxy_generation(&proxy_labels(Uuid::new_v4(), 1), scoped_id, 1).is_err());
+    assert!(verify_exact_proxy_generation(&proxy_labels(scoped_id, 0), scoped_id, 0).is_err());
+    assert!(proxy_generation_within_fence(&serde_json::Map::new(), scoped_id, 1).is_err());
+}
+
 #[test]
 fn normal_scope_allows_only_server_capability_routes() {
     let expected = id();

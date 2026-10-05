@@ -187,13 +187,10 @@ impl CiPreviewWorker {
                 placement.preview_id,
                 placement.generation,
             );
-            crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
-                placement.preview_id,
-            ))
-            .await?;
+            crate::runtime_api_proxy::remove_container(placement.preview_id, placement.generation)
+                .await?;
             crate::runtime_api_proxy::start_container(
                 &self.runtime_api_proxy_image,
-                &crate::runtime_api_proxy::container_name(placement.preview_id),
                 "ci",
                 placement.preview_id,
                 placement.generation,
@@ -226,7 +223,10 @@ impl CiPreviewWorker {
                 &container,
                 &[
                     container.clone(),
-                    crate::runtime_api_proxy::container_name(placement.preview_id),
+                    crate::runtime_api_proxy::container_name(
+                        placement.preview_id,
+                        placement.generation,
+                    ),
                 ],
                 published_ports,
             )
@@ -346,10 +346,10 @@ impl CiPreviewWorker {
             .sandbox
             .create_isolated_network(placement.preview_id, placement.generation)
             .await?;
-        let proxy_name = crate::runtime_api_proxy::container_name(placement.preview_id);
+        let proxy_name =
+            crate::runtime_api_proxy::container_name(placement.preview_id, placement.generation);
         crate::runtime_api_proxy::start_container(
             &self.runtime_api_proxy_image,
-            &proxy_name,
             "ci",
             placement.preview_id,
             placement.generation,
@@ -653,10 +653,8 @@ impl CiPreviewWorker {
             self.clear_snapshot_barrier_marker(placement)?;
         }
         self.remove_stopped_container(placement.preview_id).await?;
-        crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
-            placement.preview_id,
-        ))
-        .await?;
+        crate::runtime_api_proxy::remove_container(placement.preview_id, placement.generation)
+            .await?;
         let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
         cleanup_ingress_through(&ingress, placement.preview_id, placement.generation).await?;
         self.sandbox
@@ -839,10 +837,8 @@ impl CiPreviewWorker {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
-            placement.preview_id,
-        ))
-        .await?;
+        crate::runtime_api_proxy::remove_container(placement.preview_id, placement.generation)
+            .await?;
         let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
         cleanup_ingress_through(&ingress, placement.preview_id, placement.generation).await?;
         self.sandbox
@@ -902,18 +898,11 @@ impl CiPreviewWorker {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
-                preview_id,
-            ))
-            .await?;
             self.sandbox
                 .remove_isolated_network(preview_id, generation)
                 .await?;
         }
-        crate::runtime_api_proxy::remove_container(&crate::runtime_api_proxy::container_name(
-            preview_id,
-        ))
-        .await?;
+        crate::runtime_api_proxy::remove_containers_through(preview_id, target_generation).await?;
         let ingress = GatewayIngressPolicy::new(self.gateway_address)?;
         cleanup_ingress_through(&ingress, preview_id, target_generation).await?;
         self.sandbox.remove_isolated_networks(preview_id).await?;
