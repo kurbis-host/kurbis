@@ -63,9 +63,11 @@ impl CheckedInPumpkinPatcher {
         let patch_path = root.join(filename);
         tokio::fs::write(&patch_path, patch)
             .await
-            .map_err(|error| BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("could not stage {filename}: {error}"),
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("could not stage {filename}: {error}"),
+                )
             })?;
         let mut check = git_command(root);
         check.arg("apply");
@@ -77,15 +79,21 @@ impl CheckedInPumpkinPatcher {
             .arg(&patch_path)
             .output()
             .await
-            .map_err(|error| BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("could not check {filename}: {error}"),
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("could not check {filename}: {error}"),
+                )
             })?;
         if !check_output.status.success() {
-            return Err(BuildPipelineError::Patch(format!(
-                "{filename} does not apply cleanly: {}",
-                bounded_output(&check_output.stderr)
-            )));
+            return Err(BuildPipelineError::process_failure(
+                crate::ci::CiBuildStage::Patching,
+                check_output.status,
+                format!(
+                    "{filename} does not apply cleanly: {}",
+                    bounded_output(&check_output.stderr)
+                ),
+            ));
         }
         let mut apply = git_command(root);
         apply.arg("apply");
@@ -93,17 +101,21 @@ impl CheckedInPumpkinPatcher {
             apply.arg("--unidiff-zero");
         }
         let output = apply.arg(&patch_path).output().await.map_err(|error| {
-            BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("could not apply {filename}: {error}"),
-            }
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                format!("could not apply {filename}: {error}"),
+            )
         })?;
         tokio::fs::remove_file(patch_path).await.ok();
         if !output.status.success() {
-            return Err(BuildPipelineError::Patch(format!(
-                "{filename} application failed: {}",
-                bounded_output(&output.stderr)
-            )));
+            return Err(BuildPipelineError::process_failure(
+                crate::ci::CiBuildStage::Patching,
+                output.status,
+                format!(
+                    "{filename} application failed: {}",
+                    bounded_output(&output.stderr)
+                ),
+            ));
         }
         Ok(())
     }
@@ -117,8 +129,9 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
         fingerprint: &str,
     ) -> Result<Vec<u8>, BuildPipelineError> {
         if fingerprint != checked_in_patch_fingerprint() {
-            return Err(BuildPipelineError::Patch(
-                "build key does not match the host-compiled Pumpkin patch set".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Patching,
+                "build key does not match the host-compiled Pumpkin patch set",
             ));
         }
         let bundle = decode_source_bundle(&source_archive).map_err(archive_error)?;
@@ -132,15 +145,18 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
             .arg("--quiet")
             .output()
             .await
-            .map_err(|error| BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("git init failed: {error}"),
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("git init failed: {error}"),
+                )
             })?;
         if !init.status.success() {
-            return Err(BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("git init failed: {}", bounded_output(&init.stderr)),
-            });
+            return Err(BuildPipelineError::process_failure(
+                crate::ci::CiBuildStage::Patching,
+                init.status,
+                format!("git init failed: {}", bounded_output(&init.stderr)),
+            ));
         }
         Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH, false).await?;
         Self::apply_patch(
@@ -155,17 +171,19 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
         let host_control = root.join("crates/pumpkin/src/net/host_control.rs");
         if let Some(parent) = host_control.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                BuildPipelineError::Infrastructure {
-                    stage: crate::ci::CiBuildStage::Patching,
-                    message: format!("could not prepare host-control source: {error}"),
-                }
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("could not prepare host-control source: {error}"),
+                )
             })?;
         }
         tokio::fs::write(host_control, HOST_CONTROL_RS)
             .await
-            .map_err(|error| BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: format!("could not install host-control source: {error}"),
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("could not install host-control source: {error}"),
+                )
             })?;
         pack_source_archive(root).map_err(archive_error)
     }
@@ -194,7 +212,23 @@ fn bounded_output(bytes: &[u8]) -> String {
 }
 
 fn archive_error(error: ArchiveError) -> BuildPipelineError {
-    BuildPipelineError::Patch(error.to_string())
+    let detail = error.to_string();
+    match error {
+        ArchiveError::Invalid(_) | ArchiveError::Limit => {
+            BuildPipelineError::permanent(crate::ci::CiBuildStage::Patching, detail)
+        }
+        ArchiveError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            BuildPipelineError::permanent(crate::ci::CiBuildStage::Patching, detail)
+        }
+        ArchiveError::Io(_) => {
+            BuildPipelineError::transient(crate::ci::CiBuildStage::Patching, detail)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -209,12 +243,31 @@ mod tests {
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
+    #[test]
+    fn invalid_patch_source_is_permanent_but_local_storage_errors_are_transient() {
+        let invalid = archive_error(ArchiveError::Invalid("malformed archive".into()));
+        assert_eq!(
+            invalid.failure_class(),
+            crate::ci::CiBuildFailureClass::Permanent
+        );
+        let storage = archive_error(ArchiveError::Io(std::io::Error::from(
+            std::io::ErrorKind::Other,
+        )));
+        assert_eq!(
+            storage.failure_class(),
+            crate::ci::CiBuildFailureClass::Transient
+        );
+    }
+
     #[tokio::test]
     async fn patcher_fails_closed_when_the_source_does_not_match_the_patch_set() {
         let error = CheckedInPumpkinPatcher
             .apply(Vec::new(), "not-the-patch-fingerprint")
             .await
             .unwrap_err();
-        assert!(matches!(error, BuildPipelineError::Patch(_)));
+        assert_eq!(
+            error.failure_class(),
+            crate::ci::CiBuildFailureClass::Permanent
+        );
     }
 }

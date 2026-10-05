@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     admission::{BuildAdmissionLease, DockerBuildAdmission, parse_cgroup_memory_events},
-    archive::{MAX_ARTIFACT_BYTES, pack_source_archive},
+    archive::{ArchiveError, MAX_ARTIFACT_BYTES, pack_source_archive},
 };
 
 const MAX_BUILD_LOG_BYTES: usize = 512 * 1024;
@@ -368,20 +368,43 @@ impl DockerRootlessBuildRuntime {
                 let _ = timeout(Duration::from_secs(5), child.wait()).await;
                 let diagnostics = self.container_failure_diagnostics(name, None).await;
                 self.remove_container(name).await;
-                return Err(BuildPipelineError::Compile(format!(
-                    "controlled build exceeded its {} second limit; {diagnostics}",
-                    process_timeout.as_secs()
-                )));
+                return Err(BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!(
+                        "controlled build exceeded its {} second limit; {diagnostics}",
+                        process_timeout.as_secs()
+                    ),
+                ));
             }
         };
         let stdout = stdout_reader
             .await
-            .map_err(|error| BuildPipelineError::Compile(format!("read build stdout: {error}")))?
-            .map_err(|error| BuildPipelineError::Compile(format!("read build stdout: {error}")))?;
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("read build stdout: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("read build stdout: {error}"),
+                )
+            })?;
         let stderr = stderr_reader
             .await
-            .map_err(|error| BuildPipelineError::Compile(format!("read build stderr: {error}")))?
-            .map_err(|error| BuildPipelineError::Compile(format!("read build stderr: {error}")))?;
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("read build stderr: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("read build stderr: {error}"),
+                )
+            })?;
         Ok((status, BuildProcessReport { stdout, stderr }))
     }
 
@@ -406,18 +429,30 @@ impl DockerRootlessBuildRuntime {
                 .output(),
         )
         .await
-        .map_err(|_| BuildPipelineError::Package("validate rootless output timed out".into()))?
+        .map_err(|_| {
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                "validate rootless output timed out",
+            )
+        })?
         .map_err(|error| {
-            BuildPipelineError::Package(format!("validate rootless output: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                format!("validate rootless output: {error}"),
+            )
         })?;
         if !output.status.success() {
-            return Err(BuildPipelineError::Package(format!(
-                "rootless output is not a bounded regular file: {}",
-                tail(
-                    &String::from_utf8_lossy(&output.stderr),
-                    MAX_FAILURE_LOG_BYTES
-                )
-            )));
+            return Err(BuildPipelineError::process_failure(
+                crate::ci::CiBuildStage::Packaging,
+                output.status,
+                format!(
+                    "rootless output is not a bounded regular file: {}",
+                    tail(
+                        &String::from_utf8_lossy(&output.stderr),
+                        MAX_FAILURE_LOG_BYTES
+                    )
+                ),
+            ));
         }
         Ok(())
     }
@@ -430,8 +465,9 @@ impl DockerRootlessBuildRuntime {
         limit: usize,
     ) -> Result<(), BuildPipelineError> {
         if !source.starts_with("/work/") || source.contains("..") {
-            return Err(BuildPipelineError::Package(
-                "rootless builder output path is invalid".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Packaging,
+                "rootless builder output path is invalid",
             ));
         }
         let mut child = docker_command(&self.docker_host)
@@ -442,13 +478,22 @@ impl DockerRootlessBuildRuntime {
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
-                BuildPipelineError::Package(format!("stream from rootless builder: {error}"))
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!("stream from rootless builder: {error}"),
+                )
             })?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
-            BuildPipelineError::Package("builder output stream was not opened".into())
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                "builder output stream was not opened",
+            )
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
-            BuildPipelineError::Package("builder error stream was not opened".into())
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                "builder error stream was not opened",
+            )
         })?;
         let stderr_reader = tokio::spawn(read_capped(stderr, MAX_FAILURE_LOG_BYTES));
         let mut output = tokio::fs::OpenOptions::new()
@@ -457,9 +502,10 @@ impl DockerRootlessBuildRuntime {
             .open(destination)
             .await
             .map_err(|error| {
-                BuildPipelineError::Package(format!(
-                    "create bounded artifact staging file: {error}"
-                ))
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!("create bounded artifact staging file: {error}"),
+                )
             })?;
         let copied = async {
             let mut total = 0usize;
@@ -499,25 +545,42 @@ impl DockerRootlessBuildRuntime {
                     .ok()
                     .and_then(Result::ok)
                     .unwrap_or_default();
-                return Err(BuildPipelineError::Package(format!(
-                    "rootless output stream failed: {error}; {}",
-                    tail(&detail, MAX_FAILURE_LOG_BYTES)
-                )));
+                return Err(BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!(
+                        "rootless output stream failed: {error}; {}",
+                        tail(&detail, MAX_FAILURE_LOG_BYTES)
+                    ),
+                ));
             }
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = tokio::fs::remove_file(destination).await;
-                return Err(BuildPipelineError::Package(
-                    "copy from rootless builder timed out".into(),
+                return Err(BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    "copy from rootless builder timed out",
                 ));
             }
         };
         let stderr = stderr_reader
             .await
-            .map_err(|error| BuildPipelineError::Package(format!("read builder error: {error}")))?
-            .map_err(|error| BuildPipelineError::Package(format!("read builder error: {error}")))?;
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!("read builder error: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!("read builder error: {error}"),
+                )
+            })?;
         let metadata = fs::symlink_metadata(destination).map_err(|error| {
-            BuildPipelineError::Package(format!("inspect rootless output: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                format!("inspect rootless output: {error}"),
+            )
         })?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
@@ -526,10 +589,13 @@ impl DockerRootlessBuildRuntime {
             || metadata.len() != copied as u64
         {
             let _ = fs::remove_file(destination);
-            return Err(BuildPipelineError::Package(format!(
-                "rootless builder output is not a bounded regular file: {}",
-                tail(&stderr, MAX_FAILURE_LOG_BYTES)
-            )));
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Packaging,
+                format!(
+                    "rootless builder output is not a bounded regular file: {}",
+                    tail(&stderr, MAX_FAILURE_LOG_BYTES)
+                ),
+            ));
         }
         Ok(())
     }
@@ -549,8 +615,9 @@ impl DockerRootlessBuildRuntime {
             || plugin_archive.is_empty()
             || plugin_archive.len() > MAX_PLUGIN_SOURCE_BYTES as usize
         {
-            return Err(BuildPipelineError::Compile(
-                "source or trusted plugin archive exceeds the bounded input limit".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "source or trusted plugin archive exceeds the bounded input limit",
             ));
         }
         let output_dir = accessible_directory(output_dir, "artifact output")?;
@@ -634,10 +701,14 @@ impl DockerRootlessBuildRuntime {
                     .container_failure_diagnostics(&name, Some(&bounded_log))
                     .await;
                 self.remove_container(&name).await;
-                return Err(BuildPipelineError::Compile(format!(
-                    "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
-                    tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
-                )));
+                return Err(BuildPipelineError::process_failure(
+                    crate::ci::CiBuildStage::Compiling,
+                    status,
+                    format!(
+                        "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
+                        tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
+                    ),
+                ));
             }
             Err(error) => {
                 self.remove_container(&name).await;
@@ -648,12 +719,18 @@ impl DockerRootlessBuildRuntime {
             self.remove_container(&name).await;
             return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
-        let max_artifact = u64::try_from(MAX_ARTIFACT_BYTES)
-            .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
+        let max_artifact = u64::try_from(MAX_ARTIFACT_BYTES).map_err(|error| {
+            BuildPipelineError::permanent(crate::ci::CiBuildStage::Packaging, error.to_string())
+        })?;
         let copy_results = async {
             for filename in ["pumpkin", "kurbis-control.wasm"] {
-                let maximum = usize::try_from(max_artifact.min(limits.disk_bytes))
-                    .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
+                let maximum =
+                    usize::try_from(max_artifact.min(limits.disk_bytes)).map_err(|error| {
+                        BuildPipelineError::permanent(
+                            crate::ci::CiBuildStage::Packaging,
+                            error.to_string(),
+                        )
+                    })?;
                 let container_path = format!("/work/out/{filename}");
                 self.validate_container_file(&name, &container_path, maximum)
                     .await?;
@@ -758,6 +835,24 @@ fn disk_enospc_hint(log: &str) -> bool {
         .any(|needle| log.contains(needle))
 }
 
+fn archive_error(stage: crate::ci::CiBuildStage, error: ArchiveError) -> BuildPipelineError {
+    let detail = error.to_string();
+    match error {
+        ArchiveError::Invalid(_) | ArchiveError::Limit => {
+            BuildPipelineError::permanent(stage, detail)
+        }
+        ArchiveError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            BuildPipelineError::permanent(stage, detail)
+        }
+        ArchiveError::Io(_) => BuildPipelineError::transient(stage, detail),
+    }
+}
+
 async fn wait_for_admission_owned_child(
     child: &mut Child,
     admission: &BuildAdmissionLease,
@@ -767,7 +862,7 @@ async fn wait_for_admission_owned_child(
         tokio::select! {
             result = child.wait() => {
                 return result.map_err(|error| {
-                    BuildPipelineError::Compile(format!("builder process failed: {error}"))
+                    BuildPipelineError::transient(crate::ci::CiBuildStage::Compiling, format!("builder process failed: {error}"))
                 });
             }
             _ = heartbeat.tick() => {
@@ -792,8 +887,9 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             || source_archive.len() > super::archive::MAX_COMPRESSED_SOURCE_BYTES
             || fingerprint != super::checked_in_patch_fingerprint()
         {
-            return Err(BuildPipelineError::Patch(
-                "source archive or checked-in patch fingerprint is invalid".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Patching,
+                "source archive or checked-in patch fingerprint is invalid",
             ));
         }
         let limits = Self::workload_limits(crate::ci::ROOTLESS_BUILD_LIMITS)?;
@@ -818,10 +914,10 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             .await
         {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: error.to_string(),
-            });
+            return Err(BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                error.to_string(),
+            ));
         }
         if let Err(error) = admission.assert_alive() {
             self.remove_container(&name).await;
@@ -829,20 +925,20 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
         }
         if let Err(error) = self.start_task_container(&name).await {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: error.to_string(),
-            });
+            return Err(BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                error.to_string(),
+            ));
         }
         if let Err(error) = self
             .copy_bytes_into(&name, "source.tar.gz", &source_archive)
             .await
         {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: error.to_string(),
-            });
+            return Err(BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                error.to_string(),
+            ));
         }
         let result = self
             .run_task_container(&name, script, Duration::from_secs(15 * 60), &admission)
@@ -855,17 +951,21 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
                     .container_failure_diagnostics(&name, Some(&bounded_log))
                     .await;
                 self.remove_container(&name).await;
-                return Err(BuildPipelineError::Patch(format!(
-                    "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
-                    tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
-                )));
+                return Err(BuildPipelineError::process_failure(
+                    crate::ci::CiBuildStage::Patching,
+                    status,
+                    format!(
+                        "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
+                        tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
+                    ),
+                ));
             }
             Err(error) => {
                 self.remove_container(&name).await;
-                return Err(BuildPipelineError::Infrastructure {
-                    stage: crate::ci::CiBuildStage::Patching,
-                    message: error.to_string(),
-                });
+                return Err(BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    error.to_string(),
+                ));
             }
         };
         if let Err(error) = admission.assert_alive() {
@@ -873,10 +973,7 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
         let directory = super::private_tempdir("kurbis-ci-patched-source-").map_err(|error| {
-            BuildPipelineError::Infrastructure {
-                stage: crate::ci::CiBuildStage::Patching,
-                message: error.to_string(),
-            }
+            BuildPipelineError::transient(crate::ci::CiBuildStage::Patching, error.to_string())
         })?;
         let output = directory.path().join("patched-source.tar.gz");
         let copied = self
@@ -888,27 +985,30 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             )
             .await;
         self.remove_container(&name).await;
-        copied.map_err(|error| BuildPipelineError::Infrastructure {
-            stage: crate::ci::CiBuildStage::Patching,
-            message: error.to_string(),
-        })?;
+        copied?;
         admission.release().await;
         let metadata = fs::symlink_metadata(&output).map_err(|error| {
-            BuildPipelineError::Patch(format!("inspect patched source archive: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                format!("inspect patched source archive: {error}"),
+            )
         })?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || metadata.len() == 0
             || metadata.len() > super::archive::MAX_COMPRESSED_SOURCE_BYTES as u64
         {
-            return Err(BuildPipelineError::Patch(
-                "rootless patch workload produced invalid output".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Patching,
+                "rootless patch workload produced invalid output",
             ));
         }
         let _ = (status, report);
-        fs::read(output).map_err(|error| BuildPipelineError::Infrastructure {
-            stage: crate::ci::CiBuildStage::Patching,
-            message: format!("read patched source: {error}"),
+        fs::read(output).map_err(|error| {
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Patching,
+                format!("read patched source: {error}"),
+            )
         })
     }
 }
@@ -992,33 +1092,36 @@ where
         patched_source: Vec<u8>,
         key: &BuildKey,
     ) -> Result<ControlledBuildOutput, BuildPipelineError> {
-        key.validate()
-            .map_err(|error| BuildPipelineError::Compile(error.to_string()))?;
+        key.validate().map_err(|error| {
+            BuildPipelineError::permanent(crate::ci::CiBuildStage::Compiling, error.to_string())
+        })?;
         if key.toolchain_version != self.runtime.toolchain_version() {
-            return Err(BuildPipelineError::Compile(
-                "build key toolchain identity does not match the active immutable builder image"
-                    .into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "build key toolchain identity does not match the active immutable builder image",
             ));
         }
         let target = rust_target(&key.target_architecture)?;
         if patched_source.is_empty()
             || patched_source.len() > super::archive::MAX_COMPRESSED_SOURCE_BYTES
         {
-            return Err(BuildPipelineError::Compile(
-                "patched source archive is empty or exceeds the compressed-size limit".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "patched source archive is empty or exceeds the compressed-size limit",
             ));
         }
-        let plugin_context = plugin_build_context(&self.plugin_source)
-            .map_err(|error| BuildPipelineError::Compile(error.to_string()))?;
+        let plugin_context = plugin_build_context(&self.plugin_source)?;
         let plugin_archive = pack_source_archive(plugin_context.path())
-            .map_err(|error| BuildPipelineError::Compile(error.to_string()))?;
+            .map_err(|error| archive_error(crate::ci::CiBuildStage::Compiling, error))?;
         if plugin_archive.len() > MAX_PLUGIN_SOURCE_BYTES as usize {
-            return Err(BuildPipelineError::Compile(
-                "trusted plugin archive exceeds its size limit".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "trusted plugin archive exceeds its size limit",
             ));
         }
-        let output = super::private_tempdir("kurbis-ci-artifact-")
-            .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
+        let output = super::private_tempdir("kurbis-ci-artifact-").map_err(|error| {
+            BuildPipelineError::transient(crate::ci::CiBuildStage::Packaging, error.to_string())
+        })?;
         let report = self
             .runtime
             .compile(
@@ -1034,7 +1137,7 @@ where
         validate_pumpkin_binary(&binary, &key.target_architecture)?;
         validate_wasm_plugin(&plugin)?;
         let build_log = report.bounded_log();
-        let artifact = package_artifact(&binary, &plugin, output.path(), key, &build_log)?;
+        let artifact = package_artifact(&binary, &plugin, key, &build_log)?;
         Ok(ControlledBuildOutput {
             artifact,
             build_log,

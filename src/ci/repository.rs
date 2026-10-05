@@ -104,7 +104,10 @@ impl CiPreviewRepository {
         .await?;
         let stale_success = row.stage == "ready" && !row.artifact_valid;
         let elapsed = row.expires_at <= Utc::now();
-        let row = if stale_success || elapsed && row.stage != "queued" {
+        // A failed immutable key carries its retry budget and permanence class.
+        // Preview TTL expiry must not silently turn it into fresh queued work.
+        let refresh_expired_build = elapsed && row.stage != "queued" && row.stage != "failed";
+        let row = if stale_success || refresh_expired_build {
             sqlx::query_as::<_, CiBuildRow>(
                 "UPDATE ci_builds SET stage = 'queued', artifact_digest = NULL,
                     failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
@@ -178,6 +181,26 @@ impl CiPreviewRepository {
                 },
             )
             .collect()
+    }
+
+    /// A demand-triggered request may start failed immutable work only after
+    /// the persisted transient retry deadline. Permanent failures never retry.
+    pub async fn is_build_retry_due(&self, build_id: Uuid) -> Result<bool> {
+        let due: Option<bool> = sqlx::query_scalar(
+            "SELECT stage = 'failed'
+                 AND failure_class = 'transient'
+                 AND retry_count <= $2
+                 AND retry_at IS NOT NULL
+                 AND retry_at <= now()
+                 AND expires_at > now()
+                 AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+             FROM ci_builds WHERE id = $1",
+        )
+        .bind(build_id)
+        .bind(CI_BUILD_MAX_RETRIES)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(due.unwrap_or(false))
     }
 
     pub async fn claim_build(

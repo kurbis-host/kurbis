@@ -119,7 +119,7 @@ async fn package_contains_only_validated_runtime_files_and_metadata() {
     };
     validate_pumpkin_binary(&binary, "x86_64-linux").unwrap();
     validate_wasm_plugin(&plugin).unwrap();
-    let artifact = package_artifact(&binary, &plugin, root.path(), &key, "cargo ok\n").unwrap();
+    let artifact = package_artifact(&binary, &plugin, &key, "cargo ok\n").unwrap();
     assert!(artifact.starts_with(&[0x1f, 0x8b]));
     assert!(artifact.len() < MAX_ARTIFACT_BYTES);
 }
@@ -200,4 +200,54 @@ fn disk_failure_detection_accepts_common_quota_errors_only() {
     assert!(disk_enospc_hint("write failed: ENOSPC"));
     assert!(disk_enospc_hint("disk quota exceeded"));
     assert!(!disk_enospc_hint("memory.events: oom_kill 1"));
+}
+
+#[test]
+fn archive_and_artifact_io_failures_are_transient_but_bad_content_is_permanent() {
+    let io_error = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Io(std::io::Error::from(std::io::ErrorKind::Other)),
+    );
+    assert_eq!(
+        io_error.failure_class(),
+        crate::ci::CiBuildFailureClass::Transient
+    );
+    let truncated_archive = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+    );
+    assert_eq!(
+        truncated_archive.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
+    let invalid_archive = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Invalid("bad tar member".into()),
+    );
+    assert_eq!(
+        invalid_archive.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
+
+    let missing_output = validate_pumpkin_binary(
+        Path::new("/tmp/kurbis-ci-output-that-does-not-exist"),
+        "x86_64-linux",
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_output.failure_class(),
+        crate::ci::CiBuildFailureClass::Transient
+    );
+}
+
+#[test]
+fn malformed_compiler_artifact_is_permanent() {
+    let directory = tempdir().unwrap();
+    let binary = directory.path().join("pumpkin");
+    fs::write(&binary, b"not an ELF binary").unwrap();
+    let error = validate_pumpkin_binary(&binary, "x86_64-linux").unwrap_err();
+    assert_eq!(
+        error.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
 }

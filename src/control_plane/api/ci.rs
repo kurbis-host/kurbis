@@ -126,10 +126,19 @@ async fn ensure_commit_preview_on_demand(
             .await
             .map_err(ApiError::from)?,
     };
-    if !matches!(
+    let retry_due = if build.stage == crate::ci::CiBuildStage::Failed {
+        repository
+            .is_build_retry_due(build.id)
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        false
+    };
+    let should_start = !matches!(
         build.stage,
         crate::ci::CiBuildStage::Ready | crate::ci::CiBuildStage::Failed
-    ) {
+    ) || retry_due;
+    if should_start {
         let builder = builder.clone();
         let request = BuildRequest {
             key,

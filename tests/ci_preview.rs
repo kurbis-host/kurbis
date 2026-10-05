@@ -167,6 +167,8 @@ mod polling;
 #[derive(Default)]
 struct TestBuildComponents {
     compile_calls: std::sync::atomic::AtomicUsize,
+    transient_compile_failures: std::sync::atomic::AtomicUsize,
+    permanent_compile_failures: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
 impl kurbis_hoster::ci::PatchApplier for TestBuildComponents {
@@ -205,6 +207,34 @@ impl kurbis_hoster::ci::ControlledBuilder for TestBuildComponents {
     {
         self.compile_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .transient_compile_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(kurbis_hoster::ci::BuildPipelineError::Transient {
+                stage: CiBuildStage::Compiling,
+                message: "temporary compiler container interruption".into(),
+            });
+        }
+        if self
+            .permanent_compile_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(kurbis_hoster::ci::BuildPipelineError::Permanent {
+                stage: CiBuildStage::Compiling,
+                message: "deterministic compiler diagnostic".into(),
+            });
+        }
         let mut artifact = patched_source;
         artifact.extend_from_slice(b"verified-pumpkin-artifact");
         Ok(kurbis_hoster::ci::ControlledBuildOutput {

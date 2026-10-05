@@ -13,55 +13,109 @@ use super::{
 
 #[derive(Debug, Error)]
 pub enum BuildPipelineError {
-    #[error("source fetch failed: {0}")]
-    Source(String),
-    #[error("patch application failed: {0}")]
-    Patch(String),
-    #[error("permanent build validation failed during {stage}: {message}")]
-    Validation {
+    #[error("permanent build failure during {stage}: {message}")]
+    Permanent {
         stage: CiBuildStage,
         message: String,
     },
-    #[error("controlled compilation failed: {0}")]
-    Compile(String),
-    #[error("artifact packaging failed: {0}")]
-    Package(String),
+    #[error("transient build failure during {stage}: {message}")]
+    Transient {
+        stage: CiBuildStage,
+        message: String,
+    },
     #[error("database build coordination failed: {0}")]
     Database(String),
     #[error("sandbox admission failed: {0}")]
     Sandbox(String),
-    #[error("transient infrastructure failure during {stage}: {message}")]
-    Infrastructure {
-        stage: CiBuildStage,
-        message: String,
-    },
 }
 
 impl BuildPipelineError {
-    fn failure_stage(&self) -> CiBuildStage {
-        match self {
-            Self::Source(_) => CiBuildStage::Fetching,
-            Self::Patch(_) => CiBuildStage::Patching,
-            Self::Validation { stage, .. } => *stage,
-            Self::Compile(_) => CiBuildStage::Compiling,
-            Self::Package(_) => CiBuildStage::Packaging,
-            Self::Infrastructure { stage, .. } => *stage,
-            Self::Sandbox(_) | Self::Database(_) => CiBuildStage::Queued,
+    pub(crate) fn permanent(stage: CiBuildStage, message: impl Into<String>) -> Self {
+        Self::Permanent {
+            stage,
+            message: message.into(),
         }
     }
-
-    fn failure_class(&self) -> CiBuildFailureClass {
+    pub(crate) fn transient(stage: CiBuildStage, message: impl Into<String>) -> Self {
+        Self::Transient {
+            stage,
+            message: message.into(),
+        }
+    }
+    pub(crate) fn failure_stage(&self) -> CiBuildStage {
         match self {
-            // Patch conflicts, compiler diagnostics, and malformed artifacts are
-            // deterministic for this immutable key. Retrying them only burns
-            // the bounded retry budget and creates noisy Check Run churn.
-            Self::Patch(_) | Self::Validation { .. } | Self::Compile(_) | Self::Package(_) => {
-                CiBuildFailureClass::Permanent
+            Self::Permanent { stage, .. } | Self::Transient { stage, .. } => *stage,
+            Self::Database(_) | Self::Sandbox(_) => CiBuildStage::Queued,
+        }
+    }
+    pub(crate) fn failure_class(&self) -> CiBuildFailureClass {
+        match self {
+            Self::Permanent { .. } => CiBuildFailureClass::Permanent,
+            Self::Transient { .. } | Self::Database(_) | Self::Sandbox(_) => {
+                CiBuildFailureClass::Transient
             }
-            Self::Source(_)
-            | Self::Database(_)
-            | Self::Sandbox(_)
-            | Self::Infrastructure { .. } => CiBuildFailureClass::Transient,
+        }
+    }
+    /// Classify an exited helper/container process. Deterministic compiler or
+    /// patch output stays permanent; OS/container/storage signals stay retryable.
+    pub(crate) fn process_failure(
+        stage: CiBuildStage,
+        status: std::process::ExitStatus,
+        diagnostics: impl Into<String>,
+    ) -> Self {
+        let diagnostics = diagnostics.into();
+        if status.code().is_none()
+            || status.code().is_some_and(|code| matches!(code, 137 | 143))
+            || transient_failure_hint(&diagnostics)
+        {
+            Self::transient(stage, diagnostics)
+        } else {
+            Self::permanent(stage, diagnostics)
+        }
+    }
+}
+
+// These are OS/container error signatures, not stage-based guesses: every
+// caller passes bounded diagnostics from the process that actually failed.
+fn transient_failure_hint(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "no space left on device",
+        "enospc",
+        "disk quota exceeded",
+        "input/output error",
+        "i/o error",
+        " eio",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "resource temporarily unavailable",
+        "too many open files",
+        "docker daemon",
+        "cannot connect",
+        "no such container",
+        "error during connect",
+        "context deadline exceeded",
+        "disk_probe=enospc",
+        "build_log_enospc=true",
+        "oom_killed=true",
+        "pressure_classification=cgroup_oom",
+        "docker_state=unavailable",
+        "read-only file system",
+        "transport is closing",
+    ]
+    .iter()
+    .any(|hint| message.contains(hint))
+}
+
+fn artifact_cache_error(error: CiServiceError) -> BuildPipelineError {
+    match error {
+        CiServiceError::InvalidArtifact(message) | CiServiceError::Rejected(message) => {
+            BuildPipelineError::permanent(CiBuildStage::Packaging, message)
+        }
+        CiServiceError::SandboxUnavailable(message) | CiServiceError::Internal(message) => {
+            BuildPipelineError::transient(CiBuildStage::Packaging, message)
         }
     }
 }
@@ -97,12 +151,9 @@ fn source_fetch_error(error: PollError) -> BuildPipelineError {
         PollError::RateLimited { .. } | PollError::Transport(_) => false,
     };
     if permanent {
-        BuildPipelineError::Validation {
-            stage: CiBuildStage::Fetching,
-            message: error.to_string(),
-        }
+        BuildPipelineError::permanent(CiBuildStage::Fetching, error.to_string())
     } else {
-        BuildPipelineError::Source(error.to_string())
+        BuildPipelineError::transient(CiBuildStage::Fetching, error.to_string())
     }
 }
 
@@ -464,7 +515,10 @@ where
             .await;
             let digest = blake3::hash(&artifact).to_hex().to_string();
             let expected_size = i64::try_from(artifact.len()).map_err(|_| {
-                BuildPipelineError::Package("artifact exceeds signed size range".into())
+                BuildPipelineError::permanent(
+                    CiBuildStage::Packaging,
+                    "artifact exceeds signed size range",
+                )
             })?;
             let output = self
                 .artifacts
@@ -475,13 +529,11 @@ where
                     Utc::now() + Duration::hours(72),
                 )
                 .await
-                .map_err(|error| BuildPipelineError::Infrastructure {
-                    stage: CiBuildStage::Packaging,
-                    message: error.to_string(),
-                })?;
+                .map_err(artifact_cache_error)?;
             if output.artifact_digest != digest || output.size_bytes != expected_size {
-                return Err(BuildPipelineError::Package(
-                    "artifact cache returned mismatched digest or size".into(),
+                return Err(BuildPipelineError::permanent(
+                    CiBuildStage::Packaging,
+                    "artifact cache returned mismatched digest or size",
                 ));
             }
             self.repository
@@ -611,35 +663,25 @@ mod tests {
     }
 
     #[test]
-    fn failure_classification_retries_only_infrastructure_failures() {
+    fn failure_classification_separates_deterministic_and_recoverable_failures() {
         assert_eq!(
-            BuildPipelineError::Patch("patch conflict".into()).failure_class(),
+            BuildPipelineError::permanent(CiBuildStage::Patching, "patch conflict").failure_class(),
             CiBuildFailureClass::Permanent
         );
         assert_eq!(
-            BuildPipelineError::Package("malformed artifact".into()).failure_class(),
+            BuildPipelineError::permanent(CiBuildStage::Packaging, "malformed artifact")
+                .failure_class(),
             CiBuildFailureClass::Permanent
         );
         assert_eq!(
-            BuildPipelineError::Validation {
-                stage: CiBuildStage::Fetching,
-                message: "invalid source response".into(),
-            }
-            .failure_class(),
-            CiBuildFailureClass::Permanent
-        );
-        assert_eq!(
-            BuildPipelineError::Infrastructure {
-                stage: CiBuildStage::Packaging,
-                message: "object store unavailable".into(),
-            }
-            .failure_class(),
+            BuildPipelineError::transient(CiBuildStage::Packaging, "EIO while writing artifact")
+                .failure_class(),
             CiBuildFailureClass::Transient
         );
         assert_eq!(
             source_fetch_error(PollError::Http {
                 status: reqwest::StatusCode::NOT_FOUND,
-                message: "commit missing".into(),
+                message: "commit missing".into()
             })
             .failure_class(),
             CiBuildFailureClass::Permanent
@@ -647,10 +689,46 @@ mod tests {
         assert_eq!(
             source_fetch_error(PollError::Http {
                 status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                message: "GitHub unavailable".into(),
+                message: "GitHub unavailable".into()
             })
             .failure_class(),
             CiBuildFailureClass::Transient
+        );
+    }
+
+    #[test]
+    fn infrastructure_hints_make_compile_failures_retryable() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 1")
+            .status()
+            .unwrap();
+        assert_eq!(
+            BuildPipelineError::process_failure(
+                CiBuildStage::Compiling,
+                status,
+                "cargo failed: no space left on device"
+            )
+            .failure_class(),
+            CiBuildFailureClass::Transient
+        );
+        assert_eq!(
+            BuildPipelineError::process_failure(
+                CiBuildStage::Compiling,
+                status,
+                "error[E0308]: mismatched types"
+            )
+            .failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            BuildPipelineError::process_failure(
+                CiBuildStage::Patching,
+                status,
+                "host-control.patch does not apply cleanly: patch failed",
+            )
+            .failure_class(),
+            CiBuildFailureClass::Permanent
         );
     }
 }

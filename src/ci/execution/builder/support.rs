@@ -78,9 +78,10 @@ pub(super) fn docker_platform(target: &str) -> Result<&'static str, BuildPipelin
     match target {
         "x86_64-unknown-linux-gnu" => Ok("linux/amd64"),
         "aarch64-unknown-linux-gnu" => Ok("linux/arm64"),
-        _ => Err(BuildPipelineError::Compile(format!(
-            "unsupported native Linux target {target}"
-        ))),
+        _ => Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Compiling,
+            format!("unsupported native Linux target {target}"),
+        )),
     }
 }
 
@@ -89,19 +90,26 @@ pub(super) fn accessible_directory(
     label: &str,
 ) -> Result<PathBuf, BuildPipelineError> {
     let path = fs::canonicalize(path).map_err(|error| {
-        BuildPipelineError::Sandbox(format!("invalid {label} directory: {error}"))
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Packaging,
+            format!("resolve {label} directory: {error}"),
+        )
     })?;
     if !path.is_dir() {
-        return Err(BuildPipelineError::Sandbox(format!(
-            "{label} is not a directory"
-        )));
+        return Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Packaging,
+            format!("{label} is not a directory"),
+        ));
     }
     Ok(path)
 }
 
 pub(super) fn validate_plugin_source(path: &Path) -> Result<(), BuildPipelineError> {
     let root = fs::canonicalize(path).map_err(|error| {
-        BuildPipelineError::Sandbox(format!("invalid trusted plugin source: {error}"))
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!("resolve trusted plugin source: {error}"),
+        )
     })?;
     if !root.join("Cargo.toml").is_file()
         || !root.join("Cargo.lock").is_file()
@@ -111,8 +119,9 @@ pub(super) fn validate_plugin_source(path: &Path) -> Result<(), BuildPipelineErr
             .to_string_lossy()
             .ends_with("plugins/kurbis-control/Cargo.toml")
     {
-        return Err(BuildPipelineError::Sandbox(
-            "trusted plugin source must be the checked-in plugins/kurbis-control package".into(),
+        return Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Compiling,
+            "trusted plugin source must be the checked-in plugins/kurbis-control package",
         ));
     }
     Ok(())
@@ -120,11 +129,17 @@ pub(super) fn validate_plugin_source(path: &Path) -> Result<(), BuildPipelineErr
 
 pub(super) fn plugin_build_context(source: &Path) -> Result<tempfile::TempDir, BuildPipelineError> {
     let source = fs::canonicalize(source).map_err(|error| {
-        BuildPipelineError::Compile(format!("resolve trusted plugin source: {error}"))
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!("resolve trusted plugin source: {error}"),
+        )
     })?;
     validate_plugin_source(&source)?;
     let context = super::super::private_tempdir("kurbis-ci-plugin-").map_err(|error| {
-        BuildPipelineError::Compile(format!("create plugin build context: {error}"))
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!("create plugin build context: {error}"),
+        )
     })?;
     let mut total = 0u64;
     for name in ["Cargo.toml", "Cargo.lock", "src", "build.rs"] {
@@ -135,8 +150,9 @@ pub(super) fn plugin_build_context(source: &Path) -> Result<tempfile::TempDir, B
         copy_trusted_tree(&from, &context.path().join(name), &mut total)?;
     }
     if total > MAX_PLUGIN_SOURCE_BYTES {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin source exceeds its size limit".into(),
+        return Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Compiling,
+            "trusted plugin source exceeds its size limit",
         ));
     }
     Ok(context)
@@ -148,43 +164,66 @@ pub(super) fn copy_trusted_tree(
     total: &mut u64,
 ) -> Result<(), BuildPipelineError> {
     let metadata = fs::symlink_metadata(from).map_err(|error| {
-        BuildPipelineError::Compile(format!("inspect plugin build input: {error}"))
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!("inspect plugin build input: {error}"),
+        )
     })?;
     if metadata.file_type().is_symlink() {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin build input contains a symlink".into(),
+        return Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Compiling,
+            "trusted plugin build input contains a symlink",
         ));
     }
     if metadata.is_dir() {
         fs::create_dir_all(to).map_err(|error| {
-            BuildPipelineError::Compile(format!("copy plugin directory: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Compiling,
+                format!("copy plugin directory: {error}"),
+            )
         })?;
         for entry in fs::read_dir(from).map_err(|error| {
-            BuildPipelineError::Compile(format!("read plugin directory: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Compiling,
+                format!("read plugin directory: {error}"),
+            )
         })? {
-            let entry = entry.map_err(|error| BuildPipelineError::Compile(error.to_string()))?;
+            let entry = entry.map_err(|error| {
+                BuildPipelineError::transient(crate::ci::CiBuildStage::Compiling, error.to_string())
+            })?;
             copy_trusted_tree(&entry.path(), &to.join(entry.file_name()), total)?;
         }
     } else if metadata.is_file() {
         *total = total.checked_add(metadata.len()).ok_or_else(|| {
-            BuildPipelineError::Compile("trusted plugin source size overflow".into())
+            BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "trusted plugin source size overflow",
+            )
         })?;
         if *total > MAX_PLUGIN_SOURCE_BYTES {
-            return Err(BuildPipelineError::Compile(
-                "trusted plugin source exceeds its size limit".into(),
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Compiling,
+                "trusted plugin source exceeds its size limit",
             ));
         }
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                BuildPipelineError::Compile(format!("create plugin directory: {error}"))
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("create plugin directory: {error}"),
+                )
             })?;
         }
         fs::copy(from, to).map_err(|error| {
-            BuildPipelineError::Compile(format!("copy trusted plugin file: {error}"))
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Compiling,
+                format!("copy trusted plugin file: {error}"),
+            )
         })?;
     } else {
-        return Err(BuildPipelineError::Compile(
-            "trusted plugin build input contains a special file".into(),
+        return Err(BuildPipelineError::permanent(
+            crate::ci::CiBuildStage::Compiling,
+            "trusted plugin build input contains a special file",
         ));
     }
     Ok(())

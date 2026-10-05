@@ -1338,7 +1338,7 @@ async fn pr_updates_build_only_requested_heads_and_late_events_never_roll_back_a
 }
 
 #[tokio::test]
-async fn arbitrary_full_commit_alias_is_created_and_built_only_after_join_admission() {
+async fn on_demand_full_commit_retries_only_due_transient_failures() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     use kurbis_hoster::ci::{CiBuildIdentity, ControlledBuildPipeline, SandboxLimits};
     use kurbis_hoster::control_plane::api::router;
@@ -1351,33 +1351,38 @@ async fn arbitrary_full_commit_alias_is_created_and_built_only_after_join_admiss
         .register_repository("kurbis-host/Pumpkin", "main")
         .await
         .unwrap();
-    let requested_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
-    let key = BuildKey::new(
+
+    let transient_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
+    let transient_key = BuildKey::new(
         "kurbis-host/Pumpkin",
-        &requested_sha,
+        &transient_sha,
         "patch-v1",
         "test-toolchain",
         "x86_64-linux",
     )
     .unwrap();
-    let before: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ci_builds WHERE repository=$1 AND commit_sha=$2")
-            .bind(&key.repository)
-            .bind(&key.commit_sha)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     assert_eq!(
-        before, 0,
-        "arbitrary valid commit hostnames are not eagerly compiled"
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM ci_builds WHERE repository=$1 AND commit_sha=$2"
+        )
+        .bind(&transient_key.repository)
+        .bind(&transient_key.commit_sha)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "arbitrary full commit aliases are not eagerly built",
     );
 
     let fetches = Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = Arc::new(PullRequestFixtureSource {
         fetches: fetches.clone(),
-        head_sha: Arc::new(std::sync::RwLock::new(requested_sha.to_owned())),
+        head_sha: Arc::new(std::sync::RwLock::new(transient_sha.clone())),
     });
     let components = Arc::new(TestBuildComponents::default());
+    components
+        .transient_compile_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     let builder = Arc::new(ControlledBuildPipeline::new(
         repository.clone(),
         source,
@@ -1406,59 +1411,205 @@ async fn arbitrary_full_commit_alias_is_created_and_built_only_after_join_admiss
         target_architecture: "x86_64-linux".into(),
     });
     let app = router(state);
-    let hostname = CiHostname::for_ref(
+    let transient_host = CiHostname::for_ref(
         CiRefKind::Commit,
-        &requested_sha,
+        &transient_sha,
         kurbis_hoster::ci::CI_ROOT_DOMAIN,
     )
-    .unwrap();
-    let admission = || {
+    .unwrap()
+    .value;
+    let admission = |hostname: &str| {
         Request::builder()
             .method("POST")
             .uri("/internal/ci/previews/admit")
             .header("authorization", "Bearer on-demand-ci-internal-token")
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({"hostname": hostname.value}).to_string(),
+                serde_json::json!({"hostname": hostname}).to_string(),
             ))
             .unwrap()
     };
+
     assert_eq!(
-        app.clone().oneshot(admission()).await.unwrap().status(),
+        app.clone()
+            .oneshot(admission(&transient_host))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::ACCEPTED
     );
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let failed_transient = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let build = repository.ensure_build(&key).await.unwrap().0;
-            if matches!(build.stage, CiBuildStage::Ready | CiBuildStage::Failed) {
+            let build = repository.ensure_build(&transient_key).await.unwrap().0;
+            if build.stage == CiBuildStage::Failed {
                 break build;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("on-demand build completes");
-    assert_eq!(ready.stage, CiBuildStage::Ready);
-    assert_eq!(
-        components
-            .compile_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
+    .expect("transient on-demand build failure persists");
+    let (failure_class, retry_count, retry_is_future): (String, i32, bool) = sqlx::query_as(
+        "SELECT failure_class, retry_count, retry_at > now() FROM ci_builds WHERE id=$1",
+    )
+    .bind(failed_transient.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_class, "transient");
+    assert_eq!(retry_count, 1);
+    assert!(retry_is_future);
+    assert!(
+        !repository
+            .is_build_retry_due(failed_transient.id)
+            .await
+            .unwrap()
     );
-    assert_eq!(
-        fetches.lock().unwrap().as_slice(),
-        &[("kurbis-host/Pumpkin".into(), requested_sha)]
-    );
-    assert_eq!(
-        app.oneshot(admission()).await.unwrap().status(),
-        StatusCode::ACCEPTED
-    );
+
+    // Demand before the durable deadline must not rerun the exact same key.
+    let _ = app
+        .clone()
+        .oneshot(admission(&transient_host))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         components
             .compile_calls
             .load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "repeated demand for an immutable SHA reuses the cache"
+        "an on-demand full-SHA hit cannot bypass backoff",
+    );
+
+    sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+        .bind(failed_transient.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .is_build_retry_due(failed_transient.id)
+            .await
+            .unwrap()
+    );
+    let _ = app
+        .clone()
+        .oneshot(admission(&transient_host))
+        .await
+        .unwrap();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let build = repository.ensure_build(&transient_key).await.unwrap().0;
+            let retry_count: i32 =
+                sqlx::query_scalar("SELECT retry_count FROM ci_builds WHERE id=$1")
+                    .bind(build.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if build.stage == CiBuildStage::Ready
+                || (build.stage == CiBuildStage::Failed && retry_count > 1)
+            {
+                break build;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("due on-demand retry completes");
+    assert_eq!(ready.stage, CiBuildStage::Ready);
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "due transient retry resumes the same immutable build key exactly once",
+    );
+    let _ = app
+        .clone()
+        .oneshot(admission(&transient_host))
+        .await
+        .unwrap();
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "ready immutable build hits remain cached",
+    );
+
+    // A permanent failed key remains terminal even if an operator or test
+    // manually moves retry_at into the past.
+    let permanent_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
+    let permanent_key = BuildKey::new(
+        "kurbis-host/Pumpkin",
+        &permanent_sha,
+        "patch-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let permanent_host = CiHostname::for_ref(
+        CiRefKind::Commit,
+        &permanent_sha,
+        kurbis_hoster::ci::CI_ROOT_DOMAIN,
+    )
+    .unwrap()
+    .value;
+    components
+        .permanent_compile_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = app
+        .clone()
+        .oneshot(admission(&permanent_host))
+        .await
+        .unwrap();
+    let failed_permanent = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let build = repository.ensure_build(&permanent_key).await.unwrap().0;
+            if build.stage == CiBuildStage::Failed {
+                break build;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("permanent on-demand failure persists");
+    sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+        .bind(failed_permanent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !repository
+            .is_build_retry_due(failed_permanent.id)
+            .await
+            .unwrap()
+    );
+    let _ = app.oneshot(admission(&permanent_host)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "permanent failure is never auto-retried by repeated full-SHA demand",
+    );
+    let (failure_class, retry_count): (String, i32) =
+        sqlx::query_as("SELECT failure_class, retry_count FROM ci_builds WHERE id=$1")
+            .bind(failed_permanent.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failure_class, "permanent");
+    assert_eq!(retry_count, 0);
+
+    assert_eq!(
+        fetches.lock().unwrap().as_slice(),
+        &[
+            ("kurbis-host/Pumpkin".into(), transient_sha.clone()),
+            ("kurbis-host/Pumpkin".into(), transient_sha),
+            ("kurbis-host/Pumpkin".into(), permanent_sha),
+        ],
     );
     pool.close().await;
 }
@@ -1525,6 +1676,7 @@ async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_a
     assert_eq!(failure_class, "transient");
     assert_eq!(retry_count, 1);
     assert!(retry_is_future);
+    assert!(!repository.is_build_retry_due(build.id).await.unwrap());
     assert!(
         repository
             .due_pull_request_build_retries(&repository_name)
@@ -1553,6 +1705,7 @@ async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_a
         .execute(&pool)
         .await
         .unwrap();
+    assert!(repository.is_build_retry_due(build.id).await.unwrap());
     let due = repository
         .due_pull_request_build_retries(&repository_name)
         .await
@@ -1701,11 +1854,100 @@ async fn permanent_build_validation_failure_never_becomes_a_retry_candidate() {
             .unwrap()
             .is_empty()
     );
+    assert!(!repository.is_build_retry_due(build.id).await.unwrap());
+    assert!(!repository.is_build_retry_due(build.id).await.unwrap());
+    let expired_permanent = repository.ensure_build(&key).await.unwrap().0;
+    assert_eq!(expired_permanent.stage, CiBuildStage::Failed);
+    sqlx::query("UPDATE ci_builds SET expires_at=now() - interval '1 second' WHERE id=$1")
+        .bind(build.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.ensure_build(&key).await.unwrap().0.stage,
+        CiBuildStage::Failed
+    );
     assert!(
         !repository
             .claim_build(build.id, Uuid::new_v4(), chrono::Duration::minutes(5))
             .await
             .unwrap()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn exhausted_transient_retry_budget_stays_terminal_after_build_expiry() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let key = BuildKey::new(
+        format!("kurbis-host/Pumpkin-{}", Uuid::new_v4()),
+        "89abcdef0123456789abcdef0123456789abcdef",
+        "patch-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let (build, _) = repository.ensure_build(&key).await.unwrap();
+
+    for attempt in 0..=kurbis_hoster::ci::CI_BUILD_MAX_RETRIES {
+        if attempt > 0 {
+            sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+                .bind(build.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let lease = Uuid::new_v4();
+        assert!(
+            repository
+                .claim_build(build.id, lease, chrono::Duration::minutes(5))
+                .await
+                .unwrap(),
+            "attempt {attempt} is within the bounded retry budget",
+        );
+        assert!(
+            repository
+                .fail_claimed_build_with_class(
+                    build.id,
+                    lease,
+                    CiBuildStage::Compiling,
+                    "temporary host storage failure",
+                    kurbis_hoster::ci::CiBuildFailureClass::Transient,
+                )
+                .await
+                .unwrap()
+        );
+        repository.release_build(build.id, lease).await.unwrap();
+    }
+
+    let (stage, retry_count, retry_at): (String, i32, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT stage, retry_count, retry_at FROM ci_builds WHERE id=$1")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage, "failed");
+    assert_eq!(retry_count, kurbis_hoster::ci::CI_BUILD_MAX_RETRIES + 1);
+    assert!(retry_at.is_none());
+    assert!(!repository.is_build_retry_due(build.id).await.unwrap());
+
+    sqlx::query("UPDATE ci_builds SET expires_at=now() - interval '1 second' WHERE id=$1")
+        .bind(build.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.ensure_build(&key).await.unwrap().0.stage,
+        CiBuildStage::Failed
+    );
+    assert!(
+        !repository
+            .claim_build(build.id, Uuid::new_v4(), chrono::Duration::minutes(5))
+            .await
+            .unwrap(),
+        "build TTL expiry cannot reset the deduplicated retry budget",
     );
     pool.close().await;
 }
