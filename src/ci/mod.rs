@@ -10,9 +10,10 @@ pub mod services;
 pub mod source_control;
 
 pub use domain::{
-    BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CiBuild, CiBuildStage, CiHostname, CiPreview,
-    CiPreviewState, CiPublicPreviewStatus, CiRefKind, InvalidCiValue, POLL_INTERVAL_SECONDS,
-    normalize_root_domain, parse_pr_number, slugify_branch, validate_commit_sha,
+    BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CiBuild, CiBuildFailureClass, CiBuildStage,
+    CiHostname, CiPreview, CiPreviewState, CiPublicPreviewStatus, CiRefKind, InvalidCiValue,
+    POLL_INTERVAL_SECONDS, normalize_root_domain, parse_pr_number, slugify_branch,
+    validate_commit_sha,
 };
 pub use execution::{
     CheckedInPumpkinPatcher, DockerRootlessBuildRuntime, GitHubExactSource,
@@ -31,8 +32,8 @@ pub use checks::{
 pub use execution::{BuildProcessReport, RootlessBuildRuntime};
 pub use poller::{CiPoller, CiPollerConfig};
 pub use repository::{
-    CheckRunReconciliation, CiGitHubPrDelivery, CiGitHubPrDeliveryResult, CiPreviewRepository,
-    CiRefRecord, ClaimedCiGitHubPrDelivery, WatchedRepository,
+    CI_BUILD_MAX_RETRIES, CheckRunReconciliation, CiGitHubPrDelivery, CiGitHubPrDeliveryResult,
+    CiPreviewRepository, CiRefRecord, ClaimedCiGitHubPrDelivery, WatchedRepository,
 };
 pub use runtime::{
     CI_RUNTIME_CPU_MILLIS, CI_RUNTIME_DISK_BYTES, CI_RUNTIME_IDLE_SECONDS, CI_RUNTIME_MEMORY_BYTES,

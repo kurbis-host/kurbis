@@ -1462,3 +1462,250 @@ async fn arbitrary_full_commit_alias_is_created_and_built_only_after_join_admiss
     );
     pool.close().await;
 }
+
+#[tokio::test]
+async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_and_lease_fencing() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let key = BuildKey::new(
+        &repository_name,
+        "fedcba9876543210fedcba9876543210fedcba98",
+        "patch-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let (build, inserted) = repository.ensure_build(&key).await.unwrap();
+    assert!(inserted);
+    sqlx::query(
+        "INSERT INTO ci_refs(repository_id,kind,name,number,source_repository,commit_sha)\n         VALUES($1,'pull_request','pr-314',314,'contributor/Pumpkin',$2)",
+    )
+    .bind(watched.id)
+    .bind(&key.commit_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let initial_lease = Uuid::new_v4();
+    assert!(
+        repository
+            .claim_build(build.id, initial_lease, chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .fail_claimed_build_with_class(
+                build.id,
+                initial_lease,
+                CiBuildStage::Packaging,
+                "temporary artifact object-store outage",
+                kurbis_hoster::ci::CiBuildFailureClass::Transient,
+            )
+            .await
+            .unwrap()
+    );
+    repository
+        .release_build(build.id, initial_lease)
+        .await
+        .unwrap();
+    let (failure_class, retry_count, retry_is_future): (String, i32, bool) = sqlx::query_as(
+        "SELECT failure_class, retry_count, retry_at > now() FROM ci_builds WHERE id=$1",
+    )
+    .bind(build.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_class, "transient");
+    assert_eq!(retry_count, 1);
+    assert!(retry_is_future);
+    assert!(
+        repository
+            .due_pull_request_build_retries(&repository_name)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let (cached, inserted_again) = repository.ensure_build(&key).await.unwrap();
+    assert_eq!(
+        cached.id, build.id,
+        "the exact immutable build key is reused"
+    );
+    assert!(!inserted_again);
+    assert_eq!(cached.stage, CiBuildStage::Failed);
+    assert!(
+        !repository
+            .claim_build(build.id, Uuid::new_v4(), chrono::Duration::minutes(5))
+            .await
+            .unwrap(),
+        "a failed build cannot retry before its durable retry_at"
+    );
+
+    sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+        .bind(build.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let due = repository
+        .due_pull_request_build_retries(&repository_name)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].key, key);
+    assert_eq!(
+        due[0].source_repository.as_deref(),
+        Some("contributor/Pumpkin")
+    );
+
+    let stale_lease = Uuid::new_v4();
+    assert!(
+        repository
+            .claim_build(build.id, stale_lease, chrono::Duration::minutes(5))
+            .await
+            .unwrap(),
+        "the immutable build becomes claimable when its backoff expires"
+    );
+    sqlx::query("UPDATE ci_builds SET lease_expires_at=now() - interval '1 second' WHERE id=$1")
+        .bind(build.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let active_lease = Uuid::new_v4();
+    assert!(
+        repository
+            .claim_build(build.id, active_lease, chrono::Duration::minutes(5))
+            .await
+            .unwrap(),
+        "a replacement worker may recover the expired retry lease"
+    );
+    assert!(
+        !repository
+            .fail_claimed_build_with_class(
+                build.id,
+                stale_lease,
+                CiBuildStage::Packaging,
+                "late stale worker failure",
+                kurbis_hoster::ci::CiBuildFailureClass::Transient,
+            )
+            .await
+            .unwrap(),
+        "stale workers cannot overwrite retry state or consume retry budget"
+    );
+
+    let contender_a = Uuid::new_v4();
+    let contender_b = Uuid::new_v4();
+    let (claimed_a, claimed_b) = tokio::join!(
+        repository.claim_build(build.id, contender_a, chrono::Duration::minutes(5)),
+        repository.claim_build(build.id, contender_b, chrono::Duration::minutes(5)),
+    );
+    assert!(!claimed_a.unwrap() && !claimed_b.unwrap());
+    let (stage, lease, retry_count): (String, Uuid, i32) =
+        sqlx::query_as("SELECT stage, lease_token, retry_count FROM ci_builds WHERE id=$1")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage, "queued");
+    assert_eq!(lease, active_lease);
+    assert_eq!(retry_count, 1);
+
+    // The existing Check Run's failed conclusion is reconciled back to active
+    // progress when the retry actually starts, even if the eager poll is gone.
+    repository
+        .transition_claimed_build(build.id, active_lease, CiBuildStage::Fetching)
+        .await
+        .unwrap();
+    let check_run_id = i64::try_from(Uuid::new_v4().as_u128() & i64::MAX as u128).unwrap();
+    repository
+        .record_check_run(build.id, Some(check_run_id), None, CiBuildStage::Failed)
+        .await
+        .unwrap();
+    repository
+        .record_check_run(build.id, Some(check_run_id), None, CiBuildStage::Fetching)
+        .await
+        .unwrap();
+    let candidates = repository
+        .check_run_reconciliation_candidates(8)
+        .await
+        .unwrap();
+    assert!(
+        candidates.is_empty(),
+        "successful active Check Run sync is durable"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn permanent_build_validation_failure_never_becomes_a_retry_candidate() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let key = BuildKey::new(
+        &repository_name,
+        "0123456789abcdef0123456789abcdef01234567",
+        "patch-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let (build, _) = repository.ensure_build(&key).await.unwrap();
+    sqlx::query(
+        "INSERT INTO ci_refs(repository_id,kind,name,number,source_repository,commit_sha)\n         VALUES($1,'pull_request','pr-314',314,'contributor/Pumpkin',$2)",
+    )
+    .bind(watched.id)
+    .bind(&key.commit_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let lease = Uuid::new_v4();
+    assert!(
+        repository
+            .claim_build(build.id, lease, chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .fail_claimed_build_with_class(
+                build.id,
+                lease,
+                CiBuildStage::Patching,
+                "checked-in patch no longer applies to this commit",
+                kurbis_hoster::ci::CiBuildFailureClass::Permanent,
+            )
+            .await
+            .unwrap()
+    );
+    repository.release_build(build.id, lease).await.unwrap();
+    sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+        .bind(build.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .due_pull_request_build_retries(&repository_name)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !repository
+            .claim_build(build.id, Uuid::new_v4(), chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+    );
+    pool.close().await;
+}

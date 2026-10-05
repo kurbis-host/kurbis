@@ -5,8 +5,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::domain::{
-    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildStage, CiHostname, CiPreview, CiPreviewState,
-    CiRefKind, validate_commit_sha,
+    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildFailureClass, CiBuildStage, CiHostname, CiPreview,
+    CiPreviewState, CiRefKind, validate_commit_sha,
 };
 
 mod github_webhook;
@@ -14,6 +14,11 @@ mod polling;
 mod rows;
 pub use github_webhook::{CiGitHubPrDelivery, CiGitHubPrDeliveryResult, ClaimedCiGitHubPrDelivery};
 use rows::*;
+
+/// A failed immutable build key may be retried a small number of times. The
+/// retry budget lives on the deduplicated build row, so every poller and API
+/// replica observes the same backoff rather than creating a new build.
+pub const CI_BUILD_MAX_RETRIES: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct WatchedRepository {
@@ -102,7 +107,8 @@ impl CiPreviewRepository {
         let row = if stale_success || elapsed && row.stage != "queued" {
             sqlx::query_as::<_, CiBuildRow>(
                 "UPDATE ci_builds SET stage = 'queued', artifact_digest = NULL,
-                    failure_stage = NULL, failure_message = NULL, expires_at = now() + interval '72 hours',
+                    failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
+                    expires_at = now() + interval '72 hours',
                     lease_token = NULL, lease_expires_at = NULL, updated_at = now()
                  WHERE id = $1 AND (lease_expires_at IS NULL OR lease_expires_at <= now())
                  RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -120,6 +126,60 @@ impl CiPreviewRepository {
         Ok((row.try_into()?, inserted))
     }
 
+    /// Return only durable, due retries for current open PR heads. This is
+    /// intentionally separate from eagerly observed GitHub changes: unchanged
+    /// refs can become due after their original Check Run failure without
+    /// making every poll rebuild all queued PRs.
+    pub async fn due_pull_request_build_retries(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<super::services::BuildRequest>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
+            "SELECT build.repository, build.commit_sha, build.patch_fingerprint,
+                    build.toolchain_version, build.target_architecture,
+                    COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository
+             FROM ci_builds build
+             JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
+             JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
+             WHERE build.repository = $1 AND watched.repository = build.repository
+               AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
+               AND build.stage = 'failed' AND build.failure_class = 'transient'
+               AND build.retry_count <= $2 AND build.retry_at <= now()
+               AND build.expires_at > now()
+             GROUP BY build.id
+             ORDER BY min(build.retry_at), build.id
+             LIMIT 128",
+        )
+        .bind(repository)
+        .bind(CI_BUILD_MAX_RETRIES)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    repository,
+                    commit_sha,
+                    patch_fingerprint,
+                    toolchain_version,
+                    target_architecture,
+                    source_repository,
+                )| {
+                    Ok(super::services::BuildRequest {
+                        key: BuildKey::new(
+                            repository,
+                            commit_sha,
+                            patch_fingerprint,
+                            toolchain_version,
+                            target_architecture,
+                        )?,
+                        source_repository,
+                        source_archive: Vec::new(),
+                    })
+                },
+            )
+            .collect()
+    }
+
     pub async fn claim_build(
         &self,
         build_id: Uuid,
@@ -131,13 +191,20 @@ impl CiPreviewRepository {
         }
         let result = sqlx::query(
             "UPDATE ci_builds SET stage = 'queued', lease_token = $2, lease_expires_at = now() + $3::interval,
-                 failure_stage = NULL, failure_message = NULL, artifact_digest = NULL, updated_at = now()
-             WHERE id = $1 AND stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
-               AND (lease_expires_at IS NULL OR lease_expires_at <= now())",
+                 failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
+                 updated_at = now()
+             WHERE id = $1
+               AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+               AND (
+                    stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
+                    OR (stage = 'failed' AND failure_class = 'transient'
+                        AND retry_count <= $4 AND retry_at IS NOT NULL AND retry_at <= now())
+               )",
         )
         .bind(build_id)
         .bind(lease)
         .bind(format!("{} seconds", lease_duration.num_seconds()))
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -194,6 +261,8 @@ impl CiPreviewRepository {
         let row: CiBuildRow = sqlx::query_as(
             "UPDATE ci_builds SET stage = $2, failure_stage = CASE WHEN $2 = 'failed' THEN $2 ELSE failure_stage END,
                     failure_message = CASE WHEN $2 = 'failed' THEN $3 ELSE failure_message END,
+                    failure_class = CASE WHEN $2 = 'failed' THEN 'permanent' ELSE failure_class END,
+                    retry_at = CASE WHEN $2 = 'failed' THEN NULL ELSE retry_at END,
                     expires_at = CASE WHEN $2 = 'ready' THEN now() + interval '72 hours' ELSE expires_at END,
                     updated_at = now() WHERE id = $1
              RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -254,14 +323,44 @@ impl CiPreviewRepository {
         failure_stage: CiBuildStage,
         message: &str,
     ) -> Result<()> {
+        self.fail_build_with_class(
+            build_id,
+            failure_stage,
+            message,
+            CiBuildFailureClass::Permanent,
+        )
+        .await
+    }
+
+    pub async fn fail_build_with_class(
+        &self,
+        build_id: Uuid,
+        failure_stage: CiBuildStage,
+        message: &str,
+        failure_class: CiBuildFailureClass,
+    ) -> Result<()> {
+        let failure_class = failure_class.to_string();
         sqlx::query(
             "UPDATE ci_builds SET stage = 'failed', failure_stage = $2, failure_message = $3,
+                    failure_class = $4,
+                    retry_count = CASE WHEN $4 = 'transient' THEN retry_count + 1 ELSE retry_count END,
+                    retry_at = CASE
+                        WHEN $4 = 'transient' AND retry_count < $5 THEN
+                            now() + CASE retry_count
+                                WHEN 0 THEN interval '1 minute'
+                                WHEN 1 THEN interval '2 minutes'
+                                ELSE interval '4 minutes'
+                            END
+                        ELSE NULL
+                    END,
                     lease_token = NULL, lease_expires_at = NULL, updated_at = now()
              WHERE id = $1 AND stage NOT IN ('ready', 'expired')",
         )
         .bind(build_id)
         .bind(failure_stage.to_string())
         .bind(message.chars().take(8192).collect::<String>())
+        .bind(failure_class)
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -274,15 +373,48 @@ impl CiPreviewRepository {
         failure_stage: CiBuildStage,
         message: &str,
     ) -> Result<bool> {
+        self.fail_claimed_build_with_class(
+            build_id,
+            lease,
+            failure_stage,
+            message,
+            CiBuildFailureClass::Permanent,
+        )
+        .await
+    }
+
+    pub async fn fail_claimed_build_with_class(
+        &self,
+        build_id: Uuid,
+        lease: Uuid,
+        failure_stage: CiBuildStage,
+        message: &str,
+        failure_class: CiBuildFailureClass,
+    ) -> Result<bool> {
+        let failure_class = failure_class.to_string();
         let rows = sqlx::query(
             "UPDATE ci_builds SET stage = 'failed', failure_stage = $3, failure_message = $4,
+                    failure_class = $5,
+                    retry_count = CASE WHEN $5 = 'transient' THEN retry_count + 1 ELSE retry_count END,
+                    retry_at = CASE
+                        WHEN $5 = 'transient' AND retry_count < $6 THEN
+                            now() + CASE retry_count
+                                WHEN 0 THEN interval '1 minute'
+                                WHEN 1 THEN interval '2 minutes'
+                                ELSE interval '4 minutes'
+                            END
+                        ELSE NULL
+                    END,
                     updated_at = now()
-             WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now() AND stage NOT IN ('ready', 'expired')",
+             WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now()
+               AND stage NOT IN ('ready', 'expired')",
         )
         .bind(build_id)
         .bind(lease)
         .bind(failure_stage.to_string())
         .bind(message.chars().take(8192).collect::<String>())
+        .bind(failure_class)
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?
         .rows_affected();

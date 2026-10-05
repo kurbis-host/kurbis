@@ -18,11 +18,22 @@ use std::{
 };
 use tower::ServiceExt;
 
-#[derive(Default)]
 struct RecordingPreviewHost {
     events: Mutex<Vec<String>>,
     worlds: Mutex<HashSet<Uuid>>,
     capabilities: Mutex<Vec<String>>,
+    runtimes: CiPreviewRuntimeRepository,
+}
+
+impl RecordingPreviewHost {
+    fn new(runtimes: CiPreviewRuntimeRepository) -> Self {
+        Self {
+            events: Mutex::default(),
+            worlds: Mutex::default(),
+            capabilities: Mutex::default(),
+            runtimes,
+        }
+    }
 }
 
 #[async_trait]
@@ -39,6 +50,32 @@ impl CiPreviewRuntimeHost for RecordingPreviewHost {
     ) -> anyhow::Result<()> {
         assert_eq!(capability.preview_id(), placement.preview_id);
         assert_eq!(capability.generation(), placement.generation);
+        if !placement.world_initialized {
+            let bytes = b"recording-host-bootstrap-checkpoint";
+            self.runtimes
+                .mark_world_initialized(
+                    placement.preview_id,
+                    placement.worker_id,
+                    placement.generation,
+                    placement.lease_token,
+                )
+                .await?;
+            self.runtimes
+                .publish_world_snapshot(
+                    placement.preview_id,
+                    placement.worker_id,
+                    placement.generation,
+                    placement.lease_token,
+                    &format!(
+                        "ci-previews/{}/worlds/recording-host-{}.tar.gz",
+                        placement.preview_id,
+                        Uuid::new_v4()
+                    ),
+                    bytes.len() as i64,
+                    &blake3::hash(bytes).to_hex(),
+                )
+                .await?;
+        }
         self.worlds.lock().unwrap().insert(placement.preview_id);
         self.capabilities
             .lock()
@@ -127,6 +164,10 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
         .await
         .unwrap();
 
+    sqlx::query("UPDATE workers SET draining=true WHERE supports_ci_previews")
+        .execute(&pool)
+        .await
+        .unwrap();
     let worker_id = Uuid::new_v4();
     let worker_token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let worker_lease = Uuid::new_v4();
@@ -153,7 +194,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     .await
     .unwrap();
 
-    let host = Arc::new(RecordingPreviewHost::default());
+    let host = Arc::new(RecordingPreviewHost::new(runtimes.clone()));
     let coordinator =
         CiPreviewRuntimeCoordinator::new(previews.clone(), runtimes.clone(), host.clone());
     assert_eq!(
@@ -1105,7 +1146,7 @@ async fn worker_json_request(
 }
 
 #[tokio::test]
-async fn stale_first_generation_may_cold_start_but_initialized_world_without_checkpoint_stays_fenced()
+async fn stale_first_generation_may_cold_start_and_partial_bootstrap_rehomes_but_initialized_world_without_checkpoint_stays_fenced()
  {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
@@ -1306,18 +1347,27 @@ async fn stale_first_generation_may_cold_start_but_initialized_world_without_che
     )
     .await;
     assert_eq!(initialized.status(), StatusCode::NO_CONTENT);
-    assert!(
-        runtimes
-            .current(preview.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .world_initialized
-    );
-    // Once the worker has crossed the mutation boundary but before its first
-    // uploaded checkpoint, loss must block rehome rather than cold-start.
+    let after_barrier = runtimes.current(preview.id).await.unwrap().unwrap();
+    assert!(!after_barrier.world_initialized);
+    let bootstrap_pending: bool = sqlx::query_scalar(
+        "SELECT bootstrap_pending FROM ci_runtime_placements WHERE preview_id=$1",
+    )
+    .bind(preview.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(bootstrap_pending);
+
+    // A partial, never-visible bootstrap is safe to discard on the next player
+    // join. Maintenance does not auto-start it, but an available worker may
+    // receive a fresh generation and cold-start without losing player data.
     sqlx::query("UPDATE workers SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1")
         .bind(bootstrap_worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET heartbeat_at=now()+interval '5 minutes' WHERE id=$1")
+        .bind(replacement_worker)
         .execute(&pool)
         .await
         .unwrap();
@@ -1325,25 +1375,39 @@ async fn stale_first_generation_may_cold_start_but_initialized_world_without_che
         .claim_start(preview.id, &[12_u8; 32])
         .await
         .unwrap();
-    assert_eq!(
-        bootstrap_incomplete_recovery,
-        kurbis_hoster::ci::RuntimeLease::NoWorker
-    );
-    assert_eq!(runtimes.reconcile_stale_workers(16).await.unwrap(), 0);
-    assert_eq!(
-        runtimes
-            .current(preview.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .worker_id,
-        bootstrap_worker
-    );
-    sqlx::query("UPDATE workers SET heartbeat_at=now()+interval '5 minutes' WHERE id=$1")
-        .bind(bootstrap_worker)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let kurbis_hoster::ci::RuntimeLease::Claimed(recovered) = bootstrap_incomplete_recovery else {
+        panic!("a player join should safely rehome a never-visible partial bootstrap");
+    };
+    assert_eq!(recovered.worker_id, replacement_worker);
+    assert_eq!(recovered.generation, replacement.generation + 1);
+    assert!(!recovered.world_initialized);
+    let replacement = recovered;
+    let bootstrap_worker = replacement.worker_id;
+    let bootstrap_worker_token = if bootstrap_worker == worker_one {
+        &worker_one_token
+    } else {
+        &worker_two_token
+    };
+    let bootstrap_worker_lease = if bootstrap_worker == worker_one {
+        worker_one_lease
+    } else {
+        worker_two_lease
+    };
+    let recovered_initialized = worker_json_request(
+        bootstrap_service.clone(),
+        &format!(
+            "/internal/worker/control/ci/runtimes/{}/world-initialized",
+            preview.id
+        ),
+        bootstrap_worker_token,
+        bootstrap_worker_lease,
+        serde_json::json!({
+            "generation": replacement.generation,
+            "lease_token": replacement.lease_token,
+        }),
+    )
+    .await;
+    assert_eq!(recovered_initialized.status(), StatusCode::NO_CONTENT);
 
     // The first ready Pumpkin generation must establish a shared bootstrap
     // point-in-time snapshot before the coordinator marks the runtime Running.
@@ -1410,7 +1474,7 @@ async fn stale_first_generation_may_cold_start_but_initialized_world_without_che
         .await
         .unwrap();
     sqlx::query("UPDATE workers SET heartbeat_at=now()+interval '5 minutes' WHERE id=$1")
-        .bind(replacement_worker)
+        .bind(initial_worker)
         .execute(&pool)
         .await
         .unwrap();
@@ -1431,7 +1495,7 @@ async fn stale_first_generation_may_cold_start_but_initialized_world_without_che
          FROM ci_port_leases WHERE preview_id=$1",
     )
     .bind(preview.id)
-    .bind(replacement_worker)
+    .bind(initial_worker)
     .fetch_one(&pool)
     .await
     .unwrap();

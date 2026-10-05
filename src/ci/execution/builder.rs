@@ -818,7 +818,10 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             .await
         {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Patch(error.to_string()));
+            return Err(BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: error.to_string(),
+            });
         }
         if let Err(error) = admission.assert_alive() {
             self.remove_container(&name).await;
@@ -826,14 +829,20 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
         }
         if let Err(error) = self.start_task_container(&name).await {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Patch(error.to_string()));
+            return Err(BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: error.to_string(),
+            });
         }
         if let Err(error) = self
             .copy_bytes_into(&name, "source.tar.gz", &source_archive)
             .await
         {
             self.remove_container(&name).await;
-            return Err(BuildPipelineError::Patch(error.to_string()));
+            return Err(BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: error.to_string(),
+            });
         }
         let result = self
             .run_task_container(&name, script, Duration::from_secs(15 * 60), &admission)
@@ -853,15 +862,22 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             }
             Err(error) => {
                 self.remove_container(&name).await;
-                return Err(BuildPipelineError::Patch(error.to_string()));
+                return Err(BuildPipelineError::Infrastructure {
+                    stage: crate::ci::CiBuildStage::Patching,
+                    message: error.to_string(),
+                });
             }
         };
         if let Err(error) = admission.assert_alive() {
             self.remove_container(&name).await;
             return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
-        let directory = super::private_tempdir("kurbis-ci-patched-source-")
-            .map_err(|error| BuildPipelineError::Patch(error.to_string()))?;
+        let directory = super::private_tempdir("kurbis-ci-patched-source-").map_err(|error| {
+            BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: error.to_string(),
+            }
+        })?;
         let output = directory.path().join("patched-source.tar.gz");
         let copied = self
             .copy_from_container(
@@ -872,7 +888,10 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             )
             .await;
         self.remove_container(&name).await;
-        copied.map_err(|error| BuildPipelineError::Patch(error.to_string()))?;
+        copied.map_err(|error| BuildPipelineError::Infrastructure {
+            stage: crate::ci::CiBuildStage::Patching,
+            message: error.to_string(),
+        })?;
         admission.release().await;
         let metadata = fs::symlink_metadata(&output).map_err(|error| {
             BuildPipelineError::Patch(format!("inspect patched source archive: {error}"))
@@ -887,8 +906,10 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             ));
         }
         let _ = (status, report);
-        fs::read(output)
-            .map_err(|error| BuildPipelineError::Patch(format!("read patched source: {error}")))
+        fs::read(output).map_err(|error| BuildPipelineError::Infrastructure {
+            stage: crate::ci::CiBuildStage::Patching,
+            message: format!("read patched source: {error}"),
+        })
     }
 }
 

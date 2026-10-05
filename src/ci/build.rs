@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use super::{
     ArtifactCache, BuildKey, BuildRequest, CheckRunClient, CheckRunDetails, CheckRunId, CiBuild,
-    CiBuildStage, CiPreviewRepository, CiServiceError, ControlledBuildOutput, SandboxLimits,
-    SourceControlClient, validate_workload_limits,
+    CiBuildFailureClass, CiBuildStage, CiPreviewRepository, CiServiceError, ControlledBuildOutput,
+    SandboxLimits, SourceControlClient, source_control::PollError, validate_workload_limits,
 };
 
 #[derive(Debug, Error)]
@@ -17,6 +17,11 @@ pub enum BuildPipelineError {
     Source(String),
     #[error("patch application failed: {0}")]
     Patch(String),
+    #[error("permanent build validation failed during {stage}: {message}")]
+    Validation {
+        stage: CiBuildStage,
+        message: String,
+    },
     #[error("controlled compilation failed: {0}")]
     Compile(String),
     #[error("artifact packaging failed: {0}")]
@@ -25,6 +30,40 @@ pub enum BuildPipelineError {
     Database(String),
     #[error("sandbox admission failed: {0}")]
     Sandbox(String),
+    #[error("transient infrastructure failure during {stage}: {message}")]
+    Infrastructure {
+        stage: CiBuildStage,
+        message: String,
+    },
+}
+
+impl BuildPipelineError {
+    fn failure_stage(&self) -> CiBuildStage {
+        match self {
+            Self::Source(_) => CiBuildStage::Fetching,
+            Self::Patch(_) => CiBuildStage::Patching,
+            Self::Validation { stage, .. } => *stage,
+            Self::Compile(_) => CiBuildStage::Compiling,
+            Self::Package(_) => CiBuildStage::Packaging,
+            Self::Infrastructure { stage, .. } => *stage,
+            Self::Sandbox(_) | Self::Database(_) => CiBuildStage::Queued,
+        }
+    }
+
+    fn failure_class(&self) -> CiBuildFailureClass {
+        match self {
+            // Patch conflicts, compiler diagnostics, and malformed artifacts are
+            // deterministic for this immutable key. Retrying them only burns
+            // the bounded retry budget and creates noisy Check Run churn.
+            Self::Patch(_) | Self::Validation { .. } | Self::Compile(_) | Self::Package(_) => {
+                CiBuildFailureClass::Permanent
+            }
+            Self::Source(_)
+            | Self::Database(_)
+            | Self::Sandbox(_)
+            | Self::Infrastructure { .. } => CiBuildFailureClass::Transient,
+        }
+    }
 }
 
 #[async_trait]
@@ -45,6 +84,26 @@ pub trait ControlledBuilder: Send + Sync {
         patched_source: Vec<u8>,
         key: &BuildKey,
     ) -> Result<ControlledBuildOutput, BuildPipelineError>;
+}
+
+fn source_fetch_error(error: PollError) -> BuildPipelineError {
+    let permanent = match &error {
+        PollError::InvalidResponse(_) => true,
+        PollError::Http { status, .. } => {
+            status.is_client_error()
+                && *status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && *status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        PollError::RateLimited { .. } | PollError::Transport(_) => false,
+    };
+    if permanent {
+        BuildPipelineError::Validation {
+            stage: CiBuildStage::Fetching,
+            message: error.to_string(),
+        }
+    } else {
+        BuildPipelineError::Source(error.to_string())
+    }
 }
 
 /// Build coordinator for exactly one immutable key. Every external source is
@@ -201,6 +260,7 @@ where
                 .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
             return Ok(build);
         }
+        let retrying_failed_build = build.stage == CiBuildStage::Failed;
         let lease = Uuid::new_v4();
         let lease_duration = chrono::Duration::from_std(
             self.limits.process_timeout + std::time::Duration::from_secs(10 * 60),
@@ -213,6 +273,18 @@ where
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?
         {
             return Ok(build);
+        }
+        if retrying_failed_build {
+            self.update_check_run(
+                build.id,
+                lease,
+                &request.key,
+                CiBuildStage::Queued,
+                None,
+                None,
+                None,
+            )
+            .await;
         }
         let heartbeat = self.start_lease_heartbeat(build.id, lease);
         let result = self.run_claimed(&request, build.id, lease).await;
@@ -281,7 +353,7 @@ where
                         &request.key.commit_sha,
                     )
                     .await
-                    .map_err(|e| BuildPipelineError::Source(e.to_string()))?
+                    .map_err(source_fetch_error)?
             } else {
                 request.source_archive.clone()
             };
@@ -403,7 +475,10 @@ where
                     Utc::now() + Duration::hours(72),
                 )
                 .await
-                .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
+                .map_err(|error| BuildPipelineError::Infrastructure {
+                    stage: CiBuildStage::Packaging,
+                    message: error.to_string(),
+                })?;
             if output.artifact_digest != digest || output.size_bytes != expected_size {
                 return Err(BuildPipelineError::Package(
                     "artifact cache returned mismatched digest or size".into(),
@@ -444,15 +519,8 @@ where
         match result {
             Ok(build) => Ok(build),
             Err(error) => {
-                let failure_stage = match &error {
-                    BuildPipelineError::Source(_) => CiBuildStage::Fetching,
-                    BuildPipelineError::Patch(_) => CiBuildStage::Patching,
-                    BuildPipelineError::Compile(_) => CiBuildStage::Compiling,
-                    BuildPipelineError::Package(_) => CiBuildStage::Packaging,
-                    BuildPipelineError::Sandbox(_) | BuildPipelineError::Database(_) => {
-                        CiBuildStage::Queued
-                    }
-                };
+                let failure_stage = error.failure_stage();
+                let failure_class = error.failure_class();
                 let failure_log = format!("stage {failure_stage} failed: {}\n", error);
                 let _ = self
                     .repository
@@ -460,7 +528,13 @@ where
                     .await;
                 match self
                     .repository
-                    .fail_claimed_build(build_id, lease, failure_stage, &error.to_string())
+                    .fail_claimed_build_with_class(
+                        build_id,
+                        lease,
+                        failure_stage,
+                        &error.to_string(),
+                        failure_class,
+                    )
                     .await
                 {
                     Ok(true) => {
@@ -534,5 +608,49 @@ mod tests {
             process_timeout: std::time::Duration::from_secs(3600),
         };
         assert!(limits.memory_bytes > 0 && limits.disk_bytes > 0);
+    }
+
+    #[test]
+    fn failure_classification_retries_only_infrastructure_failures() {
+        assert_eq!(
+            BuildPipelineError::Patch("patch conflict".into()).failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            BuildPipelineError::Package("malformed artifact".into()).failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            BuildPipelineError::Validation {
+                stage: CiBuildStage::Fetching,
+                message: "invalid source response".into(),
+            }
+            .failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            BuildPipelineError::Infrastructure {
+                stage: CiBuildStage::Packaging,
+                message: "object store unavailable".into(),
+            }
+            .failure_class(),
+            CiBuildFailureClass::Transient
+        );
+        assert_eq!(
+            source_fetch_error(PollError::Http {
+                status: reqwest::StatusCode::NOT_FOUND,
+                message: "commit missing".into(),
+            })
+            .failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            source_fetch_error(PollError::Http {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                message: "GitHub unavailable".into(),
+            })
+            .failure_class(),
+            CiBuildFailureClass::Transient
+        );
     }
 }

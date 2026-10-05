@@ -59,6 +59,40 @@ pub enum CiBuildStage {
     Expired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBuildFailureClass {
+    Transient,
+    Permanent,
+}
+
+impl CiBuildFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
+impl fmt::Display for CiBuildFailureClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CiBuildFailureClass {
+    type Err = InvalidCiValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "transient" => Ok(Self::Transient),
+            "permanent" => Ok(Self::Permanent),
+            _ => Err(InvalidCiValue::new("unknown CI build failure class")),
+        }
+    }
+}
+
 impl CiBuildStage {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Ready | Self::Failed | Self::Expired)

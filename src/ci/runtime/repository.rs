@@ -140,6 +140,10 @@ impl CiPreviewRuntimeRepository {
                 .bind(preview_id)
                 .fetch_one(&mut *tx)
                 .await?;
+                // A world is safe to discard only until it has a published
+                // checkpoint. mark_world_initialized records a generation-fenced
+                // bootstrap in progress; it must not make a partial, never-routable
+                // world look like durable player data.
                 let safe_cold_start = !world_initialized
                     && matches!(
                         existing.state,
@@ -202,7 +206,8 @@ impl CiPreviewRuntimeRepository {
                 lease_token = EXCLUDED.lease_token, java_port = EXCLUDED.java_port,
                 bedrock_port = EXCLUDED.bedrock_port, signal_port = EXCLUDED.signal_port,
                 state = 'starting', active = false, capacity_reserved = true, last_activity_at = now(),
-                snapshot_requested_at = NULL, capability_hash = EXCLUDED.capability_hash, updated_at = now()",
+                bootstrap_pending = false, snapshot_requested_at = NULL,
+                capability_hash = EXCLUDED.capability_hash, updated_at = now()",
         )
         .bind(preview_id)
         .bind(worker_id)
@@ -248,8 +253,11 @@ impl CiPreviewRuntimeRepository {
         generation: i64,
         lease_token: Uuid,
     ) -> Result<bool> {
+        // This callback is sent before Pumpkin can mutate the local volume. It
+        // opens a bootstrap snapshot slot; world_initialized remains false until
+        // a complete checkpoint has been durably published.
         let result = sqlx::query(
-            "UPDATE ci_runtime_placements SET world_initialized=true, updated_at=now()
+            "UPDATE ci_runtime_placements SET bootstrap_pending=true, updated_at=now()
              WHERE preview_id=$1 AND worker_id=$2 AND generation=$3 AND lease_token=$4
                AND state='starting' AND NOT active AND NOT world_initialized",
         )
@@ -273,16 +281,18 @@ impl CiPreviewRuntimeRepository {
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE ci_runtime_placements SET state = 'running', active = true, world_initialized = true,
+            "UPDATE ci_runtime_placements SET state = 'running', active = true,
                     last_activity_at = now(), updated_at = now()
              WHERE preview_id = $1 AND worker_id = $2 AND generation = $3
-               AND lease_token = $4 AND state = 'starting' AND EXISTS (
+               AND lease_token = $4 AND state = 'starting' AND NOT active
+               AND world_initialized AND EXISTS (
                     SELECT 1 FROM ci_preview_aliases alias
                     JOIN ci_builds build ON build.id = alias.build_id
                     JOIN ci_artifacts artifact ON artifact.digest = build.artifact_digest
                     WHERE alias.id = $1 AND alias.runtime_generation = $3
-                      AND alias.expires_at > now() AND build.expires_at > now()
-                      AND artifact.expires_at > now())",
+                      AND alias.state = 'booting' AND alias.expires_at > now()
+                      AND build.expires_at > now() AND artifact.expires_at > now())
+               AND NOT bootstrap_pending",
         )
         .bind(preview_id)
         .bind(worker_id)
@@ -293,14 +303,20 @@ impl CiPreviewRuntimeRepository {
         .rows_affected()
             == 1;
         if updated {
-            sqlx::query(
+            let alias_updated = sqlx::query(
                 "UPDATE ci_preview_aliases SET state = 'running', updated_at = now()
                  WHERE id = $1 AND runtime_generation = $2 AND state = 'booting'",
             )
             .bind(preview_id)
             .bind(generation)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+                == 1;
+            if !alias_updated {
+                tx.rollback().await?;
+                return Ok(false);
+            }
         }
         tx.commit().await?;
         Ok(updated)
@@ -1012,7 +1028,7 @@ impl CiPreviewRuntimeRepository {
                AND worker.heartbeat_at <= now()-interval '30 seconds'
                AND (
                     (runtime.state IN ('starting','stopping') AND NOT runtime.world_initialized
-                     AND alias.state IN ('booting','stopping'))
+                     AND NOT runtime.bootstrap_pending AND alias.state IN ('booting','stopping'))
                     OR (runtime.world_initialized AND alias.state IN ('booting','running','stopping')
                         AND EXISTS (
                             SELECT 1 FROM ci_world_snapshots snapshot
@@ -1133,7 +1149,8 @@ impl CiPreviewRuntimeRepository {
              JOIN ci_preview_aliases alias ON alias.id=runtime.preview_id
              WHERE runtime.preview_id=$1 AND runtime.worker_id=$2 AND runtime.generation=$3
                AND runtime.lease_token=$4 AND runtime.state='starting' AND NOT runtime.active
-               AND runtime.world_initialized AND alias.state='booting'
+               AND runtime.bootstrap_pending AND NOT runtime.world_initialized
+               AND alias.state='booting'
                AND NOT EXISTS (SELECT 1 FROM ci_world_snapshots snapshot WHERE snapshot.preview_id=$1))",
         )
         .bind(preview_id)
@@ -1196,7 +1213,7 @@ impl CiPreviewRuntimeRepository {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as::<_, (String, bool, bool)>(
             "SELECT runtime.state::text, runtime.snapshot_requested_at IS NOT NULL,
-                    runtime.world_initialized AND NOT EXISTS (
+                    runtime.bootstrap_pending AND NOT runtime.world_initialized AND NOT EXISTS (
                         SELECT 1 FROM ci_world_snapshots snapshot WHERE snapshot.preview_id=runtime.preview_id
                     )
              FROM ci_runtime_placements runtime JOIN ci_preview_aliases alias ON alias.id=runtime.preview_id
@@ -1206,7 +1223,8 @@ impl CiPreviewRuntimeRepository {
                     OR (runtime.state='running' AND runtime.active AND runtime.snapshot_requested_at IS NOT NULL
                         AND alias.state='running')
                     OR (runtime.state='starting' AND NOT runtime.active AND alias.state='booting'
-                        AND runtime.world_initialized AND NOT EXISTS (
+                        AND runtime.bootstrap_pending AND NOT runtime.world_initialized
+                        AND NOT EXISTS (
                             SELECT 1 FROM ci_world_snapshots snapshot WHERE snapshot.preview_id=runtime.preview_id
                         )))
              FOR UPDATE OF runtime",
@@ -1247,17 +1265,24 @@ impl CiPreviewRuntimeRepository {
         .execute(&mut *tx)
         .await?;
         if state == "starting" {
-            sqlx::query(
-                "UPDATE ci_runtime_placements SET world_initialized=true, updated_at=now()
+            let checkpoint_published = sqlx::query(
+                "UPDATE ci_runtime_placements SET world_initialized=true, bootstrap_pending=false,
+                        updated_at=now()
                  WHERE preview_id=$1 AND worker_id=$2 AND generation=$3 AND lease_token=$4
-                   AND state='starting' AND NOT active AND NOT world_initialized",
+                   AND state='starting' AND NOT active AND bootstrap_pending
+                   AND NOT world_initialized",
             )
             .bind(preview_id)
             .bind(worker_id)
             .bind(generation)
             .bind(lease_token)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+                == 1;
+            if !checkpoint_published {
+                bail!("CI bootstrap checkpoint lost its generation fence");
+            }
         }
         if let Some(old_key) = old.filter(|old_key| old_key != object_key) {
             validate_world_snapshot_key(preview_id, &old_key)?;

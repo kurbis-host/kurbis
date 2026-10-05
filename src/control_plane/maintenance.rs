@@ -6,7 +6,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ci::CiPreviewRuntimeRepository,
+    ci::{CiPreviewRepository, CiPreviewRuntimeRepository},
     control_plane::object_cleanup::delete_if_present,
     control_plane::snapshots::{GarbageCollection, SnapshotStore},
 };
@@ -140,17 +140,43 @@ pub struct MaintenanceReport {
     pub exports_expired: u64,
     pub garbage_collection: GarbageCollection,
     pub ci_world_snapshot_gc_completed: u64,
+    pub github_webhook_processed_gc_deleted: u64,
+}
+
+const GITHUB_WEBHOOK_RETENTION_BATCH_SIZE: i64 = 128;
+
+fn webhook_mode_enabled_from_environment() -> bool {
+    std::env::var("CI_GITHUB_WEBHOOK_ENABLED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
 pub struct WorkerMaintenance {
     pool: PgPool,
     object_store: Arc<dyn ObjectStore>,
+    github_webhook_gc_enabled: bool,
 }
 
 impl WorkerMaintenance {
     pub fn new(pool: PgPool, object_store: Arc<dyn ObjectStore>) -> Self {
-        Self { pool, object_store }
+        Self {
+            pool,
+            object_store,
+            github_webhook_gc_enabled: webhook_mode_enabled_from_environment(),
+        }
+    }
+
+    /// Override the process-level webhook opt-in for an embedding or test.
+    /// Retention GC is never active unless this is true.
+    pub fn with_github_webhook_enabled(mut self, enabled: bool) -> Self {
+        self.github_webhook_gc_enabled = enabled;
+        self
     }
 
     pub async fn run_once(&self) -> Result<MaintenanceReport> {
@@ -166,6 +192,13 @@ impl WorkerMaintenance {
             64,
         )
         .await?;
+        let github_webhook_processed_gc_deleted = if self.github_webhook_gc_enabled {
+            CiPreviewRepository::new(self.pool.clone())
+                .delete_processed_github_pr_deliveries(GITHUB_WEBHOOK_RETENTION_BATCH_SIZE)
+                .await?
+        } else {
+            0
+        };
         Ok(MaintenanceReport {
             operations_assigned,
             exports_assigned,
@@ -173,6 +206,7 @@ impl WorkerMaintenance {
             exports_expired,
             garbage_collection,
             ci_world_snapshot_gc_completed,
+            github_webhook_processed_gc_deleted,
         })
     }
 
@@ -451,6 +485,7 @@ pub fn spawn_worker_maintenance(maintenance: WorkerMaintenance) {
                         || report.garbage_collection.exports_deleted > 0
                         || report.garbage_collection.staging_deleted > 0
                         || report.ci_world_snapshot_gc_completed > 0
+                        || report.github_webhook_processed_gc_deleted > 0
                     {
                         tracing::info!(?report, "worker maintenance completed");
                     }

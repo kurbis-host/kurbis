@@ -147,3 +147,140 @@ async fn object_artifact_cache_verifies_content_and_removes_expired_blobs() {
     assert_eq!(cache.get(&digest).await.unwrap(), None);
     pool.close().await;
 }
+
+struct FailOnceArtifactCache {
+    failures_left: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl kurbis_hoster::ci::ArtifactCache for FailOnceArtifactCache {
+    async fn put(
+        &self,
+        digest: &str,
+        object_key: &str,
+        bytes: &[u8],
+        _expires_at: chrono::DateTime<Utc>,
+    ) -> Result<kurbis_hoster::ci::BuildOutput, kurbis_hoster::ci::CiServiceError> {
+        if self
+            .failures_left
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(kurbis_hoster::ci::CiServiceError::Internal(
+                "temporary object-store outage".into(),
+            ));
+        }
+        Ok(kurbis_hoster::ci::BuildOutput {
+            artifact_digest: digest.to_owned(),
+            object_key: object_key.to_owned(),
+            size_bytes: bytes.len() as i64,
+        })
+    }
+
+    async fn get(
+        &self,
+        _digest: &str,
+    ) -> Result<Option<Vec<u8>>, kurbis_hoster::ci::CiServiceError> {
+        Ok(None)
+    }
+
+    async fn delete_expired(
+        &self,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<u64, kurbis_hoster::ci::CiServiceError> {
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn object_store_failure_is_retryable_and_reconciles_the_existing_check_run() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{BuildRequest, ControlledBuildPipeline, SandboxLimits};
+    let pool = pool().await;
+    let repo = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    repo.register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let components = std::sync::Arc::new(TestBuildComponents::default());
+    let check_run_id = (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
+    let check_runs = std::sync::Arc::new(TestCheckRuns {
+        id: check_run_id,
+        stages: std::sync::Mutex::new(Vec::new()),
+    });
+    let cache = std::sync::Arc::new(FailOnceArtifactCache {
+        failures_left: std::sync::atomic::AtomicUsize::new(1),
+    });
+    let pipeline = ControlledBuildPipeline::new(
+        repo.clone(),
+        std::sync::Arc::new(FixtureSource::default()),
+        components.clone(),
+        components,
+        cache,
+        SandboxLimits {
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_millis: 1000,
+            pid_limit: 512,
+            disk_bytes: 5 * 1024 * 1024 * 1024,
+            process_timeout: std::time::Duration::from_secs(3600),
+        },
+    )
+    .with_check_runs(check_runs.clone());
+    let key = BuildKey::new(
+        &repository_name,
+        "0123456789abcdef0123456789abcdef01234567",
+        "patch-v1",
+        "native",
+        "aarch64-macos",
+    )
+    .unwrap();
+    let (queued, _) = repo.ensure_build(&key).await.unwrap();
+    repo.record_check_run(queued.id, Some(check_run_id), None, CiBuildStage::Queued)
+        .await
+        .unwrap();
+    let request = BuildRequest {
+        key: key.clone(),
+        source_repository: None,
+        source_archive: b"pinned-source-archive".to_vec(),
+    };
+    assert!(pipeline.run(request.clone()).await.is_err());
+    let (stage, failure_class, retry_count): (String, String, i32) =
+        sqlx::query_as("SELECT stage, failure_class, retry_count FROM ci_builds WHERE id=$1")
+            .bind(queued.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage, "failed");
+    assert_eq!(failure_class, "transient");
+    assert_eq!(retry_count, 1);
+    assert_eq!(
+        check_runs.stages.lock().unwrap().last(),
+        Some(&CiBuildStage::Failed),
+        "the transient failure is visible before a retry is scheduled"
+    );
+
+    assert!(
+        !repo
+            .claim_build(queued.id, Uuid::new_v4(), chrono::Duration::minutes(5))
+            .await
+            .unwrap_or(false)
+    );
+    sqlx::query("UPDATE ci_builds SET retry_at=now() - interval '1 second' WHERE id=$1")
+        .bind(queued.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rebuilt = pipeline.run(request).await.unwrap();
+    assert_eq!(rebuilt.id, queued.id, "retry keeps exact build-key dedupe");
+    assert_eq!(rebuilt.stage, CiBuildStage::Ready);
+    assert_eq!(
+        check_runs.stages.lock().unwrap().last(),
+        Some(&CiBuildStage::Ready),
+        "the existing Check Run is reconciled to success after retry"
+    );
+    pool.close().await;
+}

@@ -216,10 +216,32 @@ impl CiPreviewRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn delete_processed_github_pr_deliveries(&self) -> Result<u64> {
+    /// Delete one bounded batch of processed deliveries outside the dedupe
+    /// retention window. Pending deliveries are intentionally excluded even
+    /// when their lease is expired: they still carry retry state and must be
+    /// reclaimed by the delivery worker rather than by retention GC.
+    pub async fn delete_processed_github_pr_deliveries(&self, limit: i64) -> Result<u64> {
+        if limit <= 0 {
+            return Ok(0);
+        }
+
         let result = sqlx::query(
-            "DELETE FROM ci_github_webhook_deliveries WHERE processed_at < now() - interval '7 days'",
+            "WITH expired AS (
+                 SELECT delivery_id
+                 FROM ci_github_webhook_deliveries
+                 WHERE processed_at IS NOT NULL
+                   AND processed_at < now() - interval '7 days'
+                   AND claim_token IS NULL
+                   AND claim_expires_at IS NULL
+                 ORDER BY processed_at, delivery_id
+                 LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+             )
+             DELETE FROM ci_github_webhook_deliveries delivery
+             USING expired
+             WHERE delivery.delivery_id = expired.delivery_id",
         )
+        .bind(limit.min(512))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

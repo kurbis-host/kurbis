@@ -63,8 +63,9 @@ impl CheckedInPumpkinPatcher {
         let patch_path = root.join(filename);
         tokio::fs::write(&patch_path, patch)
             .await
-            .map_err(|error| {
-                BuildPipelineError::Patch(format!("could not stage {filename}: {error}"))
+            .map_err(|error| BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("could not stage {filename}: {error}"),
             })?;
         let mut check = git_command(root);
         check.arg("apply");
@@ -76,8 +77,9 @@ impl CheckedInPumpkinPatcher {
             .arg(&patch_path)
             .output()
             .await
-            .map_err(|error| {
-                BuildPipelineError::Patch(format!("could not check {filename}: {error}"))
+            .map_err(|error| BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("could not check {filename}: {error}"),
             })?;
         if !check_output.status.success() {
             return Err(BuildPipelineError::Patch(format!(
@@ -91,7 +93,10 @@ impl CheckedInPumpkinPatcher {
             apply.arg("--unidiff-zero");
         }
         let output = apply.arg(&patch_path).output().await.map_err(|error| {
-            BuildPipelineError::Patch(format!("could not apply {filename}: {error}"))
+            BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("could not apply {filename}: {error}"),
+            }
         })?;
         tokio::fs::remove_file(patch_path).await.ok();
         if !output.status.success() {
@@ -127,12 +132,15 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
             .arg("--quiet")
             .output()
             .await
-            .map_err(|error| BuildPipelineError::Patch(format!("git init failed: {error}")))?;
+            .map_err(|error| BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("git init failed: {error}"),
+            })?;
         if !init.status.success() {
-            return Err(BuildPipelineError::Patch(format!(
-                "git init failed: {}",
-                bounded_output(&init.stderr)
-            )));
+            return Err(BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("git init failed: {}", bounded_output(&init.stderr)),
+            });
         }
         Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH, false).await?;
         Self::apply_patch(
@@ -147,13 +155,17 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
         let host_control = root.join("crates/pumpkin/src/net/host_control.rs");
         if let Some(parent) = host_control.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                BuildPipelineError::Patch(format!("could not prepare host-control source: {error}"))
+                BuildPipelineError::Infrastructure {
+                    stage: crate::ci::CiBuildStage::Patching,
+                    message: format!("could not prepare host-control source: {error}"),
+                }
             })?;
         }
         tokio::fs::write(host_control, HOST_CONTROL_RS)
             .await
-            .map_err(|error| {
-                BuildPipelineError::Patch(format!("could not install host-control source: {error}"))
+            .map_err(|error| BuildPipelineError::Infrastructure {
+                stage: crate::ci::CiBuildStage::Patching,
+                message: format!("could not install host-control source: {error}"),
             })?;
         pack_source_archive(root).map_err(archive_error)
     }

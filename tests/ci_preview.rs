@@ -269,5 +269,7 @@ impl kurbis_hoster::ci::CheckRunClient for TestCheckRuns {
     }
 }
 
+#[path = "ci_preview/bootstrap_recovery.rs"]
+mod bootstrap_recovery;
 #[path = "ci_preview/runtime.rs"]
 mod runtime;

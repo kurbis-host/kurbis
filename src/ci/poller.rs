@@ -196,6 +196,18 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
             }
         }
+        if let Some(builder) = self.builder.as_ref() {
+            for request in self
+                .repository
+                .due_pull_request_build_retries(&repository_name)
+                .await?
+            {
+                builder
+                    .ensure_build(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("scheduled CI PR retry failed: {error}"))?;
+            }
+        }
         self.reconcile_check_runs().await?;
         Ok(())
     }
