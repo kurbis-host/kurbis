@@ -38,7 +38,17 @@ export TMPDIR=/work/tmp
 # The image cache is immutable and already contains every locked offline input.
 # Avoid duplicating several GiB into the memory-backed workspace.
 export CARGO_HOME=/usr/local/cargo
+# Keep the build deterministic and low-memory without changing enabled features:
+# one Cargo job, one rustc codegen unit, no incremental state, no LTO, no line/debug
+# tables, and opt-level 2. The explicit package/bin targets below are the safe
+# feature-scope reduction; preserve the fetched source feature set.
 export CARGO_BUILD_JOBS=1
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+export CARGO_PROFILE_RELEASE_DEBUG=0
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+export CARGO_PROFILE_RELEASE_STRIP=debuginfo
 # Only bounded archives created by trusted control-plane preprocessing and the
 # checked-in plugin packer reach this offline extraction step.
 tar -xzf /input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
@@ -52,6 +62,9 @@ cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbi
 strip /work/out/pumpkin
 printf "builder_cgroup_memory\n"
 for file in memory.max memory.swap.max memory.current memory.peak memory.events; do printf "%s=" "$file"; cat "/sys/fs/cgroup/$file" | tr "\n" " "; printf "\n"; done
+printf "builder_storage\n"
+if printf x > /work/.kurbis-disk-probe 2>/dev/null; then rm -f /work/.kurbis-disk-probe; printf "disk_probe=writable\n"; else printf "disk_probe=enospc\n"; fi
+for path in /work /work/source /work/target /work/plugin-target /work/tmp /work/out; do printf "df=%s " "$path"; df -P -B1 "$path" 2>/dev/null || true; done
 # Source-controlled build scripts may leave background processes behind.
 # Kill every task process except this exec and PID 1 before the output copy.
 kill -TERM -1 2>/dev/null || true
@@ -353,7 +366,7 @@ impl DockerRootlessBuildRuntime {
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = timeout(Duration::from_secs(5), child.wait()).await;
-                let diagnostics = self.container_memory_diagnostics(name).await;
+                let diagnostics = self.container_failure_diagnostics(name, None).await;
                 self.remove_container(name).await;
                 return Err(BuildPipelineError::Compile(format!(
                     "controlled build exceeded its {} second limit; {diagnostics}",
@@ -562,10 +575,25 @@ impl DockerRootlessBuildRuntime {
                     "KURBIS_RUST_TARGET",
                     "CARGO_NET_OFFLINE",
                     "CARGO_BUILD_JOBS",
+                    "CARGO_INCREMENTAL",
                     "CARGO_PROFILE_RELEASE_LTO",
                     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+                    "CARGO_PROFILE_RELEASE_DEBUG",
+                    "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+                    "CARGO_PROFILE_RELEASE_STRIP",
                 ],
-                &[&self.expected_rustc, target, "true", "1", "false", "1"],
+                &[
+                    &self.expected_rustc,
+                    target,
+                    "true",
+                    "1",
+                    "0",
+                    "false",
+                    "1",
+                    "0",
+                    "2",
+                    "debuginfo",
+                ],
                 source_archive.len().saturating_add(plugin_archive.len()),
                 true,
                 &admission,
@@ -601,11 +629,14 @@ impl DockerRootlessBuildRuntime {
         {
             Ok((status, report)) if status.success() => (status, report),
             Ok((status, report)) => {
-                let diagnostics = self.container_memory_diagnostics(&name).await;
+                let bounded_log = report.bounded_log();
+                let diagnostics = self
+                    .container_failure_diagnostics(&name, Some(&bounded_log))
+                    .await;
                 self.remove_container(&name).await;
                 return Err(BuildPipelineError::Compile(format!(
                     "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
-                    tail(&report.bounded_log(), MAX_FAILURE_LOG_BYTES)
+                    tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
                 )));
             }
             Err(error) => {
@@ -644,7 +675,7 @@ impl DockerRootlessBuildRuntime {
         Ok(report)
     }
 
-    async fn container_memory_diagnostics(&self, name: &str) -> String {
+    async fn container_failure_diagnostics(&self, name: &str, build_log: Option<&str>) -> String {
         let inspect = timeout(
             Duration::from_secs(15),
             docker_command(&self.docker_host)
@@ -676,7 +707,7 @@ impl DockerRootlessBuildRuntime {
                     name,
                     "/bin/sh",
                     "-ec",
-                    "for file in memory.max memory.swap.max memory.current memory.peak; do printf '%s=' \"$file\"; cat /sys/fs/cgroup/$file 2>/dev/null | tr '\\n' ' '; printf '\\n'; done; printf 'memory.events='; cat /sys/fs/cgroup/memory.events 2>/dev/null | tr '\\n' ' '; printf '\\n'",
+                    "for file in memory.max memory.swap.max memory.current memory.peak; do printf '%s=' \"$file\"; cat /sys/fs/cgroup/$file 2>/dev/null | tr '\\n' ' '; printf '\\n'; done; printf 'memory.events='; cat /sys/fs/cgroup/memory.events 2>/dev/null | tr '\\n' ' '; printf '\\n'; printf 'disk_probe='; if printf x > /work/.kurbis-disk-probe 2>/dev/null; then rm -f /work/.kurbis-disk-probe; printf writable; else printf enospc; fi; printf '\\n'; for path in /work /work/source /work/target /work/plugin-target /work/tmp /work/out; do printf 'df='; df -P -B1 \"$path\" 2>/dev/null || true; done",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -685,22 +716,24 @@ impl DockerRootlessBuildRuntime {
                 .output(),
         )
         .await;
-        let mut events = match cgroup {
+        let mut diagnostics = match cgroup {
             Ok(Ok(output)) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).trim().to_owned()
             }
-            _ => "cgroup_memory_diagnostics=unavailable".into(),
+            _ => "cgroup_and_disk_diagnostics=unavailable".into(),
         };
-        if let Some(raw_events) = events
+        if let Some(raw_events) = diagnostics
             .lines()
             .find_map(|line| line.strip_prefix("memory.events="))
         {
             let classification = parse_cgroup_memory_events(raw_events)
                 .map(|events| events.classify())
                 .unwrap_or("invalid_cgroup_memory_events");
-            events.push_str(&format!("; pressure_classification={classification}"));
+            diagnostics.push_str(&format!("; pressure_classification={classification}"));
         }
-        format!("{state}; {events}")
+        let log_enospc = build_log.is_some_and(disk_enospc_hint);
+        diagnostics.push_str(&format!("; build_log_enospc={log_enospc}"));
+        format!("{state}; {diagnostics}")
     }
 
     async fn remove_container(&self, name: &str) {
@@ -716,6 +749,13 @@ impl DockerRootlessBuildRuntime {
         )
         .await;
     }
+}
+
+fn disk_enospc_hint(log: &str) -> bool {
+    let log = log.to_ascii_lowercase();
+    ["no space left on device", "enospc", "disk quota exceeded"]
+        .iter()
+        .any(|needle| log.contains(needle))
 }
 
 async fn wait_for_admission_owned_child(
@@ -801,11 +841,14 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
         let (status, report) = match result {
             Ok((status, report)) if status.success() => (status, report),
             Ok((status, report)) => {
-                let diagnostics = self.container_memory_diagnostics(&name).await;
+                let bounded_log = report.bounded_log();
+                let diagnostics = self
+                    .container_failure_diagnostics(&name, Some(&bounded_log))
+                    .await;
                 self.remove_container(&name).await;
                 return Err(BuildPipelineError::Patch(format!(
                     "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
-                    tail(&report.bounded_log(), MAX_FAILURE_LOG_BYTES)
+                    tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
                 )));
             }
             Err(error) => {
@@ -817,9 +860,7 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             self.remove_container(&name).await;
             return Err(BuildPipelineError::Sandbox(error.to_string()));
         }
-        let directory = tempfile::Builder::new()
-            .prefix("kurbis-ci-patched-source-")
-            .tempdir()
+        let directory = super::private_tempdir("kurbis-ci-patched-source-")
             .map_err(|error| BuildPipelineError::Patch(error.to_string()))?;
         let output = directory.path().join("patched-source.tar.gz");
         let copied = self
@@ -955,9 +996,7 @@ where
                 "trusted plugin archive exceeds its size limit".into(),
             ));
         }
-        let output = tempfile::Builder::new()
-            .prefix("kurbis-ci-artifact-")
-            .tempdir()
+        let output = super::private_tempdir("kurbis-ci-artifact-")
             .map_err(|error| BuildPipelineError::Package(error.to_string()))?;
         let report = self
             .runtime

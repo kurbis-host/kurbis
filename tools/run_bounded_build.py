@@ -93,10 +93,40 @@ def lock_path() -> Path:
     return cache / "kurbis" / "build-admission.lock"
 
 
+def private_build_temp_root() -> Path:
+    """Return a user-owned, mode-0700 temp root below HOME.
+
+    Remote build preparation runs on a shared lxhalle host. Never use the
+    host-wide /tmp directory for source, BuildKit probe context, or generated
+    build metadata.
+    """
+    home = Path.home().resolve()
+    root = (home / ".cache" / "kurbis" / "build-tmp").resolve()
+    if home not in root.parents:
+        raise RuntimeError("private build temp root escaped HOME")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    home_stat = home.stat()
+    root_stat = root.stat()
+    if hasattr(os, "getuid") and (
+        root_stat.st_uid != os.getuid() or home_stat.st_uid != os.getuid()
+    ):
+        raise RuntimeError("private build temp root and HOME must be owned by the current user")
+    if root_stat.st_mode & 0o077:
+        raise RuntimeError("private build temp root is accessible to other users")
+    return root
+
+
+def private_build_tempdir(prefix: str) -> tempfile.TemporaryDirectory[str]:
+    if not prefix or not all(char.isalnum() or char in "-_" for char in prefix):
+        raise ValueError("invalid private build temp prefix")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=private_build_temp_root())
+
+
 def verify_buildkit_resource_limits(image: str) -> None:
     """Prove per-RUN cgroup RAM/swap limits before any expensive Buildx build."""
     tag = f"kurbis-build-resource-probe:{os.getpid()}-{time.time_ns()}"
-    with tempfile.TemporaryDirectory(prefix="kurbis-build-resource-probe-") as directory:
+    with private_build_tempdir("kurbis-build-resource-probe-") as directory:
         context = Path(directory)
         dockerfile = r"""ARG PROBE_IMAGE
 FROM ${PROBE_IMAGE}

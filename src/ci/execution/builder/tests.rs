@@ -152,3 +152,52 @@ fn only_the_compilation_workspace_explicitly_allows_exec() {
 fn default_build_limits_reserve_ten_gib_for_pumpkin_compilation() {
     assert_eq!(default_build_limits().memory_bytes, 10 * 1024 * 1024 * 1024);
 }
+
+#[test]
+fn build_staging_uses_a_home_private_directory_not_public_tmp() {
+    let temporary = super::super::private_tempdir("kurbis-ci-test-").unwrap();
+    let home = std::env::var_os("HOME").unwrap();
+    let home = std::fs::canonicalize(home).unwrap();
+    assert!(temporary.path().starts_with(home));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            temporary.path().metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+}
+
+#[test]
+fn release_compile_script_bounds_parallelism_and_debug_memory_without_trimming_features() {
+    for setting in [
+        "export CARGO_BUILD_JOBS=1",
+        "export CARGO_INCREMENTAL=0",
+        "--jobs 1",
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_RELEASE_DEBUG",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_RELEASE_STRIP",
+        "--package pumpkin --bin pumpkin",
+        "--offline",
+    ] {
+        assert!(
+            BUILD_SCRIPT.contains(setting),
+            "missing build setting: {setting}"
+        );
+    }
+    assert!(
+        !BUILD_SCRIPT.contains("--no-default-features"),
+        "low-memory mode must not silently remove runtime features"
+    );
+}
+
+#[test]
+fn disk_failure_detection_accepts_common_quota_errors_only() {
+    assert!(disk_enospc_hint("error: No space left on device"));
+    assert!(disk_enospc_hint("write failed: ENOSPC"));
+    assert!(disk_enospc_hint("disk quota exceeded"));
+    assert!(!disk_enospc_hint("memory.events: oom_kill 1"));
+}

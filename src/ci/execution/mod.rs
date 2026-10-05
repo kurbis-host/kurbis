@@ -1,5 +1,65 @@
 //! Trusted host-side preparation and isolated compilation for untrusted Pumpkin commits.
 
+use std::{env, fs, io, path::PathBuf};
+use tempfile::TempDir;
+
+/// Create a build-only temporary directory below the current user's private home.
+/// Remote builders must never spill source, patches, or artifacts into a shared
+/// public `/tmp` directory.
+pub(super) fn private_tempdir(prefix: &str) -> io::Result<TempDir> {
+    if prefix.is_empty()
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private temporary directory prefix",
+        ));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let home = fs::canonicalize(home)?;
+    let home_metadata = fs::metadata(&home)?;
+    let root = home.join(".cache/kurbis/build-tmp");
+    fs::create_dir_all(&root)?;
+    let root = fs::canonicalize(root)?;
+    if !root.starts_with(&home) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private build temporary root escaped HOME",
+        ));
+    }
+    let metadata = fs::metadata(&root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private build temporary root is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || home_metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private build temporary root is not owned by the current user",
+            ));
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    }
+    let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(temporary)
+}
+
 mod admission;
 mod archive;
 mod builder;

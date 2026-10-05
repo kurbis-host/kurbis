@@ -123,12 +123,9 @@ pub(super) fn plugin_build_context(source: &Path) -> Result<tempfile::TempDir, B
         BuildPipelineError::Compile(format!("resolve trusted plugin source: {error}"))
     })?;
     validate_plugin_source(&source)?;
-    let context = tempfile::Builder::new()
-        .prefix("kurbis-ci-plugin-")
-        .tempdir()
-        .map_err(|error| {
-            BuildPipelineError::Compile(format!("create plugin build context: {error}"))
-        })?;
+    let context = super::super::private_tempdir("kurbis-ci-plugin-").map_err(|error| {
+        BuildPipelineError::Compile(format!("create plugin build context: {error}"))
+    })?;
     let mut total = 0u64;
     for name in ["Cargo.toml", "Cargo.lock", "src", "build.rs"] {
         let from = source.join(name);

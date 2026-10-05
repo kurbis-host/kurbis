@@ -8,7 +8,13 @@ import time
 import unittest
 from pathlib import Path
 
-from run_bounded_build import GIB, parse_meminfo, run_build
+from run_bounded_build import (
+    GIB,
+    parse_meminfo,
+    private_build_temp_root,
+    private_build_tempdir,
+    run_build,
+)
 
 
 class BuildMemoryGuardTests(unittest.TestCase):
@@ -21,6 +27,15 @@ class BuildMemoryGuardTests(unittest.TestCase):
             parse_meminfo("MemTotal: 100 kB\nMemAvailable: 101 kB\n")
         with self.assertRaises(RuntimeError):
             parse_meminfo("MemTotal: 100 MB\nMemAvailable: 80 MB\n")
+
+    def test_build_probe_tempdir_is_private_to_home(self):
+        root = private_build_temp_root()
+        self.assertTrue(root.is_relative_to(Path.home().resolve()))
+        self.assertNotEqual(root, Path("/tmp"))
+        with private_build_tempdir("kurbis-test-") as directory:
+            path = Path(directory).resolve()
+            self.assertTrue(path.is_relative_to(root))
+            self.assertEqual(path.stat().st_mode & 0o077, 0)
 
     def test_host_memory_deferral_fails_closed_with_measured_headroom(self):
         with tempfile.TemporaryDirectory() as directory:
