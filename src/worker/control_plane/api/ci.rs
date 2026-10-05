@@ -127,7 +127,12 @@ impl WorkerControl {
         .await
     }
 
-    pub async fn download_ci_artifact(&self, placement: &CiRuntimePlacement) -> Result<Vec<u8>> {
+    pub async fn download_ci_artifact(
+        &self,
+        placement: &CiRuntimePlacement,
+        destination: &std::path::Path,
+    ) -> Result<(u64, String)> {
+        use tokio::io::AsyncWriteExt;
         let mut url = self.base_url().clone();
         {
             let mut segments = url.path_segments_mut().map_err(|_| {
@@ -164,26 +169,50 @@ impl WorkerControl {
         if expected_size == 0 || expected_size > max_artifact_bytes {
             bail!("CI artifact exceeds worker transfer limit");
         }
-        let mut bytes = Vec::new();
+        let expected_digest = response
+            .headers()
+            .get("x-ci-artifact-digest")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value == &placement.artifact_digest)
+            .context("CI artifact response omitted its assigned digest")?
+            .to_owned();
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .await
+            .with_context(|| {
+                format!("create CI artifact staging file {}", destination.display())
+            })?;
         let mut stream = response.bytes_stream();
         let mut hasher = blake3::Hasher::new();
         let mut total = 0_u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read CI artifact response")?;
-            total = total
-                .checked_add(chunk.len() as u64)
-                .context("CI artifact size overflow")?;
-            if total > max_artifact_bytes || total > expected_size {
-                bail!("CI artifact exceeded its declared size");
+        let result = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("read CI artifact response")?;
+                total = total
+                    .checked_add(chunk.len() as u64)
+                    .context("CI artifact size overflow")?;
+                if total > max_artifact_bytes || total > expected_size {
+                    bail!("CI artifact exceeded its declared size");
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
             }
-            hasher.update(&chunk);
-            bytes.extend_from_slice(&chunk);
+            file.flush().await?;
+            file.sync_all().await?;
+            let digest = hasher.finalize().to_hex().to_string();
+            anyhow::ensure!(
+                total == expected_size && digest == expected_digest,
+                "downloaded CI artifact failed size or digest verification"
+            );
+            Ok::<_, anyhow::Error>((total, digest))
         }
-        let digest = hasher.finalize().to_hex().to_string();
-        if total != expected_size || digest != placement.artifact_digest {
-            bail!("downloaded CI artifact failed size or digest verification");
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(destination).await;
         }
-        Ok(bytes)
+        result
     }
 }
 

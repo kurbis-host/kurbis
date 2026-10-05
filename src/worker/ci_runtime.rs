@@ -279,8 +279,12 @@ impl CiPreviewWorker {
             )?;
             fs::remove_file(&snapshot_path)?;
         }
-        let archive = self.control_plane.download_ci_artifact(placement).await?;
-        let metadata = unpack_artifact(&archive, &runtime_dir)?;
+        let artifact_path = runtime_dir.join("artifact.tar.gz");
+        self.control_plane
+            .download_ci_artifact(placement, &artifact_path)
+            .await?;
+        let metadata = unpack_artifact_file(&artifact_path, &runtime_dir)?;
+        fs::remove_file(&artifact_path)?;
         let target = format!("{}-linux", std::env::consts::ARCH);
         if metadata.repository != placement.repository
             || metadata.commit_sha != placement.commit_sha

@@ -32,11 +32,28 @@ pub(super) struct ArtifactMetadata {
     format_version: u32,
 }
 
+#[cfg(test)]
 pub(super) fn unpack_artifact(bytes: &[u8], target: &Path) -> Result<ArtifactMetadata> {
     if bytes.is_empty() || bytes.len() > 1024 * 1024 * 1024 {
         bail!("CI artifact has invalid size");
     }
-    let decoder = GzDecoder::new(bytes);
+    unpack_artifact_reader(std::io::Cursor::new(bytes), target)
+}
+
+pub(super) fn unpack_artifact_file(path: &Path, target: &Path) -> Result<ArtifactMetadata> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open CI artifact staging file {}", path.display()))?;
+    if file.metadata()?.len() == 0 || file.metadata()?.len() > 1024 * 1024 * 1024 {
+        bail!("CI artifact has invalid size");
+    }
+    unpack_artifact_reader(file, target)
+}
+
+fn unpack_artifact_reader<R: Read>(reader: R, target: &Path) -> Result<ArtifactMetadata> {
+    let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
     let mut found = std::collections::HashSet::new();
     let mut metadata = None;
