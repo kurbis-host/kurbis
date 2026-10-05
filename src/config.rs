@@ -47,6 +47,8 @@ pub struct ControlPlaneConfig {
     pub public_base_url: String,
     pub root_domain: String,
     pub internal_token: String,
+    /// Signed webhook delivery is deliberately dormant unless explicitly enabled.
+    pub ci_github_webhook_enabled: bool,
     pub ci_github_webhook_secret: Option<SecretString>,
     pub oauth: OAuthConfig,
 }
@@ -157,6 +159,22 @@ pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {
         "CI_BUILDER_DOCKER_HOST must use ssh://user@host[:port]"
     );
     Ok(())
+}
+
+fn parse_bool(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name} must be a boolean (true/false)"),
+    }
+}
+
+fn optional_bool(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => parse_bool(name, &value),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).context(format!("{name} must be valid UTF-8")),
+    }
 }
 
 fn checked_in_ci_patch_fingerprint() -> Result<String> {
@@ -310,9 +328,7 @@ impl ControlPlaneConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let github_pat_enabled = env::var("CI_GITHUB_PAT")
-            .map(|token| !token.trim().is_empty())
-            .unwrap_or(false);
+        let ci_github_webhook_enabled = optional_bool("CI_GITHUB_WEBHOOK_ENABLED", false)?;
         let ci_github_webhook_secret = match env::var("CI_GITHUB_WEBHOOK_SECRET") {
             Ok(secret)
                 if (32..=512).contains(&secret.len())
@@ -321,9 +337,9 @@ impl ControlPlaneConfig {
                 Some(SecretString::new(secret))
             }
             Ok(_) => bail!("CI_GITHUB_WEBHOOK_SECRET must contain 32 to 512 visible ASCII bytes"),
-            Err(env::VarError::NotPresent) if !github_pat_enabled => None,
+            Err(env::VarError::NotPresent) if !ci_github_webhook_enabled => None,
             Err(env::VarError::NotPresent) => {
-                bail!("CI_GITHUB_WEBHOOK_SECRET is required when CI_GITHUB_PAT enables Pumpkin CI")
+                bail!("CI_GITHUB_WEBHOOK_SECRET is required when CI_GITHUB_WEBHOOK_ENABLED=true")
             }
             Err(error) => {
                 return Err(error).context("CI_GITHUB_WEBHOOK_SECRET must be valid UTF-8");
@@ -335,6 +351,7 @@ impl ControlPlaneConfig {
             public_base_url: required("PUBLIC_BASE_URL")?,
             root_domain: required("ROOT_DOMAIN")?,
             internal_token: required("INTERNAL_TOKEN")?,
+            ci_github_webhook_enabled,
             ci_github_webhook_secret,
             oauth: OAuthConfig {
                 google: oauth_provider(
@@ -776,7 +793,18 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::https_public_base_url;
+    use super::{https_public_base_url, parse_bool};
+
+    #[test]
+    fn parse_bool_accepts_explicit_values_and_rejects_ambiguous_values() {
+        for value in ["1", "true", "YES", "on"] {
+            assert!(parse_bool("KURBIS_TEST_BOOL", value).unwrap());
+        }
+        for value in ["0", "false", "NO", "off"] {
+            assert!(!parse_bool("KURBIS_TEST_BOOL", value).unwrap());
+        }
+        assert!(parse_bool("KURBIS_TEST_BOOL", "maybe").is_err());
+    }
 
     #[test]
     fn minecraft_links_upgrade_http_public_origins_to_https() {

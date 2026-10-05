@@ -70,6 +70,10 @@ pub struct PollCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollResult {
     pub refs: Vec<SourceRef>,
+    /// Pull-request heads whose lifecycle changed since the previous poll.
+    /// Branches and arbitrary commit aliases are intentionally excluded: they
+    /// remain lazy until a join, or until an already-admitted branch advances.
+    pub eager_refs: Vec<SourceRef>,
     pub checkpoint: PollCheckpoint,
     pub not_modified: bool,
     pub retry_after: Option<Duration>,
@@ -241,7 +245,9 @@ impl SourceControlClient for GitHubSourceControl {
         checkpoint: &PollCheckpoint,
     ) -> Result<PollResult, PollError> {
         let (owner, name) = parse_repository(repository)?;
+        let previous_poll = checkpoint.last_successful_poll;
         let mut refs = Vec::new();
+        let mut eager_refs = Vec::new();
         let mut pr_etag = checkpoint.etag.clone();
         let mut pr_page = 1u32;
         let mut pr_complete = false;
@@ -286,6 +292,13 @@ impl SourceControlClient for GitHubSourceControl {
                     updated_at: pull.updated_at,
                 };
                 source.validate()?;
+                let eager = previous_poll.is_none()
+                    || source
+                        .updated_at
+                        .is_some_and(|updated_at| Some(updated_at) > previous_poll);
+                if eager {
+                    eager_refs.push(source.clone());
+                }
                 refs.push(source);
             }
             pr_page = page;
@@ -345,6 +358,7 @@ impl SourceControlClient for GitHubSourceControl {
         }
         Ok(PollResult {
             refs: deduplicate_refs(refs),
+            eager_refs: deduplicate_refs(eager_refs),
             checkpoint: PollCheckpoint {
                 etag: pr_etag,
                 branch_etag,
@@ -531,6 +545,11 @@ mod http_tests {
             .unwrap();
         assert_eq!(result.refs.len(), 2);
         assert!(result.refs.iter().any(|value| value.name == "pr-123"));
+        assert_eq!(
+            result.eager_refs.len(),
+            1,
+            "initial PR observation is eager"
+        );
         assert_eq!(result.checkpoint.etag.as_deref(), Some("pr-etag"));
         assert_eq!(
             result.checkpoint.branch_etag.as_deref(),
@@ -541,7 +560,10 @@ mod http_tests {
             .await
             .unwrap();
         assert!(!unchanged.not_modified);
-        assert_eq!(unchanged.refs.len(), 2);
+        assert!(
+            unchanged.eager_refs.is_empty(),
+            "unchanged PR heads stay cached"
+        );
         assert_eq!(unchanged.refs.len(), 2);
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());

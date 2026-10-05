@@ -55,6 +55,13 @@ pub(super) async fn ingest(
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
+    if !state.config.ci_github_webhook_enabled {
+        return Err(ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "github_webhook_disabled",
+            "GitHub webhook ingestion is disabled",
+        ));
+    }
     let Some(secret) = state.config.ci_github_webhook_secret.as_ref() else {
         return Err(ApiError::with_code(
             StatusCode::SERVICE_UNAVAILABLE,

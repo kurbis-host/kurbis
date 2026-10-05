@@ -64,6 +64,7 @@ impl SourceControlClient for FixtureSource {
             } else {
                 Vec::new()
             },
+            eager_refs: Vec::new(),
             checkpoint: PollCheckpoint {
                 last_successful_poll: Some(Utc::now()),
                 ..Default::default()
@@ -114,6 +115,16 @@ impl SourceControlClient for PullRequestFixtureSource {
     ) -> Result<PollResult, kurbis_hoster::ci::PollError> {
         Ok(PollResult {
             refs: vec![SourceRef {
+                kind: SourceRefKind::PullRequest,
+                name: "pr-314".into(),
+                number: Some(314),
+                commit_sha: self.head_sha.read().unwrap().clone(),
+                source_repository: Some("contributor/Pumpkin".into()),
+                closed: false,
+                deleted: false,
+                updated_at: Some(Utc::now()),
+            }],
+            eager_refs: vec![SourceRef {
                 kind: SourceRefKind::PullRequest,
                 name: "pr-314".into(),
                 number: Some(314),

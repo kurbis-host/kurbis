@@ -279,19 +279,24 @@ For faster development on this Mac or Linux, use [native host execution](runtime
 
 ## Pumpkin pull-request and branch previews
 
-Set `CI_GITHUB_PAT` to enable the optional CI poller. It eagerly builds and
-caches the exact **current PR head** for every `opened`, `reopened`, and
-`synchronize` event, with one deduplicated Check Run per head. A signed GitHub
-webhook (`CI_GITHUB_WEBHOOK_SECRET`) is the durable event path; the independent
-60-second poller remains the recovery path for heads whose delivery is delayed
-or unavailable. No PR ancestors, unrelated commits, branches, or arbitrary
-commit aliases are proactively built.
+Set `CI_GITHUB_PAT` to enable the CI poller. Periodic GitHub polling is the
+active event source and runs every 60 seconds with ETag checkpoints. It eagerly
+builds and caches only the exact current PR heads that polling observes as
+opened, reopened, or updated, with one build-only Check Run per head. No PR
+ancestors, unrelated commits, branches, or arbitrary commit aliases are
+proactively built.
+
+The signed webhook implementation remains available but dormant. It is not
+configured or started by default; only an explicit
+`CI_GITHUB_WEBHOOK_ENABLED=true` plus `CI_GITHUB_WEBHOOK_SECRET` starts the
+webhook consumer. Leave both webhook settings disabled for the polling-only
+deployment.
 
 Builds use the checked-in Pumpkin patch and pinned rootless builder image, then
 publish isolated previews below `pumpkin.kurbis.host` (the CI hostname suffix is
-fixed in the service and separate from `ROOT_DOMAIN`). Configure wildcard DNS,
-TLS, and a GitHub repository webhook for **Pull requests** with the
-`opened`, `reopened`, and `synchronize` actions before enabling the service.
+fixed in the service and separate from `ROOT_DOMAIN`). Configure wildcard DNS
+and TLS before enabling the polling service. Do not configure a GitHub
+repository webhook for the default polling-only deployment.
 `CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless Docker daemon over
 restricted SSH; never give the control plane a host Docker socket. Repository
 Dockerfiles are not used.

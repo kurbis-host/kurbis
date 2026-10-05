@@ -85,6 +85,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .poll_repository(repository_id, self.source.as_ref())
             .await?;
         let repository_name = self.repository_name(repository_id).await?;
+        let eager_refs = poll.eager_refs;
         // Branch deletion is actionable only after a complete branch poll has
         // durably marked refs deleted. Pull-request close is intentionally not
         // mapped to preview teardown.
@@ -162,7 +163,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 )
                 .await?;
             }
-            let eager_pr = source_ref.kind == SourceRefKind::PullRequest && !source_ref.closed;
+            let eager_pr = source_ref.kind == SourceRefKind::PullRequest
+                && !source_ref.closed
+                && eager_refs.iter().any(|eager| {
+                    eager.name == source_ref.name && eager.commit_sha == source_ref.commit_sha
+                });
             // A stable branch alias may still serve an older successful
             // commit while the newly observed head is building. Once a player
             // has admitted that alias (anything beyond the untouched lobby),

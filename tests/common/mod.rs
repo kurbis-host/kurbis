@@ -27,6 +27,7 @@ pub fn api_state(
             public_base_url: "https://panel.example.test".to_owned(),
             root_domain: "mc.example.test".to_owned(),
             internal_token: internal_token.to_owned(),
+            ci_github_webhook_enabled: true,
             ci_github_webhook_secret: Some(kurbis_hoster::config::SecretString::new(
                 "test-webhook-secret",
             )),

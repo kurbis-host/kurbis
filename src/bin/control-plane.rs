@@ -134,18 +134,23 @@ async fn main() -> Result<()> {
                 public_status_base_url: Some(public_status_base_url),
             })
             .with_builder(pipeline);
-        let webhook_poller = ci_poller.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(error) = webhook_poller.drain_github_webhooks_once().await {
-                    tracing::error!(
-                        ?error,
-                        "failed to process queued GitHub PR webhook deliveries"
-                    );
+        // Polling is the active CI event source. Keep the signed webhook
+        // implementation available for an explicit opt-in, but do not start
+        // its delivery consumer merely because a PAT is configured.
+        if config.ci_github_webhook_enabled {
+            let webhook_poller = ci_poller.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(error) = webhook_poller.drain_github_webhooks_once().await {
+                        tracing::error!(
+                            ?error,
+                            "failed to process queued GitHub PR webhook deliveries"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
+            });
+        }
         tokio::spawn(ci_poller.run_forever(
             watched.id,
             std::time::Duration::from_secs(POLL_INTERVAL_SECONDS),

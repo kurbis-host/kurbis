@@ -200,6 +200,7 @@ impl SourceControlClient for MutableBranchSource {
                 deleted: false,
                 updated_at: Some(Utc::now()),
             }],
+            eager_refs: Vec::new(),
             checkpoint: PollCheckpoint {
                 last_successful_poll: Some(Utc::now()),
                 ..checkpoint.clone()

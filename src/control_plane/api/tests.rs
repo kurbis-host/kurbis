@@ -254,6 +254,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
             public_base_url: "https://kurbis.example".to_owned(),
             root_domain: "mc.example".to_owned(),
             internal_token: "test-internal-token".to_owned(),
+            ci_github_webhook_enabled: true,
             ci_github_webhook_secret: Some(crate::config::SecretString::new("test-webhook-secret")),
             oauth: OAuthConfig {
                 google: OAuthProviderConfig {
