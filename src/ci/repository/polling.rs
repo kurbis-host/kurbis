@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
@@ -61,7 +61,7 @@ impl CiPreviewRepository {
         .fetch_optional(&mut *tx)
         .await?
         .context("watched CI repository not found or disabled")?;
-        let poll = source
+        let mut poll = source
             .poll(
                 &row.repository,
                 &PollCheckpoint {
@@ -74,6 +74,37 @@ impl CiPreviewRepository {
             )
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
+        // GitHub's updated_at is advisory and may be absent or have only
+        // second-level precision. The durable ref row is authoritative: an
+        // open PR is eager whenever its observed head differs from the prior
+        // persisted head, or when it was closed/deleted and became live again.
+        // This also keeps polling correct when a provider repeats an ETag or
+        // emits a head replacement in the same timestamp bucket.
+        let previous_pr_refs: HashMap<String, (String, bool, bool)> = sqlx::query_as(
+            "SELECT name, commit_sha, closed, deleted FROM ci_refs
+             WHERE repository_id = $1 AND kind = 'pull_request'",
+        )
+        .bind(repository_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(name, sha, closed, deleted)| (name, (sha, closed, deleted)))
+        .collect();
+        poll.eager_refs = poll
+            .refs
+            .iter()
+            .filter(|source_ref| {
+                source_ref.kind == SourceRefKind::PullRequest
+                    && !source_ref.closed
+                    && !source_ref.deleted
+                    && previous_pr_refs.get(&source_ref.name).is_none_or(
+                        |(previous_sha, was_closed, was_deleted)| {
+                            previous_sha != &source_ref.commit_sha || *was_closed || *was_deleted
+                        },
+                    )
+            })
+            .cloned()
+            .collect();
         sqlx::query(
             "UPDATE ci_watched_repositories SET etag = $2, branch_etag = $3,
                     pull_request_page = $4, branch_cursor = $5, last_successful_poll = $6,

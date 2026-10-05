@@ -122,7 +122,7 @@ impl SourceControlClient for PullRequestFixtureSource {
                 source_repository: Some("contributor/Pumpkin".into()),
                 closed: false,
                 deleted: false,
-                updated_at: Some(Utc::now()),
+                updated_at: None,
             }],
             eager_refs: vec![SourceRef {
                 kind: SourceRefKind::PullRequest,
@@ -132,7 +132,7 @@ impl SourceControlClient for PullRequestFixtureSource {
                 source_repository: Some("contributor/Pumpkin".into()),
                 closed: false,
                 deleted: false,
-                updated_at: Some(Utc::now()),
+                updated_at: None,
             }],
             checkpoint: PollCheckpoint {
                 last_successful_poll: Some(Utc::now()),

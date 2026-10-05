@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::{MultipartUpload, ObjectStore, path::Path as ObjectPath};
 use serde::{Deserialize, Serialize};
@@ -298,8 +298,8 @@ pub(super) async fn artifact(
     else {
         return Err(invalid_ci_assignment());
     };
-    const MAX_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
-    if !(0..=MAX_ARTIFACT_BYTES).contains(&size_bytes) {
+    let max_artifact_bytes = crate::ci::execution::MAX_ARTIFACT_BYTES as i64;
+    if !(1..=max_artifact_bytes).contains(&size_bytes) {
         return Err(invalid_ci_assignment());
     }
     let path = object_store::path::Path::parse(object_key).map_err(|_| invalid_ci_assignment())?;
@@ -308,16 +308,70 @@ pub(super) async fn artifact(
         .get(&path)
         .await
         .map_err(|_| invalid_ci_assignment())?;
-    let bytes = object.bytes().await.map_err(|_| invalid_ci_assignment())?;
-    if bytes.len() as i64 != size_bytes || blake3::hash(&bytes).to_hex().as_str() != digest {
+    if object.meta.size != size_bytes as u64 {
         return Err(invalid_ci_assignment());
     }
+    let expected_size = size_bytes as u64;
+    let expected_digest = digest;
+    let digest_header = expected_digest.clone();
+    let stream_digest = expected_digest.clone();
+    let stream = futures::stream::unfold(
+        (object.into_stream(), blake3::Hasher::new(), 0_u64, false),
+        move |(mut source, mut hasher, total, finished)| {
+            let expected_digest = stream_digest.clone();
+            async move {
+                if finished {
+                    return None;
+                }
+                match source.next().await {
+                    Some(Ok(chunk)) => {
+                        let next_total = total.saturating_add(chunk.len() as u64);
+                        if next_total > expected_size {
+                            return Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "CI artifact exceeded its declared size",
+                                )),
+                                (source, hasher, next_total, true),
+                            ));
+                        }
+                        hasher.update(&chunk);
+                        Some((
+                            Ok::<Bytes, std::io::Error>(chunk),
+                            (source, hasher, next_total, false),
+                        ))
+                    }
+                    Some(Err(error)) => Some((
+                        Err(std::io::Error::other(error.to_string())),
+                        (source, hasher, total, true),
+                    )),
+                    None => {
+                        if total != expected_size
+                            || hasher.finalize().to_hex().as_str() != expected_digest
+                        {
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "CI artifact failed size or digest verification",
+                                )),
+                                (source, blake3::Hasher::new(), total, true),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        },
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/gzip")
-        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CONTENT_LENGTH, size_bytes)
+        .header("x-ci-artifact-digest", digest_header)
         .header(header::CACHE_CONTROL, "private, no-store")
-        .body(Body::from(bytes))
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from_stream(stream))
         .map_err(|_| invalid_ci_assignment())
 }
 

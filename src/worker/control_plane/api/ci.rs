@@ -157,17 +157,33 @@ impl WorkerControl {
                 response.status()
             );
         }
-        let bytes = response
-            .bytes()
-            .await
-            .context("read CI artifact response")?;
-        if bytes.len() as i64 > 1024 * 1024 * 1024 {
+        let expected_size = response
+            .content_length()
+            .context("CI artifact response omitted its size")?;
+        let max_artifact_bytes = crate::ci::execution::MAX_ARTIFACT_BYTES as u64;
+        if expected_size == 0 || expected_size > max_artifact_bytes {
             bail!("CI artifact exceeds worker transfer limit");
         }
-        if blake3::hash(&bytes).to_hex().as_str() != placement.artifact_digest {
-            bail!("downloaded CI artifact digest does not match its assigned digest");
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read CI artifact response")?;
+            total = total
+                .checked_add(chunk.len() as u64)
+                .context("CI artifact size overflow")?;
+            if total > max_artifact_bytes || total > expected_size {
+                bail!("CI artifact exceeded its declared size");
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes.to_vec())
+        let digest = hasher.finalize().to_hex().to_string();
+        if total != expected_size || digest != placement.artifact_digest {
+            bail!("downloaded CI artifact failed size or digest verification");
+        }
+        Ok(bytes)
     }
 }
 
