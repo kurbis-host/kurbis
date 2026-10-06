@@ -122,10 +122,6 @@ pub(super) struct BuildAdmissionCoordinator {
     wait_timeout: Duration,
 }
 
-/// Compatibility name for the current Docker backend. New backends should
-/// construct `BuildAdmissionCoordinator::for_builder` directly.
-pub(super) type DockerBuildAdmission = BuildAdmissionCoordinator;
-
 impl BuildAdmissionCoordinator {
     pub fn new(pool: PgPool, image: impl Into<String>, docker_host: impl Into<String>) -> Self {
         let image = image.into();

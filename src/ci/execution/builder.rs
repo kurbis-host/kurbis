@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    admission::{BuildAdmissionLease, DockerBuildAdmission, parse_cgroup_memory_events},
+    admission::{BuildAdmissionCoordinator, BuildAdmissionLease, parse_cgroup_memory_events},
     archive::{ArchiveError, MAX_ARTIFACT_BYTES, pack_source_archive},
 };
 
@@ -108,7 +108,7 @@ pub struct DockerRootlessBuildRuntime {
     toolchain_version: String,
     expected_rustc: String,
     sandbox: DockerSandbox,
-    admission: DockerBuildAdmission,
+    admission: BuildAdmissionCoordinator,
 }
 impl DockerRootlessBuildRuntime {
     pub fn new(
@@ -116,6 +116,7 @@ impl DockerRootlessBuildRuntime {
         image: impl Into<String>,
         docker_host: impl Into<String>,
         toolchain_version: impl Into<String>,
+        build_concurrency: u16,
     ) -> Result<Self, BuildPipelineError> {
         let image = image.into();
         let docker_host = docker_host.into();
@@ -124,10 +125,8 @@ impl DockerRootlessBuildRuntime {
         let toolchain_version = toolchain_version.into();
         let expected_rustc = rustc_release_from_identity(&image, &toolchain_version)
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
-        let concurrency = crate::config::ci_build_concurrency_from_env()
-            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
-        let admission = DockerBuildAdmission::new(pool, image.clone(), docker_host.clone())
-            .with_concurrency(usize::from(concurrency))
+        let admission = BuildAdmissionCoordinator::new(pool, image.clone(), docker_host.clone())
+            .with_concurrency(usize::from(build_concurrency))
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         Ok(Self {
             admission,

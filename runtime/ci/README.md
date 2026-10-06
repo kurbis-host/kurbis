@@ -142,7 +142,10 @@ not supported by the Docker Compose deployment: Compose intentionally does not
 pass or mount the host executable, immutable rootfs/toolchain, source preparer,
 or workspace. Selecting Bubblewrap in Compose therefore fails closed instead
 of pretending those host paths exist. Use `./start.sh native ...` on the Linux
-worker and configure every `CI_BUBBLEWRAP_*` path there.
+worker and configure every `CI_BUBBLEWRAP_*` path there. Native `start.sh` runs
+from the checkout root, so set `CI_PLUGIN_SOURCE=plugins/kurbis-control` (or an
+absolute checkout path); Compose overrides that setting with the image path
+`/opt/kurbis/plugins/kurbis-control`.
 
 The operator must mount the workspace below the build user's private `$HOME`,
 for example `$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly

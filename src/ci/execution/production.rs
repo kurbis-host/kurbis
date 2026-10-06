@@ -28,6 +28,7 @@ pub fn docker_pipeline<S, A>(
     builder_image: impl Into<String>,
     builder_docker_host: impl Into<String>,
     toolchain_version: impl Into<String>,
+    build_concurrency: u16,
     plugin_source: impl Into<PathBuf>,
     check_runs: Option<Arc<dyn CheckRunClient>>,
 ) -> Result<
@@ -48,6 +49,7 @@ where
         builder_image,
         builder_docker_host,
         toolchain_version,
+        build_concurrency,
     )?);
     let builder = RustPumpkinBuilder::new(runtime.clone(), plugin_source)?;
     let pipeline = ControlledBuildPipeline::new(
@@ -68,6 +70,7 @@ where
 /// used as an implicit fallback; the returned identity includes the Bubblewrap
 /// version and immutable root/toolchain manifests for cache separation.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn bubblewrap_pipeline<S, A>(
     repository: CiPreviewRepository,
     source: Arc<S>,

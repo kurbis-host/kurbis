@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
                         ci_config.builder_image.clone(),
                         ci_config.builder_docker_host.clone(),
                         ci_config.toolchain_version.clone(),
+                        ci_config.build_concurrency,
                         ci_config.plugin_source.clone(),
                         Some(check_runs.clone()),
                     )?

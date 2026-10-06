@@ -247,7 +247,7 @@ impl BubblewrapBuildRuntime {
     async fn preflight_with_token(
         &self,
         lease_token: Option<&str>,
-        lease: Option<&mut super::admission::BuildAdmissionLease>,
+        mut lease: Option<&mut super::admission::BuildAdmissionLease>,
     ) -> Result<BubblewrapPreflight, BuildPipelineError> {
         verify_workspace_tmpfs(&self.workspace_root)?;
         if let Some(token) = lease_token {
@@ -282,9 +282,23 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             }
         };
         let result = self
-            .run_sandbox(&workspace, script, &namespace_env, COMMAND_TIMEOUT, lease)
+            .run_sandbox(
+                &workspace,
+                script,
+                &namespace_env,
+                COMMAND_TIMEOUT,
+                lease.as_deref_mut(),
+            )
             .await;
+        let post_fence = lease.map(|lease| {
+            lease
+                .assert_alive()
+                .map_err(|error| sandbox_error(error.to_string()))
+        });
         let _ = tokio::fs::remove_dir_all(&workspace).await;
+        if let Some(post_fence) = post_fence {
+            post_fence?;
+        }
         let (_, report) = result?;
         if !report.stdout.contains("BWRAP_NAMESPACE_PROBE_PASSED") {
             return Err(sandbox_error(
@@ -542,7 +556,12 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
                     .assert_alive()
                     .map_err(|error| sandbox_error(error.to_string()))?;
                 let source = workspace.join("out").join(file);
-                copy_regular_file(&source, &output_dir.join(file), MAX_ARTIFACT_BYTES)?;
+                let destination = output_dir.join(file);
+                copy_regular_file(&source, &destination, MAX_ARTIFACT_BYTES)?;
+                if let Err(error) = lease.assert_alive() {
+                    let _ = fs::remove_file(&destination);
+                    return Err(sandbox_error(error.to_string()));
+                }
             }
             Ok(report)
         }
@@ -848,6 +867,7 @@ fn canonical_output_directory(path: &Path) -> Result<PathBuf, BuildPipelineError
 }
 
 fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
+    reject_symlink_input(path, "bubblewrap workspace root")?;
     if is_public_tmp(path) {
         return Err(sandbox_error(
             "bubblewrap workspace root may not reside below public /tmp",
@@ -1165,7 +1185,13 @@ fn open_bounded_regular_file(
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(source)
-        .map_err(|error| sandbox_io(format!("open {label}"), error))?;
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                permanent(format!("{label} is not a bounded regular file"))
+            } else {
+                sandbox_io(format!("open {label}"), error)
+            }
+        })?;
     let metadata = input
         .metadata()
         .map_err(|error| sandbox_io(format!("inspect {label}"), error))?;
@@ -1566,7 +1592,10 @@ mod tests {
 
         let link = root.path().join("patched-source-link.tar.gz");
         symlink(&archive, &link).unwrap();
-        assert!(read_bounded_regular_file(&link, 1024).await.is_err());
+        assert!(matches!(
+            read_bounded_regular_file(&link, 1024).await,
+            Err(BuildPipelineError::Permanent { .. })
+        ));
         assert!(read_bounded_regular_file(&archive, 4).await.is_err());
     }
 
