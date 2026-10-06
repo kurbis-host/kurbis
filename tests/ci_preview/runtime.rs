@@ -74,7 +74,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
         .unwrap();
     let key = BuildKey::new(
         &repository_name,
-        "0123456789abcdef0123456789abcdef01234567",
+        &format!("{:040x}", Uuid::new_v4().as_u128()),
         "patch-runtime-lifecycle",
         "rust-1.98@sha256:fixture",
         "x86_64-linux",
@@ -152,7 +152,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
             .unwrap()
     );
     let port_lease_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ci_port_leases WHERE server_id = $1")
+        sqlx::query_scalar("SELECT count(*) FROM port_leases WHERE server_id = $1")
             .bind(preview.id)
             .fetch_one(&pool)
             .await
@@ -236,7 +236,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
             .unwrap()
     );
     let extended_ttl_hours: f64 = sqlx::query_scalar(
-        "SELECT extract(epoch FROM (expires_at - now())) / 3600 FROM ci_preview_aliases WHERE id=$1",
+        "SELECT (extract(epoch FROM (expires_at - now())) / 3600)::float8 FROM ci_preview_aliases WHERE id=$1",
     )
     .bind(preview.id)
     .fetch_one(&pool)
