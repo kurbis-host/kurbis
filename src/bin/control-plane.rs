@@ -6,7 +6,7 @@ use kurbis_hoster::{
         ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiBuildIdentity, CiPoller,
         CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient,
         GitHubExactSource, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
-        bubblewrap_pipeline, docker_pipeline,
+        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
     },
     config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::{
@@ -40,10 +40,12 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(20))
             .build()?;
         let github_polling =
-            GitHubSourceControl::new(client.clone(), ci_config.github_pat.clone())?;
-        let source = GitHubExactSource::new(
+            GitHubSourceControl::new(client.clone(), ci_config.github_pat.clone())?
+                .with_api_base_url(ci_config.github_api_base_url.clone());
+        let source = GitHubExactSource::with_api_base_url(
             std::sync::Arc::new(github_polling),
             ci_config.github_pat.clone(),
+            &ci_config.github_api_base_url,
         )?;
         let public_status_base_url = format!(
             "{}/ci/previews",
@@ -51,6 +53,7 @@ async fn main() -> Result<()> {
         );
         let check_runs = std::sync::Arc::new(
             GitHubCheckRunClient::new(client, ci_config.github_pat)?
+                .with_api_base_url(ci_config.github_api_base_url.clone())
                 .with_details_base_url(public_status_base_url.clone())?,
         );
         let artifacts =
@@ -83,6 +86,38 @@ async fn main() -> Result<()> {
                         CiPreviewRepository::new(pool.clone()),
                         Arc::new(source.clone()),
                         artifacts.clone(),
+                        executable.clone(),
+                        rootfs.clone(),
+                        toolchain.clone(),
+                        workspace_root.clone(),
+                        source_preparer.clone(),
+                        ci_config.toolchain_version.clone(),
+                        ci_config.plugin_source.clone(),
+                        ci_config.build_concurrency,
+                        Some(check_runs.clone()),
+                    )?;
+                    (
+                        Arc::new(
+                            pipeline.with_public_status_base_url(public_status_base_url.clone()),
+                        ),
+                        identity,
+                    )
+                }
+                CiBuilderBackend::BubblewrapSsh {
+                    target,
+                    runner,
+                    executable,
+                    rootfs,
+                    toolchain,
+                    workspace_root,
+                    source_preparer,
+                } => {
+                    let (pipeline, identity) = remote_bubblewrap_pipeline(
+                        CiPreviewRepository::new(pool.clone()),
+                        Arc::new(source.clone()),
+                        artifacts.clone(),
+                        target.clone(),
+                        runner.clone(),
                         executable.clone(),
                         rootfs.clone(),
                         toolchain.clone(),

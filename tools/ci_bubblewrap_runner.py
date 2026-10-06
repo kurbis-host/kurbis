@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Private SSH job runner for the remote Bubblewrap CI builder.
+
+The control plane sends one JSON header followed by two bounded tar archives. The
+runner emits one JSON result followed by the two bounded output files. It never
+uses public /tmp or evaluates source-controlled shell input; only this checked-in
+build script runs inside the Bubblewrap namespace.
+"""
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+MAX_SOURCE = 256 * 1024 * 1024
+MAX_PLUGIN = 64 * 1024 * 1024
+MAX_ARTIFACT = 1024 * 1024 * 1024
+MAX_LOG = 512 * 1024
+
+BUILD_SCRIPT = r"""
+set -eu
+umask 077
+ulimit -n 4096 2>/dev/null || true
+mkdir -p /work/source /work/plugin /work/out /work/tmp /work/home
+export HOME=/work/home
+export TMPDIR=/work/tmp
+export CARGO_HOME=/toolchain/cargo
+export CARGO_BUILD_JOBS=1
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+export CARGO_PROFILE_RELEASE_DEBUG=0
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
+[ "$actual_rustc" = "$KURBIS_EXPECTED_RUSTC" ] || {
+  echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
+  exit 78
+}
+tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
+tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
+cd /work/source
+cargo build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
+cd /work/plugin
+cargo build --locked --offline --release --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
+strip /work/out/pumpkin
+printf 'bubblewrap_guarantee=%s\n' "$KURBIS_BWRAP_GUARANTEE"
+printf 'cgroup_delegation=%s\n' "$KURBIS_CGROUP_DELEGATION"
+printf 'workspace_boundary=operator_tmpfs_explicit_size_and_inodes\n'
+"""
+
+
+def fail(message, status=1, stdout="", stderr=""):
+    result = {"ok": False, "status": status, "stdout": stdout[-MAX_LOG:], "stderr": (message + "\n" + stderr)[-MAX_LOG:], "artifacts": []}
+    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    raise SystemExit(0)
+
+
+def read_exact(stream, length):
+    if length < 0 or length > MAX_SOURCE:
+        raise ValueError("invalid framed input length")
+    result = bytearray()
+    while len(result) < length:
+        chunk = stream.read(min(1024 * 1024, length - len(result)))
+        if not chunk:
+            raise ValueError("truncated framed input")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def private_workspace_root(value):
+    root = Path(value).expanduser()
+    home = Path(os.environ["HOME"]).resolve(strict=True)
+    root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.mkdir(mode=0o700, exist_ok=True)
+    root = root.resolve(strict=True)
+    if root == home or not root.is_relative_to(home):
+        raise ValueError("workspace root must be below HOME")
+    # The SSH command enters a private user+mount namespace. Mounting the
+    # operator-specified five-GiB workspace there gives each job the exact
+    # bounded tmpfs contract without requiring a host-wide root mount.
+    mounts = Path("/proc/self/mountinfo").read_text()
+    if str(root) not in mounts or "size=5242880k" not in mounts or "nr_inodes=1310720" not in mounts:
+        subprocess.run(["mount", "-t", "tmpfs", "-o", "size=5G,nr_inodes=1310720,mode=700", "tmpfs", str(root)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    mode = stat.S_IMODE(root.stat().st_mode)
+    if mode != 0o700 or root.stat().st_uid != os.getuid():
+        raise ValueError("workspace root must be a mode-0700 directory owned by the namespace user")
+    return root
+
+
+def runner_command(header, workspace, script):
+    bwrap = Path(header["bwrap"])
+    rootfs = Path(header["rootfs"])
+    toolchain = Path(header["toolchain"])
+    preparer = Path(header["source_preparer"])
+    for path, label in ((bwrap, "bubblewrap"), (rootfs, "rootfs"), (toolchain, "toolchain"), (preparer, "source_preparer")):
+        if label in ("rootfs", "toolchain") and path == Path("/"):
+            raise ValueError(f"{label} may not be host root")
+        if not path.is_absolute() or not path.exists():
+            raise ValueError(f"{label} path is unavailable")
+    env_values = {
+        "KURBIS_RUST_TARGET": header["target"],
+        "KURBIS_EXPECTED_RUSTC": header["rustc"],
+        "KURBIS_BWRAP_GUARANTEE": "bubblewrap_namespace_only",
+        "KURBIS_CGROUP_DELEGATION": "remote_probe",
+    }
+    command = [
+        str(bwrap), "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
+        "--unshare-ipc", "--unshare-uts", "--unshare-net", "--uid", "0", "--gid", "0",
+        "--cap-drop", "ALL", "--ro-bind", str(rootfs), "/", "--ro-bind", str(toolchain), "/toolchain",
+        "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev",
+        "--bind", str(workspace / "tmp"), "/tmp", "--bind", str(workspace / "run"), "/run",
+        "--bind", str(workspace / "root"), "/root", "--bind", str(workspace / "home"), "/home",
+        "--bind", str(workspace / "sys"), "/sys", "--chdir", "/work", "--clearenv",
+        "--setenv", "HOME", "/work/home", "--setenv", "PATH", "/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+        "--ro-bind", str(preparer), "/work/.ci-source-preparer",
+    ]
+    for key, value in env_values.items():
+        command.extend(("--setenv", key, value))
+    command.extend(("/bin/sh", "-ec", script))
+    return command
+
+
+def main():
+    line = sys.stdin.buffer.readline(16385)
+    if not line or len(line) > 16384 or not line.endswith(b"\n"):
+        fail("invalid job header")
+    try:
+        header = json.loads(line)
+        if header.get("version") != 1 or header.get("mode") not in ("preflight", "compile"):
+            raise ValueError("unsupported job header")
+        if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "workspace_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
+            raise ValueError("missing job field")
+        if not all(c in "0123456789abcdef" for c in header["job_id"].lower()) or len(header["job_id"]) > 64:
+            raise ValueError("invalid job id")
+        source_len = int(header.get("source_len", 0))
+        plugin_len = int(header.get("plugin_len", 0))
+        if source_len < 0 or source_len > MAX_SOURCE or plugin_len < 0 or plugin_len > MAX_PLUGIN:
+            raise ValueError("framed input exceeds bounds")
+        if header["mode"] == "preflight" and (source_len or plugin_len):
+            raise ValueError("preflight cannot carry input")
+        workspace_root = private_workspace_root(header["workspace_root"])
+        workspace = workspace_root / ("kurbis-bwrap-remote-" + header["job_id"])
+        workspace.mkdir(mode=0o700)
+        for name in ("input", "out", "tmp", "home", "run", "root", "sys"):
+            (workspace / name).mkdir(mode=0o700)
+        source = read_exact(sys.stdin.buffer, source_len)
+        plugin = read_exact(sys.stdin.buffer, plugin_len)
+        if source_len:
+            (workspace / "input/source.tar.gz").write_bytes(source)
+            (workspace / "input/source.tar.gz").chmod(0o600)
+        if plugin_len:
+            (workspace / "input/plugin.tar.gz").write_bytes(plugin)
+            (workspace / "input/plugin.tar.gz").chmod(0o600)
+        if header["mode"] == "preflight":
+            script = r"""set -eu
+[ "$(id -u)" = 0 ]
+grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+[ "$HOME" = /work/home ]
+[ ! -e /run/docker.sock ]
+[ ! -e /var/run/docker.sock ]
+awk 'NR > 1 && $1 != "lo" { route = 1 } END { exit route }' /proc/net/route
+awk '$NF != "lo" { route = 1 } END { exit route }' /proc/net/ipv6_route
+printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
+"""
+            command = runner_command(header, workspace, script)
+        else:
+            command = runner_command(header, workspace, BUILD_SCRIPT)
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=int(header.get("timeout_seconds", 5400)), check=False)
+        stdout = completed.stdout[-MAX_LOG:].decode("utf-8", "replace")
+        stderr = completed.stderr[-MAX_LOG:].decode("utf-8", "replace")
+        artifacts = []
+        if completed.returncode == 0 and header["mode"] == "compile":
+            for filename in ("pumpkin", "kurbis-control.wasm"):
+                path = workspace / "out" / filename
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > MAX_ARTIFACT:
+                    raise ValueError(f"invalid output {filename}")
+                data = path.read_bytes()
+                artifacts.append({"name": filename, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "data": data})
+        result = {"ok": completed.returncode == 0, "status": completed.returncode, "stdout": stdout, "stderr": stderr, "artifacts": [{k: v for k, v in item.items() if k != "data"} for item in artifacts]}
+        sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        for item in artifacts:
+            sys.stdout.buffer.write(item["data"])
+        sys.stdout.buffer.flush()
+    except subprocess.TimeoutExpired:
+        fail("bubblewrap job timed out", 124)
+    except Exception as exc:
+        fail(str(exc))
+    finally:
+        try:
+            shutil.rmtree(locals().get("workspace", ""), ignore_errors=True)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

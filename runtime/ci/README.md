@@ -157,3 +157,22 @@ input/output files remain separately bounded and are copied with counted reads.
 Both backends use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process
 PostgreSQL slot admission; each slot reserves its requested memory plus host
 system headroom.
+
+## Remote Bubblewrap mode (respond5 watcher → lxhalle builder)
+
+A control plane running in the isolated rootless respond5 stack can set
+`CI_BUILDER_BACKEND=bubblewrap_ssh`. Set `CI_GITHUB_API_BASE_URL` only when using a loopback fixture; production defaults to `https://api.github.com`. In this mode the control plane remains the
+poller, Check Run client, artifact cache, and preview coordinator. It sends one
+framed JSON-plus-archive job over a pinned non-root SSH account to the checked-in
+`tools/ci_bubblewrap_runner.py` on lxhalle. The runner enters a private user and
+mount namespace, mounts the operator workspace as an exact 5 GiB/1,310,720-inode
+tmpfs below that account's HOME, and runs the pinned Bubblewrap build with no
+network and read-only root/toolchain inputs. It returns only bounded build logs
+and SHA-256-labelled artifacts; the respond5 coordinator verifies each stream
+before the normal BLAKE3 artifact-cache verification and runtime registration.
+
+The SSH transport must use a dedicated non-root key and `BatchMode=yes`; do not
+mount `/var/run/docker.sock`, use rootful Compose, or send GitHub credentials to
+the builder. `CI_BUILDER_SSH_TARGET` is a single host target, and all
+`CI_BUBBLEWRAP_*` paths are remote builder paths. The helper removes its unique
+workspace in a `finally` path after every job.

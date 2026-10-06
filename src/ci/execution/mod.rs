@@ -66,6 +66,7 @@ mod bubblewrap;
 mod builder;
 mod patcher;
 mod production;
+mod remote_bubblewrap;
 mod source;
 
 pub(crate) use admission::parse_build_concurrency;
@@ -85,4 +86,7 @@ pub use builder::{
 pub use patcher::{CheckedInPumpkinPatcher, checked_in_patch_fingerprint};
 pub use source::GitHubExactSource;
 
-pub use production::{ROOTLESS_BUILD_LIMITS, bubblewrap_pipeline, docker_pipeline};
+pub use production::{
+    ROOTLESS_BUILD_LIMITS, bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
+};
+pub use remote_bubblewrap::SshBubblewrapBuildRuntime;

@@ -88,12 +88,22 @@ pub enum CiBuilderBackend {
         workspace_root: PathBuf,
         source_preparer: PathBuf,
     },
+    BubblewrapSsh {
+        target: String,
+        runner: PathBuf,
+        executable: String,
+        rootfs: String,
+        toolchain: String,
+        workspace_root: String,
+        source_preparer: String,
+    },
 }
 
 #[derive(Clone)]
 pub struct CiConfig {
     pub github_pat: String,
     pub repository: String,
+    pub github_api_base_url: String,
     pub default_branch: String,
     pub patch_fingerprint: String,
     pub toolchain_version: String,
@@ -122,6 +132,8 @@ impl CiConfig {
             "CI_GITHUB_PAT must be a non-empty visible token"
         );
         let repository = value("CI_REPOSITORY", "kurbis-host/Pumpkin");
+        let github_api_base_url = value("CI_GITHUB_API_BASE_URL", "https://api.github.com");
+        validate_ci_github_api_base_url(&github_api_base_url)?;
         ensure!(
             repository == "kurbis-host/Pumpkin",
             "CI_REPOSITORY is fixed to kurbis-host/Pumpkin"
@@ -168,7 +180,49 @@ impl CiConfig {
                     configured_rustc,
                 )
             }
-            other => bail!("CI_BUILDER_BACKEND must be docker or bubblewrap, got {other:?}"),
+            "bubblewrap_ssh" => {
+                let configured_rustc = exact_ci_rust_release()?;
+                let target = required("CI_BUILDER_SSH_TARGET")?;
+                ensure!(
+                    target.len() <= 255 && !target.bytes().any(|byte| byte.is_ascii_whitespace()),
+                    "CI_BUILDER_SSH_TARGET must be a single SSH target"
+                );
+                let runner = required_path("CI_BUBBLEWRAP_RUNNER")?;
+                let executable = required("CI_BUBBLEWRAP_PATH")?;
+                let rootfs = required("CI_BUBBLEWRAP_ROOTFS")?;
+                let toolchain = required("CI_BUBBLEWRAP_TOOLCHAIN")?;
+                let workspace_root = required("CI_BUBBLEWRAP_WORKSPACE")?;
+                let source_preparer = required("CI_BUBBLEWRAP_SOURCE_PREPARER")?;
+                for (name, value) in [
+                    ("CI_BUBBLEWRAP_PATH", &executable),
+                    ("CI_BUBBLEWRAP_ROOTFS", &rootfs),
+                    ("CI_BUBBLEWRAP_TOOLCHAIN", &toolchain),
+                    ("CI_BUBBLEWRAP_WORKSPACE", &workspace_root),
+                    ("CI_BUBBLEWRAP_SOURCE_PREPARER", &source_preparer),
+                ] {
+                    ensure!(
+                        value.starts_with('/') && !value.contains('\0'),
+                        "{name} must be an absolute remote path without NUL bytes"
+                    );
+                }
+                (
+                    CiBuilderBackend::BubblewrapSsh {
+                        target,
+                        runner,
+                        executable,
+                        rootfs,
+                        toolchain,
+                        workspace_root,
+                        source_preparer,
+                    },
+                    String::new(),
+                    String::new(),
+                    configured_rustc,
+                )
+            }
+            other => bail!(
+                "CI_BUILDER_BACKEND must be docker, bubblewrap, or bubblewrap_ssh, got {other:?}"
+            ),
         };
         let build_concurrency = ci_build_concurrency_from_env()?;
         let target_architecture = native_linux_target_architecture()?;
@@ -186,6 +240,7 @@ impl CiConfig {
         Ok(Some(Self {
             github_pat,
             repository,
+            github_api_base_url,
             default_branch,
             patch_fingerprint,
             toolchain_version,
@@ -205,6 +260,7 @@ impl fmt::Debug for CiConfig {
             .debug_struct("CiConfig")
             .field("github_pat", &"[redacted]")
             .field("repository", &self.repository)
+            .field("github_api_base_url", &self.github_api_base_url)
             .field("default_branch", &self.default_branch)
             .field("patch_fingerprint", &self.patch_fingerprint)
             .field("toolchain_version", &self.toolchain_version)
@@ -240,6 +296,26 @@ fn required_path(name: &str) -> Result<PathBuf> {
     let value = required(name)?;
     ensure!(!value.contains('\0'), "{name} must not contain NUL bytes");
     Ok(PathBuf::from(value))
+}
+
+pub fn validate_ci_github_api_base_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("CI_GITHUB_API_BASE_URL must be a valid URL")?;
+    ensure!(
+        url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(url.scheme(), "https" | "http"),
+        "CI_GITHUB_API_BASE_URL must be an HTTP(S) URL without credentials or query"
+    );
+    if url.scheme() == "http" {
+        ensure!(
+            matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
+            "plain HTTP CI_GITHUB_API_BASE_URL is allowed only for loopback fixtures"
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {

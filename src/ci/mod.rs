@@ -18,7 +18,7 @@ pub use domain::{
 pub use execution::{
     CheckedInPumpkinPatcher, DockerRootlessBuildRuntime, GitHubExactSource,
     MAX_COMPRESSED_SOURCE_BYTES, ROOTLESS_BUILD_LIMITS, RustPumpkinBuilder, bubblewrap_pipeline,
-    checked_in_patch_fingerprint, docker_pipeline,
+    checked_in_patch_fingerprint, docker_pipeline, remote_bubblewrap_pipeline,
 };
 pub use source_control::{
     PollCheckpoint, PollError, PollResult, SourceControlClient, SourceRef, SourceRefKind,
