@@ -135,8 +135,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     &self.config.root_domain,
                 )?,
             };
-            let stable_preview = self
-                .repository
+            self.repository
                 .ensure_preview(
                     &repository_name,
                     &source_ref.commit_sha,
@@ -146,9 +145,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     build.id,
                 )
                 .await?;
-            let should_track_check_run = !(source_ref.kind == SourceRefKind::PullRequest
-                && source_ref.closed
-                && build.stage == CiBuildStage::Queued);
+            // GitHub Check Runs are a PR-head status surface. Branch and commit
+            // aliases are deliberately build-only and remain lazy until an
+            // authenticated join asks for their exact observed head.
+            let should_track_check_run = source_ref.kind == SourceRefKind::PullRequest
+                && !(source_ref.closed && build.stage == CiBuildStage::Queued);
             if should_track_check_run
                 && let Some(check_runs) = self.check_runs.as_ref()
                 && self.repository.check_run_id(build.id).await?.is_none()
@@ -168,14 +169,6 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 && eager_refs.iter().any(|eager| {
                     eager.name == source_ref.name && eager.commit_sha == source_ref.commit_sha
                 });
-            // A stable branch alias may still serve an older successful
-            // commit while the newly observed head is building. Once a player
-            // has admitted that alias (anything beyond the untouched lobby),
-            // keep advancing the latest candidate and its build-only Check Run.
-            // This also retries a build whose lease expired while its prior
-            // poller replica was unavailable.
-            let admitted_branch = source_ref.kind == SourceRefKind::Branch
-                && stable_preview.state != crate::ci::CiPreviewState::Lobby;
             if eager_pr {
                 self.ensure_pr_head_build(
                     &source_ref,
@@ -185,15 +178,6 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     &stable_alias,
                 )
                 .await?;
-            } else if admitted_branch && let Some(builder) = self.builder.as_ref() {
-                builder
-                    .ensure_build(crate::ci::BuildRequest {
-                        key: key.clone(),
-                        source_repository: source_ref.source_repository.clone(),
-                        source_archive: Vec::new(),
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
             }
         }
         if let Some(builder) = self.builder.as_ref() {
@@ -443,6 +427,12 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         commit_alias: &CiHostname,
         stable_alias: &CiHostname,
     ) -> Result<()> {
+        // Keep this invariant at the side-effect boundary as well as at the
+        // poll decision site. A branch or arbitrary commit must never acquire
+        // a GitHub Check Run, even if a future caller passes it here.
+        if source_ref.kind != SourceRefKind::PullRequest {
+            return Ok(());
+        }
         let claim = Uuid::new_v4();
         if !self
             .repository

@@ -52,6 +52,37 @@ impl kurbis_hoster::ci::CheckRunClient for IdempotentCheckRuns {
     }
 }
 
+struct PermissionDeniedCheckRuns {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl kurbis_hoster::ci::CheckRunClient for PermissionDeniedCheckRuns {
+    async fn create(
+        &self,
+        _repository: &str,
+        _details: &kurbis_hoster::ci::CheckRunDetails,
+    ) -> Result<kurbis_hoster::ci::CheckRunId, kurbis_hoster::ci::CheckRunError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(kurbis_hoster::ci::CheckRunError::Http {
+            status: StatusCode::FORBIDDEN,
+            message: "fixture permission denied".into(),
+        })
+    }
+
+    async fn update(
+        &self,
+        _repository: &str,
+        _id: kurbis_hoster::ci::CheckRunId,
+        _details: &kurbis_hoster::ci::CheckRunDetails,
+    ) -> Result<(), kurbis_hoster::ci::CheckRunError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(kurbis_hoster::ci::CheckRunError::Http {
+            status: StatusCode::FORBIDDEN,
+            message: "fixture permission denied".into(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_check_run() {
     let _test_guard = CI_TEST_LOCK.lock().await;
@@ -280,6 +311,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
 
 #[derive(Clone)]
 struct MutableBranchSource {
+    name: String,
     commit: std::sync::Arc<std::sync::RwLock<String>>,
     fetches: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -294,7 +326,7 @@ impl SourceControlClient for MutableBranchSource {
         Ok(PollResult {
             refs: vec![SourceRef {
                 kind: SourceRefKind::Branch,
-                name: "main".into(),
+                name: self.name.clone(),
                 number: None,
                 commit_sha,
                 source_repository: Some(repository.to_owned()),
@@ -324,7 +356,7 @@ impl SourceControlClient for MutableBranchSource {
 }
 
 #[tokio::test]
-async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_stops() {
+async fn branch_polling_stays_lazy_after_admission_and_ignores_check_run_permission_errors() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
 
@@ -332,22 +364,21 @@ async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_st
     let repository = CiPreviewRepository::new(pool.clone());
     let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
-        .register_repository(&repository_name, "main")
+        .register_repository(&repository_name, "master")
         .await
         .unwrap();
     let root_domain = format!("pumpkin-{}.kurbis.host", Uuid::new_v4().simple());
+    let branch_name = "copilot/pumpkin-game-tick-research";
     let first_sha = "0123456789abcdef0123456789abcdef01234567";
     let next_sha = "fedcba9876543210fedcba9876543210fedcba98";
     let source = std::sync::Arc::new(MutableBranchSource {
+        name: branch_name.into(),
         commit: std::sync::Arc::new(std::sync::RwLock::new(first_sha.into())),
         fetches: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     let components = std::sync::Arc::new(TestBuildComponents::default());
-    let check_run_id = (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
-    let check_runs = std::sync::Arc::new(IdempotentCheckRuns {
-        id: check_run_id,
-        create_count: std::sync::atomic::AtomicUsize::new(0),
-        update_stages: std::sync::Mutex::new(Vec::new()),
+    let check_runs = std::sync::Arc::new(PermissionDeniedCheckRuns {
+        calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let builder = std::sync::Arc::new(
         ControlledBuildPipeline::new(
@@ -378,28 +409,56 @@ async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_st
         .with_check_runs(check_runs.clone())
         .with_builder(builder.clone());
 
+    // Polling observes the branch and creates only lazy DB records.
     poller.poll_once(watched.id).await.unwrap();
     assert_eq!(
         components
             .compile_calls
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "branch polling alone remains lazy"
+        "branch polling must not dispatch the BuildCoordinator"
     );
-    let branch_host = CiHostname::for_ref(CiRefKind::Branch, "main", &root_domain).unwrap();
+    assert_eq!(
+        check_runs.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "branch polling must not create a GitHub Check Run"
+    );
+    let check_run_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ci_check_runs WHERE repository = $1")
+            .bind(&repository_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        check_run_rows, 0,
+        "lazy branch polling must not persist Check Runs"
+    );
+    let branch_host = CiHostname::for_ref(CiRefKind::Branch, branch_name, &root_domain).unwrap();
     let lobby = repository
         .lookup_preview(&branch_host.value)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(lobby.state, kurbis_hoster::ci::CiPreviewState::Lobby);
-    let (_, first_request, _) = repository
+
+    // The explicit join path remains the only branch build admission point.
+    let (admitted, request, build_id) = repository
         .prepare_lazy_branch_admission(lobby.id, &root_domain)
         .await
         .unwrap();
-    let first_build = builder.run(first_request.unwrap()).await.unwrap();
-    assert_eq!(first_build.stage, CiBuildStage::Ready);
+    assert_eq!(admitted.commit_sha, first_sha);
+    builder.run(request.unwrap()).await.unwrap();
+    assert_eq!(build_id, Some(admitted.build_id));
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an explicit branch join still dispatches exactly one build"
+    );
 
+    // A later branch head is persisted for the next demand-triggered join, but
+    // does not build or create a Check Run while the current runtime is active.
     sqlx::query("UPDATE ci_preview_aliases SET state = 'running' WHERE hostname = $1")
         .bind(&branch_host.value)
         .execute(&pool)
@@ -417,10 +476,19 @@ async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_st
     )
     .unwrap();
     let next_build = repository.ensure_build(&next_key).await.unwrap().0;
-    assert_eq!(next_build.stage, CiBuildStage::Ready);
+    assert_eq!(next_build.stage, CiBuildStage::Queued);
+    assert_eq!(repository.check_run_id(next_build.id).await.unwrap(), None);
     assert_eq!(
-        repository.check_run_id(next_build.id).await.unwrap(),
-        Some(check_run_id + 1)
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a branch head update must not dispatch another build"
+    );
+    assert_eq!(
+        check_runs.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "branch head updates must remain outside the Check Run surface"
     );
     assert_eq!(
         repository
@@ -430,42 +498,12 @@ async fn admitted_branch_builds_new_heads_and_advances_only_after_old_runtime_st
             .unwrap()
             .commit_sha,
         first_sha,
-        "the stable alias keeps serving the prior successful runtime until it stops"
-    );
-    assert!(
-        check_runs
-            .update_stages
-            .lock()
-            .unwrap()
-            .contains(&CiBuildStage::Ready)
-    );
-
-    sqlx::query("UPDATE ci_preview_aliases SET state = 'ready' WHERE hostname = $1")
-        .bind(&branch_host.value)
-        .execute(&pool)
-        .await
-        .unwrap();
-    poller.poll_once(watched.id).await.unwrap();
-    assert_eq!(
-        repository
-            .lookup_preview(&branch_host.value)
-            .await
-            .unwrap()
-            .unwrap()
-            .commit_sha,
-        next_sha,
-        "a subsequent poll advances the stable alias after the previous runtime is idle"
-    );
-    assert_eq!(
-        components
-            .compile_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the admitted branch compiles its new immutable head once"
+        "the active branch runtime continues serving its admitted commit"
     );
     assert_eq!(
         source.fetches.lock().unwrap().as_slice(),
-        &[first_sha.to_owned(), next_sha.to_owned()]
+        &[first_sha.to_owned()],
+        "branch polling does not fetch source archives until a join dispatches a build"
     );
     pool.close().await;
 }

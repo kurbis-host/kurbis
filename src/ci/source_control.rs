@@ -72,7 +72,7 @@ pub struct PollResult {
     pub refs: Vec<SourceRef>,
     /// Pull-request heads whose lifecycle changed since the previous poll.
     /// Branches and arbitrary commit aliases are intentionally excluded: they
-    /// remain lazy until a join, or until an already-admitted branch advances.
+    /// remain lazy until an explicit on-demand join.
     pub eager_refs: Vec<SourceRef>,
     pub checkpoint: PollCheckpoint,
     pub not_modified: bool,
@@ -524,6 +524,89 @@ mod http_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LiveBranchFixture {
+        pulls: Vec<serde_json::Value>,
+        branches: Vec<serde_json::Value>,
+    }
+
+    async fn github_branch_fixture(request: Request<Body>) -> axum::response::Response {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let is_pr = path.contains("/pulls?");
+        let fixture: LiveBranchFixture = serde_json::from_str(include_str!(
+            "../../verification/fixtures/github_polling_branch.json"
+        ))
+        .unwrap();
+        let etag = if is_pr {
+            "live-pr-etag"
+        } else {
+            "live-branch-etag"
+        };
+        if request
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            == Some(etag)
+        {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(Body::empty())
+                .unwrap();
+        }
+        let body = if is_pr {
+            serde_json::to_vec(&fixture.pulls).unwrap()
+        } else {
+            serde_json::to_vec(&fixture.branches).unwrap()
+        };
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ETAG, etag)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn github_live_branch_fixture_never_marks_branch_heads_eager() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(any(github_branch_fixture)))
+                .await
+                .unwrap();
+        });
+        let client = GitHubSourceControl::new(Client::new(), "fixture-token")
+            .unwrap()
+            .with_api_base_url(format!("http://{address}"));
+        let first = client
+            .poll("kurbis-host/Pumpkin", &PollCheckpoint::default())
+            .await
+            .unwrap();
+        assert_eq!(first.refs.len(), 2);
+        assert!(first.eager_refs.is_empty());
+        assert!(first.refs.iter().any(|source| {
+            source.kind == SourceRefKind::Branch
+                && source.name == "copilot/pumpkin-game-tick-research"
+        }));
+        let unchanged = client
+            .poll("kurbis-host/Pumpkin", &first.checkpoint)
+            .await
+            .unwrap();
+        assert!(unchanged.eager_refs.is_empty());
+        assert!(
+            unchanged
+                .refs
+                .iter()
+                .all(|source| source.kind == SourceRefKind::Branch)
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
