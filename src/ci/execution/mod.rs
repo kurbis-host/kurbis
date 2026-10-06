@@ -75,7 +75,8 @@ pub use archive::{
     MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES, pack_source_archive, unpack_source_archive,
 };
 pub use bubblewrap::{
-    BUBBLEWRAP_GUARANTEE, BubblewrapBuildRuntime, BubblewrapPreflight, CgroupDelegation,
+    BUBBLEWRAP_GUARANTEE, BUBBLEWRAP_WORKSPACE_INODES, BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
+    BubblewrapBuildRuntime, BubblewrapPreflight, CgroupDelegation,
 };
 pub use builder::{
     BuildProcessReport, DockerRootlessBuildRuntime, RootlessBuildRuntime, RustPumpkinBuilder,

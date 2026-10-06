@@ -249,11 +249,7 @@ impl BubblewrapBuildRuntime {
         lease_token: Option<&str>,
         lease: Option<&mut super::admission::BuildAdmissionLease>,
     ) -> Result<BubblewrapPreflight, BuildPipelineError> {
-        verify_workspace_tmpfs(
-            &self.workspace_root,
-            BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
-            BUBBLEWRAP_WORKSPACE_INODES,
-        )?;
+        verify_workspace_tmpfs(&self.workspace_root)?;
         if let Some(token) = lease_token {
             self.cleanup_lease_workspace(token).await?;
         }
@@ -499,11 +495,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             ));
         }
         let output_dir = canonical_output_directory(output_dir)?;
-        verify_workspace_tmpfs(
-            &self.workspace_root,
-            limits.disk_bytes,
-            BUBBLEWRAP_WORKSPACE_INODES,
-        )?;
+        verify_workspace_tmpfs(&self.workspace_root)?;
         self.cleanup_lease_workspace(lease_token).await?;
         let workspace = self.create_workspace("compile", Some(lease_token))?;
         let result = async {
@@ -567,6 +559,7 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
     }
 
     async fn verify_sandbox(&self, limits: SandboxLimits) -> Result<(), BuildPipelineError> {
+        validate_limits(limits)?;
         let admission = self.admission.as_ref().ok_or_else(|| {
             sandbox_error("bubblewrap backend requires configured cross-process build admission")
         })?;
@@ -590,6 +583,7 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
         target: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
+        validate_limits(limits)?;
         let admission = self.admission.as_ref().ok_or_else(|| {
             sandbox_error("bubblewrap backend requires configured cross-process build admission")
         })?;
@@ -645,11 +639,7 @@ impl PatchApplier for BubblewrapBuildRuntime {
             .map_err(|error| sandbox_error(error.to_string()))?;
         let token = lease.token();
         let result = async {
-            verify_workspace_tmpfs(
-                &self.workspace_root,
-                BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
-                BUBBLEWRAP_WORKSPACE_INODES,
-            )?;
+            verify_workspace_tmpfs(&self.workspace_root)?;
             self.cleanup_lease_workspace(&token).await?;
             let workspace = self.create_workspace("patch", Some(&token))?;
             let result = async {
@@ -897,22 +887,14 @@ fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
     }
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .map_err(|error| sandbox_io("protect bubblewrap workspace root", error))?;
-    verify_workspace_tmpfs(
-        &path,
-        BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
-        BUBBLEWRAP_WORKSPACE_INODES,
-    )?;
+    verify_workspace_tmpfs(&path)?;
     Ok(path)
 }
 
-fn verify_workspace_tmpfs(
-    path: &Path,
-    required_size: u64,
-    required_inodes: u64,
-) -> Result<(), BuildPipelineError> {
+fn verify_workspace_tmpfs(path: &Path) -> Result<(), BuildPipelineError> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (path, required_size, required_inodes);
+        let _ = path;
         Err(sandbox_error(
             "bubblewrap workspace requires a Linux tmpfs mount",
         ))
@@ -921,23 +903,28 @@ fn verify_workspace_tmpfs(
     {
         let mounts = fs::read_to_string("/proc/self/mountinfo")
             .map_err(|error| sandbox_io("read workspace mount table", error))?;
-        let Some((size, inodes)) = mountinfo_tmpfs_limits(&mounts, path) else {
+        let Some(limits) = mountinfo_tmpfs_limits(&mounts, path) else {
             return Err(sandbox_error(
                 "bubblewrap workspace root must be an explicit tmpfs mount with size and nr_inodes options",
             ));
         };
-        if size != required_size {
-            return Err(sandbox_error(format!(
-                "bubblewrap workspace tmpfs size {size} does not match required build budget {required_size}"
-            )));
-        }
-        if inodes != required_inodes {
-            return Err(sandbox_error(format!(
-                "bubblewrap workspace tmpfs inode limit {inodes} does not match required limit {required_inodes}"
-            )));
-        }
-        Ok(())
+        enforce_workspace_tmpfs_limits(limits)
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn enforce_workspace_tmpfs_limits((size, inodes): (u64, u64)) -> Result<(), BuildPipelineError> {
+    if size != BUBBLEWRAP_WORKSPACE_SIZE_BYTES {
+        return Err(sandbox_error(format!(
+            "bubblewrap workspace tmpfs size {size} does not match required build budget {BUBBLEWRAP_WORKSPACE_SIZE_BYTES}"
+        )));
+    }
+    if inodes != BUBBLEWRAP_WORKSPACE_INODES {
+        return Err(sandbox_error(format!(
+            "bubblewrap workspace tmpfs inode limit {inodes} does not match required limit {BUBBLEWRAP_WORKSPACE_INODES}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1164,6 +1151,11 @@ fn validate_limits(limits: SandboxLimits) -> Result<(), BuildPipelineError> {
         || limits.process_timeout.is_zero()
     {
         return Err(sandbox_error("bubblewrap limits must be non-zero"));
+    }
+    if limits.disk_bytes != BUBBLEWRAP_WORKSPACE_SIZE_BYTES {
+        return Err(sandbox_error(format!(
+            "bubblewrap workspace disk limit must be exactly {BUBBLEWRAP_WORKSPACE_SIZE_BYTES} bytes; custom workspace limits are rejected"
+        )));
     }
     Ok(())
 }
@@ -1424,6 +1416,49 @@ mod tests {
     fn workspace_contract_matches_the_rootless_build_budget() {
         assert_eq!(BUBBLEWRAP_WORKSPACE_SIZE_BYTES, 5 * 1024 * 1024 * 1024);
         assert_eq!(BUBBLEWRAP_WORKSPACE_INODES, 1_310_720);
+    }
+
+    fn test_limits() -> SandboxLimits {
+        SandboxLimits {
+            memory_bytes: 10 * 1024 * 1024 * 1024,
+            cpu_millis: 2_000,
+            pid_limit: 512,
+            disk_bytes: BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
+            process_timeout: Duration::from_secs(90 * 60),
+        }
+    }
+
+    #[test]
+    fn bubblewrap_rejects_custom_workspace_disk_limits() {
+        for disk_bytes in [
+            BUBBLEWRAP_WORKSPACE_SIZE_BYTES - 1,
+            BUBBLEWRAP_WORKSPACE_SIZE_BYTES + 1,
+        ] {
+            let mut limits = test_limits();
+            limits.disk_bytes = disk_bytes;
+            let error =
+                validate_limits(limits).expect_err("custom workspace limits must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("custom workspace limits are rejected")
+            );
+        }
+    }
+
+    #[test]
+    fn bubblewrap_accepts_only_the_fixed_workspace_disk_limit() {
+        validate_limits(test_limits()).expect("the fixed workspace contract must be accepted");
+    }
+
+    #[test]
+    fn workspace_mount_contract_rejects_each_nonmatching_limit() {
+        let expected = (BUBBLEWRAP_WORKSPACE_SIZE_BYTES, BUBBLEWRAP_WORKSPACE_INODES);
+        assert!(enforce_workspace_tmpfs_limits(expected).is_ok());
+        assert!(enforce_workspace_tmpfs_limits((expected.0 - 1, expected.1)).is_err());
+        assert!(enforce_workspace_tmpfs_limits((expected.0 + 1, expected.1)).is_err());
+        assert!(enforce_workspace_tmpfs_limits((expected.0, expected.1 - 1)).is_err());
+        assert!(enforce_workspace_tmpfs_limits((expected.0, expected.1 + 1)).is_err());
     }
 
     #[cfg(target_os = "linux")]

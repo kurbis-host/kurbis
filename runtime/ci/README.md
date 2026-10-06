@@ -134,15 +134,23 @@ worker world, port leases, and resource reservations.
 ## Builder backend and concurrency
 
 `CI_BUILDER_BACKEND=docker` is the default and keeps the rootless Docker
-contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a Linux worker with
-private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately reported as
-`bubblewrap_namespace_only`: it does not claim cgroup CPU, memory, or PID
-enforcement, and there is no automatic Docker fallback. The operator must
-mount the workspace below the build user's private `$HOME`, for example
-`$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly `size=5G,nr_inodes=1310720`.
-Startup and every workload preflight parse `/proc/self/mountinfo` and fail
-closed for an ordinary directory, a different size, or a different inode
-limit. Build input/output files remain separately bounded and are copied with
-counted reads. Both backends use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for
-cross-process PostgreSQL slot admission; each slot reserves its requested
-memory plus host system headroom.
+contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a Linux native
+control plane with private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately
+reported as `bubblewrap_namespace_only`: it does not claim cgroup CPU, memory,
+or PID enforcement, and there is no automatic Docker fallback. Bubblewrap is
+not supported by the Docker Compose deployment: Compose intentionally does not
+pass or mount the host executable, immutable rootfs/toolchain, source preparer,
+or workspace. Selecting Bubblewrap in Compose therefore fails closed instead
+of pretending those host paths exist. Use `./start.sh native ...` on the Linux
+worker and configure every `CI_BUBBLEWRAP_*` path there.
+
+The operator must mount the workspace below the build user's private `$HOME`,
+for example `$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly
+`size=5G,nr_inodes=1310720`. Startup and every workload preflight parse
+`/proc/self/mountinfo` and fail closed for an ordinary directory, a different
+size, or a different inode limit. Compile and patch workloads always use this
+fixed 5 GiB workspace contract; any custom disk limit is rejected. Build
+input/output files remain separately bounded and are copied with counted reads.
+Both backends use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process
+PostgreSQL slot admission; each slot reserves its requested memory plus host
+system headroom.
