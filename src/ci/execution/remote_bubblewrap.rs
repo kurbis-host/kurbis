@@ -123,12 +123,17 @@ impl SshBubblewrapBuildRuntime {
             "-o",
             "BatchMode=yes",
             "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
             "ConnectTimeout=15",
             "-o",
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=2",
             "-T",
+            "--",
             &self.target,
         ]);
         command
@@ -397,6 +402,19 @@ impl SshBubblewrapBuildRuntime {
             return Err(BuildPipelineError::permanent(
                 crate::ci::CiBuildStage::Packaging,
                 "remote Bubblewrap result contained trailing output after its framed payload",
+            ));
+        }
+        let mut trailing = Vec::new();
+        reader.read_to_end(&mut trailing).await.map_err(|error| {
+            BuildPipelineError::transient(
+                crate::ci::CiBuildStage::Packaging,
+                format!("read remote Bubblewrap trailing output: {error}"),
+            )
+        })?;
+        if !trailing.is_empty() {
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Packaging,
+                "remote Bubblewrap protocol returned unexpected trailing bytes",
             ));
         }
         let mut remote_stderr = Vec::new();

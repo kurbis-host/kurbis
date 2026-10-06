@@ -184,11 +184,16 @@ network and read-only root/toolchain inputs. It returns only bounded build logs
 and SHA-256-labelled artifacts; the respond5 coordinator verifies each stream
 before the normal BLAKE3 artifact-cache verification and runtime registration.
 
-The SSH transport must use a dedicated non-root key and `BatchMode=yes`; do not
+The SSH transport must use a dedicated non-root key, `BatchMode=yes`,
+`IdentitiesOnly=yes`, and strict host-key verification from the control-plane
+user's private `known_hosts`; unknown or changed host keys fail closed. Do not
 mount `/var/run/docker.sock`, use rootful Compose, or send GitHub credentials to
 the builder. `CI_BUILDER_SSH_TARGET` is a single host target, and all
-`CI_BUBBLEWRAP_*` paths are remote builder paths. The helper removes its unique
-workspace in a `finally` path after every job.
+`CI_BUBBLEWRAP_*` paths are remote builder paths. The runner's namespace
+preflight also performs a C compiler/sysroot link probe, so a runtime-only
+rootfs (for example, one missing GCC `libexec`, linker startup objects, or C
+headers) fails before source transfer/build admission. The helper removes its
+unique workspace in a `finally` path after every job.
 
 ### Persistent operator configuration
 
