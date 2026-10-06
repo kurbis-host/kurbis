@@ -49,6 +49,10 @@ if [[ $service == worker ]]; then
     echo "Docker worker bundle is missing WORKER_GATEWAY_ADDRESS" >&2
     exit 2
   fi
+  if [[ $WORKER_RUNTIME == docker && ( -z ${WORKER_GATEWAY_BEDROCK_IP:-} || -z ${WORKER_GATEWAY_BEDROCK_PORT:-} ) ]]; then
+    echo "Docker worker bundle is missing WORKER_GATEWAY_BEDROCK_IP/PORT" >&2
+    exit 2
+  fi
   if [[ ! $WORKER_API_TOKEN =~ ^[A-Za-z0-9_-]{43}$ ]]; then
     echo "worker credential bundle contains a malformed WORKER_API_TOKEN" >&2
     exit 2
@@ -76,7 +80,8 @@ if [[ $service == worker ]]; then
   for variable_name in \
     LANG LC_ALL TMPDIR SSL_CERT_FILE SSL_CERT_DIR RUST_LOG DOCKER_HOST DOCKER_CONFIG \
     DOCKER_TLS_VERIFY DOCKER_CERT_PATH WORKER_ID WORKER_NAME WORKER_ADDRESS \
-    WORKER_SIGNAL_ADDRESS WORKER_GATEWAY_ADDRESS WORKER_API_TOKEN \
+    WORKER_SIGNAL_ADDRESS WORKER_GATEWAY_ADDRESS WORKER_GATEWAY_BEDROCK_IP \
+    WORKER_GATEWAY_BEDROCK_PORT WORKER_API_TOKEN \
     WORKER_ALLOW_INSECURE_LOCAL_CONTROL_PLANE_HTTP WORKER_ROOT WORKER_STORAGE_MODE \
     WORKER_RUNTIME WORKER_MEMORY_GIB WORKER_DISK_GIB WORKER_CPU_MILLIS \
     WORKER_PORT_MIN WORKER_PORT_MAX PUMPKIN_HOST_CONTROL_TOKEN CONTROL_PLANE_URL \
@@ -137,8 +142,17 @@ case "$service" in
     fi
     export CONTROL_PLANE_URL=http://127.0.0.1:8080
     export JAVA_LISTEN=0.0.0.0:25565
+    export JAVA_PUBLIC_PORT=${JAVA_PUBLIC_PORT:-${JAVA_PORT:-25565}}
     export BEDROCK_LISTEN=0.0.0.0:19132
+    export BEDROCK_PUBLIC_IP=${BEDROCK_PUBLIC_IP:-}
     export BEDROCK_PUBLIC_PORT=${BEDROCK_PUBLIC_PORT:-${BEDROCK_PORT:-19132}}
+    if [[ -z $BEDROCK_PUBLIC_IP && $mode == native-debug && $ROOT_DOMAIN == localhost ]]; then
+      export BEDROCK_PUBLIC_IP=127.0.0.1
+    fi
+    if [[ -z $BEDROCK_PUBLIC_IP ]]; then
+      echo "BEDROCK_PUBLIC_IP must identify the public Gateway IP advertised in NetherNet ICE" >&2
+      exit 2
+    fi
     export WAITING_SIGNAL_ADDRESS=${WAITING_SIGNAL_ADDRESS:-127.0.0.1:19134}
     if [[ -z ${BEDROCK_TLS_CERT_FILE:-} && -z ${BEDROCK_TLS_KEY_FILE:-} ]]; then
       if [[ $mode != native-debug || $ROOT_DOMAIN != localhost ]]; then

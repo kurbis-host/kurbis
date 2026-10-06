@@ -17,6 +17,7 @@ if [ ! -d "$source_dir/.git" ]; then
 fi
 fingerprint=$(cat "$root/runtime/pumpkin/REVISION" \
     "$root/runtime/pumpkin/host-control.patch" \
+    "$root/runtime/pumpkin/snapshot-barrier.patch" \
     "$root/runtime/pumpkin/nethernet-gateway.patch" \
     "$root/runtime/pumpkin/host_control.rs" | shasum -a 256 | cut -d ' ' -f 1)
 stamp="$root/output/native-pumpkin/source-fingerprint"
@@ -27,26 +28,34 @@ if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$fingerprint" ]; then
     git -C "$source_dir" submodule update --init --recursive --depth=1
     git -C "$source_dir" apply --check "$root/runtime/pumpkin/host-control.patch"
     git -C "$source_dir" apply "$root/runtime/pumpkin/host-control.patch"
+    git -C "$source_dir" apply --check "$root/runtime/pumpkin/snapshot-barrier.patch"
+    git -C "$source_dir" apply "$root/runtime/pumpkin/snapshot-barrier.patch"
     git -C "$source_dir" apply --unidiff-zero --check "$root/runtime/pumpkin/nethernet-gateway.patch"
     git -C "$source_dir" apply --unidiff-zero "$root/runtime/pumpkin/nethernet-gateway.patch"
     cp "$root/runtime/pumpkin/host_control.rs" "$source_dir/crates/pumpkin/src/net/host_control.rs"
     printf '%s\n' "$fingerprint" > "$stamp"
 fi
 export CARGO_TARGET_DIR="$root/output/native-pumpkin/target"
-export CARGO_BUILD_JOBS="${PUMPKIN_BUILD_JOBS:-4}"
+export CARGO_BUILD_JOBS=1
 # Native debug builds retain fast development compilation without huge DWARF.
 export CARGO_PROFILE_DEV_DEBUG=0
-export CARGO_PROFILE_DEV_CODEGEN_UNITS=16
+export CARGO_PROFILE_DEV_CODEGEN_UNITS=1
 export CARGO_PROFILE_DEV_INCREMENTAL=false
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 cd "$source_dir"
 set --
 if [ "$profile" = release ]; then
     set -- --release
 fi
-cargo +1.98.1 build "$@" --locked --package pumpkin --bin pumpkin
+python3 "$root/tools/run_bounded_build.py" \
+    --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+    -- python3 -c 'import os,sys; os.execvp(sys.argv[1], sys.argv[1:])' \
+    cargo +1.98.1 build --jobs 1 "$@" --locked --package pumpkin --bin pumpkin
 printf 'Native Pumpkin: %s/%s/pumpkin\n' "$CARGO_TARGET_DIR" "$cargo_profile"
 
 rustup target add --toolchain 1.98.1 wasm32-wasip2
-CARGO_TARGET_DIR="$root/plugins/kurbis-control/target" \
-    cargo +1.98.1 build --locked --manifest-path "$root/plugins/kurbis-control/Cargo.toml" --target wasm32-wasip2 "$@"
+python3 "$root/tools/run_bounded_build.py" \
+    --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+    -- env "CARGO_TARGET_DIR=$root/plugins/kurbis-control/target" \
+    cargo +1.98.1 build --jobs 1 --locked --manifest-path "$root/plugins/kurbis-control/Cargo.toml" --target wasm32-wasip2 "$@"
 printf 'Kurbis control plugin: %s/wasm32-wasip2/%s/kurbis_control.wasm\n' "$root/plugins/kurbis-control/target" "$cargo_profile"

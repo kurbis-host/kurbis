@@ -30,6 +30,8 @@ WORKER_BUNDLE_REQUIRED = {
 }
 WORKER_BUNDLE_OPTIONAL = {
     "WORKER_GATEWAY_ADDRESS",
+    "WORKER_GATEWAY_BEDROCK_IP",
+    "WORKER_GATEWAY_BEDROCK_PORT",
     "PUMPKIN_BINARY",
     "PUMPKIN_IMAGE",
     "KURBIS_CONTROL_PLUGIN_WASM",
@@ -129,10 +131,8 @@ def command_route(document):
     matches = [
         path
         for path, operations in paths.items()
-        if path.startswith("/api/v1/servers/")
-        and path.endswith("/commands")
+        if re.fullmatch(r"/api/v1/servers/\{[^{}]+\}/commands", path)
         and "post" in operations
-        and len(re.findall(r"\{[^{}]+\}", path)) == 1
     ]
     if len(matches) != 1:
         raise ValueError(f"expected one server command route in generated API, found {len(matches)}")

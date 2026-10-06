@@ -13,5 +13,6 @@ pub use coordinator::{
 };
 pub use repository::{
     CI_RUNTIME_CPU_MILLIS, CI_RUNTIME_DISK_BYTES, CI_RUNTIME_IDLE_SECONDS, CI_RUNTIME_MEMORY_BYTES,
-    CiPreviewRuntimeRepository, CiRuntimePlacement, ExpiredCiRuntime,
+    CiPreviewRuntimeRepository, CiRuntimePlacement, CiWorldSnapshot, CiWorldSnapshotGarbageClaim,
+    ExpiredCiRuntime,
 };

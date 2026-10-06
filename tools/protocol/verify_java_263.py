@@ -469,7 +469,8 @@ class ProtocolClient:
                     self.transfer_seen = True
                     self.record("native_transfer", host=host, port=port)
                     sock.close()
-                    self.connect(host, port, host, True)
+                    connect_host = self.args.transfer_connect_host or host
+                    self.connect(connect_host, port, host, True)
                     return
 
             raise TimeoutError(
@@ -521,6 +522,7 @@ def main():
     parser.add_argument("--transfer-port", type=int)
     parser.add_argument("--transfer-port-range", type=port_range, action="append", default=[])
     parser.add_argument("--transfer-host", default="127.0.0.1")
+    parser.add_argument("--transfer-connect-host", help="test-only DNS override; Java handshake retains the transferred hostname")
     parser.add_argument("--expect-kick")
     parser.add_argument("--hold-seconds", type=float, default=2)
     parser.add_argument("--expect-close", action="store_true")

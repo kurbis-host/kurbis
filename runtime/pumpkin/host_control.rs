@@ -69,6 +69,8 @@ enum Action {
     Transfer,
     Kick,
     Save,
+    BeginSnapshot,
+    EndSnapshot,
     Shutdown,
     WhitelistReplace,
     OperatorsReplace,
@@ -173,6 +175,18 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
         return write_response(
             &mut write_half,
             json!({"ok": false, "error": "unauthorized"}),
+        )
+        .await;
+    }
+    if server.snapshot_barrier_active.load(Ordering::Acquire)
+        && !matches!(
+            &request.action,
+            Action::Status | Action::Players | Action::EndSnapshot | Action::Shutdown
+        )
+    {
+        return write_response(
+            &mut write_half,
+            json!({"ok": false, "error": "snapshot_barrier_active"}),
         )
         .await;
     }
@@ -509,6 +523,21 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
                 .await
             }
         },
+        Action::BeginSnapshot => match server.begin_snapshot_barrier().await {
+            Ok(()) => write_response(&mut write_half, json!({"ok": true})).await,
+            Err(error) => {
+                warn!("Host control snapshot barrier failed: {error}");
+                write_response(
+                    &mut write_half,
+                    json!({"ok": false, "error": "snapshot_barrier_failed"}),
+                )
+                .await
+            }
+        },
+        Action::EndSnapshot => {
+            server.end_snapshot_barrier();
+            write_response(&mut write_half, json!({"ok": true})).await
+        }
         Action::Shutdown => {
             write_response(&mut write_half, json!({"ok": true})).await?;
             stop_server();

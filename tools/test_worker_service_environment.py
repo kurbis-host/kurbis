@@ -111,6 +111,8 @@ class WorkerLaunch:
         }
         if self.mode == "docker":
             values["WORKER_GATEWAY_ADDRESS"] = "198.51.100.24"
+            values["WORKER_GATEWAY_BEDROCK_IP"] = "203.0.113.25"
+            values["WORKER_GATEWAY_BEDROCK_PORT"] = "19132"
             values["PUMPKIN_IMAGE"] = "melon-pumpkin:host-control"
         else:
             values["PUMPKIN_BINARY"] = str(self.root / "output/native-pumpkin/target/release/pumpkin")
@@ -187,8 +189,12 @@ class WorkerServiceEnvironmentTests(unittest.TestCase):
                 self.assertEqual(environment["WORKER_SIGNAL_ADDRESS"], "10.0.0.20")
                 if mode == "docker":
                     self.assertEqual(environment["WORKER_GATEWAY_ADDRESS"], "198.51.100.24")
+                    self.assertEqual(environment["WORKER_GATEWAY_BEDROCK_IP"], "203.0.113.25")
+                    self.assertEqual(environment["WORKER_GATEWAY_BEDROCK_PORT"], "19132")
                 else:
                     self.assertNotIn("WORKER_GATEWAY_ADDRESS", environment)
+                    self.assertNotIn("WORKER_GATEWAY_BEDROCK_IP", environment)
+                    self.assertNotIn("WORKER_GATEWAY_BEDROCK_PORT", environment)
                 self.assertEqual(environment["WORKER_RUNTIME"], "docker" if mode == "docker" else "native")
                 self.assertEqual(environment["CONTROL_PLANE_URL"], "http://127.0.0.1:18080" if mode == "docker" else "http://127.0.0.1:8080")
                 self.assertEqual(environment["PUBLIC_BASE_URL"], "https://panel.example.test")

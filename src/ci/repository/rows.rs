@@ -21,6 +21,7 @@ pub(super) struct CheckRunReconciliationRow {
     pub(super) artifact_digest: Option<String>,
     pub(super) failure_stage: Option<String>,
     pub(super) failure_message: Option<String>,
+    pub(super) tombstone: bool,
 }
 
 impl TryFrom<CheckRunReconciliationRow> for CheckRunReconciliation {
@@ -44,6 +45,7 @@ impl TryFrom<CheckRunReconciliationRow> for CheckRunReconciliation {
             artifact_digest: row.artifact_digest,
             failure_stage: row.failure_stage.map(|stage| stage.parse()).transpose()?,
             failure_message: row.failure_message,
+            tombstone: row.tombstone,
         })
     }
 }

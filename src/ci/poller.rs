@@ -85,6 +85,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .poll_repository(repository_id, self.source.as_ref())
             .await?;
         let repository_name = self.repository_name(repository_id).await?;
+        let eager_refs = poll.eager_refs;
         // Branch deletion is actionable only after a complete branch poll has
         // durably marked refs deleted. Pull-request close is intentionally not
         // mapped to preview teardown.
@@ -134,8 +135,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     &self.config.root_domain,
                 )?,
             };
-            let stable_preview = self
-                .repository
+            self.repository
                 .ensure_preview(
                     &repository_name,
                     &source_ref.commit_sha,
@@ -145,9 +145,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     build.id,
                 )
                 .await?;
-            let should_track_check_run = !(source_ref.kind == SourceRefKind::PullRequest
-                && source_ref.closed
-                && build.stage == CiBuildStage::Queued);
+            // GitHub Check Runs are a PR-head status surface. Branch and commit
+            // aliases are deliberately build-only and remain lazy until an
+            // authenticated join asks for their exact observed head.
+            let should_track_check_run = source_ref.kind == SourceRefKind::PullRequest
+                && !(source_ref.closed && build.stage == CiBuildStage::Queued);
             if should_track_check_run
                 && let Some(check_runs) = self.check_runs.as_ref()
                 && self.repository.check_run_id(build.id).await?.is_none()
@@ -162,30 +164,179 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 )
                 .await?;
             }
-            let eager_pr = source_ref.kind == SourceRefKind::PullRequest && !source_ref.closed;
-            // A stable branch alias may still serve an older successful
-            // commit while the newly observed head is building. Once a player
-            // has admitted that alias (anything beyond the untouched lobby),
-            // keep advancing the latest candidate and its build-only Check Run.
-            // This also retries a build whose lease expired while its prior
-            // poller replica was unavailable.
-            let admitted_branch = source_ref.kind == SourceRefKind::Branch
-                && stable_preview.state != crate::ci::CiPreviewState::Lobby;
-            if eager_pr || admitted_branch {
-                if let Some(builder) = self.builder.as_ref() {
-                    let request = crate::ci::BuildRequest {
-                        key: key.clone(),
-                        source_repository: source_ref.source_repository.clone(),
-                        source_archive: Vec::new(),
-                    };
-                    builder
-                        .ensure_build(request)
+            let eager_pr = source_ref.kind == SourceRefKind::PullRequest
+                && !source_ref.closed
+                && eager_refs.iter().any(|eager| {
+                    eager.name == source_ref.name && eager.commit_sha == source_ref.commit_sha
+                });
+            if eager_pr {
+                self.ensure_pr_head_build(
+                    &source_ref,
+                    &repository_name,
+                    &source_ref.commit_sha,
+                    &commit_alias,
+                    &stable_alias,
+                )
+                .await?;
+            }
+        }
+        if let Some(builder) = self.builder.as_ref() {
+            // The durable queue is necessary even when the GitHub collections
+            // return 304: a process can die after admitting a PR head but before
+            // starting its build, and the next poll must recover that exact head
+            // without asking GitHub to emit another event.
+            for request in self
+                .repository
+                .queued_pull_request_builds(&repository_name)
+                .await?
+            {
+                builder
+                    .ensure_build(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("queued CI PR build failed: {error}"))?;
+            }
+            for request in self
+                .repository
+                .due_pull_request_build_retries(&repository_name)
+                .await?
+            {
+                builder
+                    .ensure_build(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("scheduled CI PR retry failed: {error}"))?;
+            }
+        }
+        self.reconcile_check_runs().await?;
+        Ok(())
+    }
+
+    /// Process queued signed PR lifecycle events without expanding a head into
+    /// its ancestors. Each delivery represents exactly one requested PR head.
+    pub async fn drain_github_webhooks_once(&self) -> Result<()> {
+        for delivery in self.repository.claim_github_pr_deliveries(16).await? {
+            let delivery_id = delivery.delivery_id;
+            let claim_token = delivery.claim_token;
+            let repository = self.repository.clone();
+            let renewal = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    match repository
+                        .renew_github_pr_delivery_claim(delivery_id, claim_token)
                         .await
-                        .map_err(|error| anyhow::anyhow!("CI build failed: {error}"))?;
+                    {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(delivery_id = %delivery_id, ?error, "failed to renew GitHub PR delivery lease")
+                        }
+                    }
+                }
+            });
+            let result = self.process_github_pr_delivery(&delivery).await;
+            renewal.abort();
+            match result {
+                Ok(()) => {
+                    self.repository
+                        .complete_github_pr_delivery(delivery_id, claim_token)
+                        .await?;
+                }
+                Err(error) => {
+                    self.repository
+                        .retry_github_pr_delivery(delivery_id, claim_token, &error.to_string())
+                        .await?;
+                    tracing::warn!(delivery_id = %delivery_id, ?error, "GitHub PR delivery will retry");
                 }
             }
         }
         self.reconcile_check_runs().await?;
+        Ok(())
+    }
+
+    async fn process_github_pr_delivery(
+        &self,
+        delivery: &crate::ci::ClaimedCiGitHubPrDelivery,
+    ) -> Result<()> {
+        let commit_alias = CiHostname::for_ref(
+            CiRefKind::Commit,
+            &delivery.head_sha,
+            &self.config.root_domain,
+        )?;
+        let stable_alias = CiHostname::for_ref(
+            CiRefKind::PullRequest,
+            &format!("pr-{}", delivery.pull_request_number),
+            &self.config.root_domain,
+        )?;
+        let source_ref = crate::ci::SourceRef {
+            kind: SourceRefKind::PullRequest,
+            name: format!("pr-{}", delivery.pull_request_number),
+            number: Some(delivery.pull_request_number),
+            commit_sha: delivery.head_sha.clone(),
+            source_repository: Some(delivery.source_repository.clone()),
+            closed: false,
+            deleted: false,
+            updated_at: Some(chrono::Utc::now()),
+        };
+        self.ensure_pr_head_build(
+            &source_ref,
+            &delivery.repository,
+            &delivery.head_sha,
+            &commit_alias,
+            &stable_alias,
+        )
+        .await
+    }
+
+    async fn ensure_pr_head_build(
+        &self,
+        source_ref: &crate::ci::SourceRef,
+        repository: &str,
+        commit_sha: &str,
+        commit_alias: &CiHostname,
+        stable_alias: &CiHostname,
+    ) -> Result<()> {
+        let key = BuildKey::new(
+            repository,
+            commit_sha,
+            &self.config.patch_fingerprint,
+            &self.config.toolchain_version,
+            &self.config.target_architecture,
+        )?;
+        let (build, _) = self.repository.ensure_build(&key).await?;
+        self.repository
+            .ensure_preview(
+                repository,
+                commit_sha,
+                CiRefKind::Commit,
+                None,
+                commit_alias,
+                build.id,
+            )
+            .await?;
+        if let Some(check_runs) = self.check_runs.as_ref()
+            && self.repository.check_run_id(build.id).await?.is_none()
+        {
+            let mut head = source_ref.clone();
+            head.commit_sha = commit_sha.to_owned();
+            self.ensure_check_run(
+                check_runs.as_ref(),
+                build.id,
+                &head,
+                repository,
+                commit_alias,
+                stable_alias,
+            )
+            .await?;
+        }
+        if let Some(builder) = self.builder.as_ref() {
+            builder
+                .ensure_build(crate::ci::BuildRequest {
+                    key,
+                    source_repository: source_ref.source_repository.clone(),
+                    source_archive: Vec::new(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("PR head build failed: {error}"))?;
+        }
         Ok(())
     }
 
@@ -198,10 +349,15 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .check_run_reconciliation_candidates(128)
             .await?
         {
-            let (build_log, expires_at, preview_hostnames) = self
-                .repository
-                .build_diagnostics(candidate.build_id, &self.config.root_domain)
-                .await?;
+            let (build_log, expires_at, preview_hostnames) = if candidate.tombstone {
+                (String::new(), None, Vec::new())
+            } else {
+                let (build_log, expires_at, preview_hostnames) = self
+                    .repository
+                    .build_diagnostics(candidate.build_id, &self.config.root_domain)
+                    .await?;
+                (build_log, Some(expires_at), preview_hostnames)
+            };
             let details_url = self
                 .config
                 .public_status_base_url
@@ -231,7 +387,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .rev()
                     .collect(),
                 preview_hostnames,
-                expires_at: Some(expires_at.to_rfc3339()),
+                expires_at: expires_at.map(|expires_at| expires_at.to_rfc3339()),
                 details_url,
             };
             match check_runs
@@ -244,7 +400,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             {
                 Ok(()) => {
                     self.repository
-                        .mark_check_run_stage_synced(candidate.build_id, candidate.stage)
+                        .mark_check_run_stage_synced(
+                            candidate.build_id,
+                            candidate.stage,
+                            candidate.tombstone,
+                        )
                         .await?;
                 }
                 Err(error) => tracing::warn!(
@@ -267,6 +427,12 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         commit_alias: &CiHostname,
         stable_alias: &CiHostname,
     ) -> Result<()> {
+        // Keep this invariant at the side-effect boundary as well as at the
+        // poll decision site. A branch or arbitrary commit must never acquire
+        // a GitHub Check Run, even if a future caller passes it here.
+        if source_ref.kind != SourceRefKind::PullRequest {
+            return Ok(());
+        }
         let claim = Uuid::new_v4();
         if !self
             .repository
@@ -337,13 +503,24 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             }
         }
     }
-    pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()> {
+    pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()>
+    where
+        C: Clone,
+    {
         let interval = interval.max(Duration::from_secs(1));
+        let mut poll_tick = tokio::time::interval(interval);
+        // Build execution is deliberately detached from the source watcher. A
+        // remote Bubblewrap compile can take tens of minutes; awaiting it here
+        // would stop ETag polling, Check Run reconciliation, and recovery of
+        // other PR heads on this control-plane process.
         loop {
-            if let Err(error) = self.poll_with_retry(repository_id, 3).await {
-                tracing::error!(?error, %repository_id, "CI source-control poll failed");
-            }
-            sleep(interval).await;
+            poll_tick.tick().await;
+            let poller = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = poller.poll_with_retry(repository_id, 3).await {
+                    tracing::error!(?error, %repository_id, "CI source-control poll failed");
+                }
+            });
         }
     }
 }

@@ -1,8 +1,6 @@
 FROM docker:28-cli AS docker-cli
 
 FROM rust:1.98-bookworm AS builder
-ARG BUILD_REVISION=development
-ENV KURBIS_BUILD_REVISION=${BUILD_REVISION}
 ENV CARGO_BUILD_JOBS=2
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
@@ -11,11 +9,9 @@ COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
 COPY plugins/kurbis-control /opt/kurbis/plugins/kurbis-control
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target cargo build --jobs 1 --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
 
 FROM debian:bookworm-slim
-ARG BUILD_REVISION=development
-LABEL org.opencontainers.image.revision=${BUILD_REVISION}
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl iptables openssh-client && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/lib/kurbis/object-store /home/kurbis/.ssh /opt/kurbis/plugins /opt/kurbis/runtime && chown -R 65532:65532 /var/lib/kurbis/object-store /home/kurbis
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker

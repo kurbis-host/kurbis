@@ -305,7 +305,7 @@ async fn first_branch_join_uses_latest_observed_head_after_lobby_was_created() {
     let root_domain = unique_ci_root_domain();
     let poller = kurbis_hoster::ci::CiPoller::new(repository.clone(), source.clone()).with_config(
         kurbis_hoster::ci::CiPollerConfig {
-            root_domain: root_domain.clone().into(),
+            root_domain: root_domain.clone(),
             patch_fingerprint: "patch-v1".into(),
             toolchain_version: "rust-1.98@sha256:test".into(),
             target_architecture: "x86_64-linux".into(),

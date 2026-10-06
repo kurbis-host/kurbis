@@ -9,9 +9,18 @@ use anyhow::{Context, Result, bail, ensure};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommonConfig {
     pub database_url: String,
+}
+
+impl fmt::Debug for CommonConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommonConfig")
+            .field("database_url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl CommonConfig {
@@ -22,26 +31,88 @@ impl CommonConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone)]
 pub struct ControlPlaneConfig {
     pub common: CommonConfig,
     pub listen: SocketAddr,
     pub public_base_url: String,
     pub root_domain: String,
     pub internal_token: String,
+    /// Signed webhook delivery is deliberately dormant unless explicitly enabled.
+    pub ci_github_webhook_enabled: bool,
+    pub ci_github_webhook_secret: Option<SecretString>,
     pub oauth: OAuthConfig,
+}
+
+impl fmt::Debug for ControlPlaneConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneConfig")
+            .field("common", &self.common)
+            .field("listen", &self.listen)
+            .field("public_base_url", &self.public_base_url)
+            .field("root_domain", &self.root_domain)
+            .field("internal_token", &"[REDACTED]")
+            .field("ci_github_webhook_enabled", &self.ci_github_webhook_enabled)
+            .field("ci_github_webhook_secret", &self.ci_github_webhook_secret)
+            .field("oauth", &self.oauth)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CiBuilderBackend {
+    Docker,
+    Bubblewrap {
+        executable: PathBuf,
+        rootfs: PathBuf,
+        toolchain: PathBuf,
+        workspace_root: PathBuf,
+        source_preparer: PathBuf,
+    },
+    BubblewrapSsh {
+        target: String,
+        runner: PathBuf,
+        executable: String,
+        rootfs: String,
+        toolchain: String,
+        workspace_root: String,
+        source_preparer: String,
+    },
 }
 
 #[derive(Clone)]
 pub struct CiConfig {
     pub github_pat: String,
     pub repository: String,
+    pub github_api_base_url: String,
     pub default_branch: String,
     pub patch_fingerprint: String,
     pub toolchain_version: String,
     pub target_architecture: String,
     pub builder_image: String,
     pub builder_docker_host: String,
+    pub builder_backend: CiBuilderBackend,
+    /// Maximum number of concurrent build slots per concrete builder identity.
+    pub build_concurrency: u16,
     pub plugin_source: PathBuf,
 }
 
@@ -61,26 +132,99 @@ impl CiConfig {
             "CI_GITHUB_PAT must be a non-empty visible token"
         );
         let repository = value("CI_REPOSITORY", "kurbis-host/Pumpkin");
+        let github_api_base_url = value("CI_GITHUB_API_BASE_URL", "https://api.github.com");
+        validate_ci_github_api_base_url(&github_api_base_url)?;
         ensure!(
             repository == "kurbis-host/Pumpkin",
             "CI_REPOSITORY is fixed to kurbis-host/Pumpkin"
         );
         let patch_fingerprint = checked_in_ci_patch_fingerprint()?;
-        let builder_image = required("CI_BUILDER_IMAGE")?;
-        let builder_docker_host = required("CI_BUILDER_DOCKER_HOST")?;
-        validate_ci_builder_docker_host(&builder_docker_host)?;
-        let configured_rustc = required("CI_TOOLCHAIN_VERSION")?;
-        ensure!(
-            configured_rustc.len() <= 32
-                && configured_rustc.split('.').count() == 3
-                && configured_rustc
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
-            "CI_TOOLCHAIN_VERSION must be an exact Rust release such as 1.98.1"
-        );
-        let toolchain_version =
-            crate::ci::execution::toolchain_identity(&builder_image, &configured_rustc)
-                .context("CI_BUILDER_IMAGE must be digest-pinned and match CI_TOOLCHAIN_VERSION")?;
+        let backend = value("CI_BUILDER_BACKEND", "docker");
+        let (builder_backend, builder_image, builder_docker_host, toolchain_version) = match backend
+            .as_str()
+        {
+            "docker" => {
+                let builder_image = required("CI_BUILDER_IMAGE")?;
+                let builder_docker_host = required("CI_BUILDER_DOCKER_HOST")?;
+                validate_ci_builder_docker_host(&builder_docker_host)?;
+                let configured_rustc = exact_ci_rust_release()?;
+                let toolchain_version =
+                    crate::ci::execution::toolchain_identity(&builder_image, &configured_rustc)
+                        .context(
+                            "CI_BUILDER_IMAGE must be digest-pinned and match CI_TOOLCHAIN_VERSION",
+                        )?;
+                (
+                    CiBuilderBackend::Docker,
+                    builder_image,
+                    builder_docker_host,
+                    toolchain_version,
+                )
+            }
+            "bubblewrap" => {
+                let configured_rustc = exact_ci_rust_release()?;
+                let executable = required_path("CI_BUBBLEWRAP_PATH")?;
+                let rootfs = required_path("CI_BUBBLEWRAP_ROOTFS")?;
+                let toolchain = required_path("CI_BUBBLEWRAP_TOOLCHAIN")?;
+                let workspace_root = required_path("CI_BUBBLEWRAP_WORKSPACE")?;
+                let source_preparer = required_path("CI_BUBBLEWRAP_SOURCE_PREPARER")?;
+                (
+                    CiBuilderBackend::Bubblewrap {
+                        executable,
+                        rootfs,
+                        toolchain,
+                        workspace_root,
+                        source_preparer,
+                    },
+                    String::new(),
+                    String::new(),
+                    configured_rustc,
+                )
+            }
+            "bubblewrap_ssh" => {
+                let configured_rustc = exact_ci_rust_release()?;
+                let target = required("CI_BUILDER_SSH_TARGET")?;
+                ensure!(
+                    target.len() <= 255 && !target.bytes().any(|byte| byte.is_ascii_whitespace()),
+                    "CI_BUILDER_SSH_TARGET must be a single SSH target"
+                );
+                let runner = required_path("CI_BUBBLEWRAP_RUNNER")?;
+                let executable = required("CI_BUBBLEWRAP_PATH")?;
+                let rootfs = required("CI_BUBBLEWRAP_ROOTFS")?;
+                let toolchain = required("CI_BUBBLEWRAP_TOOLCHAIN")?;
+                let workspace_root = required("CI_BUBBLEWRAP_WORKSPACE")?;
+                let source_preparer = required("CI_BUBBLEWRAP_SOURCE_PREPARER")?;
+                for (name, value) in [
+                    ("CI_BUBBLEWRAP_PATH", &executable),
+                    ("CI_BUBBLEWRAP_ROOTFS", &rootfs),
+                    ("CI_BUBBLEWRAP_TOOLCHAIN", &toolchain),
+                    ("CI_BUBBLEWRAP_WORKSPACE", &workspace_root),
+                    ("CI_BUBBLEWRAP_SOURCE_PREPARER", &source_preparer),
+                ] {
+                    ensure!(
+                        value.starts_with('/') && !value.contains('\0'),
+                        "{name} must be an absolute remote path without NUL bytes"
+                    );
+                }
+                (
+                    CiBuilderBackend::BubblewrapSsh {
+                        target,
+                        runner,
+                        executable,
+                        rootfs,
+                        toolchain,
+                        workspace_root,
+                        source_preparer,
+                    },
+                    String::new(),
+                    String::new(),
+                    configured_rustc,
+                )
+            }
+            other => bail!(
+                "CI_BUILDER_BACKEND must be docker, bubblewrap, or bubblewrap_ssh, got {other:?}"
+            ),
+        };
+        let build_concurrency = ci_build_concurrency_from_env()?;
         let target_architecture = native_linux_target_architecture()?;
         let plugin_source = PathBuf::from(value("CI_PLUGIN_SOURCE", "plugins/kurbis-control"));
         let plugin_source = if plugin_source.is_absolute() {
@@ -96,12 +240,15 @@ impl CiConfig {
         Ok(Some(Self {
             github_pat,
             repository,
+            github_api_base_url,
             default_branch,
             patch_fingerprint,
             toolchain_version,
             target_architecture,
             builder_image,
             builder_docker_host,
+            builder_backend,
+            build_concurrency,
             plugin_source,
         }))
     }
@@ -113,15 +260,62 @@ impl fmt::Debug for CiConfig {
             .debug_struct("CiConfig")
             .field("github_pat", &"[redacted]")
             .field("repository", &self.repository)
+            .field("github_api_base_url", &self.github_api_base_url)
             .field("default_branch", &self.default_branch)
             .field("patch_fingerprint", &self.patch_fingerprint)
             .field("toolchain_version", &self.toolchain_version)
             .field("target_architecture", &self.target_architecture)
             .field("builder_image", &self.builder_image)
             .field("builder_docker_host", &self.builder_docker_host)
+            .field("builder_backend", &self.builder_backend)
+            .field("build_concurrency", &self.build_concurrency)
             .field("plugin_source", &self.plugin_source)
             .finish()
     }
+}
+
+pub fn ci_build_concurrency_from_env() -> Result<u16> {
+    crate::ci::execution::parse_build_concurrency(env::var("CI_BUILD_CONCURRENCY").ok().as_deref())
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn exact_ci_rust_release() -> Result<String> {
+    let configured_rustc = required("CI_TOOLCHAIN_VERSION")?;
+    ensure!(
+        configured_rustc.len() <= 32
+            && configured_rustc.split('.').count() == 3
+            && configured_rustc
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "CI_TOOLCHAIN_VERSION must be an exact Rust release such as 1.98.1"
+    );
+    Ok(configured_rustc)
+}
+
+fn required_path(name: &str) -> Result<PathBuf> {
+    let value = required(name)?;
+    ensure!(!value.contains('\0'), "{name} must not contain NUL bytes");
+    Ok(PathBuf::from(value))
+}
+
+pub fn validate_ci_github_api_base_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("CI_GITHUB_API_BASE_URL must be a valid URL")?;
+    ensure!(
+        url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(url.scheme(), "https" | "http"),
+        "CI_GITHUB_API_BASE_URL must be an HTTP(S) URL without credentials or query"
+    );
+    if url.scheme() == "http" {
+        ensure!(
+            matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
+            "plain HTTP CI_GITHUB_API_BASE_URL is allowed only for loopback fixtures"
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {
@@ -138,6 +332,22 @@ pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {
         "CI_BUILDER_DOCKER_HOST must use ssh://user@host[:port]"
     );
     Ok(())
+}
+
+fn parse_bool(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name} must be a boolean (true/false)"),
+    }
+}
+
+fn optional_bool(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => parse_bool(name, &value),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).context(format!("{name} must be valid UTF-8")),
+    }
 }
 
 fn checked_in_ci_patch_fingerprint() -> Result<String> {
@@ -277,14 +487,45 @@ impl OAuthConfig {
     }
 }
 
+pub(crate) fn https_public_base_url(value: &str) -> String {
+    value.strip_prefix("http://").map_or_else(
+        || value.trim_end_matches('/').to_owned(),
+        |rest| format!("https://{}", rest.trim_end_matches('/')),
+    )
+}
+
 impl ControlPlaneConfig {
+    /// Returns the public origin using HTTPS for links that Minecraft must open.
+    pub fn https_public_base_url(&self) -> String {
+        https_public_base_url(&self.public_base_url)
+    }
+
     pub fn from_env() -> Result<Self> {
+        let ci_github_webhook_enabled = optional_bool("CI_GITHUB_WEBHOOK_ENABLED", false)?;
+        let ci_github_webhook_secret = match env::var("CI_GITHUB_WEBHOOK_SECRET") {
+            Ok(secret)
+                if (32..=512).contains(&secret.len())
+                    && secret.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) =>
+            {
+                Some(SecretString::new(secret))
+            }
+            Ok(_) => bail!("CI_GITHUB_WEBHOOK_SECRET must contain 32 to 512 visible ASCII bytes"),
+            Err(env::VarError::NotPresent) if !ci_github_webhook_enabled => None,
+            Err(env::VarError::NotPresent) => {
+                bail!("CI_GITHUB_WEBHOOK_SECRET is required when CI_GITHUB_WEBHOOK_ENABLED=true")
+            }
+            Err(error) => {
+                return Err(error).context("CI_GITHUB_WEBHOOK_SECRET must be valid UTF-8");
+            }
+        };
         Ok(Self {
             common: CommonConfig::from_env()?,
             listen: value("CONTROL_PLANE_LISTEN", "0.0.0.0:8080").parse()?,
             public_base_url: required("PUBLIC_BASE_URL")?,
             root_domain: required("ROOT_DOMAIN")?,
             internal_token: required("INTERNAL_TOKEN")?,
+            ci_github_webhook_enabled,
+            ci_github_webhook_secret,
             oauth: OAuthConfig {
                 google: oauth_provider(
                     "GOOGLE_OAUTH",
@@ -312,6 +553,8 @@ pub struct WorkerConfig {
     pub address: String,
     pub signal_address: IpAddr,
     pub gateway_address: Option<IpAddr>,
+    pub gateway_bedrock_ip: Option<std::net::Ipv4Addr>,
+    pub gateway_bedrock_port: Option<u16>,
     pub root: PathBuf,
     pub storage_mode: StorageMode,
     pub runtime: RuntimeConfig,
@@ -371,6 +614,44 @@ impl WorkerConfig {
             }
             Err(error) => return Err(error).context("WORKER_GATEWAY_ADDRESS must be UTF-8"),
         };
+        let (gateway_bedrock_ip, gateway_bedrock_port) = match (
+            env::var("WORKER_GATEWAY_BEDROCK_IP"),
+            env::var("WORKER_GATEWAY_BEDROCK_PORT"),
+        ) {
+            (Ok(address), Ok(port)) => {
+                let address: std::net::Ipv4Addr = address
+                    .parse()
+                    .context("WORKER_GATEWAY_BEDROCK_IP must be IPv4")?;
+                ensure!(
+                    crate::model::is_gateway_source_address(&address.to_string()),
+                    "WORKER_GATEWAY_BEDROCK_IP must be a concrete unicast Gateway public IPv4 address"
+                );
+                let port = port
+                    .parse::<u16>()
+                    .context("WORKER_GATEWAY_BEDROCK_PORT must be a valid port")?;
+                ensure!(
+                    port > 1024,
+                    "WORKER_GATEWAY_BEDROCK_PORT must be an unprivileged port"
+                );
+                (Some(address), Some(port))
+            }
+            (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) if native => {
+                (None, None)
+            }
+            (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => {
+                bail!(
+                    "Docker workloads require WORKER_GATEWAY_BEDROCK_IP and WORKER_GATEWAY_BEDROCK_PORT"
+                )
+            }
+            (Err(env::VarError::NotPresent), _) | (_, Err(env::VarError::NotPresent)) => {
+                bail!(
+                    "WORKER_GATEWAY_BEDROCK_IP and WORKER_GATEWAY_BEDROCK_PORT must be configured together"
+                )
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                return Err(error).context("WORKER_GATEWAY_BEDROCK_IP/PORT must be valid UTF-8");
+            }
+        };
         let control_plane_url = required("CONTROL_PLANE_URL")?;
         let runtime_api_proxy_upstream =
             value("WORKER_RUNTIME_API_PROXY_UPSTREAM", &control_plane_url);
@@ -422,6 +703,8 @@ impl WorkerConfig {
             address: worker_address,
             signal_address,
             gateway_address,
+            gateway_bedrock_ip,
+            gateway_bedrock_port,
             root,
             storage_mode: StorageMode::from_env(native)?,
             runtime,
@@ -511,11 +794,13 @@ impl StorageMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     pub common: CommonConfig,
     pub java_listen: SocketAddr,
+    pub java_public_port: u16,
     pub bedrock_listen: SocketAddr,
+    pub bedrock_public_address: std::net::Ipv4Addr,
     pub bedrock_public_port: u16,
     pub bedrock_tls_certificate: PathBuf,
     pub bedrock_tls_private_key: PathBuf,
@@ -531,19 +816,64 @@ pub struct GatewayConfig {
     pub allow_offline_waiting_for_tests: bool,
 }
 
+impl fmt::Debug for GatewayConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayConfig")
+            .field("common", &self.common)
+            .field("java_listen", &self.java_listen)
+            .field("java_public_port", &self.java_public_port)
+            .field("bedrock_listen", &self.bedrock_listen)
+            .field("bedrock_public_address", &self.bedrock_public_address)
+            .field("bedrock_public_port", &self.bedrock_public_port)
+            .field("bedrock_tls_certificate", &self.bedrock_tls_certificate)
+            .field("bedrock_tls_private_key", &self.bedrock_tls_private_key)
+            .field("waiting_java_address", &self.waiting_java_address)
+            .field("waiting_bedrock_address", &self.waiting_bedrock_address)
+            .field("waiting_signal_address", &self.waiting_signal_address)
+            .field("waiting_control_socket", &self.waiting_control_socket)
+            .field("waiting_control_token", &"[REDACTED]")
+            .field("control_plane_url", &self.control_plane_url)
+            .field("internal_token", &"[REDACTED]")
+            .field("root_domain", &self.root_domain)
+            .field("wake_timeout", &self.wake_timeout)
+            .field(
+                "allow_offline_waiting_for_tests",
+                &self.allow_offline_waiting_for_tests,
+            )
+            .finish()
+    }
+}
+
 impl GatewayConfig {
     pub fn from_env() -> Result<Self> {
+        let java_public_port = value("JAVA_PUBLIC_PORT", "25565")
+            .parse::<u16>()
+            .context("invalid JAVA_PUBLIC_PORT")?;
+        anyhow::ensure!(
+            java_public_port > 1024,
+            "JAVA_PUBLIC_PORT must be an unprivileged port"
+        );
         let bedrock_public_port: u16 = required("BEDROCK_PUBLIC_PORT")?
             .parse()
             .context("invalid BEDROCK_PUBLIC_PORT")?;
         anyhow::ensure!(
-            bedrock_public_port != 0,
-            "BEDROCK_PUBLIC_PORT must be non-zero"
+            bedrock_public_port > 1024,
+            "BEDROCK_PUBLIC_PORT must be an unprivileged non-zero port"
+        );
+        let bedrock_public_address: std::net::Ipv4Addr = required("BEDROCK_PUBLIC_IP")?
+            .parse()
+            .context("BEDROCK_PUBLIC_IP must be IPv4")?;
+        anyhow::ensure!(
+            !bedrock_public_address.is_unspecified(),
+            "BEDROCK_PUBLIC_IP must be a concrete public IPv4 address"
         );
         Ok(Self {
             common: CommonConfig::from_env()?,
             java_listen: value("JAVA_LISTEN", "0.0.0.0:25565").parse()?,
+            java_public_port,
             bedrock_listen: value("BEDROCK_LISTEN", "0.0.0.0:19132").parse()?,
+            bedrock_public_address,
             bedrock_public_port,
             bedrock_tls_certificate: PathBuf::from(required("BEDROCK_TLS_CERT_FILE")?),
             bedrock_tls_private_key: PathBuf::from(required("BEDROCK_TLS_KEY_FILE")?),
@@ -565,7 +895,7 @@ impl GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ObjectStoreConfig {
     Local {
         root: PathBuf,
@@ -578,6 +908,32 @@ pub enum ObjectStoreConfig {
         secret_key: String,
         allow_http: bool,
     },
+}
+
+impl fmt::Debug for ObjectStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { root } => formatter
+                .debug_struct("ObjectStoreConfig::Local")
+                .field("root", root)
+                .finish(),
+            Self::S3 {
+                bucket,
+                region,
+                endpoint,
+                allow_http,
+                ..
+            } => formatter
+                .debug_struct("ObjectStoreConfig::S3")
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field("access_key", &"[REDACTED]")
+                .field("secret_key", &"[REDACTED]")
+                .field("allow_http", allow_http)
+                .finish(),
+        }
+    }
 }
 
 impl ObjectStoreConfig {
@@ -661,4 +1017,81 @@ fn value(name: &str, default: &str) -> String {
 fn gib_env(name: &str, default: i64) -> Result<i64> {
     let gib: i64 = value(name, &default.to_string()).parse()?;
     Ok(gib * 1024 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CommonConfig, GatewayConfig, ObjectStoreConfig, https_public_base_url, parse_bool,
+    };
+
+    #[test]
+    fn parse_bool_accepts_explicit_values_and_rejects_ambiguous_values() {
+        for value in ["1", "true", "YES", "on"] {
+            assert!(parse_bool("KURBIS_TEST_BOOL", value).unwrap());
+        }
+        for value in ["0", "false", "NO", "off"] {
+            assert!(!parse_bool("KURBIS_TEST_BOOL", value).unwrap());
+        }
+        assert!(parse_bool("KURBIS_TEST_BOOL", "maybe").is_err());
+    }
+
+    #[test]
+    fn debug_output_redacts_database_and_service_credentials() {
+        let common = CommonConfig {
+            database_url: "postgres://alice:super-secret@db.example/melon".into(),
+        };
+        let common_debug = format!("{common:?}");
+        assert!(!common_debug.contains("super-secret"));
+        assert!(common_debug.contains("REDACTED"));
+
+        let gateway = GatewayConfig {
+            common,
+            java_listen: "127.0.0.1:25565".parse().unwrap(),
+            java_public_port: 25565,
+            bedrock_listen: "127.0.0.1:19132".parse().unwrap(),
+            bedrock_public_address: "198.51.100.10".parse().unwrap(),
+            bedrock_public_port: 19132,
+            bedrock_tls_certificate: "/run/cert.pem".into(),
+            bedrock_tls_private_key: "/run/key.pem".into(),
+            waiting_java_address: "127.0.0.1:25566".parse().unwrap(),
+            waiting_bedrock_address: "127.0.0.1:19133".parse().unwrap(),
+            waiting_signal_address: "127.0.0.1:19134".parse().unwrap(),
+            waiting_control_socket: "/run/gateway.sock".into(),
+            waiting_control_token: "gateway-secret".into(),
+            control_plane_url: "https://control.example.test".into(),
+            internal_token: "internal-secret".into(),
+            root_domain: "example.test".into(),
+            wake_timeout: std::time::Duration::from_secs(90),
+            allow_offline_waiting_for_tests: false,
+        };
+        let gateway_debug = format!("{gateway:?}");
+        assert!(!gateway_debug.contains("gateway-secret"));
+        assert!(!gateway_debug.contains("internal-secret"));
+        assert!(!gateway_debug.contains("super-secret"));
+
+        let object_store = ObjectStoreConfig::S3 {
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key: "access-secret".into(),
+            secret_key: "object-secret".into(),
+            allow_http: false,
+        };
+        let object_store_debug = format!("{object_store:?}");
+        assert!(!object_store_debug.contains("access-secret"));
+        assert!(!object_store_debug.contains("object-secret"));
+    }
+
+    #[test]
+    fn minecraft_links_upgrade_http_public_origins_to_https() {
+        assert_eq!(
+            https_public_base_url("http://panel.example.test/"),
+            "https://panel.example.test"
+        );
+        assert_eq!(
+            https_public_base_url("https://panel.example.test/"),
+            "https://panel.example.test"
+        );
+    }
 }

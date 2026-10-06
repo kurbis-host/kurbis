@@ -6,7 +6,10 @@ use std::{
 };
 
 use super::{
-    ingress::{GatewayIngressPolicy, PublishedWorkloadPorts, docker_publish_binding},
+    ingress::{
+        GatewayIngressPolicy, PublishedWorkloadPorts, cleanup_ingress_through,
+        ensure_runtime_ingress,
+    },
     runtime::{ServerRuntime, settings::render_pumpkin_config},
 };
 use anyhow::{Context, Result, bail};
@@ -34,6 +37,8 @@ pub struct DockerRuntime {
     ingress: GatewayIngressPolicy,
     public_address: IpAddr,
     signal_address: IpAddr,
+    gateway_bedrock_ip: std::net::Ipv4Addr,
+    gateway_bedrock_port: u16,
     runtime_api_proxy_image: String,
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
@@ -41,6 +46,7 @@ pub struct DockerRuntime {
 }
 
 impl DockerRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         image: String,
         host_control_token: String,
@@ -48,6 +54,8 @@ impl DockerRuntime {
         public_address: IpAddr,
         signal_address: IpAddr,
         gateway_address: IpAddr,
+        gateway_bedrock_ip: std::net::Ipv4Addr,
+        gateway_bedrock_port: u16,
         runtime_api_proxy_image: String,
         runtime_api_proxy_upstream: String,
         runtime_api_proxy_egress_network: String,
@@ -65,12 +73,38 @@ impl DockerRuntime {
             sandbox: DockerSandbox,
             public_address,
             signal_address,
+            gateway_bedrock_ip,
+            gateway_bedrock_port,
             ingress,
             runtime_api_proxy_image,
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
         })
+    }
+
+    async fn ensure_ingress_relay(
+        &self,
+        server_id: Uuid,
+        generation: i64,
+        internal_network: &str,
+        backend_container: &str,
+        internal_peers: &[String],
+        ports: PublishedWorkloadPorts,
+    ) -> Result<()> {
+        ensure_runtime_ingress(
+            &self.ingress,
+            &self.sandbox,
+            &self.runtime_api_proxy_image,
+            server_id,
+            generation,
+            internal_network,
+            backend_container,
+            internal_peers,
+            ports,
+        )
+        .await
+        .context("ensure generation-scoped Gateway-only workload ingress")
     }
 }
 
@@ -106,14 +140,13 @@ impl ServerRuntime for DockerRuntime {
         let api_capability =
             api_capability.context("managed plugin capability is required for Docker runtime")?;
         let name = container_name(server_id);
-        let proxy_name = runtime_api_proxy::container_name(server_id);
+        let proxy_name = runtime_api_proxy::container_name(server_id, placement.generation);
         match self.running_generation(&name).await? {
             Some(generation) if generation == placement.generation => {
                 let network = crate::worker::sandbox::workload_network_name(server_id, generation);
-                runtime_api_proxy::remove_container(&proxy_name).await?;
+                runtime_api_proxy::remove_container(server_id, placement.generation).await?;
                 runtime_api_proxy::start_container(
                     &self.runtime_api_proxy_image,
-                    &proxy_name,
                     "server",
                     server_id,
                     generation,
@@ -124,12 +157,16 @@ impl ServerRuntime for DockerRuntime {
                     self.runtime_api_proxy_allow_insecure,
                 )
                 .await?;
-                self.sandbox
-                    .verify_isolated_network(&network, &[name.clone(), proxy_name.clone()])
-                    .await?;
                 let ports = workload_ports(self.public_address, self.signal_address, placement)?;
-                self.ingress.verify_host_policy().await?;
-                self.ingress.install(server_id, generation, ports).await?;
+                self.ensure_ingress_relay(
+                    server_id,
+                    generation,
+                    &network,
+                    &name,
+                    &[name.clone(), proxy_name.clone()],
+                    ports,
+                )
+                .await?;
                 return self
                     .wait_ready(server_id, server_dir, Duration::from_secs(120))
                     .await;
@@ -143,9 +180,9 @@ impl ServerRuntime for DockerRuntime {
             None => {}
         }
         self.remove_stopped(&name).await?;
-        runtime_api_proxy::remove_container(&proxy_name).await?;
+        runtime_api_proxy::remove_containers_through(server_id, placement.generation).await?;
+        cleanup_ingress_through(&self.ingress, server_id, placement.generation).await?;
         self.sandbox.remove_isolated_networks(server_id).await?;
-        self.ingress.remove_server(server_id).await?;
         self.sandbox
             .verify_with_limits(
                 &self.image,
@@ -162,8 +199,8 @@ impl ServerRuntime for DockerRuntime {
                 25565,
                 19132,
                 "0.0.0.0:19132".parse()?,
-                self.public_address,
-                u16::try_from(placement.bedrock_port)?,
+                IpAddr::V4(self.gateway_bedrock_ip),
+                self.gateway_bedrock_port,
             ),
         )
         .await?;
@@ -173,34 +210,6 @@ impl ServerRuntime for DockerRuntime {
         prepare_control_socket_alias(server_id, server_dir).await?;
 
         let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
-        let java = docker_publish_binding(
-            published_ports.java_tcp.ip(),
-            published_ports.java_tcp.port(),
-            25565,
-            "tcp",
-        )?;
-        let java_health = docker_publish_binding(
-            if published_ports.java_tcp.is_ipv4() {
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            } else {
-                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-            },
-            published_ports.java_tcp.port(),
-            25565,
-            "tcp",
-        )?;
-        let bedrock_udp = docker_publish_binding(
-            published_ports.bedrock_udp.ip(),
-            published_ports.bedrock_udp.port(),
-            19132,
-            "udp",
-        )?;
-        let bedrock_signal = docker_publish_binding(
-            published_ports.bedrock_signal_tcp.ip(),
-            published_ports.bedrock_signal_tcp.port(),
-            19132,
-            "tcp",
-        )?;
         let volume = format!(
             "type=bind,source={},target=/pumpkin,bind-propagation=rprivate",
             server_dir.display()
@@ -222,7 +231,7 @@ impl ServerRuntime for DockerRuntime {
         ];
         args.extend(self.sandbox.run_security_args(
             WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            &runtime_user,
+            runtime_user,
             &network,
             true,
         )?);
@@ -238,25 +247,12 @@ impl ServerRuntime for DockerRuntime {
             generation_label,
         ]);
         args.extend(runtime_environment_args);
-        args.extend([
-            "--publish".to_owned(),
-            java,
-            "--publish".to_owned(),
-            java_health,
-            "--publish".to_owned(),
-            bedrock_udp,
-            "--publish".to_owned(),
-            bedrock_signal,
-            "--mount".to_owned(),
-            volume,
-            self.image.clone(),
-        ]);
+        args.extend(["--mount".to_owned(), volume, self.image.clone()]);
         self.sandbox
             .create_isolated_network(server_id, placement.generation)
             .await?;
         if let Err(error) = runtime_api_proxy::start_container(
             &self.runtime_api_proxy_image,
-            &proxy_name,
             "server",
             server_id,
             placement.generation,
@@ -275,20 +271,6 @@ impl ServerRuntime for DockerRuntime {
             remove_runtime_generation(&self.root, server_id).await?;
             remove_control_socket_alias(server_id).await?;
             return Err(error).context("start scoped managed-plugin API proxy");
-        }
-        if let Err(error) = self
-            .ingress
-            .install(server_id, placement.generation, published_ports)
-            .await
-        {
-            runtime_api_proxy::remove_container(&proxy_name).await?;
-            self.sandbox
-                .remove_isolated_network(server_id, placement.generation)
-                .await?;
-            remove_runtime_generation(&self.root, server_id).await?;
-            remove_control_socket_alias(server_id).await?;
-            return Err(error)
-                .context("failed to install Gateway-only ingress before workload start");
         }
         let output = match tokio::time::timeout(
             Duration::from_secs(30),
@@ -344,6 +326,15 @@ impl ServerRuntime for DockerRuntime {
             let _ = self.remove_runtime(server_id).await;
             return Err(error).context("workload network isolation check failed");
         }
+        self.ensure_ingress_relay(
+            server_id,
+            placement.generation,
+            &network,
+            &name,
+            &[name.clone(), proxy_name.clone()],
+            published_ports,
+        )
+        .await?;
         if let Err(error) = self
             .wait_ready(server_id, server_dir, Duration::from_secs(120))
             .await
@@ -374,10 +365,12 @@ impl ServerRuntime for DockerRuntime {
         let generation = self.running_generation(&container_name(server_id)).await?;
         if generation.is_none() {
             remove_control_socket_alias(server_id).await?;
-            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
-                .await?;
+            let max_generation = read_runtime_generation(&self.root, server_id)
+                .await?
+                .unwrap_or(1);
+            runtime_api_proxy::remove_containers_through(server_id, max_generation).await?;
+            cleanup_ingress_through(&self.ingress, server_id, max_generation).await?;
             self.sandbox.remove_isolated_networks(server_id).await?;
-            self.ingress.remove_server(server_id).await?;
             remove_runtime_generation(&self.root, server_id).await?;
         }
         Ok(generation)
@@ -414,10 +407,12 @@ impl ServerRuntime for DockerRuntime {
             || String::from_utf8_lossy(&output.stderr).contains("No such container")
         {
             remove_control_socket_alias(server_id).await?;
-            runtime_api_proxy::remove_container(&runtime_api_proxy::container_name(server_id))
-                .await?;
+            let max_generation = read_runtime_generation(&self.root, server_id)
+                .await?
+                .unwrap_or(1);
+            runtime_api_proxy::remove_containers_through(server_id, max_generation).await?;
+            cleanup_ingress_through(&self.ingress, server_id, max_generation).await?;
             self.sandbox.remove_isolated_networks(server_id).await?;
-            self.ingress.remove_server(server_id).await?;
             remove_runtime_generation(&self.root, server_id).await?;
             return Ok(());
         }
@@ -532,6 +527,20 @@ async fn persist_runtime_generation(root: &Path, server_id: Uuid, generation: i6
     tokio::fs::write(&temporary, generation.to_string()).await?;
     tokio::fs::rename(temporary, path).await?;
     Ok(())
+}
+
+async fn read_runtime_generation(root: &Path, server_id: Uuid) -> Result<Option<i64>> {
+    let path = runtime_generation_path(root, server_id);
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => Ok(Some(
+            value
+                .trim()
+                .parse()
+                .context("invalid persisted runtime generation")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read persisted runtime generation"),
+    }
 }
 
 async fn remove_runtime_generation(root: &Path, server_id: Uuid) -> Result<()> {

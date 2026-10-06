@@ -7,6 +7,7 @@ cross-worker gameplay and real idle behavior.
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -173,6 +174,10 @@ def main():
     parser.add_argument("--worker-port-base", type=int, default=46000)
     parser.add_argument("--waiting-port-base", type=int, default=45000)
     parser.add_argument("--snapshot-interval-seconds", type=int, default=90)
+    parser.add_argument("--worker-address", default="127.0.0.1",
+                        help="worker public bind IP; use loopback for isolated rootless acceptance")
+    parser.add_argument("--gateway-address", default="127.0.0.1",
+                        help="Gateway source IP expected by the host ingress firewall")
     args = parser.parse_args()
     native = args.native_binary is not None
     if native:
@@ -205,11 +210,21 @@ def main():
     worker_ports = (args.worker_port_base, args.worker_port_base + 100)
     waiting_java_port = args.waiting_port_base
     waiting_bedrock_port = args.waiting_port_base + 1
+    gateway_java_port = free_port()
+    bedrock_public_port = free_port()
     args.output.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="melon-runtime-", dir="/tmp" if native else "/opt/melon-hoster-verification"))
+    if not native:
+        # Rootless dockerd runs as a separate host uid and must traverse the
+        # acceptance workspace to bind-mount only the object-store directory.
+        root.chmod(0o755)
     identifier = uuid.uuid4().hex[:12]
     proxy_image = None if native else build_runtime_api_proxy_image(args.runtime_host_image, args.bin_dir, root, identifier)
     proxy_egress_network = None if native else f"kurbis-runtime-api-egress-{identifier}"
+    control_plane_container = f"melon-runtime-control-plane-{identifier}"
+    oauth_container = f"melon-runtime-oauth-{identifier}"
+    control_plane_host_network = f"kurbis-runtime-control-plane-host-{identifier}"
+    database_host_network = f"kurbis-runtime-database-host-{identifier}"
     proxy_upstream = None
     egress_gateway = None
     egress_canary_port = None
@@ -271,8 +286,11 @@ def main():
         provisioning_environment.update({
             "WORKER_ID": workers[index],
             "WORKER_NAME": f"runtime-{identifier}-{index}",
-            "WORKER_ADDRESS": "127.0.0.1",
+            "WORKER_ADDRESS": args.worker_address,
             "WORKER_SIGNAL_ADDRESS": "127.0.0.1",
+            "WORKER_GATEWAY_ADDRESS": args.gateway_address,
+            "WORKER_GATEWAY_BEDROCK_IP": "127.0.0.1",
+            "WORKER_GATEWAY_BEDROCK_PORT": str(bedrock_public_port),
             "WORKER_CONTROL_PLANE_URL": f"http://127.0.0.1:{api_port}",
             "WORKER_RUNTIME_API_PROXY_UPSTREAM": proxy_upstream or plugin_api_base_url,
             "WORKER_RUNTIME_API_EGRESS_NETWORK": proxy_egress_network or "bridge",
@@ -297,7 +315,6 @@ def main():
             provisioning_environment["KURBIS_CONTROL_PLUGIN_WASM"] = str(args.plugin_wasm)
         else:
             provisioning_environment["PUMPKIN_IMAGE"] = args.pumpkin_image
-            provisioning_environment["WORKER_GATEWAY_ADDRESS"] = "127.0.0.1"
         provisioning_database_url = (
             args.database_url if native else
             f"postgres://postgres:{secret}@127.0.0.1:{db_port}/melon_runtime_test"
@@ -388,6 +405,41 @@ def main():
     def launch(binary, environment, name):
         log = (args.output / f"{name}.log").open("wb")
         logs.append(log)
+        if not native and binary == "control-plane":
+            object_root = root / "objects"
+            object_root.mkdir(parents=True, exist_ok=True)
+            run("chown", "-R", "65532:65532", str(object_root))
+            container_environment = {
+                **environment,
+                "DATABASE_URL": f"postgres://postgres:{secret}@{postgres}:5432/melon_runtime_test",
+                "CONTROL_PLANE_LISTEN": "0.0.0.0:8080",
+                "OBJECT_STORE_LOCAL_ROOT": "/var/lib/kurbis/object-store",
+                "GOOGLE_OAUTH_AUTHORIZE_URL": f"http://oauth-fixture:{oauth_port}/authorize",
+                "GOOGLE_OAUTH_TOKEN_URL": f"http://oauth-fixture:{oauth_port}/token",
+                "GOOGLE_OAUTH_USERINFO_URL": f"http://oauth-fixture:{oauth_port}/userinfo",
+                "DISCORD_OAUTH_AUTHORIZE_URL": f"http://oauth-fixture:{oauth_port}/authorize",
+                "DISCORD_OAUTH_TOKEN_URL": f"http://oauth-fixture:{oauth_port}/token",
+                "DISCORD_OAUTH_USERINFO_URL": f"http://oauth-fixture:{oauth_port}/userinfo",
+            }
+            command = [
+                "docker", "run", "--detach", "--name", control_plane_container,
+                "--network", control_plane_host_network,
+                "--publish", f"127.0.0.1:{api_port}:8080", "--user", "65532:65532",
+                "--volume", f"{object_root}:/var/lib/kurbis/object-store",
+                "--entrypoint", "/usr/local/bin/control-plane",
+            ]
+            for key, value in container_environment.items():
+                command.extend(["--env", f"{key}={value}"])
+            command.append(args.runtime_host_image)
+            run(*command)
+            run("docker", "network", "connect", "--alias", "control-plane",
+                proxy_egress_network, control_plane_container)
+            follower = subprocess.Popen(
+                ["docker", "logs", "--follow", control_plane_container],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            )
+            processes.append(follower)
+            return follower
         if binary == "worker":
             allow = {
                 "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "RUST_LOG",
@@ -428,7 +480,14 @@ def main():
         }
         if native:
             environment["NATIVE_FIXTURE_BINARY"] = str(args.native_binary)
-        return launch("worker", environment, f"worker-{index}-{len(processes)}")
+        process = launch("worker", environment, f"worker-{index}-{len(processes)}")
+        if not native:
+            # The worker itself owns the source tree, but rootless dockerd runs
+            # as ci-e2e and must traverse the disposable bind-mount prefix.
+            for path in (root, root / f"worker-{index}", root / f"worker-{index}" / "servers"):
+                if path.exists():
+                    run("chmod", "a+rx", str(path), check=False)
+        return process
 
     def worker_healthy(index):
         return sql(
@@ -843,6 +902,8 @@ def main():
             root=root,
             waiting_java_port=waiting_java_port,
             waiting_bedrock_port=waiting_bedrock_port,
+            gateway_java_port=gateway_java_port,
+            bedrock_public_port=bedrock_public_port,
             api_port=api_port,
             secret=secret,
             bedrock_certificate=bedrock_certificate,
@@ -877,14 +938,31 @@ def main():
 
     try:
         if not native:
+            # Keep the disposable test services on the proxy's dedicated
+            # bridge so it can resolve the control-plane by service alias. The
+            # proxy's OUTPUT firewall remains the authority for destination egress.
             run("docker", "network", "create", "--driver", "bridge", "--internal", proxy_egress_network)
+            run("docker", "network", "create", "--driver", "bridge", control_plane_host_network)
+            run("docker", "network", "create", "--driver", "bridge", database_host_network)
             egress_details = json.loads(run("docker", "network", "inspect", proxy_egress_network).stdout)[0]
+            assert egress_details["Internal"] is True, egress_details
             egress_gateway = egress_details["IPAM"]["Config"][0]["Gateway"]
-            proxy_upstream = f"http://{egress_gateway}:{api_port}"
-            run("docker", "run", "--detach", "--name", postgres, "--publish", f"127.0.0.1:{db_port}:5432",
+            proxy_upstream = "http://control-plane:8080"
+            run("docker", "run", "--detach", "--name", postgres,
+                "--network", database_host_network, "--network-alias", "postgres",
+                "--publish", f"127.0.0.1:{db_port}:5432",
                 "--env", f"POSTGRES_PASSWORD={secret}", "--env", "POSTGRES_DB=melon_runtime_test", "postgres:18")
+            run("docker", "network", "connect", "--alias", "postgres",
+                proxy_egress_network, postgres)
             wait(lambda: run("docker", "exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", check=False).returncode == 0, "Postgres readiness", 60)
-        oauth_service = start_provider("127.0.0.1", oauth_port)
+        if native:
+            oauth_service = start_provider("127.0.0.1", oauth_port)
+        else:
+            run("docker", "run", "--detach", "--name", oauth_container,
+                "--network", proxy_egress_network, "--network-alias", "oauth-fixture",
+                "--publish", f"127.0.0.1:{oauth_port}:{oauth_port}",
+                "--entrypoint", "/usr/local/bin/oauth-fixture",
+                args.runtime_host_image, str(oauth_port))
         common = {
             "DATABASE_URL": args.database_url if native else f"postgres://postgres:{secret}@127.0.0.1:{db_port}/melon_runtime_test",
             "OBJECT_STORE_TYPE": "local",
@@ -904,7 +982,7 @@ def main():
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/healthz", timeout=2) as response:
                     return response.status == 204
-            except (TimeoutError, urllib.error.URLError):
+            except (TimeoutError, urllib.error.URLError, http.client.RemoteDisconnected, ConnectionError):
                 return False
         wait(control_plane_ready, "control-plane HTTP readiness", timeout=90)
         if not native:
@@ -1150,7 +1228,7 @@ def main():
         protocol(
             gateway_java,
             "idle-rejoin",
-            transfer_port=worker_ports[workers.index(idle_worker)],
+            transfer_port=worker_ports[0],
             expect_item=["diamond:7"],
             hold_seconds=2,
         )
@@ -1189,7 +1267,7 @@ def main():
             ["Native development processes have no hard memory cgroup or ext4 quota"]
             if native else []
         )
-        evidence["not_performed_by_user_instruction"] = [
+        evidence["limitations"] = evidence.get("limitations", []) + [
             "physical Bedrock client login/UI interaction"
         ]
         evidence["passed"] = True
@@ -1240,6 +1318,10 @@ def main():
         if not native:
             waiting_logs = run("docker", "logs", waiting_container, check=False)
             (args.output / "waiting.log").write_text(waiting_logs.stdout + waiting_logs.stderr)
+            control_plane_logs = run("docker", "logs", control_plane_container, check=False)
+            (args.output / "control-plane.log").write_text(
+                control_plane_logs.stdout + control_plane_logs.stderr
+            )
             runtime_containers = [
                 f"kurbis-ci-{uuid.UUID(preview_id).hex}"
                 for preview_id in ci_preview_ids
@@ -1247,8 +1329,11 @@ def main():
                 f"kurbis-api-proxy-{uuid.UUID(preview_id).hex}"
                 for preview_id in ci_preview_ids
             ]
-            run("docker", "rm", "--force", waiting_container, backend, queued_backend, *runtime_containers, check=False)
+            run("docker", "rm", "--force", waiting_container, backend, queued_backend,
+                control_plane_container, oauth_container, *runtime_containers, check=False)
             run("docker", "rm", "--force", "--volumes", postgres, check=False)
+            run("docker", "network", "rm", control_plane_host_network,
+                database_host_network, proxy_egress_network, check=False)
             for preview_id in ci_preview_ids:
                 mount = root / "worker-1" / "ci-preview-storage" / "servers" / preview_id
                 if mount.exists():

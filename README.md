@@ -52,18 +52,25 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 
 Local development runs directly on macOS or Linux. See [native setup](runtime/pumpkin/NATIVE.md) for workers and the waiting gateway runtime. On macOS, workers default to the native backend.
 
-Build the Rust project:
+Build the Rust project through host-wide memory admission (10 GiB build cap,
+4 GiB reserved for the OS/services, one Cargo job):
 
 ```bash
-cargo build
+tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --jobs 1
 ```
 
-Run Rust tests:
+Run Rust tests through the same admission gate:
 
 ```bash
 TEST_DATABASE_URL=postgres://localhost/melon_hoster_test \
-  cargo test --locked --all-targets -- --test-threads=1
+  tools/run_bounded_build.py --memory-bytes 10737418240 -- \
+  cargo --jobs 1 test --locked --all-targets -- --test-threads=1
 ```
+
+Use `tools/docker_build_with_limits.sh` rather than raw `docker buildx build` or
+`docker compose build`; it serializes independent build clients, samples memory
+on the Docker daemon host, reserves 4 GiB of headroom, and verifies BuildKit's
+per-RUN cgroup memory/swap/CPU caps under controlled pressure before building.
 
 Use a disposable local database. The schema is bootstrapped from the canonical
 empty-database definition; historical migration fixtures and upgrade
@@ -165,23 +172,28 @@ the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
 `WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
 quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the
 permissions needed to mount ext4 loop devices; `directory` mode has no hard
-disk quota. Docker workers also require `WORKER_GATEWAY_ADDRESS` to equal the
-source IP the Gateway uses to reach the worker. The worker binds published
-server ports only on the configured worker addresses and installs dedicated
-nftables input rules allowing those assigned ports only from that Gateway IP;
+disk quota. Docker workers require `WORKER_GATEWAY_ADDRESS` to equal the source IP the
+Gateway uses to reach the worker and require `WORKER_GATEWAY_BEDROCK_IP` plus
+`WORKER_GATEWAY_BEDROCK_PORT` to match the public shared Bedrock Gateway endpoint.
+Each rootless Pumpkin remains on a per-runtime internal network; a bounded,
+fixed-destination relay publishes only its Java, NetherNet UDP, and signaling
+ports on separate per-runtime networks. Host nftables admits only the Gateway
+source on those leased ports. NetherNet SDP advertises the shared Gateway
+endpoint rather than a worker port, so clients cannot bypass the Gateway ACL;
 missing nftables privileges fail worker startup before it acquires assignments.
 For remote Gateways, configure the actual routed source address with
 `WORKER_GATEWAY_ADDRESS` (network ACLs must preserve or predictably SNAT that
 source). Local Compose defaults it to `GATEWAY_IP`. A matching Java probe is
-also published on loopback for worker-local CI readiness checks; it is not
+also published on loopback for worker-local readiness checks; it is not
 reachable from remote hosts. The worker must have host `CAP_NET_ADMIN` for the
 dedicated nftables chain; this firewall privilege is separate from Docker,
 which must still run rootless under a non-root account.
 
 Managed Pumpkin plugin API traffic uses a per-server, per-generation sidecar
 proxy. The server container remains on its own Docker `internal` network with
-IPv6 and masquerading disabled; that network contains only Pumpkin and its
-proxy. Only the proxy also joins `WORKER_RUNTIME_API_EGRESS_NETWORK`. It carries
+IPv6 and masquerading disabled; that network contains Pumpkin, its API proxy,
+and its fixed-backend ingress relay. The relay's own OUTPUT firewall permits
+only the exact Pumpkin IPv4 address and Java/Bedrock backend ports. Only the proxy also joins `WORKER_RUNTIME_API_EGRESS_NETWORK`. It carries
 no worker, gateway, database, or object-store credentials: it pins the request
 to the configured `WORKER_RUNTIME_API_PROXY_UPSTREAM`, checks the presented
 server/preview capability against its hash, and allows only the managed plugin's
@@ -281,7 +293,7 @@ See [`PROGRESS.md`](PROGRESS.md) for the current implementation state and [`PLAN
 
 Browser lifecycle and OAuth verification uses a disposable database and real panel/API/Postgres, with controlled external provider and worker boundaries. Run it using [the E2E instructions](web/tests/e2e/README.md).
 
-Build local hoster binaries with `cargo build --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Its Linux image can be built with `docker build -f runtime/Dockerfile -t melon-hoster:local .`; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
+Build local hoster binaries with `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --jobs 1 --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Use `tools/docker_build_with_limits.sh --file runtime/Dockerfile --tag melon-hoster:local .` rather than an unbounded Compose/Docker build; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
 
 To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks Java 26.3 login, save/shutdown, and player activity. The native lifecycle harness also exercises Java waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
 
@@ -289,22 +301,34 @@ For faster development on this Mac or Linux, use [native host execution](runtime
 
 ## Pumpkin pull-request and branch previews
 
-Set `CI_GITHUB_PAT` to enable the optional CI poller. It creates GitHub Check
-Runs for the exact pull-request heads observed by a completed poll, builds the
-checked-in Pumpkin patch with the pinned rootless builder image, and publishes
-isolated previews below `pumpkin.kurbis.host` (the CI hostname suffix is
-currently fixed in the service and is separate from `ROOT_DOMAIN`). Configure DNS
-and TLS for that suffix before enabling previews. `CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless
-Docker daemon over restricted SSH; never give the control plane a host Docker
-socket. The builder uses preloaded dependencies and compiles offline in a
-network-disabled, resource-bounded task container; repository Dockerfiles are
-not used.
+Set `CI_GITHUB_PAT` to enable the CI poller. Periodic GitHub polling is the
+active event source and runs every 60 seconds with ETag checkpoints. It eagerly
+builds and caches only the exact current PR heads that polling observes as
+opened, reopened, or updated, with one build-only Check Run per head. No PR
+ancestors, unrelated commits, branches, or arbitrary commit aliases are
+proactively built.
 
-Branch previews start as a lobby and build lazily on first join. A new observed
-branch head replaces the stable branch alias only after the new build is ready
-and any prior runtime generation has stopped. Deleted branches expire their
-stable alias and enter generation-fenced runtime cleanup. Closing a pull request
-does not currently expire its preview. GitHub polling cannot promise a separate
-build for every intermediate push: a commit superseded between successful polls
-may never be observed or built. The Check Run details link is a read-only status
-page and does not expose build logs, runtime capabilities, or controls.
+The signed webhook implementation remains available but dormant. It is not
+configured or started by default; only an explicit
+`CI_GITHUB_WEBHOOK_ENABLED=true` plus `CI_GITHUB_WEBHOOK_SECRET` starts the
+webhook consumer. Leave both webhook settings disabled for the polling-only
+deployment.
+
+Builds use the checked-in Pumpkin patch and pinned rootless builder image, then
+publish isolated previews below `pumpkin.kurbis.host` (the CI hostname suffix is
+fixed in the service and separate from `ROOT_DOMAIN`). Configure wildcard DNS
+and TLS before enabling the polling service. Do not configure a GitHub
+repository webhook for the default polling-only deployment.
+`CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless Docker daemon over
+restricted SSH; never give the control plane a host Docker socket. Repository
+Dockerfiles are not used.
+The builder backend is explicit and fail-closed. Docker remains the default and requires a dedicated non-root rootless daemon over restricted SSH; never use `ssh://root@host` or the rootful `/var/run/docker.sock`. A Bubblewrap backend is available only with `CI_BUILDER_BACKEND=bubblewrap` and never falls back to Docker. It provides `bubblewrap_namespace_only` isolation (private paths, read-only root/toolchain, no network, dropped capabilities, `NoNewPrivs`, a kernel-enforced size-bounded `/work` tmpfs, timeout/descendant cleanup, and cross-process memory admission) but does not claim cgroup CPU, memory, or PID enforcement. Bubblewrap's writable build tree is never checked with post-hoc `du`, `statvfs`, or shell `ulimit` claims: startup/build preflight must find the operator-mounted tmpfs below private `$HOME` with exactly `size=5G,nr_inodes=1310720`, or the backend fails closed. Configure its immutable rootfs/toolchain paths and a pre-created private `CI_BUBBLEWRAP_WORKSPACE` mount such as `$HOME/.cache/kurbis/ci/workspace-tmpfs`; ordinary host directories and other tmpfs limits are rejected. Bubblewrap is native-control-plane-only: Compose deliberately does not pass or mount these host fixtures, so select it only with `./start.sh native ...` on Linux; a Compose Bubblewrap selection fails closed. Native `start.sh` resolves `CI_PLUGIN_SOURCE=plugins/kurbis-control` from the checkout, while Compose supplies `/opt/kurbis/plugins/kurbis-control` inside the control-plane image.
+
+Branch previews remain lobbies and build lazily on first join. A full immutable
+`commit-<sha>` hostname also builds lazily when a player joins; repeat joins use
+the same build/artifact cache. A new observed PR head moves the stable PR alias
+only after that head is ready, and late/out-of-order older events can never move
+it backward. Deleted branches expire their stable alias and enter
+ generation-fenced runtime cleanup. Closing a pull request does not currently
+expire its preview. Check Run details are read-only and do not expose build logs,
+runtime capabilities, or controls.

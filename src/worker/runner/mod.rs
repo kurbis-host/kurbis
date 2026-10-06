@@ -83,6 +83,12 @@ impl WorkerRunner {
                     config
                         .gateway_address
                         .context("Docker workload ingress needs WORKER_GATEWAY_ADDRESS")?,
+                    config
+                        .gateway_bedrock_ip
+                        .context("Docker workload ingress needs WORKER_GATEWAY_BEDROCK_IP")?,
+                    config
+                        .gateway_bedrock_port
+                        .context("Docker workload ingress needs WORKER_GATEWAY_BEDROCK_PORT")?,
                     config.runtime_api_proxy_image.clone(),
                     config.runtime_api_proxy_upstream.clone(),
                     config.runtime_api_proxy_egress_network.clone(),
@@ -118,6 +124,12 @@ impl WorkerRunner {
                 config
                     .gateway_address
                     .context("CI preview ingress needs WORKER_GATEWAY_ADDRESS")?,
+                config
+                    .gateway_bedrock_ip
+                    .context("CI preview ingress needs WORKER_GATEWAY_BEDROCK_IP")?,
+                config
+                    .gateway_bedrock_port
+                    .context("CI preview ingress needs WORKER_GATEWAY_BEDROCK_PORT")?,
                 config.storage_mode,
                 config.runtime_api_proxy_image.clone(),
                 config.runtime_api_proxy_upstream.clone(),

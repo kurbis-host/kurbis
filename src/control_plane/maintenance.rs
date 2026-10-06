@@ -1,11 +1,136 @@
 use std::sync::Arc;
 
-use anyhow::Result;
-use object_store::ObjectStore;
+use anyhow::{Context, Result};
+use object_store::{ObjectStore, path::Path as ObjectPath};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::control_plane::snapshots::{GarbageCollection, SnapshotStore};
+use crate::{
+    ci::{CiPreviewRepository, CiPreviewRuntimeRepository},
+    control_plane::object_cleanup::delete_if_present,
+    control_plane::snapshots::{GarbageCollection, SnapshotStore},
+};
+
+/// Finish TTL/branch-deletion cleanup when the assigned worker is offline.
+/// Shared checkpoint objects and database ownership are removed here; the
+/// returning worker's next reconciliation removes its now-orphaned local disk.
+pub async fn cleanup_stale_ci_preview_deletions(
+    runtimes: &CiPreviewRuntimeRepository,
+    object_store: Arc<dyn ObjectStore>,
+    limit: i64,
+) -> Result<u64> {
+    let claims = runtimes.claim_stale_expired(limit).await?;
+    let mut cleaned = 0;
+    for claim in claims {
+        finish_claimed_stale_ci_preview_deletion(runtimes, object_store.clone(), &claim).await?;
+        cleaned += 1;
+    }
+    Ok(cleaned)
+}
+
+/// Complete a previously claimed stale-worker deletion. The caller must pass
+/// the exact repository claim; worker routes are fenced while its claim marker
+/// exists, and complete_stale_expiry revalidates it in the same transaction
+/// that releases ports, disk and capacity.
+pub async fn finish_claimed_stale_ci_preview_deletion(
+    runtimes: &CiPreviewRuntimeRepository,
+    object_store: Arc<dyn ObjectStore>,
+    claim: &crate::ci::ExpiredCiRuntime,
+) -> Result<()> {
+    let placement = &claim.placement;
+    let result = async {
+        if let Some(snapshot) = runtimes
+            .world_snapshot_for_stale_deletion(
+                placement.preview_id,
+                placement.worker_id,
+                placement.generation,
+                placement.lease_token,
+                claim
+                    .stale_cleanup_claim_token
+                    .context("stale CI deletion claim omitted its token")?,
+            )
+            .await?
+        {
+            let path = ObjectPath::parse(&snapshot.object_key)?;
+            delete_if_present(object_store.as_ref(), &path).await?;
+        }
+        let claim_token = claim
+            .stale_cleanup_claim_token
+            .context("stale CI deletion claim omitted its token")?;
+        if !runtimes
+            .complete_stale_expiry(placement, claim_token)
+            .await?
+        {
+            anyhow::bail!("stale CI expiry cleanup lost its generation fence");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(claim_token) = claim.stale_cleanup_claim_token {
+                let _ = runtimes
+                    .release_stale_expiry_claim(placement, claim_token)
+                    .await;
+            }
+            Err(error).context("finish stale CI preview deletion")
+        }
+    }
+}
+
+/// Drain the durable CI world-snapshot outbox. Database rows are created in
+/// the same transaction that supersedes a checkpoint, so transient object-store
+/// failures and process crashes cannot orphan superseded snapshots silently.
+pub async fn cleanup_ci_world_snapshot_garbage(
+    runtimes: &CiPreviewRuntimeRepository,
+    object_store: Arc<dyn ObjectStore>,
+    limit: i64,
+) -> Result<u64> {
+    let claims = runtimes.claim_world_snapshot_garbage(limit).await?;
+    let mut completed = 0;
+    let mut first_error = None;
+    for claim in claims {
+        let result = async {
+            // Protect against a reused key or a delayed stale claim that points
+            // at the currently published checkpoint.
+            if !runtimes
+                .world_snapshot_object_is_current(&claim.object_key)
+                .await?
+            {
+                let path = ObjectPath::parse(&claim.object_key)?;
+                delete_if_present(object_store.as_ref(), &path).await?;
+            }
+            if !runtimes
+                .complete_world_snapshot_garbage(&claim.object_key, claim.claim_token)
+                .await?
+            {
+                anyhow::bail!("CI snapshot garbage-collection claim was superseded");
+            }
+            completed += 1;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(release_error) = runtimes
+                .release_world_snapshot_garbage(&claim.object_key, claim.claim_token)
+                .await
+            {
+                tracing::error!(?release_error, object_key=%claim.object_key,
+                    "failed to release CI snapshot garbage claim after deletion error");
+            }
+            tracing::warn!(?error, object_key=%claim.object_key,
+                "CI world snapshot garbage deletion will be retried");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error).context("drain CI world snapshot garbage queue");
+    }
+    Ok(completed)
+}
 
 #[derive(Debug, Default)]
 pub struct MaintenanceReport {
@@ -14,17 +139,44 @@ pub struct MaintenanceReport {
     pub exports_requeued: u64,
     pub exports_expired: u64,
     pub garbage_collection: GarbageCollection,
+    pub ci_world_snapshot_gc_completed: u64,
+    pub github_webhook_processed_gc_deleted: u64,
+}
+
+const GITHUB_WEBHOOK_RETENTION_BATCH_SIZE: i64 = 128;
+
+fn webhook_mode_enabled_from_environment() -> bool {
+    std::env::var("CI_GITHUB_WEBHOOK_ENABLED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
 pub struct WorkerMaintenance {
     pool: PgPool,
     object_store: Arc<dyn ObjectStore>,
+    github_webhook_gc_enabled: bool,
 }
 
 impl WorkerMaintenance {
     pub fn new(pool: PgPool, object_store: Arc<dyn ObjectStore>) -> Self {
-        Self { pool, object_store }
+        Self {
+            pool,
+            object_store,
+            github_webhook_gc_enabled: webhook_mode_enabled_from_environment(),
+        }
+    }
+
+    /// Override the process-level webhook opt-in for an embedding or test.
+    /// Retention GC is never active unless this is true.
+    pub fn with_github_webhook_enabled(mut self, enabled: bool) -> Self {
+        self.github_webhook_gc_enabled = enabled;
+        self
     }
 
     pub async fn run_once(&self) -> Result<MaintenanceReport> {
@@ -34,12 +186,27 @@ impl WorkerMaintenance {
         let exports_expired = self.expire_exports().await?;
         let garbage_collection =
             SnapshotStore::collect_garbage_with(&self.pool, self.object_store.clone()).await?;
+        let ci_world_snapshot_gc_completed = cleanup_ci_world_snapshot_garbage(
+            &CiPreviewRuntimeRepository::new(self.pool.clone()),
+            self.object_store.clone(),
+            64,
+        )
+        .await?;
+        let github_webhook_processed_gc_deleted = if self.github_webhook_gc_enabled {
+            CiPreviewRepository::new(self.pool.clone())
+                .delete_processed_github_pr_deliveries(GITHUB_WEBHOOK_RETENTION_BATCH_SIZE)
+                .await?
+        } else {
+            0
+        };
         Ok(MaintenanceReport {
             operations_assigned,
             exports_assigned,
             exports_requeued,
             exports_expired,
             garbage_collection,
+            ci_world_snapshot_gc_completed,
+            github_webhook_processed_gc_deleted,
         })
     }
 
@@ -317,6 +484,8 @@ pub fn spawn_worker_maintenance(maintenance: WorkerMaintenance) {
                         || report.garbage_collection.manifests_deleted > 0
                         || report.garbage_collection.exports_deleted > 0
                         || report.garbage_collection.staging_deleted > 0
+                        || report.ci_world_snapshot_gc_completed > 0
+                        || report.github_webhook_processed_gc_deleted > 0
                     {
                         tracing::info!(?report, "worker maintenance completed");
                     }

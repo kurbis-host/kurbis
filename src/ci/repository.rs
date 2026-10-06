@@ -5,13 +5,20 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::domain::{
-    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildStage, CiHostname, CiPreview, CiPreviewState,
-    CiRefKind, validate_commit_sha,
+    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildFailureClass, CiBuildStage, CiHostname, CiPreview,
+    CiPreviewState, CiRefKind, validate_commit_sha,
 };
 
+mod github_webhook;
 mod polling;
 mod rows;
+pub use github_webhook::{CiGitHubPrDelivery, CiGitHubPrDeliveryResult, ClaimedCiGitHubPrDelivery};
 use rows::*;
+
+/// A failed immutable build key may be retried a small number of times. The
+/// retry budget lives on the deduplicated build row, so every poller and API
+/// replica observes the same backoff rather than creating a new build.
+pub const CI_BUILD_MAX_RETRIES: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct WatchedRepository {
@@ -31,6 +38,7 @@ pub struct CheckRunReconciliation {
     pub artifact_digest: Option<String>,
     pub failure_stage: Option<CiBuildStage>,
     pub failure_message: Option<String>,
+    pub tombstone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +62,10 @@ pub struct CiPreviewRepository {
 impl CiPreviewRepository {
     pub const fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn pool(&self) -> PgPool {
+        self.pool.clone()
     }
 
     pub async fn ensure_build(&self, key: &BuildKey) -> Result<(CiBuild, bool)> {
@@ -92,10 +104,14 @@ impl CiPreviewRepository {
         .await?;
         let stale_success = row.stage == "ready" && !row.artifact_valid;
         let elapsed = row.expires_at <= Utc::now();
-        let row = if stale_success || elapsed && row.stage != "queued" {
+        // A failed immutable key carries its retry budget and permanence class.
+        // Preview TTL expiry must not silently turn it into fresh queued work.
+        let refresh_expired_build = elapsed && row.stage != "queued" && row.stage != "failed";
+        let row = if stale_success || refresh_expired_build {
             sqlx::query_as::<_, CiBuildRow>(
                 "UPDATE ci_builds SET stage = 'queued', artifact_digest = NULL,
-                    failure_stage = NULL, failure_message = NULL, expires_at = now() + interval '72 hours',
+                    failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
+                    expires_at = now() + interval '72 hours',
                     lease_token = NULL, lease_expires_at = NULL, updated_at = now()
                  WHERE id = $1 AND (lease_expires_at IS NULL OR lease_expires_at <= now())
                  RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -113,6 +129,135 @@ impl CiPreviewRepository {
         Ok((row.try_into()?, inserted))
     }
 
+    /// Return only durable, due retries for current open PR heads. This is
+    /// intentionally separate from eagerly observed GitHub changes: unchanged
+    /// refs can become due after their original Check Run failure without
+    /// making every poll rebuild all queued PRs.
+    pub async fn due_pull_request_build_retries(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<super::services::BuildRequest>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
+            "SELECT build.repository, build.commit_sha, build.patch_fingerprint,
+                    build.toolchain_version, build.target_architecture,
+                    COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository
+             FROM ci_builds build
+             JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
+             JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
+             WHERE build.repository = $1 AND watched.repository = build.repository
+               AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
+               AND build.stage = 'failed' AND build.failure_class = 'transient'
+               AND build.retry_count <= $2 AND build.retry_at <= now()
+               AND build.expires_at > now()
+             GROUP BY build.id
+             ORDER BY min(build.retry_at), build.id
+             LIMIT 128",
+        )
+        .bind(repository)
+        .bind(CI_BUILD_MAX_RETRIES)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    repository,
+                    commit_sha,
+                    patch_fingerprint,
+                    toolchain_version,
+                    target_architecture,
+                    source_repository,
+                )| {
+                    Ok(super::services::BuildRequest {
+                        key: BuildKey::new(
+                            repository,
+                            commit_sha,
+                            patch_fingerprint,
+                            toolchain_version,
+                            target_architecture,
+                        )?,
+                        source_repository,
+                        source_archive: Vec::new(),
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Return PR-head builds that were durably admitted but have no live build
+    /// lease. This is the recovery queue for a poller restart or a control-plane
+    /// crash: the source poll may return an unchanged ETag, so rebuilding only
+    /// eager refs would strand these rows forever. Branch and arbitrary commit
+    /// previews remain lazy and are intentionally excluded.
+    pub async fn queued_pull_request_builds(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<super::services::BuildRequest>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
+            "SELECT build.repository, build.commit_sha, build.patch_fingerprint,
+                    build.toolchain_version, build.target_architecture,
+                    COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository
+             FROM ci_builds build
+             JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
+             JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
+             WHERE watched.repository = $1 AND watched.enabled
+               AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
+               AND build.repository = watched.repository
+               AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
+               AND build.expires_at > now()
+               AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
+             GROUP BY build.id
+             ORDER BY build.updated_at, build.id
+             LIMIT 128",
+        )
+        .bind(repository)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    repository,
+                    commit_sha,
+                    patch_fingerprint,
+                    toolchain_version,
+                    target_architecture,
+                    source_repository,
+                )| {
+                    Ok(super::services::BuildRequest {
+                        key: BuildKey::new(
+                            repository,
+                            commit_sha,
+                            patch_fingerprint,
+                            toolchain_version,
+                            target_architecture,
+                        )?,
+                        source_repository,
+                        source_archive: Vec::new(),
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// A demand-triggered request may start failed immutable work only after
+    /// the persisted transient retry deadline. Permanent failures never retry.
+    pub async fn is_build_retry_due(&self, build_id: Uuid) -> Result<bool> {
+        let due: Option<bool> = sqlx::query_scalar(
+            "SELECT stage = 'failed'
+                 AND failure_class = 'transient'
+                 AND retry_count <= $2
+                 AND retry_at IS NOT NULL
+                 AND retry_at <= now()
+                 AND expires_at > now()
+                 AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+             FROM ci_builds WHERE id = $1",
+        )
+        .bind(build_id)
+        .bind(CI_BUILD_MAX_RETRIES)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(due.unwrap_or(false))
+    }
+
     pub async fn claim_build(
         &self,
         build_id: Uuid,
@@ -124,13 +269,20 @@ impl CiPreviewRepository {
         }
         let result = sqlx::query(
             "UPDATE ci_builds SET stage = 'queued', lease_token = $2, lease_expires_at = now() + $3::interval,
-                 failure_stage = NULL, failure_message = NULL, artifact_digest = NULL, updated_at = now()
-             WHERE id = $1 AND stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
-               AND (lease_expires_at IS NULL OR lease_expires_at <= now())",
+                 failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
+                 updated_at = now()
+             WHERE id = $1
+               AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+               AND (
+                    stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
+                    OR (stage = 'failed' AND failure_class = 'transient'
+                        AND retry_count <= $4 AND retry_at IS NOT NULL AND retry_at <= now())
+               )",
         )
         .bind(build_id)
         .bind(lease)
         .bind(format!("{} seconds", lease_duration.num_seconds()))
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -187,6 +339,8 @@ impl CiPreviewRepository {
         let row: CiBuildRow = sqlx::query_as(
             "UPDATE ci_builds SET stage = $2, failure_stage = CASE WHEN $2 = 'failed' THEN $2 ELSE failure_stage END,
                     failure_message = CASE WHEN $2 = 'failed' THEN $3 ELSE failure_message END,
+                    failure_class = CASE WHEN $2 = 'failed' THEN 'permanent' ELSE failure_class END,
+                    retry_at = CASE WHEN $2 = 'failed' THEN NULL ELSE retry_at END,
                     expires_at = CASE WHEN $2 = 'ready' THEN now() + interval '72 hours' ELSE expires_at END,
                     updated_at = now() WHERE id = $1
              RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -247,14 +401,44 @@ impl CiPreviewRepository {
         failure_stage: CiBuildStage,
         message: &str,
     ) -> Result<()> {
+        self.fail_build_with_class(
+            build_id,
+            failure_stage,
+            message,
+            CiBuildFailureClass::Permanent,
+        )
+        .await
+    }
+
+    pub async fn fail_build_with_class(
+        &self,
+        build_id: Uuid,
+        failure_stage: CiBuildStage,
+        message: &str,
+        failure_class: CiBuildFailureClass,
+    ) -> Result<()> {
+        let failure_class = failure_class.to_string();
         sqlx::query(
             "UPDATE ci_builds SET stage = 'failed', failure_stage = $2, failure_message = $3,
+                    failure_class = $4,
+                    retry_count = CASE WHEN $4 = 'transient' THEN retry_count + 1 ELSE retry_count END,
+                    retry_at = CASE
+                        WHEN $4 = 'transient' AND retry_count < $5 THEN
+                            now() + CASE retry_count
+                                WHEN 0 THEN interval '1 minute'
+                                WHEN 1 THEN interval '2 minutes'
+                                ELSE interval '4 minutes'
+                            END
+                        ELSE NULL
+                    END,
                     lease_token = NULL, lease_expires_at = NULL, updated_at = now()
              WHERE id = $1 AND stage NOT IN ('ready', 'expired')",
         )
         .bind(build_id)
         .bind(failure_stage.to_string())
         .bind(message.chars().take(8192).collect::<String>())
+        .bind(failure_class)
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -267,15 +451,48 @@ impl CiPreviewRepository {
         failure_stage: CiBuildStage,
         message: &str,
     ) -> Result<bool> {
+        self.fail_claimed_build_with_class(
+            build_id,
+            lease,
+            failure_stage,
+            message,
+            CiBuildFailureClass::Permanent,
+        )
+        .await
+    }
+
+    pub async fn fail_claimed_build_with_class(
+        &self,
+        build_id: Uuid,
+        lease: Uuid,
+        failure_stage: CiBuildStage,
+        message: &str,
+        failure_class: CiBuildFailureClass,
+    ) -> Result<bool> {
+        let failure_class = failure_class.to_string();
         let rows = sqlx::query(
             "UPDATE ci_builds SET stage = 'failed', failure_stage = $3, failure_message = $4,
+                    failure_class = $5,
+                    retry_count = CASE WHEN $5 = 'transient' THEN retry_count + 1 ELSE retry_count END,
+                    retry_at = CASE
+                        WHEN $5 = 'transient' AND retry_count < $6 THEN
+                            now() + CASE retry_count
+                                WHEN 0 THEN interval '1 minute'
+                                WHEN 1 THEN interval '2 minutes'
+                                ELSE interval '4 minutes'
+                            END
+                        ELSE NULL
+                    END,
                     updated_at = now()
-             WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now() AND stage NOT IN ('ready', 'expired')",
+             WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now()
+               AND stage NOT IN ('ready', 'expired')",
         )
         .bind(build_id)
         .bind(lease)
         .bind(failure_stage.to_string())
         .bind(message.chars().take(8192).collect::<String>())
+        .bind(failure_class)
+        .bind(CI_BUILD_MAX_RETRIES)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -394,16 +611,29 @@ impl CiPreviewRepository {
         limit: i64,
     ) -> Result<Vec<CheckRunReconciliation>> {
         let rows = sqlx::query_as::<_, CheckRunReconciliationRow>(
-            "SELECT build.id AS build_id, check_run.external_id AS check_run_id,
-                    build.repository, build.commit_sha, build.patch_fingerprint,
-                    build.toolchain_version, build.target_architecture, build.stage,
-                    build.artifact_digest, build.failure_stage, build.failure_message
-             FROM ci_check_runs check_run
-             JOIN ci_builds build ON build.id = check_run.build_id
-             WHERE check_run.external_id IS NOT NULL
-               AND check_run.last_stage IS DISTINCT FROM build.stage
-             ORDER BY build.updated_at, build.id
-             LIMIT $1",
+            "WITH candidates AS (
+                SELECT build.id AS build_id, check_run.external_id AS check_run_id,
+                       build.repository, build.commit_sha, build.patch_fingerprint,
+                       build.toolchain_version, build.target_architecture, build.stage,
+                       build.artifact_digest, build.failure_stage, build.failure_message,
+                       FALSE AS tombstone, build.updated_at
+                FROM ci_check_runs check_run
+                JOIN ci_builds build ON build.id = check_run.build_id
+                WHERE check_run.external_id IS NOT NULL
+                  AND check_run.last_stage IS DISTINCT FROM build.stage
+                UNION ALL
+                SELECT tombstone.build_id, tombstone.external_id,
+                       tombstone.repository, tombstone.commit_sha, tombstone.patch_fingerprint,
+                       tombstone.toolchain_version, tombstone.target_architecture, tombstone.stage,
+                       NULL::text AS artifact_digest, NULL::text AS failure_stage,
+                       NULL::text AS failure_message, TRUE AS tombstone, tombstone.updated_at
+                FROM ci_check_run_tombstones tombstone
+                WHERE tombstone.last_stage IS DISTINCT FROM tombstone.stage
+            )
+            SELECT build_id, check_run_id, repository, commit_sha, patch_fingerprint,
+                   toolchain_version, target_architecture, stage, artifact_digest,
+                   failure_stage, failure_message, tombstone
+            FROM candidates ORDER BY updated_at, build_id LIMIT $1",
         )
         .bind(limit.clamp(1, 256))
         .fetch_all(&self.pool)
@@ -415,18 +645,31 @@ impl CiPreviewRepository {
         &self,
         build_id: Uuid,
         stage: CiBuildStage,
+        tombstone: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE ci_check_runs check_run SET last_stage = $2, updated_at = now()
-             FROM ci_builds build
-             WHERE check_run.build_id = $1 AND build.id = check_run.build_id
-               AND build.stage = $2 AND check_run.external_id IS NOT NULL",
-        )
-        .bind(build_id)
-        .bind(stage.to_string())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let rows = if tombstone {
+            sqlx::query(
+                "UPDATE ci_check_run_tombstones SET last_stage=$2, updated_at=now()
+                 WHERE build_id=$1 AND stage=$2",
+            )
+            .bind(build_id)
+            .bind(stage.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE ci_check_runs check_run SET last_stage = $2, updated_at = now()
+                 FROM ci_builds build
+                 WHERE check_run.build_id = $1 AND build.id = check_run.build_id
+                   AND build.stage = $2 AND check_run.external_id IS NOT NULL",
+            )
+            .bind(build_id)
+            .bind(stage.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        };
         Ok(rows == 1)
     }
 
@@ -588,6 +831,13 @@ impl CiPreviewRepository {
     ) -> Result<CiPreview> {
         validate_commit_sha(commit_sha).map_err(|error| anyhow::anyhow!(error))?;
         let mut tx = self.pool.begin().await?;
+        // PostgreSQL row locks do not lock a missing hostname. Serialize the
+        // first insert for each canonical alias so overlapping repository
+        // pollers do not race into the unique hostname constraint.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&alias.value)
+            .execute(&mut *tx)
+            .await?;
         let existing = sqlx::query_as::<_, CiPreviewRow>(
             "SELECT id, repository, commit_sha, kind, hostname, build_id, state,
                     runtime_generation, NULL::text AS failure_message, ''::text AS build_log, expires_at FROM ci_preview_aliases
@@ -943,22 +1193,43 @@ impl CiPreviewRepository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        // Runtime-bearing aliases remain as tombstones until their worker has
-        // confirmed world deletion. Build-only aliases and unreferenced builds
-        // can be removed in this transaction without orphaning a runtime.
-        // If GitHub has been unavailable for a full week after expiration,
-        // stop retaining failed logs solely for an external status retry.
-        // The regular poller still retries terminal Check Run updates throughout
-        // that grace period; after it, the build/check metadata can be collected.
+        // Expired build diagnostics have the same 72-hour lifetime as the
+        // artifact. Preserve only the small provider reconciliation tombstone
+        // if GitHub has not yet accepted the terminal Check Run update.
         sqlx::query(
-            "DELETE FROM ci_check_runs check_run USING ci_builds build
-             WHERE check_run.build_id = build.id AND build.stage = 'expired'
-               AND check_run.last_stage IS DISTINCT FROM build.stage
-               AND check_run.updated_at <= $1 - interval '7 days'",
+            "UPDATE ci_builds SET build_log='', failure_message=NULL, updated_at=now()
+             WHERE stage='expired' AND expires_at <= $1 AND (build_log <> '' OR failure_message IS NOT NULL)",
         )
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO ci_check_run_tombstones(
+                build_id,repository,commit_sha,patch_fingerprint,toolchain_version,
+                target_architecture,external_id,stage,last_stage,updated_at)
+             SELECT build.id,build.repository,build.commit_sha,build.patch_fingerprint,
+                    build.toolchain_version,build.target_architecture,check_run.external_id,
+                    build.stage,check_run.last_stage,now()
+             FROM ci_check_runs check_run JOIN ci_builds build ON build.id=check_run.build_id
+             WHERE build.stage='expired' AND build.expires_at <= $1
+               AND check_run.external_id IS NOT NULL
+               AND check_run.last_stage IS DISTINCT FROM build.stage
+             ON CONFLICT(build_id) DO UPDATE SET
+                stage=EXCLUDED.stage,last_stage=EXCLUDED.last_stage,updated_at=now()",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM ci_check_runs check_run USING ci_builds build
+             WHERE check_run.build_id=build.id AND build.stage='expired' AND build.expires_at <= $1",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM ci_check_run_tombstones WHERE last_stage=stage")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM ci_preview_aliases alias
              WHERE alias.state = 'expired'
@@ -970,12 +1241,7 @@ impl CiPreviewRepository {
             "DELETE FROM ci_builds build
              WHERE build.stage = 'expired'
                AND NOT EXISTS (SELECT 1 FROM ci_preview_aliases alias WHERE alias.build_id = build.id)
-               AND NOT EXISTS (
-                   SELECT 1 FROM ci_check_runs check_run
-                   WHERE check_run.build_id = build.id
-                     AND check_run.external_id IS NOT NULL
-                     AND check_run.last_stage IS DISTINCT FROM build.stage
-               )",
+",
         )
         .execute(&mut *tx)
         .await?;

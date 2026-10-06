@@ -1,7 +1,7 @@
 # Hosted Pumpkin runtime
 
 The hosted runtime builds Pumpkin directly on the local host with
-`tools/build_pumpkin_native.sh`; local development does not use Docker. The
+`tools/build_pumpkin_native.sh`, which serializes Rust compilation behind the shared host-memory admission gate; local development does not use Docker. The
 source pin is Pumpkin `0.2.0+26.3-26.51`, which speaks Java protocol 777 and
 Bedrock 1.26.51/protocol 2193.
 

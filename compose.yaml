@@ -7,10 +7,17 @@ x-control-plane-environment: &control-plane-environment
   ROOT_DOMAIN: ${ROOT_DOMAIN}
   INTERNAL_TOKEN: ${INTERNAL_TOKEN}
   CI_GITHUB_PAT: ${CI_GITHUB_PAT:-}
+  CI_GITHUB_WEBHOOK_ENABLED: ${CI_GITHUB_WEBHOOK_ENABLED:-false}
+  CI_GITHUB_WEBHOOK_SECRET: ${CI_GITHUB_WEBHOOK_SECRET:-}
   CI_DEFAULT_BRANCH: ${CI_DEFAULT_BRANCH:-main}
+  # Docker is the default Compose builder. bubblewrap_ssh is also supported: it
+  # delegates only the isolated build job over SSH and keeps the watcher, cache,
+  # and worker on this rootless stack; native bubblewrap fixtures are never mounted.
+  CI_BUILDER_BACKEND: ${CI_BUILDER_BACKEND:-docker}
   CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE:-}
   CI_TOOLCHAIN_VERSION: ${CI_TOOLCHAIN_VERSION:-1.98.1}
   CI_BUILDER_DOCKER_HOST: ${CI_BUILDER_DOCKER_HOST:-}
+  CI_BUILD_CONCURRENCY: ${CI_BUILD_CONCURRENCY:-2}
   CI_PLUGIN_SOURCE: /opt/kurbis/plugins/kurbis-control
   CI_INTEGRATION_SOURCE_ROOT: /opt/kurbis
   GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
@@ -96,7 +103,9 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       JAVA_LISTEN: 0.0.0.0:25565
+      JAVA_PUBLIC_PORT: ${JAVA_PORT}
       BEDROCK_LISTEN: 0.0.0.0:19132
+      BEDROCK_PUBLIC_IP: ${BEDROCK_PUBLIC_IP}
       BEDROCK_PUBLIC_PORT: ${BEDROCK_PORT}
       BEDROCK_TLS_CERT_FILE: /run/kurbis-tls/fullchain.pem
       BEDROCK_TLS_KEY_FILE: /run/kurbis-tls/privkey.pem

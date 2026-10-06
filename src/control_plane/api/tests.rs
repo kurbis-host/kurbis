@@ -245,6 +245,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
     let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is configured");
     Arc::new(AppState {
         ci_build_coordinator: None,
+        ci_build_identity: None,
         lifecycle: Lifecycle::new(pool.clone()),
         pool,
         config: ControlPlaneConfig {
@@ -253,6 +254,8 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
             public_base_url: "https://kurbis.example".to_owned(),
             root_domain: "mc.example".to_owned(),
             internal_token: "test-internal-token".to_owned(),
+            ci_github_webhook_enabled: true,
+            ci_github_webhook_secret: Some(crate::config::SecretString::new("test-webhook-secret")),
             oauth: OAuthConfig {
                 google: OAuthProviderConfig {
                     client_id: "google-client".to_owned(),

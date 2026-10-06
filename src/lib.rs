@@ -10,6 +10,7 @@ pub mod routing;
 pub mod runtime_api_proxy;
 pub mod snapshot;
 pub mod worker;
+pub mod workload_ingress;
 
 /// Full source revision embedded into every Rust application binary by the release build.
 pub const BUILD_REVISION: &str = match option_env!("KURBIS_BUILD_REVISION") {

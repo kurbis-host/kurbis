@@ -119,7 +119,7 @@ async fn package_contains_only_validated_runtime_files_and_metadata() {
     };
     validate_pumpkin_binary(&binary, "x86_64-linux").unwrap();
     validate_wasm_plugin(&plugin).unwrap();
-    let artifact = package_artifact(&binary, &plugin, root.path(), &key, "cargo ok\n").unwrap();
+    let artifact = package_artifact(&binary, &plugin, &key, "cargo ok\n").unwrap();
     assert!(artifact.starts_with(&[0x1f, 0x8b]));
     assert!(artifact.len() < MAX_ARTIFACT_BYTES);
 }
@@ -151,4 +151,103 @@ fn only_the_compilation_workspace_explicitly_allows_exec() {
 #[test]
 fn default_build_limits_reserve_ten_gib_for_pumpkin_compilation() {
     assert_eq!(default_build_limits().memory_bytes, 10 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn build_staging_uses_a_home_private_directory_not_public_tmp() {
+    let temporary = super::super::private_tempdir("kurbis-ci-test-").unwrap();
+    let home = std::env::var_os("HOME").unwrap();
+    let home = std::fs::canonicalize(home).unwrap();
+    assert!(temporary.path().starts_with(home));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            temporary.path().metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+}
+
+#[test]
+fn release_compile_script_bounds_parallelism_and_debug_memory_without_trimming_features() {
+    for setting in [
+        "export CARGO_BUILD_JOBS=1",
+        "export CARGO_INCREMENTAL=0",
+        "--jobs 1",
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_RELEASE_DEBUG",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_RELEASE_STRIP",
+        "--package pumpkin --bin pumpkin",
+        "--offline",
+    ] {
+        assert!(
+            BUILD_SCRIPT.contains(setting),
+            "missing build setting: {setting}"
+        );
+    }
+    assert!(
+        !BUILD_SCRIPT.contains("--no-default-features"),
+        "low-memory mode must not silently remove runtime features"
+    );
+}
+
+#[test]
+fn disk_failure_detection_accepts_common_quota_errors_only() {
+    assert!(disk_enospc_hint("error: No space left on device"));
+    assert!(disk_enospc_hint("write failed: ENOSPC"));
+    assert!(disk_enospc_hint("disk quota exceeded"));
+    assert!(!disk_enospc_hint("memory.events: oom_kill 1"));
+}
+
+#[test]
+fn archive_and_artifact_io_failures_are_transient_but_bad_content_is_permanent() {
+    let io_error = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Io(std::io::Error::from(std::io::ErrorKind::Other)),
+    );
+    assert_eq!(
+        io_error.failure_class(),
+        crate::ci::CiBuildFailureClass::Transient
+    );
+    let truncated_archive = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+    );
+    assert_eq!(
+        truncated_archive.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
+    let invalid_archive = archive_error(
+        crate::ci::CiBuildStage::Patching,
+        ArchiveError::Invalid("bad tar member".into()),
+    );
+    assert_eq!(
+        invalid_archive.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
+
+    let missing_output = validate_pumpkin_binary(
+        Path::new("/tmp/kurbis-ci-output-that-does-not-exist"),
+        "x86_64-linux",
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_output.failure_class(),
+        crate::ci::CiBuildFailureClass::Transient
+    );
+}
+
+#[test]
+fn malformed_compiler_artifact_is_permanent() {
+    let directory = tempdir().unwrap();
+    let binary = directory.path().join("pumpkin");
+    fs::write(&binary, b"not an ELF binary").unwrap();
+    let error = validate_pumpkin_binary(&binary, "x86_64-linux").unwrap_err();
+    assert_eq!(
+        error.failure_class(),
+        crate::ci::CiBuildFailureClass::Permanent
+    );
 }

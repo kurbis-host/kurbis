@@ -9,6 +9,17 @@ use uuid::Uuid;
 
 use super::domain::{BuildKey, CiBuild, CiBuildStage, CiPreview, CiPreviewState};
 
+/// Immutable build identity pinned to the service's checked-in integration patch
+/// and native target. API admission uses this only after a concrete commit is
+/// requested; it does not authorize eager branch or ancestor builds.
+#[derive(Debug, Clone)]
+pub struct CiBuildIdentity {
+    pub repository: String,
+    pub patch_fingerprint: String,
+    pub toolchain_version: String,
+    pub target_architecture: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
     pub key: BuildKey,

@@ -59,15 +59,15 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
         }
     };
     let ci_root_domain = crate::ci::CI_ROOT_DOMAIN;
-    if routes.accepts_ci_address(&handshake.hostname, &ci_root_domain) {
+    if routes.accepts_ci_address(&handshake.hostname, ci_root_domain) {
         return match handshake.next_state {
             1 => {
                 let target = routes
-                    .resolve_ci(&handshake.hostname, &ci_root_domain)
+                    .resolve_ci(&handshake.hostname, ci_root_domain)
                     .await?;
                 handle_ci_status(&mut client, &handshake, target.as_ref()).await
             }
-            2 => handle_ci_login(client, config, routes, handshake, &ci_root_domain).await,
+            2 => handle_ci_login(client, config, routes, handshake, ci_root_domain).await,
             _ => Ok(()),
         };
     }
@@ -353,8 +353,23 @@ async fn connect_backend(address: impl tokio::net::ToSocketAddrs) -> Result<TcpS
     .context("backend connection timed out")??)
 }
 
-fn ci_status_info(target: Option<&CiRouteTarget>) -> (&'static str, String) {
+fn ci_status_info(hostname: &str, target: Option<&CiRouteTarget>) -> (&'static str, String) {
     let Some(target) = target else {
+        // A valid immutable commit alias is intentionally discoverable before
+        // its first join. Status requests must show a lobby, while login
+        // admission creates the build record and starts the on-demand build.
+        if let Some(label) =
+            crate::routing::ci_subdomain_from_hostname(hostname, crate::ci::CI_ROOT_DOMAIN)
+                .and_then(|label| label.strip_prefix("commit-").map(str::to_owned))
+            && crate::ci::CiHostname::for_ref(
+                crate::ci::CiRefKind::Commit,
+                &label,
+                crate::ci::CI_ROOT_DOMAIN,
+            )
+            .is_ok()
+        {
+            return ("lobby", format!("Pumpkin CI preview (lobby) — {label}"));
+        }
         return ("unknown", "Unknown CI preview address".into());
     };
     let state = target.state;
@@ -374,10 +389,10 @@ fn ci_status_info(target: Option<&CiRouteTarget>) -> (&'static str, String) {
     };
     let mut description = format!("Pumpkin CI preview ({state}) — {}", target.commit_sha);
     if let Some(failure) = target.failure_message.as_deref() {
-        description.push_str("\n");
+        description.push('\n');
         description.push_str(&tail_utf8(failure, 512));
     } else if !target.build_log.is_empty() {
-        description.push_str("\n");
+        description.push('\n');
         description.push_str(&tail_utf8(&target.build_log, 512));
     }
     (label, description)
@@ -401,7 +416,7 @@ async fn handle_ci_status(
     if read_varint(&request, &mut cursor)? != 0 {
         bail!("unexpected status request packet");
     }
-    let (state, description) = ci_status_info(target);
+    let (state, description) = ci_status_info(&handshake.hostname, target);
     let status = json!({"version":{"name":format!("kurbis ({state})"),"protocol":handshake.protocol},"players":{"max":0,"online":0,"sample":[]},"description":{"text":description}});
     let mut packet = Vec::new();
     write_varint(0, &mut packet);
@@ -704,6 +719,22 @@ mod tests {
         assert_eq!(description, "Unknown server address");
     }
 
+    #[test]
+    fn unknown_full_commit_alias_is_a_status_lobby() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let hostname = format!("commit-{sha}.{}", crate::ci::CI_ROOT_DOMAIN);
+        let (state, description) = ci_status_info(&hostname, None);
+        assert_eq!(state, "lobby");
+        assert!(description.contains(sha));
+    }
+
+    #[test]
+    fn unknown_branch_alias_remains_unknown() {
+        let (state, description) = ci_status_info("branch-feature.pumpkin.kurbis.host", None);
+        assert_eq!(state, "unknown");
+        assert_eq!(description, "Unknown CI preview address");
+    }
+
     #[tokio::test]
     async fn login_is_authenticated_by_the_waiting_runtime_before_transfer() {
         let waiting_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -712,8 +743,10 @@ mod tests {
                 database_url: String::new(),
             },
             java_listen: "127.0.0.1:0".parse().unwrap(),
+            java_public_port: 25565,
             bedrock_listen: "127.0.0.1:0".parse().unwrap(),
             bedrock_public_port: 19132,
+            bedrock_public_address: "127.0.0.1".parse().unwrap(),
             bedrock_tls_certificate: "/unused/test-cert.pem".into(),
             bedrock_tls_private_key: "/unused/test-key.pem".into(),
             waiting_java_address: waiting_listener.local_addr().unwrap(),
@@ -787,8 +820,10 @@ mod tests {
                 database_url: String::new(),
             },
             java_listen: "127.0.0.1:0".parse().unwrap(),
+            java_public_port: 25565,
             bedrock_listen: "127.0.0.1:0".parse().unwrap(),
             bedrock_public_port: 19132,
+            bedrock_public_address: "127.0.0.1".parse().unwrap(),
             bedrock_tls_certificate: "/unused/test-cert.pem".into(),
             bedrock_tls_private_key: "/unused/test-key.pem".into(),
             waiting_java_address: address,

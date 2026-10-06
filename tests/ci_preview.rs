@@ -64,6 +64,7 @@ impl SourceControlClient for FixtureSource {
             } else {
                 Vec::new()
             },
+            eager_refs: Vec::new(),
             checkpoint: PollCheckpoint {
                 last_successful_poll: Some(Utc::now()),
                 ..Default::default()
@@ -103,6 +104,7 @@ async fn pool() -> PgPool {
 #[derive(Clone)]
 struct PullRequestFixtureSource {
     fetches: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    head_sha: std::sync::Arc<std::sync::RwLock<String>>,
 }
 #[async_trait]
 impl SourceControlClient for PullRequestFixtureSource {
@@ -116,11 +118,21 @@ impl SourceControlClient for PullRequestFixtureSource {
                 kind: SourceRefKind::PullRequest,
                 name: "pr-314".into(),
                 number: Some(314),
-                commit_sha: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                commit_sha: self.head_sha.read().unwrap().clone(),
                 source_repository: Some("contributor/Pumpkin".into()),
                 closed: false,
                 deleted: false,
-                updated_at: Some(Utc::now()),
+                updated_at: None,
+            }],
+            eager_refs: vec![SourceRef {
+                kind: SourceRefKind::PullRequest,
+                name: "pr-314".into(),
+                number: Some(314),
+                commit_sha: self.head_sha.read().unwrap().clone(),
+                source_repository: Some("contributor/Pumpkin".into()),
+                closed: false,
+                deleted: false,
+                updated_at: None,
             }],
             checkpoint: PollCheckpoint {
                 last_successful_poll: Some(Utc::now()),
@@ -141,7 +153,7 @@ impl SourceControlClient for PullRequestFixtureSource {
             .lock()
             .unwrap()
             .push((repository.to_owned(), commit_sha.to_owned()));
-        Ok(b"exact-fork-head-source".to_vec())
+        Ok(format!("exact-fork-commit:{commit_sha}").into_bytes())
     }
 }
 
@@ -155,6 +167,8 @@ mod polling;
 #[derive(Default)]
 struct TestBuildComponents {
     compile_calls: std::sync::atomic::AtomicUsize,
+    transient_compile_failures: std::sync::atomic::AtomicUsize,
+    permanent_compile_failures: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
 impl kurbis_hoster::ci::PatchApplier for TestBuildComponents {
@@ -193,6 +207,34 @@ impl kurbis_hoster::ci::ControlledBuilder for TestBuildComponents {
     {
         self.compile_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .transient_compile_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(kurbis_hoster::ci::BuildPipelineError::Transient {
+                stage: CiBuildStage::Compiling,
+                message: "temporary compiler container interruption".into(),
+            });
+        }
+        if self
+            .permanent_compile_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(kurbis_hoster::ci::BuildPipelineError::Permanent {
+                stage: CiBuildStage::Compiling,
+                message: "deterministic compiler diagnostic".into(),
+            });
+        }
         let mut artifact = patched_source;
         artifact.extend_from_slice(b"verified-pumpkin-artifact");
         Ok(kurbis_hoster::ci::ControlledBuildOutput {
@@ -257,5 +299,9 @@ impl kurbis_hoster::ci::CheckRunClient for TestCheckRuns {
     }
 }
 
+#[path = "ci_preview/bootstrap_recovery.rs"]
+mod bootstrap_recovery;
 #[path = "ci_preview/runtime.rs"]
 mod runtime;
+#[path = "ci_preview/streaming.rs"]
+mod streaming;

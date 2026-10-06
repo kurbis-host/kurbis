@@ -10,12 +10,21 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
+use bytes::BytesMut;
+use futures::StreamExt;
+use object_store::{MultipartUpload, ObjectStore, path::Path as ObjectPath};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ci::{CiPreviewRuntimeRepository, CiRuntimePlacement};
+use crate::{
+    ci::{CI_RUNTIME_DISK_BYTES, CiPreviewRuntimeRepository, CiRuntimePlacement},
+    control_plane::object_cleanup::delete_if_present,
+};
 
 use super::{ApiError, AppState, worker_auth};
+
+mod transfer;
+use transfer::body_with_reauthorization;
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +94,24 @@ pub(super) async fn capability(
         .await
         .map_err(ApiError::from)?;
     if !updated {
+        return Err(invalid_ci_assignment());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn world_initialized(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(preview_id): Path<Uuid>,
+    Json(fence): Json<RuntimeFence>,
+) -> Result<StatusCode, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let repository = CiPreviewRuntimeRepository::new(state.pool.clone());
+    if !repository
+        .mark_world_initialized(preview_id, worker_id, fence.generation, fence.lease_token)
+        .await
+        .map_err(ApiError::from)?
+    {
         return Err(invalid_ci_assignment());
     }
     Ok(StatusCode::NO_CONTENT)
@@ -174,6 +201,29 @@ pub(super) async fn deleted(
                 && placement.state == crate::ci::CiRuntimeState::Deleting
         })
         .ok_or_else(invalid_ci_assignment)?;
+    if let Some(snapshot) = repository
+        .world_snapshot_for_deletion(preview_id, worker_id, fence.generation, fence.lease_token)
+        .await
+        .map_err(|_| invalid_ci_assignment())?
+    {
+        let path = ObjectPath::parse(&snapshot.object_key).map_err(|_| invalid_ci_assignment())?;
+        delete_if_present(state.object_store.as_ref(), &path)
+            .await
+            .map_err(|_| invalid_ci_assignment())?;
+        if !repository
+            .complete_world_snapshot_deletion(
+                preview_id,
+                worker_id,
+                fence.generation,
+                fence.lease_token,
+                &snapshot.object_key,
+            )
+            .await
+            .map_err(ApiError::from)?
+        {
+            return Err(invalid_ci_assignment());
+        }
+    }
     if !repository
         .complete_expiry(&placement)
         .await
@@ -251,27 +301,352 @@ pub(super) async fn artifact(
     else {
         return Err(invalid_ci_assignment());
     };
-    const MAX_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
-    if !(0..=MAX_ARTIFACT_BYTES).contains(&size_bytes) {
+    let max_artifact_bytes = crate::ci::execution::MAX_ARTIFACT_BYTES as i64;
+    if !(1..=max_artifact_bytes).contains(&size_bytes) {
         return Err(invalid_ci_assignment());
     }
-    let path = object_store::path::Path::parse(object_key).map_err(|_| invalid_ci_assignment())?;
+    let path = ObjectPath::parse(&object_key).map_err(|_| invalid_ci_assignment())?;
     let object = state
         .object_store
         .get(&path)
         .await
         .map_err(|_| invalid_ci_assignment())?;
-    let bytes = object.bytes().await.map_err(|_| invalid_ci_assignment())?;
-    if bytes.len() as i64 != size_bytes || blake3::hash(&bytes).to_hex().as_str() != digest {
+    if object.meta.size != size_bytes as u64 {
         return Err(invalid_ci_assignment());
     }
-    Ok(Response::builder()
+
+    let expected_key = object_key.clone();
+    let expected_digest = digest.clone();
+    let authorize_state = state.clone();
+    let authorize_headers = headers.clone();
+    let authorize = move || {
+        let state = authorize_state.clone();
+        let headers = authorize_headers.clone();
+        let expected_key = expected_key.clone();
+        let expected_digest = expected_digest.clone();
+        async move {
+            transfer::artifact_authorization_fence(transfer::ArtifactDownloadAuthorization {
+                state: &state,
+                headers: &headers,
+                preview_id,
+                worker_id,
+                generation,
+                lease_token,
+                expected_key: &expected_key,
+                expected_size: size_bytes,
+                expected_digest: &expected_digest,
+            })
+            .await
+        }
+    };
+    let body = body_with_reauthorization(
+        object.into_stream(),
+        size_bytes as u64,
+        digest.clone(),
+        authorize,
+    );
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/gzip")
-        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CONTENT_LENGTH, size_bytes)
+        .header("x-ci-artifact-digest", digest)
         .header(header::CACHE_CONTROL, "private, no-store")
-        .body(Body::from(bytes))
-        .map_err(|_| invalid_ci_assignment())?)
+        .header("x-content-type-options", "nosniff")
+        .body(body)
+        .map_err(|_| invalid_ci_assignment())
+}
+
+pub(super) async fn world_snapshot_requested(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((preview_id, generation, lease_token)): Path<(Uuid, i64, Uuid)>,
+) -> Result<Json<WorldSnapshotRequestState>, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let repository = CiPreviewRuntimeRepository::new(state.pool.clone());
+    require_ci_placement(
+        &repository,
+        preview_id,
+        worker_id,
+        generation,
+        lease_token,
+        crate::ci::CiRuntimeState::Running,
+    )
+    .await?;
+    let requested = repository
+        .world_snapshot_requested(preview_id, worker_id, generation, lease_token)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(WorldSnapshotRequestState { requested }))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorldSnapshotRequestState {
+    requested: bool,
+}
+
+pub(super) async fn world_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((preview_id, generation, lease_token)): Path<(Uuid, i64, Uuid)>,
+    request: axum::http::Request<Body>,
+) -> Result<Response, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let repository = CiPreviewRuntimeRepository::new(state.pool.clone());
+    match *request.method() {
+        axum::http::Method::GET => {
+            repository
+                .current(preview_id)
+                .await
+                .map_err(ApiError::from)?
+                .filter(|placement| {
+                    placement.worker_id == worker_id
+                        && placement.generation == generation
+                        && placement.lease_token == lease_token
+                        && ((placement.state == crate::ci::CiRuntimeState::Starting
+                            && !placement.active)
+                            || (placement.state == crate::ci::CiRuntimeState::Stopping
+                                && placement.active))
+                })
+                .ok_or_else(invalid_ci_assignment)?;
+            let snapshot = repository
+                .world_snapshot_metadata(preview_id, worker_id, generation, lease_token)
+                .await
+                .map_err(ApiError::from)?;
+            let Some(snapshot) = snapshot else {
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .expect("static snapshot response is valid"));
+            };
+            let path =
+                ObjectPath::parse(&snapshot.object_key).map_err(|_| invalid_ci_assignment())?;
+            let expected_size =
+                u64::try_from(snapshot.size_bytes).map_err(|_| invalid_ci_assignment())?;
+            if !(1..=CI_RUNTIME_DISK_BYTES as u64).contains(&expected_size) {
+                return Err(invalid_ci_assignment());
+            }
+            let object = state
+                .object_store
+                .get(&path)
+                .await
+                .map_err(|_| invalid_ci_assignment())?;
+            if object.meta.size != expected_size {
+                return Err(invalid_ci_assignment());
+            }
+
+            let expected_snapshot = snapshot.clone();
+            let authorize_state = state.clone();
+            let authorize_headers = headers.clone();
+            let authorize = move || {
+                let state = authorize_state.clone();
+                let headers = authorize_headers.clone();
+                let expected_snapshot = expected_snapshot.clone();
+                async move {
+                    transfer::world_snapshot_authorization_fence(
+                        &state,
+                        &headers,
+                        preview_id,
+                        worker_id,
+                        generation,
+                        lease_token,
+                        &expected_snapshot,
+                    )
+                    .await
+                }
+            };
+            let body = body_with_reauthorization(
+                object.into_stream(),
+                expected_size,
+                snapshot.checksum.clone(),
+                authorize,
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/gzip")
+                .header(header::CONTENT_LENGTH, snapshot.size_bytes)
+                .header("x-ci-world-snapshot-checksum", &snapshot.checksum)
+                .header(header::CACHE_CONTROL, "private, no-store")
+                .header("x-content-type-options", "nosniff")
+                .body(body)
+                .map_err(|_| invalid_ci_assignment())
+        }
+        axum::http::Method::PUT => {
+            let placement = repository
+                .current(preview_id)
+                .await
+                .map_err(ApiError::from)?
+                .filter(|placement| {
+                    placement.worker_id == worker_id
+                        && placement.generation == generation
+                        && placement.lease_token == lease_token
+                        && ((placement.state == crate::ci::CiRuntimeState::Stopping
+                            && placement.active)
+                            || (placement.state == crate::ci::CiRuntimeState::Running
+                                && placement.active)
+                            || (placement.state == crate::ci::CiRuntimeState::Starting
+                                && !placement.active))
+                })
+                .ok_or_else(invalid_ci_assignment)?;
+            let bootstrap_snapshot = placement.state == crate::ci::CiRuntimeState::Starting
+                && repository
+                    .bootstrap_world_snapshot_allowed(
+                        preview_id,
+                        worker_id,
+                        generation,
+                        lease_token,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+            if !bootstrap_snapshot
+                && placement.state == crate::ci::CiRuntimeState::Running
+                && !repository
+                    .world_snapshot_requested(preview_id, worker_id, generation, lease_token)
+                    .await
+                    .map_err(ApiError::from)?
+            {
+                return Err(invalid_ci_assignment());
+            }
+            if !bootstrap_snapshot && placement.state == crate::ci::CiRuntimeState::Starting {
+                return Err(invalid_ci_assignment());
+            }
+            let declared_size = request
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(invalid_ci_assignment)?;
+            if !(1..=CI_RUNTIME_DISK_BYTES).contains(&declared_size) {
+                return Err(invalid_ci_assignment());
+            }
+            let key = format!(
+                "ci-previews/{preview_id}/worlds/{generation}-{}.tar.gz",
+                Uuid::new_v4().simple()
+            );
+            let path = ObjectPath::parse(&key).map_err(|_| invalid_ci_assignment())?;
+            let mut upload = state
+                .object_store
+                .put_multipart(&path)
+                .await
+                .map_err(|_| invalid_ci_assignment())?;
+            let mut body = request.into_body().into_data_stream();
+            let mut hasher = blake3::Hasher::new();
+            let mut total = 0_i64;
+            let mut buffered = BytesMut::with_capacity(8 * 1024 * 1024);
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        let _ = upload.abort().await;
+                        return Err(invalid_ci_assignment());
+                    }
+                };
+                total = total
+                    .checked_add(i64::try_from(chunk.len()).map_err(|_| invalid_ci_assignment())?)
+                    .ok_or_else(invalid_ci_assignment)?;
+                if total > declared_size || total > CI_RUNTIME_DISK_BYTES {
+                    let _ = upload.abort().await;
+                    return Err(invalid_ci_assignment());
+                }
+                hasher.update(&chunk);
+                buffered.extend_from_slice(&chunk);
+                while buffered.len() >= 8 * 1024 * 1024 {
+                    let part = buffered.split_to(8 * 1024 * 1024).freeze();
+                    if upload.put_part(part.into()).await.is_err() {
+                        let _ = upload.abort().await;
+                        return Err(invalid_ci_assignment());
+                    }
+                }
+            }
+            if total != declared_size {
+                let _ = upload.abort().await;
+                return Err(invalid_ci_assignment());
+            }
+            if !buffered.is_empty() && upload.put_part(buffered.freeze().into()).await.is_err() {
+                let _ = upload.abort().await;
+                return Err(invalid_ci_assignment());
+            }
+            if upload.complete().await.is_err() {
+                // Completion errors are ambiguous: an object store may have
+                // committed the multipart upload before the response failed.
+                // Put the immutable key in durable cleanup before rejecting it.
+                if repository
+                    .enqueue_world_snapshot_garbage(preview_id, &key)
+                    .await
+                    .is_err()
+                    && let Err(error) = delete_if_present(state.object_store.as_ref(), &path).await
+                {
+                    tracing::warn!(preview_id=%preview_id, ?error,
+                        "failed to clean an ambiguously completed CI snapshot upload");
+                }
+                return Err(invalid_ci_assignment());
+            }
+            let checksum = hasher.finalize().to_hex().to_string();
+            if let Err(error) = repository
+                .publish_world_snapshot(
+                    preview_id,
+                    worker_id,
+                    generation,
+                    lease_token,
+                    &key,
+                    declared_size,
+                    &checksum,
+                )
+                .await
+            {
+                // The multipart object may have completed even though the
+                // snapshot transaction was rejected or its response was lost.
+                // Persist cleanup first; only fall back to direct deletion if
+                // the control-plane database is unavailable.
+                if let Err(queue_error) = repository
+                    .enqueue_world_snapshot_garbage(preview_id, &key)
+                    .await
+                    && let Err(cleanup_error) =
+                        delete_if_present(state.object_store.as_ref(), &path).await
+                {
+                    tracing::warn!(preview_id=%preview_id, ?queue_error, ?cleanup_error,
+                        "failed to queue or immediately clean rejected CI world snapshot upload");
+                }
+                return Err(ApiError::from(error));
+            }
+            Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .expect("static snapshot upload response is valid"))
+        }
+        _ => Err(ApiError::with_code(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "ci_snapshot_method_not_allowed",
+            "CI snapshot endpoint only supports GET and PUT",
+        )),
+    }
+}
+
+pub(super) async fn world_snapshot_complete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(preview_id): Path<Uuid>,
+    Json(fence): Json<RuntimeFence>,
+) -> Result<StatusCode, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let repository = CiPreviewRuntimeRepository::new(state.pool.clone());
+    require_ci_placement(
+        &repository,
+        preview_id,
+        worker_id,
+        fence.generation,
+        fence.lease_token,
+        crate::ci::CiRuntimeState::Running,
+    )
+    .await?;
+    if !repository
+        .complete_world_snapshot_request(preview_id, worker_id, fence.generation, fence.lease_token)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(invalid_ci_assignment());
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn invalid_ci_assignment() -> ApiError {
@@ -280,4 +655,27 @@ fn invalid_ci_assignment() -> ApiError {
         "ci_runtime_assignment_invalid",
         "CI runtime assignment is stale or outside this worker's authority",
     )
+}
+
+async fn require_ci_placement(
+    repository: &CiPreviewRuntimeRepository,
+    preview_id: Uuid,
+    worker_id: Uuid,
+    generation: i64,
+    lease_token: Uuid,
+    allowed_state: crate::ci::CiRuntimeState,
+) -> Result<CiRuntimePlacement, ApiError> {
+    repository
+        .current(preview_id)
+        .await
+        .map_err(ApiError::from)?
+        .filter(|placement| {
+            placement.worker_id == worker_id
+                && placement.generation == generation
+                && placement.lease_token == lease_token
+                && placement.state == allowed_state
+                && (allowed_state != crate::ci::CiRuntimeState::Running || placement.active)
+                && (allowed_state != crate::ci::CiRuntimeState::Starting || !placement.active)
+        })
+        .ok_or_else(invalid_ci_assignment)
 }

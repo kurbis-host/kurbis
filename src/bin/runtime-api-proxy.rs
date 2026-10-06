@@ -14,6 +14,8 @@ async fn main() -> Result<()> {
     kurbis_hoster::init_tracing("kurbis_hoster=info");
     match std::env::args().nth(1).as_deref() {
         Some("--health-check") => kurbis_hoster::runtime_api_proxy::health_check().await,
+        Some("--workload-ingress") => kurbis_hoster::workload_ingress::run_from_env().await,
+        Some("--ingress-health-check") => kurbis_hoster::workload_ingress::health_check().await,
         #[cfg(debug_assertions)]
         Some("--probe-http") => probe_http().await,
         #[cfg(debug_assertions)]

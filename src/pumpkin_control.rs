@@ -188,6 +188,18 @@ impl PumpkinControl {
         Ok(())
     }
 
+    pub async fn begin_snapshot_barrier(&self, socket: &Path) -> Result<()> {
+        self.request(socket, json!({"action":"begin_snapshot"}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn end_snapshot_barrier(&self, socket: &Path) -> Result<()> {
+        self.request(socket, json!({"action":"end_snapshot"}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn shutdown(&self, socket: &Path) -> Result<()> {
         self.request(socket, json!({"action":"shutdown"})).await?;
         Ok(())

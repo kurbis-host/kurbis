@@ -249,9 +249,7 @@ pub fn unpack_source_archive(bytes: &[u8]) -> Result<SourceWorkspace, ArchiveErr
     if bytes.is_empty() || bytes.len() > MAX_COMPRESSED_SOURCE_BYTES {
         return Err(ArchiveError::Limit);
     }
-    let temporary = tempfile::Builder::new()
-        .prefix("kurbis-ci-source-")
-        .tempdir()?;
+    let temporary = super::private_tempdir("kurbis-ci-source-")?;
     let source = temporary.path().join("source");
     fs::create_dir(&source)?;
     let decoder = GzDecoder::new(bytes);

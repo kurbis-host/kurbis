@@ -32,6 +32,7 @@ pub(super) struct CiRuntimeRow {
     pub(super) signal_port: i32,
     pub(super) state: String,
     pub(super) active: bool,
+    pub(super) world_initialized: bool,
     pub(super) last_activity_at: DateTime<Utc>,
     pub(super) expires_at: DateTime<Utc>,
 }
@@ -57,6 +58,7 @@ impl TryFrom<CiRuntimeRow> for CiRuntimePlacement {
             signal_port: row.signal_port,
             state: row.state.parse()?,
             active: row.active,
+            world_initialized: row.world_initialized,
             last_activity_at: row.last_activity_at,
             expires_at: row.expires_at,
         })
@@ -81,9 +83,11 @@ pub(super) struct ExpiredRuntimeRow {
     signal_port: i32,
     state: String,
     active: bool,
+    world_initialized: bool,
     last_activity_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     pub(super) capability_hash: Vec<u8>,
+    pub(super) stale_cleanup_claim_token: Option<Uuid>,
 }
 impl ExpiredRuntimeRow {
     pub(super) fn placement(self) -> Result<CiRuntimePlacement> {
@@ -104,6 +108,7 @@ impl ExpiredRuntimeRow {
             signal_port: self.signal_port,
             state: self.state,
             active: self.active,
+            world_initialized: self.world_initialized,
             last_activity_at: self.last_activity_at,
             expires_at: self.expires_at,
         }
@@ -120,7 +125,7 @@ pub(super) async fn load_optional_placement(
                 build.artifact_digest, alias.hostname, runtime.worker_id, worker.address AS worker_address,
                 worker.signal_address, runtime.generation, runtime.lease_token, runtime.java_port,
                 runtime.bedrock_port, runtime.signal_port, runtime.state, runtime.active,
-                runtime.last_activity_at, alias.expires_at
+                runtime.world_initialized, runtime.last_activity_at, alias.expires_at
          FROM ci_runtime_placements runtime
          JOIN ci_preview_aliases alias ON alias.id = runtime.preview_id
          JOIN ci_builds build ON build.id = alias.build_id

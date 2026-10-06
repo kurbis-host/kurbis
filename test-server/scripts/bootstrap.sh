@@ -56,10 +56,12 @@ blocked_permissions = []
 loopback_only = true
 TOML
 
-cargo build --manifest-path "$ROOT/vibe-bridge/Cargo.toml" --release --target wasm32-wasip2
+python3 "$ROOT/../tools/run_bounded_build.py" --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+  -- cargo build --jobs 1 --manifest-path "$ROOT/vibe-bridge/Cargo.toml" --release --target wasm32-wasip2
 cp "$ROOT/vibe-bridge/target/wasm32-wasip2/release/vibe_bridge.wasm" \
   "$SERVER/plugins/vibe-bridge.wasm"
-cargo build --manifest-path "$ROOT/Cargo.toml" -p vibe-controller
+python3 "$ROOT/../tools/run_bounded_build.py" --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+  -- cargo build --jobs 1 --manifest-path "$ROOT/Cargo.toml" -p vibe-controller
 
 echo "Bootstrap complete."
 echo "Run: $ROOT/scripts/run.sh"

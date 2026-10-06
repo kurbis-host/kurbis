@@ -90,6 +90,10 @@ class RuntimeVerificationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "legacy /actions"):
             command_request(self.document, "start")
 
+    def test_ignores_console_command_route_when_selecting_lifecycle_commands(self):
+        self.document["paths"]["/api/v1/servers/{server_id}/console/commands"] = {"post": {}}
+        self.assertEqual(command_route(self.document), COMMAND_PATH)
+
     def test_rejects_missing_canonical_route_or_variant(self):
         self.document["paths"].clear()
         with self.assertRaisesRegex(ValueError, "expected one server command route"):

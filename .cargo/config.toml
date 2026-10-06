@@ -1,0 +1,3 @@
+[build]
+# Keep per-invocation Rust compiler fan-out bounded on every local build path.
+jobs = 1

@@ -48,8 +48,19 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
             .await?;
     assert_eq!(
         versions,
-        vec![1, 2],
-        "fresh bootstrap applies the canonical schema and additive CI preview migration"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, bounded Check Run tombstone, reservation accounting, stale recovery, durable snapshot-GC, webhook-delivery, bounded build-retry, runtime bootstrap barrier, and cross-process build-admission slot migrations"
+    );
+
+    let snapshot_gc_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='ci_world_snapshot_gc')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        snapshot_gc_table,
+        "superseded CI checkpoints have durable GC ownership"
     );
 
     let forbidden: i64 = sqlx::query_scalar(

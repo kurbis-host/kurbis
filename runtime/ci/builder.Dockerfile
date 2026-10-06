@@ -27,7 +27,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
-RUN cargo build --locked --release --bin ci-source-preparer \
+RUN cargo build --jobs 1 --locked --release --bin ci-source-preparer \
     && install -D -m 0755 target/release/ci-source-preparer /usr/local/bin/ci-source-preparer \
     && rm -rf /hoster
 

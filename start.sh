@@ -134,6 +134,10 @@ provision_worker_bundle() {
     local gateway_address=${WORKER_GATEWAY_ADDRESS:-${GATEWAY_IP:-}}
     [[ -n $gateway_address ]] || die "WORKER_GATEWAY_ADDRESS or GATEWAY_IP is required for Gateway-only workload ingress"
     provision_env+=("WORKER_GATEWAY_ADDRESS=$gateway_address")
+    local gateway_bedrock_ip=${WORKER_GATEWAY_BEDROCK_IP:-${BEDROCK_PUBLIC_IP:-}}
+    local gateway_bedrock_port=${WORKER_GATEWAY_BEDROCK_PORT:-${BEDROCK_PUBLIC_PORT:-${BEDROCK_PORT:-}}}
+    [[ -n $gateway_bedrock_ip && -n $gateway_bedrock_port ]] || die "WORKER_GATEWAY_BEDROCK_IP/PORT or BEDROCK_PUBLIC_IP/PORT is required for Gateway-routed Bedrock ICE"
+    provision_env+=("WORKER_GATEWAY_BEDROCK_IP=$gateway_bedrock_ip" "WORKER_GATEWAY_BEDROCK_PORT=$gateway_bedrock_port")
   fi
   for variable_name in WORKER_MEMORY_GIB WORKER_DISK_GIB WORKER_CPU_MILLIS WORKER_PORT_MIN WORKER_PORT_MAX; do
     if [[ -n ${!variable_name:-} ]]; then
@@ -349,9 +353,13 @@ start_native() {
   if [[ $profile == release ]]; then
     cargo_args+=(--release)
     printf 'Building the production panel...\n'
-    (cd "$ROOT/web" && CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080 pnpm run build)
+    python3 "$ROOT/tools/run_bounded_build.py" \
+      --memory-bytes "${KURBIS_PANEL_BUILD_MEMORY_BYTES:-4294967296}" \
+      -- bash -lc "cd '$ROOT/web' && CONTROL_PLANE_INTERNAL_URL=http://127.0.0.1:8080 pnpm run build"
   fi
-  (cd "$ROOT" && cargo "${cargo_args[@]}")
+  python3 "$ROOT/tools/run_bounded_build.py" \
+    --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+    -- bash -lc "cd '$ROOT' && cargo --jobs 1 ${cargo_args[*]}"
 
   mkdir -p "$ROOT/data/native-waiting"
   printf 'native\n' > "$MODE_FILE"
@@ -374,23 +382,42 @@ start_docker() {
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
   docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to this user"
   [[ -n ${WORKER_GATEWAY_ADDRESS:-${GATEWAY_IP:-}} ]] || die "set WORKER_GATEWAY_ADDRESS to the Gateway's reachable source IP"
+  [[ -n ${WORKER_GATEWAY_BEDROCK_IP:-${BEDROCK_PUBLIC_IP:-}} ]] || die "set BEDROCK_PUBLIC_IP to the Gateway's public NetherNet/ICE endpoint"
+  [[ -n ${WORKER_GATEWAY_BEDROCK_PORT:-${BEDROCK_PUBLIC_PORT:-${BEDROCK_PORT:-}}} ]] || die "set BEDROCK_PUBLIC_PORT to the Gateway's public NetherNet/ICE port"
   check_docker_storage
   case "$WORKER_SIGNAL_ADDRESS" in
     127.*|::1) die "WORKER_SIGNAL_ADDRESS must be a host-private address reachable by the gateway container" ;;
   esac
 
   printf 'Building the Docker Pumpkin runtime...\n'
-  docker build -f "$ROOT/runtime/pumpkin/Dockerfile" -t melon-pumpkin:host-control "$ROOT"
+  "$ROOT/tools/docker_build_with_limits.sh" \
+    -f "$ROOT/runtime/pumpkin/Dockerfile" \
+    --tag melon-pumpkin:host-control \
+    "$ROOT"
   printf 'Building the Docker waiting runtime...\n'
-  docker build -f "$ROOT/deployment/waiting.Dockerfile" -t melon-pumpkin:waiting "$ROOT"
-  printf 'Building Compose services...\n'
-  docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yaml" build --parallel 1
+  "$ROOT/tools/docker_build_with_limits.sh" \
+    -f "$ROOT/deployment/waiting.Dockerfile" \
+    --tag melon-pumpkin:waiting \
+    "$ROOT"
+  printf 'Building Compose services with per-step cgroup caps...\n'
+  KURBIS_BUILD_MEMORY_BYTES="${KURBIS_DOCKER_BUILD_MEMORY_BYTES:-10737418240}" \
+    "$ROOT/tools/docker_build_with_limits.sh" \
+      --file "$ROOT/runtime/Dockerfile" \
+      --tag melon-hoster:local \
+      "$ROOT"
+  KURBIS_BUILD_MEMORY_BYTES="${KURBIS_PANEL_BUILD_MEMORY_BYTES:-4294967296}" \
+    "$ROOT/tools/docker_build_with_limits.sh" \
+      --file "$ROOT/web/Dockerfile" \
+      --tag kurbis-panel:local \
+      "$ROOT/web"
   printf 'Building the host worker for Docker mode...\n'
-  (cd "$ROOT" && cargo build --release --bin worker)
+  python3 "$ROOT/tools/run_bounded_build.py" \
+    --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
+    -- bash -lc "cd '$ROOT' && cargo --jobs 1 build --release --bin worker"
   mkdir -p "$ROOT/data"
   printf 'docker\n' > "$MODE_FILE"
   printf 'Starting Compose services...\n'
-  if ! docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yaml" up --detach --wait; then
+  if ! docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yaml" up --no-build --detach --wait; then
     docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yaml" logs --tail=100 || true
     die "Compose services did not become healthy"
   fi

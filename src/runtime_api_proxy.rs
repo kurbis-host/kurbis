@@ -91,9 +91,9 @@ struct ProxyState {
 /// Start a capability-bound proxy attached to exactly one runtime network and
 /// the configured egress network. The workload itself is never attached to the
 /// egress network.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_container(
     image: &str,
-    name: &str,
     scope: &str,
     scoped_id: Uuid,
     generation: i64,
@@ -107,6 +107,7 @@ pub async fn start_container(
         generation > 0,
         "runtime API proxy generation must be positive"
     );
+    let name = container_name(scoped_id, generation);
     ensure!(
         runtime_network != egress_network,
         "runtime and proxy egress networks must differ"
@@ -152,7 +153,7 @@ pub async fn start_container(
                 "run",
                 "--detach",
                 "--name",
-                name,
+                &name,
                 "--restart",
                 "no",
                 "--network",
@@ -226,11 +227,11 @@ pub async fn start_container(
     let output = match output {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            let _ = remove_container(name).await;
+            let _ = remove_container(scoped_id, generation).await;
             return Err(error).context("start runtime API proxy container");
         }
         Err(error) => {
-            let _ = remove_container(name).await;
+            let _ = remove_container(scoped_id, generation).await;
             return Err(error).context("runtime API proxy container startup timed out");
         }
     };
@@ -244,7 +245,7 @@ pub async fn start_container(
     let connect = match timeout(
         Duration::from_secs(30),
         Command::new("docker")
-            .args(["network", "connect", egress_network, name])
+            .args(["network", "connect", egress_network, &name])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -255,16 +256,16 @@ pub async fn start_container(
     {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            let _ = remove_container(name).await;
+            let _ = remove_container(scoped_id, generation).await;
             return Err(error).context("attach runtime API proxy to its egress network");
         }
         Err(error) => {
-            let _ = remove_container(name).await;
+            let _ = remove_container(scoped_id, generation).await;
             return Err(error).context("attach runtime API proxy to its egress network timed out");
         }
     };
     if !connect.status.success() {
-        let _ = remove_container(name).await;
+        let _ = remove_container(scoped_id, generation).await;
         bail!(
             "failed to attach runtime API proxy to egress network {egress_network}: {}",
             String::from_utf8_lossy(&connect.stderr).trim()
@@ -281,7 +282,7 @@ pub async fn start_container(
                     "inspect",
                     "--format",
                     "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
-                    name,
+                    &name,
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -305,7 +306,7 @@ pub async fn start_container(
             Err(error).context("runtime API proxy did not become healthy within 60 seconds")
         }
     } {
-        let _ = remove_container(name).await;
+        let _ = remove_container(scoped_id, generation).await;
         return Err(error);
     }
     Ok(())
@@ -351,7 +352,7 @@ fn validate_egress_network_metadata(network: &serde_json::Value) -> Result<bool>
     Ok(internal)
 }
 
-pub async fn remove_container(name: &str) -> Result<()> {
+async fn remove_named_container(name: &str) -> Result<()> {
     let output = timeout(
         Duration::from_secs(30),
         Command::new("docker")
@@ -373,8 +374,140 @@ pub async fn remove_container(name: &str) -> Result<()> {
     )
 }
 
-pub fn container_name(scoped_id: Uuid) -> String {
-    format!("kurbis-api-proxy-{}", scoped_id.simple())
+async fn inspect_container_labels(
+    name: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new("docker")
+            .args(["inspect", "--format", "{{json .Config.Labels}}", name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("inspect runtime API proxy timed out")??;
+    if !output.status.success() {
+        if is_docker_not_found(&output.stderr) {
+            return Ok(None);
+        }
+        bail!(
+            "failed to inspect runtime API proxy {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let labels: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Docker returned invalid runtime API proxy labels")?;
+    Ok(labels.as_object().cloned())
+}
+
+fn proxy_generation(
+    labels: &serde_json::Map<String, serde_json::Value>,
+    scoped_id: Uuid,
+) -> Result<i64> {
+    let expected_id = scoped_id.to_string();
+    ensure!(
+        labels
+            .get("kurbis.runtime_api_proxy")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_id.as_str()),
+        "refusing to remove runtime API proxy with a mismatched scoped-id label"
+    );
+    let generation = labels
+        .get("kurbis.generation")
+        .and_then(serde_json::Value::as_str)
+        .context("runtime API proxy has no valid generation label")?
+        .parse::<i64>()
+        .context("runtime API proxy has an invalid generation label")?;
+    ensure!(
+        generation > 0,
+        "runtime API proxy generation must be positive"
+    );
+    Ok(generation)
+}
+
+/// Remove one generation's proxy only after checking both ownership labels.
+/// The generation is part of the Docker name, so an old worker cannot target a
+/// newer proxy by reusing a server/preview-only name.
+pub async fn remove_container(scoped_id: Uuid, generation: i64) -> Result<()> {
+    ensure!(
+        generation > 0,
+        "runtime API proxy generation must be positive"
+    );
+    let name = container_name(scoped_id, generation);
+    let Some(labels) = inspect_container_labels(&name).await? else {
+        return Ok(());
+    };
+    verify_exact_proxy_generation(&labels, scoped_id, generation)?;
+    remove_named_container(&name).await
+}
+
+fn verify_exact_proxy_generation(
+    labels: &serde_json::Map<String, serde_json::Value>,
+    scoped_id: Uuid,
+    expected_generation: i64,
+) -> Result<()> {
+    ensure!(
+        proxy_generation(labels, scoped_id)? == expected_generation,
+        "refusing to remove runtime API proxy with a mismatched generation label"
+    );
+    Ok(())
+}
+
+fn proxy_generation_within_fence(
+    labels: &serde_json::Map<String, serde_json::Value>,
+    scoped_id: Uuid,
+    max_generation: i64,
+) -> Result<Option<i64>> {
+    let generation = proxy_generation(labels, scoped_id)?;
+    Ok((generation <= max_generation).then_some(generation))
+}
+
+/// Remove all proxy generations up to a caller's durable fence. Newer
+/// generations are intentionally left untouched; every candidate is inspected
+/// by Docker ID immediately before removal and must carry both ownership labels.
+pub async fn remove_containers_through(scoped_id: Uuid, max_generation: i64) -> Result<()> {
+    ensure!(
+        max_generation > 0,
+        "runtime API proxy cleanup fence must be positive"
+    );
+    let filter = format!("label=kurbis.runtime_api_proxy={scoped_id}");
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new("docker")
+            .args(["ps", "-aq", "--filter", &filter])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("list runtime API proxies timed out")??;
+    if !output.status.success() {
+        bail!(
+            "failed to list runtime API proxies: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    for id in String::from_utf8_lossy(&output.stdout).split_ascii_whitespace() {
+        let Some(labels) = inspect_container_labels(id).await? else {
+            continue;
+        };
+        if proxy_generation_within_fence(&labels, scoped_id, max_generation)?.is_some() {
+            // Remove by immutable Docker ID, not by a mutable generation-less
+            // name. If a concurrent worker replaces a container, the ID cannot
+            // be rebound to that newer generation between inspect and remove.
+            remove_named_container(id).await?;
+        }
+    }
+    Ok(())
+}
+
+pub fn container_name(scoped_id: Uuid, generation: i64) -> String {
+    format!("kurbis-api-proxy-{}-g{generation}", scoped_id.simple())
 }
 
 /// Install destination-pinned egress policy before binding a listener. DNS is
@@ -1081,6 +1214,7 @@ fn valid_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn hex_decode_32(value: &str) -> Result<[u8; 32]> {
     ensure!(value.len() == 64, "capability hash must be 32-byte hex");
     let mut bytes = [0_u8; 32];

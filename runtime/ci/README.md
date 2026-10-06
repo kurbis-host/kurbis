@@ -10,12 +10,16 @@ Build and push this host-owned image from the repository root on a trusted Linux
 builder. Pin `RUST_TOOLCHAIN` to the exact Rust release that the image must use:
 
 ```sh
-docker buildx build \
+KURBIS_BUILD_MEMORY_BYTES=10737418240 \
+KURBIS_BUILD_SYSTEM_RESERVE_BYTES=4294967296 \
+KURBIS_BUILD_OUTPUT_MODE=push \
+tools/docker_build_with_limits.sh \
+  --platform linux/amd64 \
   --build-arg RUST_TOOLCHAIN=1.98.1 \
   --build-arg PUMPKIN_REVISION="$(cat runtime/pumpkin/REVISION)" \
-  -f runtime/ci/builder.Dockerfile \
-  -t registry.example/kurbis/pumpkin-ci-builder:1.98.1 \
-  --push .
+  --file runtime/ci/builder.Dockerfile \
+  --tag registry.example/kurbis/pumpkin-ci-builder:1.98.1 \
+  .
 ```
 
 Take the resulting manifest digest from the registry and configure the control
@@ -47,15 +51,38 @@ daemon. Provision the dedicated builder host with enough disk for the pinned too
 image and rootless Docker data root. Per-build source, target, and temporary scratch
 are volatile bounded tmpfs mounts. The pre-seeded Cargo package/git cache remains
 in the immutable image and is read-only to workloads; only the image and bounded
-Docker logs persist on the host. Compilation is serialized, with a 10 GiB
-memory cap and a 90-minute process timeout, release LTO disabled, and 16 codegen units. Provision the dedicated
-builder with at least 16 GiB RAM so its host and Docker daemon retain headroom. The Kurbis
-startup probe rejects builders whose cgroup v2, user namespace, CPU/memory/PID
-controls, no-egress policy, read-only image root, or bounded workspace tmpfs do
-not pass disposable workload tests. Builder workspaces use a per-container
-tmpfs cap sized to the configured build disk budget; input, `/tmp`, and
-`/dev/shm` caps are deducted from that same budget. This avoids reliance on
-rootless Docker's unsupported overlay `--storage-opt` while preserving a hard
+Docker logs persist on the host.
+
+Every CI patch/compile phase, across control-plane processes and coordinated jobs,
+first takes one session-scoped PostgreSQL advisory lock. The coordinator also samples
+`MemAvailable` on the builder host (not the control-plane machine) and starts a build
+only when the requested container memory plus a fixed 4 GiB system/runtime reserve
+fits in current headroom. Admission waits at most 10 minutes and then fails closed
+with the last measured host-memory figures; it never raises the configured container
+limit to work around low headroom. If a coordinator is cancelled or crashes, its
+PostgreSQL session releases the lock. The next owner reclaims only CI build containers
+carrying Kurbis's build label before admission. A dropped lease also schedules
+immediate removal of its lease-owned containers.
+
+The Rust compiler runs with one Cargo job and each rootless task container has a hard
+10 GiB memory cap, an equal memory+swap cap (zero swap allowance), 2 CPU, 512 PIDs,
+a 90-minute process timeout, read-only root, no network, and bounded tmpfs scratch.
+Release LTO is disabled and release codegen units are forced to one to avoid
+intra-crate codegen fan-out on top of the single Cargo job. Container failure diagnostics
+include Docker's `OOMKilled` state plus cgroup-v2 `memory.max`, `memory.swap.max`,
+`memory.current`, `memory.peak`, and `memory.events`, so a cgroup OOM can be
+separated from a host-memory admission deferral. Startup also runs a disposable
+32 MiB pressure probe and requires the cgroup `oom_kill` counter to increase under
+controlled pressure; a successful limit-shaped Docker command without an observed
+kernel enforcement event is not accepted.
+
+Provision the dedicated builder with at least 16 GiB RAM so its host and Docker
+daemon retain headroom. The Kurbis startup probe rejects builders whose cgroup v2,
+user namespace, CPU/memory/PID controls, no-egress policy, read-only image root, or
+bounded workspace tmpfs do not pass disposable workload tests. Builder workspaces
+use a per-container tmpfs cap sized to the configured build disk budget; input,
+`/tmp`, and `/dev/shm` caps are deducted from that same budget. This avoids reliance
+on rootless Docker's unsupported overlay `--storage-opt` while preserving a hard
 bound on writable build storage.
 
 Use a dedicated SSH key with access only to this rootless builder account. In the
@@ -81,3 +108,71 @@ patches, validates/extracts/patches source archives inside the rootless,
 quota-bounded workload before compilation. The trusted plugin source is copied
 from the image build context into the control-plane image; it is not accepted
 from the Pumpkin commit.
+
+## Preview world snapshots and worker loss
+
+CI previews now publish full 72-hour world checkpoints into the existing object
+store under a preview-specific `ci-previews/<preview-id>/worlds/` namespace.
+A small `ci_world_snapshots` row stores the latest verified size, checksum, and
+source runtime generation; it is separate from account-owned `snapshots` and
+`servers`. The control plane requests periodic checkpoints every ten minutes,
+and an idle stop saves and publishes one before releasing active capacity. The
+managed plugin's `snapshot` command requests the same worker-authenticated
+checkpoint path. Archive packing excludes generated `pumpkin.toml`, host-control
+sockets, the managed plugin binary, and its capability-bearing config; these are
+regenerated from the trusted runtime assignment on start.
+
+If a worker heartbeat expires, the runtime may be assigned to a compatible
+worker only if a complete shared checkpoint exists. The replacement downloads
+and verifies the snapshot digest before extracting into its quota volume. A
+worker without an assignment removes its orphaned local preview world on
+reconciliation. If no checkpoint exists, the system fails closed rather than
+silently starting an empty world on a different host. Expired-preview cleanup
+removes the checkpoint object and metadata along with the generation-fenced
+worker world, port leases, and resource reservations.
+
+## Builder backend and concurrency
+
+`CI_BUILDER_BACKEND=docker` is the default and keeps the rootless Docker
+contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a Linux native
+control plane with private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately
+reported as `bubblewrap_namespace_only`: it does not claim cgroup CPU, memory,
+or PID enforcement, and there is no automatic Docker fallback. Bubblewrap is
+not supported by the Docker Compose deployment: Compose intentionally does not
+pass or mount the host executable, immutable rootfs/toolchain, source preparer,
+or workspace. Selecting Bubblewrap in Compose therefore fails closed instead
+of pretending those host paths exist. Use `./start.sh native ...` on the Linux
+worker and configure every `CI_BUBBLEWRAP_*` path there. Native `start.sh` runs
+from the checkout root, so set `CI_PLUGIN_SOURCE=plugins/kurbis-control` (or an
+absolute checkout path); Compose overrides that setting with the image path
+`/opt/kurbis/plugins/kurbis-control`.
+
+The operator must mount the workspace below the build user's private `$HOME`,
+for example `$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly
+`size=5G,nr_inodes=1310720`. Startup and every workload preflight parse
+`/proc/self/mountinfo` and fail closed for an ordinary directory, a different
+size, or a different inode limit. Compile and patch workloads always use this
+fixed 5 GiB workspace contract; any custom disk limit is rejected. Build
+input/output files remain separately bounded and are copied with counted reads.
+Both backends use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process
+PostgreSQL slot admission; each slot reserves its requested memory plus host
+system headroom.
+
+## Remote Bubblewrap mode (respond5 watcher → lxhalle builder)
+
+A control plane running in the isolated rootless respond5 stack can set
+`CI_BUILDER_BACKEND=bubblewrap_ssh`. Set `CI_GITHUB_API_BASE_URL` only when using a loopback fixture; production defaults to `https://api.github.com`. In this mode the control plane remains the
+poller, Check Run client, artifact cache, and preview coordinator. It sends one
+framed JSON-plus-archive job over a pinned non-root SSH account to the checked-in
+`tools/ci_bubblewrap_runner.py` on lxhalle. The runner enters a private user and
+mount namespace, mounts the operator workspace as an exact 5 GiB/1,310,720-inode
+tmpfs below that account's HOME, and runs the pinned Bubblewrap build with no
+network and read-only root/toolchain inputs. It returns only bounded build logs
+and SHA-256-labelled artifacts; the respond5 coordinator verifies each stream
+before the normal BLAKE3 artifact-cache verification and runtime registration.
+
+The SSH transport must use a dedicated non-root key and `BatchMode=yes`; do not
+mount `/var/run/docker.sock`, use rootful Compose, or send GitHub credentials to
+the builder. `CI_BUILDER_SSH_TARGET` is a single host target, and all
+`CI_BUBBLEWRAP_*` paths are remote builder paths. The helper removes its unique
+workspace in a `finally` path after every job.
