@@ -35,6 +35,9 @@ const MAX_PLUGIN_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Public guarantee label for every bubblewrap build and cache identity.
 pub const BUBBLEWRAP_GUARANTEE: &str = "bubblewrap_namespace_only";
+/// The operator-mounted workspace contract shared with the Docker backend.
+pub const BUBBLEWRAP_WORKSPACE_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const BUBBLEWRAP_WORKSPACE_INODES: u64 = 1_310_720;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOG_BYTES: usize = 512 * 1024;
 const MAX_FAILURE_BYTES: usize = 8 * 1024;
@@ -170,7 +173,7 @@ impl BubblewrapBuildRuntime {
             return Err(sandbox_error("toolchain identity cannot be empty"));
         }
         let identity = format!(
-            "{BUBBLEWRAP_GUARANTEE};bwrap={bwrap_version};bwrap_sha256={bwrap_digest};rootfs={rootfs_manifest};toolchain={toolchain_manifest};source_preparer_sha256={source_preparer_digest};rust={toolchain_version}"
+            "{BUBBLEWRAP_GUARANTEE};bwrap={bwrap_version};bwrap_blake3={bwrap_digest};rootfs={rootfs_manifest};toolchain={toolchain_manifest};source_preparer_blake3={source_preparer_digest};rust={toolchain_version}"
         );
         Ok(Self {
             bwrap,
@@ -246,7 +249,11 @@ impl BubblewrapBuildRuntime {
         lease_token: Option<&str>,
         lease: Option<&mut super::admission::BuildAdmissionLease>,
     ) -> Result<BubblewrapPreflight, BuildPipelineError> {
-        verify_workspace_tmpfs(&self.workspace_root, None)?;
+        verify_workspace_tmpfs(
+            &self.workspace_root,
+            BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
+            BUBBLEWRAP_WORKSPACE_INODES,
+        )?;
         if let Some(token) = lease_token {
             self.cleanup_lease_workspace(token).await?;
         }
@@ -457,7 +464,7 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
                 }
             }
         };
-        terminate_descendants(root_pid).await?;
+        terminate_process_group(root_pid).await?;
         let stdout = stdout_task
             .await
             .map_err(|error| sandbox_error(format!("read bubblewrap stdout: {error}")))?
@@ -492,7 +499,11 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             ));
         }
         let output_dir = canonical_output_directory(output_dir)?;
-        verify_workspace_tmpfs(&self.workspace_root, Some(limits.disk_bytes))?;
+        verify_workspace_tmpfs(
+            &self.workspace_root,
+            limits.disk_bytes,
+            BUBBLEWRAP_WORKSPACE_INODES,
+        )?;
         self.cleanup_lease_workspace(lease_token).await?;
         let workspace = self.create_workspace("compile", Some(lease_token))?;
         let result = async {
@@ -531,7 +542,13 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
                     ),
                 ));
             }
+            lease
+                .assert_alive()
+                .map_err(|error| sandbox_error(error.to_string()))?;
             for file in ["pumpkin", "kurbis-control.wasm"] {
+                lease
+                    .assert_alive()
+                    .map_err(|error| sandbox_error(error.to_string()))?;
                 let source = workspace.join("out").join(file);
                 copy_regular_file(&source, &output_dir.join(file), MAX_ARTIFACT_BYTES)?;
             }
@@ -553,11 +570,14 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
         let admission = self.admission.as_ref().ok_or_else(|| {
             sandbox_error("bubblewrap backend requires configured cross-process build admission")
         })?;
-        let lease = admission
+        let mut lease = admission
             .acquire(limits.memory_bytes)
             .await
             .map_err(|error| sandbox_error(error.to_string()))?;
-        let result = self.preflight().await;
+        let token = lease.token();
+        let result = self
+            .preflight_with_token(Some(&token), Some(&mut lease))
+            .await;
         lease.release().await;
         result.map(|_| ())
     }
@@ -624,67 +644,68 @@ impl PatchApplier for BubblewrapBuildRuntime {
             .await
             .map_err(|error| sandbox_error(error.to_string()))?;
         let token = lease.token();
-        verify_workspace_tmpfs(
-            &self.workspace_root,
-            Some(crate::ci::execution::production::ROOTLESS_BUILD_LIMITS.disk_bytes),
-        )?;
-        self.cleanup_lease_workspace(&token).await?;
-        let workspace = match self.create_workspace("patch", Some(&token)) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                lease.release().await;
-                return Err(error);
-            }
-        };
         let result = async {
-            tokio::fs::write(workspace.join("input/source.tar.gz"), source_archive)
-                .await
-                .map_err(|error| sandbox_io("write source archive to private workspace", error))?;
-            let envs = [
-                ("KURBIS_EXPECTED_PATCH_FINGERPRINT", fingerprint.to_owned()),
-                (
-                    "KURBIS_MAX_SOURCE_BYTES",
-                    MAX_COMPRESSED_SOURCE_BYTES.to_string(),
-                ),
-            ];
-            let (status, report) = self
-                .run_sandbox(
-                    &workspace,
-                    PATCH_SCRIPT,
-                    &envs,
-                    Duration::from_secs(15 * 60),
-                    Some(&mut lease),
-                )
-                .await?;
-            if !status.success() {
-                return Err(BuildPipelineError::process_failure(
-                    crate::ci::CiBuildStage::Patching,
-                    status,
-                    format!(
-                        "bubblewrap patch workload failed ({}): {}",
-                        status,
-                        tail(&report.bounded(), MAX_FAILURE_BYTES)
+            verify_workspace_tmpfs(
+                &self.workspace_root,
+                BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
+                BUBBLEWRAP_WORKSPACE_INODES,
+            )?;
+            self.cleanup_lease_workspace(&token).await?;
+            let workspace = self.create_workspace("patch", Some(&token))?;
+            let result = async {
+                tokio::fs::write(workspace.join("input/source.tar.gz"), source_archive)
+                    .await
+                    .map_err(|error| {
+                        sandbox_io("write source archive to private workspace", error)
+                    })?;
+                let envs = [
+                    ("KURBIS_EXPECTED_PATCH_FINGERPRINT", fingerprint.to_owned()),
+                    (
+                        "KURBIS_MAX_SOURCE_BYTES",
+                        MAX_COMPRESSED_SOURCE_BYTES.to_string(),
                     ),
-                ));
+                ];
+                let (status, report) = self
+                    .run_sandbox(
+                        &workspace,
+                        PATCH_SCRIPT,
+                        &envs,
+                        Duration::from_secs(15 * 60),
+                        Some(&mut lease),
+                    )
+                    .await?;
+                if !status.success() {
+                    return Err(BuildPipelineError::process_failure(
+                        crate::ci::CiBuildStage::Patching,
+                        status,
+                        format!(
+                            "bubblewrap patch workload failed ({}): {}",
+                            status,
+                            tail(&report.bounded(), MAX_FAILURE_BYTES)
+                        ),
+                    ));
+                }
+                let output = workspace.join("out/patched-source.tar.gz");
+                let metadata = fs::symlink_metadata(&output)
+                    .map_err(|error| sandbox_io("inspect patched source archive", error))?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() == 0
+                    || metadata.len() > MAX_COMPRESSED_SOURCE_BYTES as u64
+                {
+                    return Err(permanent(
+                        "bubblewrap patch workload produced an invalid output archive",
+                    ));
+                }
+                tokio::fs::read(output)
+                    .await
+                    .map_err(|error| sandbox_io("read patched source archive", error))
             }
-            let output = workspace.join("out/patched-source.tar.gz");
-            let metadata = fs::symlink_metadata(&output)
-                .map_err(|error| sandbox_io("inspect patched source archive", error))?;
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() == 0
-                || metadata.len() > MAX_COMPRESSED_SOURCE_BYTES as u64
-            {
-                return Err(permanent(
-                    "bubblewrap patch workload produced an invalid output archive",
-                ));
-            }
-            tokio::fs::read(output)
-                .await
-                .map_err(|error| sandbox_io("read patched source archive", error))
+            .await;
+            let _ = tokio::fs::remove_dir_all(&workspace).await;
+            result
         }
         .await;
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
         lease.release().await;
         result
     }
@@ -876,17 +897,22 @@ fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
     }
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .map_err(|error| sandbox_io("protect bubblewrap workspace root", error))?;
-    verify_workspace_tmpfs(&path, None)?;
+    verify_workspace_tmpfs(
+        &path,
+        BUBBLEWRAP_WORKSPACE_SIZE_BYTES,
+        BUBBLEWRAP_WORKSPACE_INODES,
+    )?;
     Ok(path)
 }
 
 fn verify_workspace_tmpfs(
     path: &Path,
-    required_size: Option<u64>,
+    required_size: u64,
+    required_inodes: u64,
 ) -> Result<(), BuildPipelineError> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (path, required_size);
+        let _ = (path, required_size, required_inodes);
         Err(sandbox_error(
             "bubblewrap workspace requires a Linux tmpfs mount",
         ))
@@ -897,20 +923,18 @@ fn verify_workspace_tmpfs(
             .map_err(|error| sandbox_io("read workspace mount table", error))?;
         let Some((size, inodes)) = mountinfo_tmpfs_limits(&mounts, path) else {
             return Err(sandbox_error(
-                "bubblewrap workspace root must be an explicit tmpfs mount with non-zero size and nr_inodes options",
+                "bubblewrap workspace root must be an explicit tmpfs mount with size and nr_inodes options",
             ));
         };
-        if let Some(required_size) = required_size
-            && size != required_size
-        {
+        if size != required_size {
             return Err(sandbox_error(format!(
                 "bubblewrap workspace tmpfs size {size} does not match required build budget {required_size}"
             )));
         }
-        if inodes == 0 {
-            return Err(sandbox_error(
-                "bubblewrap workspace tmpfs must set a non-zero nr_inodes limit",
-            ));
+        if inodes != required_inodes {
+            return Err(sandbox_error(format!(
+                "bubblewrap workspace tmpfs inode limit {inodes} does not match required limit {required_inodes}"
+            )));
         }
         Ok(())
     }
@@ -1246,35 +1270,39 @@ async fn terminate_process_tree(
         let _ = child.wait().await;
         return Ok(());
     };
+
+    // --new-session makes bwrap the process-group leader. Signal both the
+    // group and the currently visible tree: the group catches descendants
+    // reparented after bwrap exits, while the tree covers children before the
+    // kernel has published their process-group metadata.
+    signal_process_group(root_pid, libc::SIGTERM);
     signal_process_tree(root_pid, libc::SIGTERM);
-    let _ = timeout(Duration::from_secs(3), child.wait())
-        .await
-        .map_err(|_| sandbox_error("bubblewrap termination timed out after SIGTERM"))?
-        .map_err(|error| sandbox_io("wait for terminated bubblewrap sandbox", error))?;
-    // The root process may have exited cleanly while a malicious descendant
-    // ignored SIGTERM. Escalate the entire still-visible tree before waiting.
-    signal_process_tree(root_pid, libc::SIGKILL);
-    wait_for_descendants(root_pid).await
+    match timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(result) => {
+            result.map_err(|error| sandbox_io("wait for terminated bubblewrap sandbox", error))?;
+        }
+        Err(_) => {
+            signal_process_group(root_pid, libc::SIGKILL);
+            signal_process_tree(root_pid, libc::SIGKILL);
+            timeout(Duration::from_secs(3), child.wait())
+                .await
+                .map_err(|_| sandbox_error("bubblewrap termination timed out after SIGKILL"))?
+                .map_err(|error| sandbox_io("wait for killed bubblewrap sandbox", error))?;
+        }
+    }
+    wait_for_process_group(root_pid).await
 }
 
-async fn terminate_descendants(root_pid: Option<u32>) -> Result<(), BuildPipelineError> {
+async fn terminate_process_group(root_pid: Option<u32>) -> Result<(), BuildPipelineError> {
     let Some(root_pid) = root_pid else {
         return Ok(());
     };
-    let descendants = descendant_pids(root_pid);
-    if descendants.is_empty() {
-        return Ok(());
-    }
     signal_process_group(root_pid, libc::SIGTERM);
-    for pid in descendants.iter().rev() {
-        signal_pid(*pid, libc::SIGTERM);
-    }
+    signal_process_tree(root_pid, libc::SIGTERM);
     tokio::time::sleep(Duration::from_millis(100)).await;
     signal_process_group(root_pid, libc::SIGKILL);
-    for pid in descendant_pids(root_pid).into_iter().rev() {
-        signal_pid(pid, libc::SIGKILL);
-    }
-    wait_for_descendants(root_pid).await
+    signal_process_tree(root_pid, libc::SIGKILL);
+    wait_for_process_group(root_pid).await
 }
 
 fn signal_process_group(root_pid: u32, signal: libc::c_int) {
@@ -1316,19 +1344,38 @@ fn descendant_pids(root_pid: u32) -> Vec<u32> {
     descendants
 }
 
-async fn wait_for_descendants(root_pid: u32) -> Result<(), BuildPipelineError> {
+fn process_group_pids(group_id: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let mut fields = stat.rsplit_once(") ")?.1.split_ascii_whitespace();
+            // After the final ')' the fields start at state: ppid, pgrp is
+            // therefore the third field in this suffix.
+            let process_group = fields.nth(2)?.parse::<u32>().ok()?;
+            (process_group == group_id).then_some(pid)
+        })
+        .collect()
+}
+
+async fn wait_for_process_group(root_pid: u32) -> Result<(), BuildPipelineError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let descendants = descendant_pids(root_pid);
-        if descendants.is_empty() {
+        let members = process_group_pids(root_pid);
+        if members.is_empty() {
             return Ok(());
         }
+        signal_process_group(root_pid, libc::SIGKILL);
+        for pid in &members {
+            signal_pid(*pid, libc::SIGKILL);
+        }
         if tokio::time::Instant::now() >= deadline {
-            for pid in descendants {
-                signal_pid(pid, libc::SIGKILL);
-            }
             return Err(sandbox_error(
-                "bubblewrap descendants did not exit before cleanup deadline",
+                "bubblewrap process group did not exit before cleanup deadline",
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1373,18 +1420,49 @@ mod tests {
         assert!(!is_public_tmp(Path::new("/home/user/.cache/kurbis")));
     }
 
+    #[test]
+    fn workspace_contract_matches_the_rootless_build_budget() {
+        assert_eq!(BUBBLEWRAP_WORKSPACE_SIZE_BYTES, 5 * 1024 * 1024 * 1024);
+        assert_eq!(BUBBLEWRAP_WORKSPACE_INODES, 1_310_720);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn mountinfo_requires_explicit_tmpfs_size_and_inode_limits() {
+    fn mountinfo_requires_the_exact_tmpfs_size_and_inode_limits() {
         let path = Path::new("/home/ci/workspace");
-        let bounded =
-            "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw,size=5G,nr_inodes=131072";
+        let bounded = "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw,size=5G,nr_inodes=1310720";
         assert_eq!(
             mountinfo_tmpfs_limits(bounded, path),
-            Some((5 * 1024 * 1024 * 1024, 131072))
+            Some((BUBBLEWRAP_WORKSPACE_SIZE_BYTES, BUBBLEWRAP_WORKSPACE_INODES))
+        );
+        let wrong_size = "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw,size=4G,nr_inodes=1310720";
+        assert_eq!(
+            mountinfo_tmpfs_limits(wrong_size, path),
+            Some((4 * 1024 * 1024 * 1024, 1_310_720))
         );
         let unbounded = "29 24 0:26 / /home/ci/workspace rw,relatime - tmpfs tmpfs rw";
         assert_eq!(mountinfo_tmpfs_limits(unbounded, path), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_group_cleanup_escalates_and_waits_for_ignored_descendants() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-ec")
+            .arg("trap '' TERM; sleep 300 & wait")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn disposable process group");
+        let root_pid = child.id().expect("process group leader has a pid");
+        terminate_process_tree(&mut child)
+            .await
+            .expect("SIGKILL escalation must clean up the whole process group");
+        assert!(process_group_pids(root_pid).is_empty());
     }
 
     #[test]

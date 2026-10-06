@@ -632,14 +632,14 @@ impl DockerRootlessBuildRuntime {
             .acquire(limits.memory_bytes)
             .await
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
-        if output_dir.to_string_lossy().contains(',') {
-            return Err(BuildPipelineError::Sandbox(
-                "CI artifact output path may not contain Docker mount separators".into(),
-            ));
-        }
         let name = format!("kurbis-ci-build-{}", Uuid::new_v4().simple());
-        if let Err(error) = self
-            .create_task_container(
+        let result = async {
+            if output_dir.to_string_lossy().contains(',') {
+                return Err(BuildPipelineError::Sandbox(
+                    "CI artifact output path may not contain Docker mount separators".into(),
+                ));
+            }
+            self.create_task_container(
                 &name,
                 limits,
                 Some(target),
@@ -671,64 +671,44 @@ impl DockerRootlessBuildRuntime {
                 true,
                 &admission,
             )
-            .await
-        {
-            self.remove_container(&name).await;
-            return Err(error);
-        }
-        if let Err(error) = admission.assert_alive() {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::Sandbox(error.to_string()));
-        }
-        if let Err(error) = self.start_task_container(&name).await {
-            self.remove_container(&name).await;
-            return Err(error);
-        }
-        for (name_in_container, archive) in [
-            ("source.tar.gz", source_archive),
-            ("plugin.tar.gz", plugin_archive),
-        ] {
-            if let Err(error) = self
-                .copy_bytes_into(&name, name_in_container, archive)
-                .await
+            .await?;
+            admission
+                .assert_alive()
+                .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+            self.start_task_container(&name).await?;
+            for (name_in_container, archive) in [
+                ("source.tar.gz", source_archive),
+                ("plugin.tar.gz", plugin_archive),
+            ] {
+                self.copy_bytes_into(&name, name_in_container, archive)
+                    .await?;
+            }
+            let (_status, report) = match self
+                .run_task_container(&name, BUILD_SCRIPT, process_timeout, &admission)
+                .await?
             {
-                self.remove_container(&name).await;
-                return Err(error);
-            }
-        }
-        let (status, report) = match self
-            .run_task_container(&name, BUILD_SCRIPT, process_timeout, &admission)
-            .await
-        {
-            Ok((status, report)) if status.success() => (status, report),
-            Ok((status, report)) => {
-                let bounded_log = report.bounded_log();
-                let diagnostics = self
-                    .container_failure_diagnostics(&name, Some(&bounded_log))
-                    .await;
-                self.remove_container(&name).await;
-                return Err(BuildPipelineError::process_failure(
-                    crate::ci::CiBuildStage::Compiling,
-                    status,
-                    format!(
-                        "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
-                        tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
-                    ),
-                ));
-            }
-            Err(error) => {
-                self.remove_container(&name).await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = admission.assert_alive() {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::Sandbox(error.to_string()));
-        }
-        let max_artifact = u64::try_from(MAX_ARTIFACT_BYTES).map_err(|error| {
-            BuildPipelineError::permanent(crate::ci::CiBuildStage::Packaging, error.to_string())
-        })?;
-        let copy_results = async {
+                (status, report) if status.success() => (status, report),
+                (status, report) => {
+                    let bounded_log = report.bounded_log();
+                    let diagnostics = self
+                        .container_failure_diagnostics(&name, Some(&bounded_log))
+                        .await;
+                    return Err(BuildPipelineError::process_failure(
+                        crate::ci::CiBuildStage::Compiling,
+                        status,
+                        format!(
+                            "sandboxed Pumpkin build failed ({status}); {diagnostics}\n{}",
+                            tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
+                        ),
+                    ));
+                }
+            };
+            admission
+                .assert_alive()
+                .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+            let max_artifact = u64::try_from(MAX_ARTIFACT_BYTES).map_err(|error| {
+                BuildPipelineError::permanent(crate::ci::CiBuildStage::Packaging, error.to_string())
+            })?;
             for filename in ["pumpkin", "kurbis-control.wasm"] {
                 let maximum =
                     usize::try_from(max_artifact.min(limits.disk_bytes)).map_err(|error| {
@@ -748,14 +728,12 @@ impl DockerRootlessBuildRuntime {
                 )
                 .await?;
             }
-            Ok::<(), BuildPipelineError>(())
+            Ok::<BuildProcessReport, BuildPipelineError>(report)
         }
         .await;
         self.remove_container(&name).await;
-        copy_results?;
         admission.release().await;
-        let _ = status;
-        Ok(report)
+        result
     }
 
     async fn container_failure_diagnostics(&self, name: &str, build_log: Option<&str>) -> String {
@@ -906,116 +884,111 @@ impl crate::ci::PatchApplier for DockerRootlessBuildRuntime {
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let name = format!("kurbis-ci-prepare-{}", Uuid::new_v4().simple());
         let script = "set -eu; mkdir -p /work/tmp; export TMPDIR=/work/tmp; /usr/local/bin/ci-source-preparer /input/source.tar.gz /work/patched-source.tar.gz \"$KURBIS_EXPECTED_PATCH_FINGERPRINT\"";
-        if let Err(error) = self
-            .create_task_container(
-                &name,
-                limits,
-                None,
-                &["KURBIS_EXPECTED_PATCH_FINGERPRINT"],
-                &[fingerprint],
-                source_archive.len(),
-                false,
-                &admission,
-            )
-            .await
-        {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                error.to_string(),
-            ));
-        }
-        if let Err(error) = admission.assert_alive() {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::Sandbox(error.to_string()));
-        }
-        if let Err(error) = self.start_task_container(&name).await {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                error.to_string(),
-            ));
-        }
-        if let Err(error) = self
-            .copy_bytes_into(&name, "source.tar.gz", &source_archive)
-            .await
-        {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                error.to_string(),
-            ));
-        }
-        let result = self
-            .run_task_container(&name, script, Duration::from_secs(15 * 60), &admission)
-            .await;
-        let (status, report) = match result {
-            Ok((status, report)) if status.success() => (status, report),
-            Ok((status, report)) => {
-                let bounded_log = report.bounded_log();
-                let diagnostics = self
-                    .container_failure_diagnostics(&name, Some(&bounded_log))
-                    .await;
-                self.remove_container(&name).await;
-                return Err(BuildPipelineError::process_failure(
-                    crate::ci::CiBuildStage::Patching,
-                    status,
-                    format!(
-                        "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
-                        tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
-                    ),
-                ));
-            }
-            Err(error) => {
-                self.remove_container(&name).await;
+        let result = async {
+            if let Err(error) = self
+                .create_task_container(
+                    &name,
+                    limits,
+                    None,
+                    &["KURBIS_EXPECTED_PATCH_FINGERPRINT"],
+                    &[fingerprint],
+                    source_archive.len(),
+                    false,
+                    &admission,
+                )
+                .await
+            {
                 return Err(BuildPipelineError::transient(
                     crate::ci::CiBuildStage::Patching,
                     error.to_string(),
                 ));
             }
-        };
-        if let Err(error) = admission.assert_alive() {
-            self.remove_container(&name).await;
-            return Err(BuildPipelineError::Sandbox(error.to_string()));
-        }
-        let directory = super::private_tempdir("kurbis-ci-patched-source-").map_err(|error| {
-            BuildPipelineError::transient(crate::ci::CiBuildStage::Patching, error.to_string())
-        })?;
-        let output = directory.path().join("patched-source.tar.gz");
-        let copied = self
-            .copy_from_container(
+            admission
+                .assert_alive()
+                .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+            self.start_task_container(&name).await.map_err(|error| {
+                BuildPipelineError::transient(crate::ci::CiBuildStage::Patching, error.to_string())
+            })?;
+            self.copy_bytes_into(&name, "source.tar.gz", &source_archive)
+                .await
+                .map_err(|error| {
+                    BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Patching,
+                        error.to_string(),
+                    )
+                })?;
+            let (status, report) = match self
+                .run_task_container(&name, script, Duration::from_secs(15 * 60), &admission)
+                .await
+            {
+                Ok((status, report)) if status.success() => (status, report),
+                Ok((status, report)) => {
+                    let bounded_log = report.bounded_log();
+                    let diagnostics = self
+                        .container_failure_diagnostics(&name, Some(&bounded_log))
+                        .await;
+                    return Err(BuildPipelineError::process_failure(
+                        crate::ci::CiBuildStage::Patching,
+                        status,
+                        format!(
+                            "rootless Pumpkin patch workload failed ({status}); {diagnostics}: {}",
+                            tail(&bounded_log, MAX_FAILURE_LOG_BYTES)
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Err(BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Patching,
+                        error.to_string(),
+                    ));
+                }
+            };
+            admission
+                .assert_alive()
+                .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+            let directory =
+                super::private_tempdir("kurbis-ci-patched-source-").map_err(|error| {
+                    BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Patching,
+                        error.to_string(),
+                    )
+                })?;
+            let output = directory.path().join("patched-source.tar.gz");
+            self.copy_from_container(
                 &name,
                 "/work/patched-source.tar.gz",
                 &output,
                 super::archive::MAX_COMPRESSED_SOURCE_BYTES,
             )
-            .await;
-        self.remove_container(&name).await;
-        copied?;
-        admission.release().await;
-        let metadata = fs::symlink_metadata(&output).map_err(|error| {
-            BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                format!("inspect patched source archive: {error}"),
-            )
-        })?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() == 0
-            || metadata.len() > super::archive::MAX_COMPRESSED_SOURCE_BYTES as u64
-        {
-            return Err(BuildPipelineError::permanent(
-                crate::ci::CiBuildStage::Patching,
-                "rootless patch workload produced invalid output",
-            ));
+            .await?;
+            let metadata = fs::symlink_metadata(&output).map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("inspect patched source archive: {error}"),
+                )
+            })?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() == 0
+                || metadata.len() > super::archive::MAX_COMPRESSED_SOURCE_BYTES as u64
+            {
+                return Err(BuildPipelineError::permanent(
+                    crate::ci::CiBuildStage::Patching,
+                    "rootless patch workload produced invalid output",
+                ));
+            }
+            let _ = (status, report);
+            fs::read(output).map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("read patched source: {error}"),
+                )
+            })
         }
-        let _ = (status, report);
-        fs::read(output).map_err(|error| {
-            BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                format!("read patched source: {error}"),
-            )
-        })
+        .await;
+        self.remove_container(&name).await;
+        admission.release().await;
+        result
     }
 }
 

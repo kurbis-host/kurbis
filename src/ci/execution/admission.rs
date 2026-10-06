@@ -312,7 +312,7 @@ impl BuildAdmissionCoordinator {
                 let _ = unlock_advisory(&mut connection, slot_key).await;
             }
             let Some((slot, slot_key)) = selected else {
-                let _ = unlock_and_close(connection, global_key).await;
+                let _ = bounded_unlock_and_close(connection, global_key).await;
                 tokio::time::sleep(self.lock_poll_interval).await;
                 continue;
             };
@@ -337,7 +337,7 @@ impl BuildAdmissionCoordinator {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     let _ = unlock_advisory(&mut connection, global_key).await;
-                    let _ = unlock_and_close(connection, slot_key).await;
+                    let _ = bounded_unlock_and_close(connection, slot_key).await;
                     return Err(error);
                 }
             };
@@ -348,7 +348,7 @@ impl BuildAdmissionCoordinator {
             ) {
                 last_snapshot = Some(snapshot);
                 let _ = unlock_advisory(&mut connection, global_key).await;
-                let _ = unlock_and_close(connection, slot_key).await;
+                let _ = bounded_unlock_and_close(connection, slot_key).await;
                 tracing::warn!(
                     requested_memory_bytes,
                     reserved_memory_bytes = reserved_bytes,
@@ -721,7 +721,7 @@ fn start_heartbeat(
                 }
             }
         }
-        if let Err(error) = unlock_and_close(connection, slot_key).await {
+        if let Err(error) = bounded_unlock_and_close(connection, slot_key).await {
             lost.store(true, Ordering::Release);
             tracing::warn!(
                 backend_pid,
@@ -770,15 +770,21 @@ async fn unlock_advisory(
     connection: &mut PgConnection,
     key: i64,
 ) -> Result<(), BuildAdmissionError> {
-    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-        .bind(key)
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|error| {
-            BuildAdmissionError::Unavailable(format!(
-                "release PostgreSQL build-admission lock: {error}"
-            ))
-        })?;
+    let unlocked: bool = timeout(
+        DB_OPERATION_TIMEOUT,
+        sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .fetch_one(&mut *connection),
+    )
+    .await
+    .map_err(|_| {
+        BuildAdmissionError::Unavailable("release PostgreSQL build-admission lock timed out".into())
+    })?
+    .map_err(|error| {
+        BuildAdmissionError::Unavailable(format!(
+            "release PostgreSQL build-admission lock: {error}"
+        ))
+    })?;
     if unlocked {
         Ok(())
     } else {
@@ -794,6 +800,13 @@ async fn unlock_and_close(mut connection: PgConnection, slot_key: i64) -> Result
         .fetch_one(&mut connection)
         .await?;
     connection.close().await
+}
+
+async fn bounded_unlock_and_close(connection: PgConnection, slot_key: i64) -> Result<(), String> {
+    timeout(DB_OPERATION_TIMEOUT, unlock_and_close(connection, slot_key))
+        .await
+        .map_err(|_| "release PostgreSQL build-admission session timed out".to_owned())?
+        .map_err(|error| format!("release PostgreSQL build-admission session: {error}"))
 }
 
 fn advisory_key(builder_identity: &str, slot: u32) -> i64 {

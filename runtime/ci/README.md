@@ -134,13 +134,15 @@ worker world, port leases, and resource reservations.
 ## Builder backend and concurrency
 
 `CI_BUILDER_BACKEND=docker` is the default and keeps the rootless Docker
-contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a
-Linux worker with private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately
-reported as `bubblewrap_namespace_only`: it does not claim cgroup CPU, memory,
-or PID enforcement, and there is no automatic Docker fallback. Each workload
-must pass a real kernel-enforced, size-bounded `/work` tmpfs mount; if the
-configured Bubblewrap cannot create that mount, preflight fails closed. The backend does not set an independent per-build inode quota; the operator
-tmpfs mount must declare a non-zero `nr_inodes=` ceiling. Build input/output files remain separately bounded and are
-copied with counted reads. Both backends use `CI_BUILD_CONCURRENCY` (bounded to
-1-64) for cross-process PostgreSQL slot admission; each slot reserves its
-requested memory plus host system headroom.
+contract above. `CI_BUILDER_BACKEND=bubblewrap` is an explicit opt-in for a Linux worker with
+private `CI_BUBBLEWRAP_*` paths. Bubblewrap is deliberately reported as
+`bubblewrap_namespace_only`: it does not claim cgroup CPU, memory, or PID
+enforcement, and there is no automatic Docker fallback. The operator must
+mount the workspace below the build user's private `$HOME`, for example
+`$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly `size=5G,nr_inodes=1310720`.
+Startup and every workload preflight parse `/proc/self/mountinfo` and fail
+closed for an ordinary directory, a different size, or a different inode
+limit. Build input/output files remain separately bounded and are copied with
+counted reads. Both backends use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for
+cross-process PostgreSQL slot admission; each slot reserves its requested
+memory plus host system headroom.
