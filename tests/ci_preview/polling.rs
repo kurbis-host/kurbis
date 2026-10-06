@@ -177,6 +177,108 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
 }
 
 #[derive(Clone)]
+struct EmptyPollSource;
+#[async_trait]
+impl SourceControlClient for EmptyPollSource {
+    async fn poll(
+        &self,
+        _repository: &str,
+        checkpoint: &PollCheckpoint,
+    ) -> Result<PollResult, kurbis_hoster::ci::PollError> {
+        Ok(PollResult {
+            refs: Vec::new(),
+            eager_refs: Vec::new(),
+            checkpoint: PollCheckpoint {
+                last_successful_poll: Some(Utc::now()),
+                ..checkpoint.clone()
+            },
+            not_modified: true,
+            retry_after: None,
+            complete_kinds: Vec::new(),
+        })
+    }
+
+    async fn fetch_commit(
+        &self,
+        _repository: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<u8>, kurbis_hoster::ci::PollError> {
+        Ok(format!("recovered-pr-head:{commit_sha}").into_bytes())
+    }
+}
+
+#[tokio::test]
+async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let commit_sha = "fedcba9876543210fedcba9876543210fedcba98";
+    sqlx::query(
+        "INSERT INTO ci_refs(repository_id,kind,name,number,commit_sha,source_repository,closed,deleted)
+         VALUES($1,'pull_request','pr-77',77,$2,'contributor/Pumpkin',false,false)",
+    )
+    .bind(watched.id)
+    .bind(commit_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = BuildKey::new(
+        &repository_name,
+        commit_sha,
+        "patch-recovery-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let (queued, _) = repository.ensure_build(&key).await.unwrap();
+    assert_eq!(queued.stage, CiBuildStage::Queued);
+
+    let source = std::sync::Arc::new(EmptyPollSource);
+    let components = std::sync::Arc::new(TestBuildComponents::default());
+    let builder = std::sync::Arc::new(ControlledBuildPipeline::new(
+        repository.clone(),
+        source.clone(),
+        components.clone(),
+        components.clone(),
+        std::sync::Arc::new(TestArtifactCache),
+        SandboxLimits {
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_millis: 1000,
+            pid_limit: 512,
+            disk_bytes: 5 * 1024 * 1024 * 1024,
+            process_timeout: std::time::Duration::from_secs(3600),
+        },
+    ));
+    let poller = CiPoller::new(repository.clone(), source)
+        .with_config(CiPollerConfig {
+            root_domain: unique_ci_root_domain(),
+            patch_fingerprint: "patch-recovery-v1".into(),
+            toolchain_version: "test-toolchain".into(),
+            target_architecture: "x86_64-linux".into(),
+            public_status_base_url: None,
+        })
+        .with_builder(builder);
+
+    poller.poll_once(watched.id).await.unwrap();
+    let recovered = repository.ensure_build(&key).await.unwrap().0;
+    assert_eq!(recovered.stage, CiBuildStage::Ready);
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    pool.close().await;
+}
+
+#[derive(Clone)]
 struct MutableBranchSource {
     commit: std::sync::Arc<std::sync::RwLock<String>>,
     fetches: std::sync::Arc<std::sync::Mutex<Vec<String>>>,

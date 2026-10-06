@@ -270,75 +270,137 @@ impl SshBubblewrapBuildRuntime {
             stdout: result.stdout,
             stderr: result.stderr,
         };
-        let output_dir = output_dir.ok_or_else(|| {
-            BuildPipelineError::transient(
+        // The runner returns no output frames for a failed compile. Classify
+        // that process result before validating the success-only artifact set;
+        // otherwise an ordinary transient remote/compiler failure would be
+        // misreported as a permanent packaging error and would skip retries.
+        if mode != "preflight" && !result.ok {
+            let mut remote_stderr = Vec::new();
+            stderr.read_to_end(&mut remote_stderr).await.ok();
+            let status = child.wait().await.map_err(|e| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Compiling,
+                    format!("wait for remote Bubblewrap SSH job: {e}"),
+                )
+            })?;
+            build_report
+                .stderr
+                .push_str(&String::from_utf8_lossy(&remote_stderr));
+            return Err(BuildPipelineError::process_failure(
                 crate::ci::CiBuildStage::Compiling,
-                "remote Bubblewrap preflight returned artifacts",
-            )
-        })?;
-        for artifact in result.artifacts {
-            let destination = output_dir.join(&artifact.name);
-            if artifact.size == 0
-                || artifact.size > MAX_ARTIFACT_BYTES
-                || !matches!(artifact.name.as_str(), "pumpkin" | "kurbis-control.wasm")
-            {
+                status,
+                format!("remote Bubblewrap build failed: {}", build_report.stderr),
+            ));
+        }
+        let mut artifacts = result.artifacts;
+        if mode == "preflight" {
+            if !artifacts.is_empty() {
+                let _ = child.kill().await;
                 return Err(BuildPipelineError::permanent(
                     crate::ci::CiBuildStage::Packaging,
-                    "remote Bubblewrap artifact metadata is invalid",
+                    "remote Bubblewrap preflight returned artifacts",
                 ));
             }
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&destination)
-                .await
-                .map_err(|e| {
-                    BuildPipelineError::transient(
-                        crate::ci::CiBuildStage::Packaging,
-                        format!("stage remote artifact: {e}"),
-                    )
-                })?;
-            let mut hasher = Sha256::new();
-            let mut limited = (&mut reader).take(artifact.size as u64);
-            let copied = tokio::io::copy(&mut limited, &mut file)
-                .await
-                .map_err(|e| {
-                    BuildPipelineError::transient(
-                        crate::ci::CiBuildStage::Packaging,
-                        format!("stream remote artifact: {e}"),
-                    )
-                })?;
-            if copied != artifact.size as u64 {
-                return Err(BuildPipelineError::transient(
-                    crate::ci::CiBuildStage::Packaging,
-                    "remote Bubblewrap artifact stream was truncated",
-                ));
-            }
-            file.flush().await.map_err(|e| {
-                BuildPipelineError::transient(
-                    crate::ci::CiBuildStage::Packaging,
-                    format!("flush remote artifact: {e}"),
-                )
-            })?;
-            drop(file);
-            let bytes = tokio::fs::read(&destination).await.map_err(|e| {
-                BuildPipelineError::transient(
-                    crate::ci::CiBuildStage::Packaging,
-                    format!("verify remote artifact: {e}"),
-                )
-            })?;
-            hasher.update(&bytes);
-            let digest = format!("{:x}", hasher.finalize());
-            if digest != artifact.sha256 {
-                let _ = tokio::fs::remove_file(&destination).await;
+        } else {
+            let Some(output_dir) = output_dir else {
+                let _ = child.kill().await;
                 return Err(BuildPipelineError::permanent(
                     crate::ci::CiBuildStage::Packaging,
-                    format!(
-                        "remote Bubblewrap artifact {} failed SHA-256 verification",
-                        artifact.name
-                    ),
+                    "remote Bubblewrap compile did not provide an output directory",
+                ));
+            };
+            let mut names = artifacts
+                .iter()
+                .map(|artifact| artifact.name.as_str())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            if names != ["kurbis-control.wasm", "pumpkin"] {
+                let _ = child.kill().await;
+                return Err(BuildPipelineError::permanent(
+                    crate::ci::CiBuildStage::Packaging,
+                    "remote Bubblewrap compile returned an unexpected artifact set",
                 ));
             }
+            for artifact in artifacts.drain(..) {
+                let destination = output_dir.join(&artifact.name);
+                if artifact.size == 0
+                    || artifact.size > MAX_ARTIFACT_BYTES
+                    || !matches!(artifact.name.as_str(), "pumpkin" | "kurbis-control.wasm")
+                {
+                    return Err(BuildPipelineError::permanent(
+                        crate::ci::CiBuildStage::Packaging,
+                        "remote Bubblewrap artifact metadata is invalid",
+                    ));
+                }
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&destination)
+                    .await
+                    .map_err(|e| {
+                        BuildPipelineError::transient(
+                            crate::ci::CiBuildStage::Packaging,
+                            format!("stage remote artifact: {e}"),
+                        )
+                    })?;
+                let mut hasher = Sha256::new();
+                let mut limited = (&mut reader).take(artifact.size as u64);
+                let copied = tokio::io::copy(&mut limited, &mut file)
+                    .await
+                    .map_err(|e| {
+                        BuildPipelineError::transient(
+                            crate::ci::CiBuildStage::Packaging,
+                            format!("stream remote artifact: {e}"),
+                        )
+                    })?;
+                if copied != artifact.size as u64 {
+                    return Err(BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Packaging,
+                        "remote Bubblewrap artifact stream was truncated",
+                    ));
+                }
+                file.flush().await.map_err(|e| {
+                    BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Packaging,
+                        format!("flush remote artifact: {e}"),
+                    )
+                })?;
+                drop(file);
+                let bytes = tokio::fs::read(&destination).await.map_err(|e| {
+                    BuildPipelineError::transient(
+                        crate::ci::CiBuildStage::Packaging,
+                        format!("verify remote artifact: {e}"),
+                    )
+                })?;
+                hasher.update(&bytes);
+                let digest = format!("{:x}", hasher.finalize());
+                if digest != artifact.sha256 {
+                    let _ = tokio::fs::remove_file(&destination).await;
+                    return Err(BuildPipelineError::permanent(
+                        crate::ci::CiBuildStage::Packaging,
+                        format!(
+                            "remote Bubblewrap artifact {} failed SHA-256 verification",
+                            artifact.name
+                        ),
+                    ));
+                }
+            }
+        }
+        let mut trailing_stdout = Vec::new();
+        reader
+            .read_to_end(&mut trailing_stdout)
+            .await
+            .map_err(|e| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Packaging,
+                    format!("read remote Bubblewrap trailing output: {e}"),
+                )
+            })?;
+        if !trailing_stdout.is_empty() {
+            return Err(BuildPipelineError::permanent(
+                crate::ci::CiBuildStage::Packaging,
+                "remote Bubblewrap result contained trailing output after its framed payload",
+            ));
         }
         let mut remote_stderr = Vec::new();
         stderr.read_to_end(&mut remote_stderr).await.ok();

@@ -183,6 +183,61 @@ impl CiPreviewRepository {
             .collect()
     }
 
+    /// Return PR-head builds that were durably admitted but have no live build
+    /// lease. This is the recovery queue for a poller restart or a control-plane
+    /// crash: the source poll may return an unchanged ETag, so rebuilding only
+    /// eager refs would strand these rows forever. Branch and arbitrary commit
+    /// previews remain lazy and are intentionally excluded.
+    pub async fn queued_pull_request_builds(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<super::services::BuildRequest>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
+            "SELECT build.repository, build.commit_sha, build.patch_fingerprint,
+                    build.toolchain_version, build.target_architecture,
+                    COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository
+             FROM ci_builds build
+             JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
+             JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
+             WHERE watched.repository = $1 AND watched.enabled
+               AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
+               AND build.repository = watched.repository
+               AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
+               AND build.expires_at > now()
+               AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
+             GROUP BY build.id
+             ORDER BY build.updated_at, build.id
+             LIMIT 128",
+        )
+        .bind(repository)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    repository,
+                    commit_sha,
+                    patch_fingerprint,
+                    toolchain_version,
+                    target_architecture,
+                    source_repository,
+                )| {
+                    Ok(super::services::BuildRequest {
+                        key: BuildKey::new(
+                            repository,
+                            commit_sha,
+                            patch_fingerprint,
+                            toolchain_version,
+                            target_architecture,
+                        )?,
+                        source_repository,
+                        source_archive: Vec::new(),
+                    })
+                },
+            )
+            .collect()
+    }
+
     /// A demand-triggered request may start failed immutable work only after
     /// the persisted transient retry deadline. Permanent failures never retry.
     pub async fn is_build_retry_due(&self, build_id: Uuid) -> Result<bool> {

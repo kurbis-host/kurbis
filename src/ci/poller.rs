@@ -197,6 +197,20 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             }
         }
         if let Some(builder) = self.builder.as_ref() {
+            // The durable queue is necessary even when the GitHub collections
+            // return 304: a process can die after admitting a PR head but before
+            // starting its build, and the next poll must recover that exact head
+            // without asking GitHub to emit another event.
+            for request in self
+                .repository
+                .queued_pull_request_builds(&repository_name)
+                .await?
+            {
+                builder
+                    .ensure_build(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("queued CI PR build failed: {error}"))?;
+            }
             for request in self
                 .repository
                 .due_pull_request_build_retries(&repository_name)
@@ -499,13 +513,24 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             }
         }
     }
-    pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()> {
+    pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()>
+    where
+        C: Clone,
+    {
         let interval = interval.max(Duration::from_secs(1));
+        let mut poll_tick = tokio::time::interval(interval);
+        // Build execution is deliberately detached from the source watcher. A
+        // remote Bubblewrap compile can take tens of minutes; awaiting it here
+        // would stop ETag polling, Check Run reconciliation, and recovery of
+        // other PR heads on this control-plane process.
         loop {
-            if let Err(error) = self.poll_with_retry(repository_id, 3).await {
-                tracing::error!(?error, %repository_id, "CI source-control poll failed");
-            }
-            sleep(interval).await;
+            poll_tick.tick().await;
+            let poller = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = poller.poll_with_retry(repository_id, 3).await {
+                    tracing::error!(?error, %repository_id, "CI source-control poll failed");
+                }
+            });
         }
     }
 }
