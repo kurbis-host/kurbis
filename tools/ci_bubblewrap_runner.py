@@ -22,6 +22,47 @@ MAX_PLUGIN = 64 * 1024 * 1024
 MAX_ARTIFACT = 1024 * 1024 * 1024
 MAX_LOG = 512 * 1024
 
+PREFLIGHT_SCRIPT = r"""
+set -eu
+[ "$(id -u)" = 0 ]
+grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+[ "$HOME" = /work/home ]
+[ ! -e /run/docker.sock ]
+[ ! -e /var/run/docker.sock ]
+awk 'NR > 1 && $1 != "lo" { route = 1 } END { exit route }' /proc/net/route
+awk '$NF != "lo" { route = 1 } END { exit route }' /proc/net/ipv6_route
+for tool in rustc cargo gcc tar git strip awk; do
+  command -v "$tool" >/dev/null || { echo "builder tool unavailable: $tool" >&2; exit 78; }
+done
+actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
+[ "$actual_rustc" = "$KURBIS_EXPECTED_RUSTC" ] || {
+  echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
+  exit 78
+}
+# Exercise the same GCC/native link and Rust target linker paths used by Cargo;
+# a namespace-only probe alone would miss a truncated rootfs or sysroot.
+printf 'int main(void) { return 0; }\n' > /work/tmp/c-link-probe.c
+gcc /work/tmp/c-link-probe.c -o /work/out/c-link-probe
+/work/out/c-link-probe
+strip /work/out/c-link-probe
+printf 'fn main() {}\n' > /work/tmp/rust-link-probe.rs
+rustc --target "$KURBIS_RUST_TARGET" -C strip=debuginfo /work/tmp/rust-link-probe.rs -o /work/out/rust-link-probe
+/work/out/rust-link-probe
+wasm_libdir="$(rustc --print target-libdir --target wasm32-wasip2)"
+test -d "$wasm_libdir" || { echo "WASI target libraries unavailable: $wasm_libdir" >&2; exit 78; }
+test -x /work/.ci-source-preparer || { echo "trusted source preparer unavailable" >&2; exit 78; }
+mkdir -p /work/tmp/tar-source /work/tmp/tar-dest
+printf probe > /work/tmp/tar-source/probe
+tar -czf /work/tmp/archive-probe.tar.gz -C /work/tmp/tar-source .
+tar -xzf /work/tmp/archive-probe.tar.gz -C /work/tmp/tar-dest --no-same-owner --no-same-permissions
+[ "$(cat /work/tmp/tar-dest/probe)" = probe ]
+printf 'BWRAP_NAMESPACE_AND_TOOLCHAIN_PROBE_PASSED\n'
+printf 'rustc=%s\n' "$actual_rustc"
+printf 'rust_target=%s\n' "$KURBIS_RUST_TARGET"
+printf 'wasi_libdir=%s\n' "$wasm_libdir"
+"""
+
 BUILD_SCRIPT = r"""
 set -eu
 umask 077
@@ -161,18 +202,7 @@ def main():
             (workspace / "input/plugin.tar.gz").write_bytes(plugin)
             (workspace / "input/plugin.tar.gz").chmod(0o600)
         if header["mode"] == "preflight":
-            script = r"""set -eu
-[ "$(id -u)" = 0 ]
-grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
-grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
-[ "$HOME" = /work/home ]
-[ ! -e /run/docker.sock ]
-[ ! -e /var/run/docker.sock ]
-awk 'NR > 1 && $1 != "lo" { route = 1 } END { exit route }' /proc/net/route
-awk '$NF != "lo" { route = 1 } END { exit route }' /proc/net/ipv6_route
-printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
-"""
-            command = runner_command(header, workspace, script)
+            command = runner_command(header, workspace, PREFLIGHT_SCRIPT)
         else:
             command = runner_command(header, workspace, BUILD_SCRIPT)
         completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=int(header.get("timeout_seconds", 5400)), check=False)
