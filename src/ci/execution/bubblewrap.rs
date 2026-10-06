@@ -675,21 +675,16 @@ impl PatchApplier for BubblewrapBuildRuntime {
                         ),
                     ));
                 }
+                lease
+                    .assert_alive()
+                    .map_err(|error| sandbox_error(error.to_string()))?;
                 let output = workspace.join("out/patched-source.tar.gz");
-                let metadata = fs::symlink_metadata(&output)
-                    .map_err(|error| sandbox_io("inspect patched source archive", error))?;
-                if !metadata.is_file()
-                    || metadata.file_type().is_symlink()
-                    || metadata.len() == 0
-                    || metadata.len() > MAX_COMPRESSED_SOURCE_BYTES as u64
-                {
-                    return Err(permanent(
-                        "bubblewrap patch workload produced an invalid output archive",
-                    ));
-                }
-                tokio::fs::read(output)
-                    .await
-                    .map_err(|error| sandbox_io("read patched source archive", error))
+                let patched_source =
+                    read_bounded_regular_file(&output, MAX_COMPRESSED_SOURCE_BYTES).await?;
+                lease
+                    .assert_alive()
+                    .map_err(|error| sandbox_error(error.to_string()))?;
+                Ok(patched_source)
             }
             .await;
             let _ = tokio::fs::remove_dir_all(&workspace).await;
@@ -873,6 +868,7 @@ fn private_workspace_root(path: &Path) -> Result<PathBuf, BuildPipelineError> {
         .map_err(|error| sandbox_io("inspect bubblewrap workspace root", error))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
+        || path == home
         || !path.starts_with(&home)
         || is_public_tmp(&path)
     {
@@ -1160,34 +1156,39 @@ fn validate_limits(limits: SandboxLimits) -> Result<(), BuildPipelineError> {
     Ok(())
 }
 
+fn open_bounded_regular_file(
+    source: &Path,
+    maximum: usize,
+    label: &str,
+) -> Result<(fs::File, u64), BuildPipelineError> {
+    let input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| sandbox_io(format!("open {label}"), error))?;
+    let metadata = input
+        .metadata()
+        .map_err(|error| sandbox_io(format!("inspect {label}"), error))?;
+    let maximum = maximum as u64;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum {
+        return Err(permanent(format!("{label} is not a bounded regular file")));
+    }
+    Ok((input, metadata.len()))
+}
+
 fn copy_regular_file(
     source: &Path,
     destination: &Path,
     maximum: usize,
 ) -> Result<(), BuildPipelineError> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| sandbox_io("inspect bubblewrap artifact", error))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() == 0
-        || metadata.len() > maximum as u64
-    {
-        return Err(permanent(
-            "bubblewrap artifact is not a bounded regular file",
-        ));
-    }
-    let input = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(source)
-        .map_err(|error| sandbox_io("open bubblewrap artifact", error))?;
+    let (input, expected_size) = open_bounded_regular_file(source, maximum, "bubblewrap artifact")?;
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(destination)
         .map_err(|error| sandbox_io("create bubblewrap artifact", error))?;
-    let copied = std::io::copy(&mut input.take(maximum as u64 + 1), &mut output);
+    let copied = std::io::copy(&mut input.take(expected_size + 1), &mut output);
     let copied = match copied {
         Ok(copied) => copied,
         Err(error) => {
@@ -1195,16 +1196,37 @@ fn copy_regular_file(
             return Err(sandbox_io("copy bubblewrap artifact", error));
         }
     };
-    if copied == 0 || copied > maximum as u64 {
+    if copied != expected_size {
         let _ = fs::remove_file(destination);
         return Err(permanent(
-            "bubblewrap artifact exceeded its bounded copy limit",
+            "bubblewrap artifact changed while it was being copied",
         ));
     }
     output
         .sync_all()
         .map_err(|error| sandbox_io("sync bubblewrap artifact", error))?;
     Ok(())
+}
+
+async fn read_bounded_regular_file(
+    source: &Path,
+    maximum: usize,
+) -> Result<Vec<u8>, BuildPipelineError> {
+    let (input, expected_size) =
+        open_bounded_regular_file(source, maximum, "patched source archive")?;
+    let input = tokio::fs::File::from_std(input);
+    let mut output = Vec::with_capacity(expected_size as usize);
+    input
+        .take(expected_size + 1)
+        .read_to_end(&mut output)
+        .await
+        .map_err(|error| sandbox_io("read patched source archive", error))?;
+    if output.len() as u64 != expected_size {
+        return Err(permanent(
+            "bubblewrap patch workload output changed while it was being read",
+        ));
+    }
+    Ok(output)
 }
 
 fn tail(value: &str, limit: usize) -> String {
@@ -1521,6 +1543,31 @@ mod tests {
     fn private_workspace_root_rejects_non_home_paths() {
         let root = tempfile::tempdir().unwrap();
         assert!(private_workspace_root(root.path()).is_err());
+    }
+
+    #[test]
+    fn private_workspace_root_rejects_home_itself() {
+        let home = env::var_os("HOME").expect("tests require HOME");
+        let home = fs::canonicalize(home).expect("HOME must resolve");
+        assert!(private_workspace_root(&home).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_symlinks_and_enforces_opened_size() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("patched-source.tar.gz");
+        fs::write(&archive, b"valid archive").unwrap();
+        assert_eq!(
+            read_bounded_regular_file(&archive, 1024).await.unwrap(),
+            b"valid archive"
+        );
+
+        let link = root.path().join("patched-source-link.tar.gz");
+        symlink(&archive, &link).unwrap();
+        assert!(read_bounded_regular_file(&link, 1024).await.is_err());
+        assert!(read_bounded_regular_file(&archive, 4).await.is_err());
     }
 
     #[test]
