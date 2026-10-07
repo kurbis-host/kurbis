@@ -1,38 +1,77 @@
+use std::future::Future;
+use std::path::Path;
 use std::str::FromStr;
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sha2::{Digest, Sha384};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
+
+// SHA-384 of the exact production baseline committed at c719cdc.
+const PRODUCTION_MIGRATION_ONE_SHA384: &str = "db50116c89d038a0ad0ca5ee67ae01017d859bed99151f4437092c651fc38c7c3dc6189f4c0d561a1ad5b3ba0fd8cfd6";
+
+#[test]
+fn production_migration_one_checksum_is_immutable() {
+    let source = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/0001_fresh_schema.sql"),
+    )
+    .expect("read production migration one");
+    let checksum = format!("{:x}", Sha384::digest(&source));
+    assert_eq!(
+        checksum, PRODUCTION_MIGRATION_ONE_SHA384,
+        "migration 0001 is production state and must never be edited; append a new migration instead"
+    );
+}
 
 #[tokio::test]
 async fn fresh_database_bootstraps_canonical_api_only_schema() {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must point to a disposable local PostgreSQL instance");
     let options = PgConnectOptions::from_str(&database_url).expect("valid TEST_DATABASE_URL");
+    with_disposable_database(options, |options| async move {
+        verify_fresh_database(options).await
+    })
+    .await
+    .expect("canonical schema bootstrap assertions");
+}
+
+#[tokio::test]
+async fn production_database_with_only_migration_one_upgrades_without_editing_baseline() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to a disposable local PostgreSQL instance");
+    let options = PgConnectOptions::from_str(&database_url).expect("valid TEST_DATABASE_URL");
+    with_disposable_database(options, |options| async move {
+        verify_production_upgrade(options).await
+    })
+    .await
+    .expect("production migration upgrade assertions");
+}
+
+async fn with_disposable_database<F, Fut>(options: PgConnectOptions, test: F) -> anyhow::Result<()>
+where
+    F: FnOnce(PgConnectOptions) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options.clone().database("postgres"))
-        .await
-        .expect("connect to local PostgreSQL admin database");
+        .await?;
     let database = format!("kurbis_bootstrap_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE {database}"))
         .execute(&admin)
-        .await
-        .expect("create disposable bootstrap database");
-
-    let result = verify_fresh_database(options.clone().database(&database)).await;
+        .await?;
     admin.close().await;
+
+    let result = test(options.clone().database(&database)).await;
 
     let cleanup = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options.database("postgres"))
-        .await
-        .expect("reconnect to local PostgreSQL admin database");
+        .await?;
     sqlx::query(&format!("DROP DATABASE {database}"))
         .execute(&cleanup)
-        .await
-        .expect("drop disposable bootstrap database");
+        .await?;
     cleanup.close().await;
-    result.expect("canonical schema bootstrap assertions");
+    result
 }
 
 async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> {
@@ -46,71 +85,131 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
+    assert_eq!(versions, (1..=13).collect::<Vec<_>>());
+
+    assert_migration_one_checksum(&pool).await?;
+    assert_schema_objects(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn verify_production_upgrade(options: PgConnectOptions) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await?;
+    let migrator =
+        sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+            .await?;
+    let migration_one = migrator
+        .iter()
+        .find(|migration| migration.version == 1)
+        .expect("migration one is present");
     assert_eq!(
-        versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-        "fresh bootstrap applies canonical schema, CI runtime, world snapshot, bounded Check Run tombstone, reservation accounting, stale recovery, durable snapshot-GC, webhook-delivery, bounded build-retry, runtime bootstrap barrier, and cross-process build-admission slot migrations"
+        hex_string(migration_one.checksum.as_ref()),
+        PRODUCTION_MIGRATION_ONE_SHA384
     );
 
+    sqlx::raw_sql(include_str!("../migrations/0001_fresh_schema.sql"))
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time)
+         VALUES ($1, $2, true, $3, 0)",
+    )
+    .bind(migration_one.version)
+    .bind(migration_one.description.as_ref())
+    .bind(migration_one.checksum.as_ref())
+    .execute(&pool)
+    .await?;
+
+    kurbis_hoster::db::migrate(&pool).await?;
+    assert_migration_one_checksum(&pool).await?;
+    assert_schema_objects(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn assert_migration_one_checksum(pool: &PgPool) -> anyhow::Result<()> {
+    let checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1 AND success")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(hex_string(&checksum), PRODUCTION_MIGRATION_ONE_SHA384);
+    Ok(())
+}
+
+async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
     let snapshot_gc_table: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables
          WHERE table_schema='public' AND table_name='ci_world_snapshot_gc')",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
-    assert!(
-        snapshot_gc_table,
-        "superseded CI checkpoints have durable GC ownership"
-    );
+    assert!(snapshot_gc_table);
+
+    let expected_tables = [
+        "worker_snapshot_hints",
+        "operator_entries",
+        "server_known_players",
+        "console_commands",
+    ];
+    for table in expected_tables {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = $1)",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        assert!(present, "expected migrated table {table}");
+    }
 
     let forbidden: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables
          WHERE table_schema IN ('public', 'worker_auth')
            AND table_name IN ('worker_snapshot_cache', 'credentials')",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
-    assert_eq!(
-        forbidden, 0,
-        "legacy worker DB credential/cache tables must be absent"
-    );
-
-    let local_snapshot_hints: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM information_schema.tables
-         WHERE table_schema = 'public' AND table_name = 'worker_snapshot_hints')",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert!(
-        local_snapshot_hints,
-        "the control plane owns generation-scoped worker cache hints"
-    );
+    assert_eq!(forbidden, 0);
 
     let worker_auth_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname='worker_auth')")
-            .fetch_one(&pool)
+            .fetch_one(pool)
             .await?;
-    assert!(
-        !worker_auth_schema,
-        "worker database role schema must not be created"
-    );
+    assert!(!worker_auth_schema);
+
     let role_column: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns
          WHERE table_schema='public' AND table_name='worker_credentials' AND column_name='database_role')",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
-    assert!(
-        !role_column,
-        "worker API credentials cannot carry a PostgreSQL principal"
-    );
+    assert!(!role_column);
 
     let lease_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
          WHERE table_schema='public' AND table_name='worker_credentials'
            AND column_name IN ('worker_id', 'api_token_hash', 'lease_id', 'lease_expires_at', 'revoked_at')",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
     assert_eq!(lease_columns, 5);
 
@@ -118,25 +217,17 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
          WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
-    assert_eq!(
-        rls_tables, 0,
-        "worker isolation must be enforced by the control-plane API"
-    );
+    assert_eq!(rls_tables, 0);
 
     let grant_expiry_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
          WHERE table_schema='public' AND table_name IN ('server_session_grants', 'server_sessions')
            AND column_name='expires_at'",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await?;
-    assert_eq!(
-        grant_expiry_columns, 0,
-        "server-scoped browser grants are permanent until explicit revoke"
-    );
-
-    pool.close().await;
+    assert_eq!(grant_expiry_columns, 0);
     Ok(())
 }
