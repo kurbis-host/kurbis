@@ -172,9 +172,11 @@ impl BubblewrapBuildRuntime {
         if toolchain_version.trim().is_empty() {
             return Err(sandbox_error("toolchain identity cannot be empty"));
         }
-        let identity = format!(
+        let full_identity = format!(
             "{BUBBLEWRAP_GUARANTEE};bwrap={bwrap_version};bwrap_blake3={bwrap_digest};rootfs={rootfs_manifest};toolchain={toolchain_manifest};source_preparer_blake3={source_preparer_digest};rust={toolchain_version}"
         );
+        let identity =
+            super::bounded_build_identity(BUBBLEWRAP_GUARANTEE, &full_identity, &toolchain_version);
         Ok(Self {
             bwrap,
             rootfs,
