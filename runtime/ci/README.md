@@ -189,3 +189,47 @@ mount `/var/run/docker.sock`, use rootful Compose, or send GitHub credentials to
 the builder. `CI_BUILDER_SSH_TARGET` is a single host target, and all
 `CI_BUBBLEWRAP_*` paths are remote builder paths. The helper removes its unique
 workspace in a `finally` path after every job.
+
+### Persistent operator configuration
+
+The deployment must persist the operator values outside the checkout and inject
+them through the service's real deployment environment. On lxhalle, keep the
+non-secret configuration at `$HOME/.config/kurbis/ci-bubblewrap/env` (mode `0600`)
+and keep immutable fixtures on a user-owned local filesystem, for example
+`/var/tmp/kurbis-ci-bubblewrap-20261007` (mode `0700`). The accepted fixture
+uses `/usr/bin/bwrap`, a rootfs and Rust 1.98.1 toolchain under that staging
+root, the checked-in source preparer, and the private HOME workspace
+`$HOME/.cache/kurbis/ci/workspace-tmpfs`. `$HOME` on lxhalle is NFS; therefore
+that workspace path is only the operator namespace anchor. The runner mounts an
+exact `size=5G,nr_inodes=1310720,mode=700` tmpfs over each per-job workspace
+inside its private user/mount namespace. Do not place source, artifacts, or
+Cargo state in bare public `/tmp`; any local staging path must be a dedicated
+mode-0700 operator directory with private files. The `/var/tmp` path above is
+only that private immutable fixture root, never the host-wide directory itself.
+
+On respond5, store the deployment-only SSH material at
+`/etc/dokploy/secrets/kurbis-hoster/ci-builder-ssh` with directory mode `0700`,
+files mode `0600`, and ownership `65532:65532` so the unprivileged
+control-plane can read it after a read-only bind mount. The directory contains a
+dedicated `id_ed25519`, a `config` with `IdentitiesOnly=yes`,
+`BatchMode=yes`, and `StrictHostKeyChecking=yes`, and a `known_hosts` file
+containing only the pinned lxhalle Ed25519 key. The corresponding public key is
+installed in the `ci` account with forwarding and TTY disabled. Set
+`CI_BUILDER_SSH_HOST_DIRECTORY` to this host path and set the
+`CI_BUBBLEWRAP_*` variables to the absolute lxhalle paths above in Dokploy's
+service environment; never commit either the private key or a PAT.
+
+This is deliberately **namespace-only**. The preflight proves user/PID/mount/IPC/
+UTS/network isolation, read-only root and toolchain inputs, dropped
+capabilities, `NoNewPrivs`, no route, and the exact namespace-local workspace
+tmpfs. lxhalle does not delegate per-build cgroup controllers, so this backend
+must not claim hard CPU, memory, swap, or PID limits. Cross-process admission
+and process timeouts remain coordination controls, not kernel cgroup quotas.
+If any immutable path, pinned host key, workspace contract, or toolchain probe
+is missing, startup fails closed; it never falls back to Docker or rootful
+execution.
+
+To roll back only this operator setup, stop the deployment before unmounting
+its read-only SSH directory, then remove the named lxhalle fixture/config paths
+and the respond5 secret directory. Do not remove unrelated Docker resources or
+edit `/etc/docker`, system services, or rootful production sockets.

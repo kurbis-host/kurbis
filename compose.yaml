@@ -17,6 +17,13 @@ x-control-plane-environment: &control-plane-environment
   CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE:-}
   CI_TOOLCHAIN_VERSION: ${CI_TOOLCHAIN_VERSION:-1.98.1}
   CI_BUILDER_DOCKER_HOST: ${CI_BUILDER_DOCKER_HOST:-}
+  CI_BUILDER_SSH_TARGET: ${CI_BUILDER_SSH_TARGET:-}
+  CI_BUBBLEWRAP_PATH: ${CI_BUBBLEWRAP_PATH:-}
+  CI_BUBBLEWRAP_ROOTFS: ${CI_BUBBLEWRAP_ROOTFS:-}
+  CI_BUBBLEWRAP_TOOLCHAIN: ${CI_BUBBLEWRAP_TOOLCHAIN:-}
+  CI_BUBBLEWRAP_WORKSPACE: ${CI_BUBBLEWRAP_WORKSPACE:-}
+  CI_BUBBLEWRAP_SOURCE_PREPARER: ${CI_BUBBLEWRAP_SOURCE_PREPARER:-}
+  CI_BUBBLEWRAP_RUNNER: ${CI_BUBBLEWRAP_RUNNER:-}
   CI_BUILD_CONCURRENCY: ${CI_BUILD_CONCURRENCY:-2}
   CI_PLUGIN_SOURCE: /opt/kurbis/plugins/kurbis-control
   CI_INTEGRATION_SOURCE_ROOT: /opt/kurbis
@@ -63,7 +70,10 @@ services:
     environment: *control-plane-environment
     volumes:
       - object-store:/var/lib/kurbis/object-store
-      - ./deployment/ci-builder-ssh:/home/kurbis/.ssh:ro
+      # The deployment supplies a root-owned, mode-0700 host directory whose
+      # files are owned by UID 65532. Keep the default checkout path for local
+      # development, but never bake a private key into the repository.
+      - ${CI_BUILDER_SSH_HOST_DIRECTORY:-./deployment/ci-builder-ssh}:/home/kurbis/.ssh:ro
     ports:
       - 127.0.0.1:${CONTROL_PLANE_PORT:-18080}:8080
     depends_on:
