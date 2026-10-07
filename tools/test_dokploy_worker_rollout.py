@@ -832,6 +832,7 @@ class RolloutTests(unittest.TestCase):
             control_environment = services["control-plane"]["environment"]
             self.assertEqual(control_environment["CI_REPOSITORY"],"Pumpkin-MC/Pumpkin")
             self.assertEqual(control_environment["CI_GITHUB_API_BASE_URL"],"https://api.github.com")
+            self.assertNotIn("CI_GITHUB_WEBHOOK_SECRET", control_environment)
             for key in ("CI_GITHUB_PAT", "CI_GITHUB_WEBHOOK_ENABLED", "CI_DEFAULT_BRANCH", "CI_BUILDER_BACKEND",
                         "CI_BUILDER_SSH_TARGET", "CI_BUBBLEWRAP_RUNNER", "CI_BUBBLEWRAP_PATH",
                         "CI_BUBBLEWRAP_ROOTFS", "CI_BUBBLEWRAP_TOOLCHAIN", "CI_BUBBLEWRAP_WORKSPACE",
