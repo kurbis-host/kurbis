@@ -2179,3 +2179,247 @@ async fn exhausted_transient_retry_budget_stays_terminal_after_build_expiry() {
     );
     pool.close().await;
 }
+
+#[derive(Clone, Default)]
+struct Pr3865GithubFixture {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn pr3865_github_api(
+    axum::extract::State(fixture): axum::extract::State<Pr3865GithubFixture>,
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    fixture
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{path}?{query}"));
+
+    if path.ends_with("/pulls") && query.contains("page=1") {
+        if request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            == Some("pr3865-v1")
+        {
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::NOT_MODIFIED)
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::ETAG, "pr3865-v1")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!([{
+                    "number": 3865,
+                    "state": "open",
+                    "updated_at": "2026-10-08T00:00:00Z",
+                    "head": {
+                        "sha": "c80f6fd0123456789abcdef0123456789abcdef0",
+                        "repository": {"full_name": "contributor/Pumpkin"}
+                    }
+                }])
+                .to_string(),
+            ))
+            .unwrap();
+    }
+    if path.ends_with("/pulls") || path.ends_with("/branches") {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("[]"))
+            .unwrap();
+    }
+    if path.contains("/tarball/") {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .body(axum::body::Body::from("fixture-pr-3865-source"))
+            .unwrap();
+    }
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::NOT_FOUND)
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded_remote_identity() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::execution::SshBubblewrapBuildRuntime;
+    use kurbis_hoster::ci::{
+        CiPoller, CiPollerConfig, ControlledBuildPipeline, GitHubSourceControl, SandboxLimits,
+    };
+    use kurbis_hoster::routing::RouteRepository;
+    use reqwest::Client;
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = "Pumpkin-MC/Pumpkin";
+    let watched = repository
+        .register_repository(repository_name, "master")
+        .await
+        .unwrap();
+    let fixture = Pr3865GithubFixture::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn({
+        let fixture = fixture.clone();
+        async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .fallback(axum::routing::any(pr3865_github_api))
+                    .with_state(fixture),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let api_base = format!("http://{address}");
+    let source = std::sync::Arc::new(
+        GitHubSourceControl::new(Client::new(), "fixture-token")
+            .unwrap()
+            .with_api_base_url(api_base),
+    );
+
+    // The old remote Bubblewrap identity embedded all operator paths and could
+    // exceed ci_builds.toolchain_version's 255-byte constraint. Use deliberately
+    // long local fixture paths so this test fails if that unbounded identity is
+    // ever passed back into BuildKey again.
+    let path_suffix = "x".repeat(160);
+    let remote = SshBubblewrapBuildRuntime::new(
+        pool.clone(),
+        "ci@127.0.0.1",
+        format!("/home/ci/{path_suffix}/runner.py"),
+        format!("/opt/ci/{path_suffix}/bubblewrap"),
+        format!("/opt/ci/{path_suffix}/rootfs"),
+        format!("/opt/ci/{path_suffix}/toolchain"),
+        format!("/home/ci/{path_suffix}/workspace"),
+        format!("/opt/ci/{path_suffix}/source-preparer"),
+        "1.98.1",
+        1,
+    )
+    .unwrap();
+    let remote_identity = remote.build_identity().to_owned();
+    assert!(remote_identity.len() <= 255);
+    assert!(remote_identity.contains("identity_sha256="));
+
+    let root_domain = unique_ci_root_domain();
+    let components = std::sync::Arc::new(TestBuildComponents::default());
+    let check_runs = std::sync::Arc::new(PermissionDeniedCheckRuns {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let builder = std::sync::Arc::new(
+        ControlledBuildPipeline::new(
+            repository.clone(),
+            source.clone(),
+            components.clone(),
+            components.clone(),
+            std::sync::Arc::new(TestArtifactCache),
+            SandboxLimits {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                cpu_millis: 1000,
+                pid_limit: 512,
+                disk_bytes: 5 * 1024 * 1024 * 1024,
+                process_timeout: std::time::Duration::from_secs(3600),
+            },
+        )
+        .with_check_runs(check_runs.clone())
+        .with_root_domain(root_domain.clone()),
+    );
+    let poller = CiPoller::new(repository.clone(), source)
+        .with_config(CiPollerConfig {
+            root_domain: root_domain.clone(),
+            patch_fingerprint: "patch-v1".into(),
+            toolchain_version: remote_identity,
+            target_architecture: "x86_64-linux".into(),
+            public_status_base_url: None,
+        })
+        .with_check_runs(check_runs.clone())
+        .with_builder(builder);
+
+    poller.poll_once(watched.id).await.unwrap();
+    // A periodic poll gets a 304 and still performs the unconditional page-one
+    // refetch; the durable rows must remain idempotent and ready.
+    poller.poll_once(watched.id).await.unwrap();
+
+    let head_sha = "c80f6fd0123456789abcdef0123456789abcdef0";
+    let ref_row: (String, String) = sqlx::query_as(
+        "SELECT kind, commit_sha FROM ci_refs WHERE repository_id = $1 AND name = 'pr-3865'",
+    )
+    .bind(watched.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ref_row, ("pull_request".into(), head_sha.into()));
+    let build_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT stage, artifact_digest FROM ci_builds WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(repository_name)
+    .bind(head_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(build_row.0, "ready");
+    assert!(
+        build_row.1.is_some(),
+        "a ready PR build must publish an artifact"
+    );
+    let build_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_builds WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(repository_name)
+    .bind(head_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let alias_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_preview_aliases WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(repository_name)
+    .bind(head_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(build_count, 1);
+    assert_eq!(
+        alias_count, 2,
+        "immutable commit and stable PR aliases are both durable"
+    );
+    let alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-3865", &root_domain).unwrap();
+    let preview = repository
+        .lookup_preview(&alias.value)
+        .await
+        .unwrap()
+        .expect("PR stable alias is durable after a successful build");
+    assert_eq!(preview.commit_sha, head_sha);
+    assert_eq!(preview.state, kurbis_hoster::ci::CiPreviewState::Ready);
+    let route = RouteRepository::new(pool.clone(), "kurbis.host")
+        .resolve_ci_hostname(&alias.value, &root_domain)
+        .await
+        .unwrap()
+        .expect("gateway resolves the persisted PR alias");
+    assert_eq!(route.preview_id, preview.id);
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(check_runs.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("/pulls?") && request.contains("page=1"))
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    pool.close().await;
+}
