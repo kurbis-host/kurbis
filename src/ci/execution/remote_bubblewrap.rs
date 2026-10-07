@@ -41,6 +41,8 @@ pub struct SshBubblewrapBuildRuntime {
     toolchain: String,
     workspace_root: String,
     source_preparer: String,
+    compiler_cache_root: String,
+    compiler_cache_size: u64,
     rustc_version: String,
     identity: String,
     admission: BuildAdmissionCoordinator,
@@ -86,6 +88,17 @@ impl SshBubblewrapBuildRuntime {
         let toolchain = toolchain.into();
         let workspace_root = workspace_root.into();
         let source_preparer = source_preparer.into();
+        let compiler_cache_root = std::path::Path::new(&workspace_root)
+            .parent()
+            .ok_or_else(|| {
+                BuildPipelineError::Sandbox("remote Bubblewrap workspace has no parent".into())
+            })?
+            .join("compiler-cache")
+            .display()
+            .to_string();
+        let compiler_cache_size = super::cache::configured_cache_size().map_err(|error| {
+            BuildPipelineError::Sandbox(format!("configure compiler cache size: {error}"))
+        })?;
         for (name, value) in [
             ("bwrap", &bwrap),
             ("rootfs", &rootfs),
@@ -122,6 +135,8 @@ impl SshBubblewrapBuildRuntime {
             toolchain,
             workspace_root,
             source_preparer,
+            compiler_cache_root,
+            compiler_cache_size,
             rustc_version,
             identity,
             admission,
@@ -203,6 +218,8 @@ impl SshBubblewrapBuildRuntime {
             rootfs: self.rootfs.clone(),
             toolchain: self.toolchain.clone(),
             source_preparer: self.source_preparer.clone(),
+            cache_root: self.compiler_cache_root.clone(),
+            cache_max_bytes: self.compiler_cache_size,
             source_len: source.len(),
             plugin_len: plugin.len(),
             timeout_seconds: limits.process_timeout.as_secs().clamp(1, 90 * 60),
@@ -479,6 +496,8 @@ struct JobHeader {
     rootfs: String,
     toolchain: String,
     source_preparer: String,
+    cache_root: String,
+    cache_max_bytes: u64,
     source_len: usize,
     plugin_len: usize,
     timeout_seconds: u64,

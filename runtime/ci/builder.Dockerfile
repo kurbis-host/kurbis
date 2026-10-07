@@ -5,6 +5,7 @@ ARG RUST_TOOLCHAIN=1.98.1
 FROM rust:1.98-bookworm
 ARG RUST_TOOLCHAIN
 ARG PUMPKIN_REVISION=204a94ed895f041a845630d5a23c094705a0704e
+ARG SCCACHE_VERSION=0.10.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -13,6 +14,14 @@ RUN apt-get update \
     && rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
     && rustup default "${RUST_TOOLCHAIN}" \
     && rustup target add wasm32-wasip2
+
+# sccache is optional at runtime but is part of the trusted image so every
+# build uses the same pinned compiler-cache implementation. The runtime only
+# enables its local disk backend; no remote cache credentials or network are
+# ever present in a build container.
+RUN cargo install --locked --version "${SCCACHE_VERSION}" sccache --root /opt/sccache \
+    && install -m 0755 /opt/sccache/bin/sccache /usr/local/bin/sccache \
+    && rm -rf /opt/sccache
 
 ENV CARGO_HOME=/usr/local/cargo \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \

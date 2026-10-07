@@ -64,6 +64,7 @@ mod admission;
 mod archive;
 mod bubblewrap;
 mod builder;
+mod cache;
 mod patcher;
 mod production;
 mod remote_bubblewrap;

@@ -182,6 +182,10 @@ fn release_compile_script_bounds_parallelism_and_debug_memory_without_trimming_f
         "CARGO_PROFILE_RELEASE_STRIP",
         "--package pumpkin --bin pumpkin",
         "--offline",
+        "RUSTC_WRAPPER=sccache",
+        "SCCACHE_CACHE_SIZE",
+        "build_cache=sccache_error_retry_without_cache",
+        "build_elapsed_seconds",
     ] {
         assert!(
             BUILD_SCRIPT.contains(setting),
