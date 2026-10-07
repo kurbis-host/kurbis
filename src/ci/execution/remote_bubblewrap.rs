@@ -15,14 +15,15 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    sync::Semaphore,
     time::timeout,
 };
 
 use super::{
+    admission::{AbandonedBuildCleaner, BuildAdmissionCoordinator, HostMemoryProbe},
     archive::{MAX_ARTIFACT_BYTES, MAX_COMPRESSED_SOURCE_BYTES},
     builder::{BuildProcessReport, RootlessBuildRuntime},
 };
@@ -42,12 +43,13 @@ pub struct SshBubblewrapBuildRuntime {
     source_preparer: String,
     rustc_version: String,
     identity: String,
-    slots: Arc<Semaphore>,
+    admission: BuildAdmissionCoordinator,
 }
 
 impl SshBubblewrapBuildRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        pool: PgPool,
         target: impl Into<String>,
         runner: impl Into<PathBuf>,
         bwrap: impl Into<String>,
@@ -94,11 +96,24 @@ impl SshBubblewrapBuildRuntime {
             crate::config::validate_ci_remote_path(value, &format!("remote Bubblewrap {name}"))
                 .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         }
-        let slots = usize::from(concurrency.max(1));
         let identity = format!(
             "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};rust={rustc_version}",
             runner.display()
         );
+        let admission_identity = format!("bubblewrap_ssh:{identity}");
+        let admission = BuildAdmissionCoordinator::for_builder(
+            pool,
+            admission_identity,
+            Arc::new(RemoteHostMemoryProbe {
+                target: target.clone(),
+            }),
+            Arc::new(RemoteWorkspaceCleaner {
+                target: target.clone(),
+                workspace_root: workspace_root.clone(),
+            }),
+        )
+        .with_concurrency(usize::from(concurrency))
+        .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         Ok(Self {
             target,
             runner,
@@ -109,7 +124,7 @@ impl SshBubblewrapBuildRuntime {
             source_preparer,
             rustc_version,
             identity,
-            slots: Arc::new(Semaphore::new(slots)),
+            admission,
         })
     }
 
@@ -117,7 +132,7 @@ impl SshBubblewrapBuildRuntime {
         &self.identity
     }
 
-    fn command(&self) -> Command {
+    fn ssh_command(&self) -> Command {
         let mut command = Command::new("ssh");
         command.args([
             "-o",
@@ -137,14 +152,22 @@ impl SshBubblewrapBuildRuntime {
             &self.target,
         ]);
         command
+    }
+
+    fn command(&self) -> Command {
+        let mut command = self.ssh_command();
+        command
             .args(["unshare", "-Urnm", "python3"])
             .arg(&self.runner);
         command
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_job(
         &self,
         mode: &str,
+        job_id: &str,
+        lease: &super::admission::BuildAdmissionLease,
         source: &[u8],
         plugin: &[u8],
         target: &str,
@@ -166,11 +189,13 @@ impl SshBubblewrapBuildRuntime {
                 "remote Rust target is invalid",
             ));
         }
-        let job_id = uuid::Uuid::new_v4().simple().to_string();
+        lease
+            .assert_alive()
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let header = JobHeader {
             version: 1,
             mode: mode.to_owned(),
-            job_id,
+            job_id: job_id.to_owned(),
             target: target.to_owned(),
             rustc: self.rustc_version.clone(),
             workspace_root: self.workspace_root.clone(),
@@ -268,6 +293,9 @@ impl SshBubblewrapBuildRuntime {
                 format!("decode remote Bubblewrap result: {e}"),
             )
         })?;
+        lease
+            .assert_alive()
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let mut build_report = BuildProcessReport {
             stdout: result.stdout,
             stderr: result.stderr,
@@ -476,21 +504,30 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
     fn toolchain_version(&self) -> &str {
         &self.identity
     }
+
     async fn verify_sandbox(&self, limits: SandboxLimits) -> Result<(), BuildPipelineError> {
-        let _permit = self.slots.acquire().await.map_err(|_| {
-            BuildPipelineError::Sandbox("remote Bubblewrap semaphore closed".into())
-        })?;
-        self.run_job(
-            "preflight",
-            &[],
-            &[],
-            "x86_64-unknown-linux-gnu",
-            limits,
-            None,
-        )
-        .await
-        .map(|_| ())
+        let lease = self
+            .admission
+            .acquire(limits.memory_bytes)
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let token = lease.token();
+        let result = self
+            .run_job(
+                "preflight",
+                &token,
+                &lease,
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                limits,
+                None,
+            )
+            .await;
+        lease.release().await;
+        result.map(|_| ())
     }
+
     async fn compile(
         &self,
         source_archive: &[u8],
@@ -499,17 +536,141 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
         target: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
-        let _permit = self.slots.acquire().await.map_err(|_| {
-            BuildPipelineError::Sandbox("remote Bubblewrap semaphore closed".into())
-        })?;
-        self.run_job(
-            "compile",
-            source_archive,
-            plugin_archive,
-            target,
-            limits,
-            Some(output_dir),
-        )
-        .await
+        let lease = self
+            .admission
+            .acquire(limits.memory_bytes)
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let token = lease.token();
+        let result = self
+            .run_job(
+                "compile",
+                &token,
+                &lease,
+                source_archive,
+                plugin_archive,
+                target,
+                limits,
+                Some(output_dir),
+            )
+            .await;
+        lease.release().await;
+        result
     }
+}
+
+struct RemoteHostMemoryProbe {
+    target: String,
+}
+
+#[async_trait]
+impl HostMemoryProbe for RemoteHostMemoryProbe {
+    async fn snapshot(
+        &self,
+    ) -> Result<super::admission::HostMemorySnapshot, super::admission::BuildAdmissionError> {
+        let mut command = ssh_base_command(&self.target);
+        let output = command
+            .args(["cat", "/proc/meminfo"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        let output = timeout(Duration::from_secs(30), output)
+            .await
+            .map_err(|_| {
+                super::admission::BuildAdmissionError::Unavailable(
+                    "remote Bubblewrap host memory probe timed out".into(),
+                )
+            })?
+            .map_err(|error| {
+                super::admission::BuildAdmissionError::Unavailable(format!(
+                    "remote Bubblewrap host memory probe: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(super::admission::BuildAdmissionError::Unavailable(format!(
+                "remote Bubblewrap host memory probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        super::admission::parse_meminfo(&String::from_utf8_lossy(&output.stdout)).map_err(|error| {
+            super::admission::BuildAdmissionError::Unavailable(format!(
+                "remote Bubblewrap host memory probe returned invalid data: {error}"
+            ))
+        })
+    }
+}
+
+struct RemoteWorkspaceCleaner {
+    target: String,
+    workspace_root: String,
+}
+
+#[async_trait]
+impl AbandonedBuildCleaner for RemoteWorkspaceCleaner {
+    async fn remove_lease(
+        &self,
+        lease_token: &str,
+    ) -> Result<(), super::admission::BuildAdmissionError> {
+        if lease_token.len() != 32 || !lease_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(super::admission::BuildAdmissionError::Unavailable(
+                "remote Bubblewrap lease token is malformed".into(),
+            ));
+        }
+        let workspace = format!(
+            "{}/kurbis-bwrap-remote-{lease_token}",
+            self.workspace_root.trim_end_matches('/')
+        );
+        let mut command = ssh_base_command(&self.target);
+        let output = command
+            .args(["rm", "-rf", "--", &workspace])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        let output = timeout(Duration::from_secs(30), output)
+            .await
+            .map_err(|_| {
+                super::admission::BuildAdmissionError::Unavailable(
+                    "remote Bubblewrap workspace cleanup timed out".into(),
+                )
+            })?
+            .map_err(|error| {
+                super::admission::BuildAdmissionError::Unavailable(format!(
+                    "remote Bubblewrap workspace cleanup: {error}"
+                ))
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(super::admission::BuildAdmissionError::Unavailable(format!(
+                "remote Bubblewrap workspace cleanup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
+    }
+}
+
+fn ssh_base_command(target: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-T",
+        "--",
+        target,
+    ]);
+    command
 }

@@ -9,7 +9,7 @@ x-control-plane-environment: &control-plane-environment
   CI_GITHUB_PAT: ${CI_GITHUB_PAT:-}
   CI_GITHUB_WEBHOOK_ENABLED: ${CI_GITHUB_WEBHOOK_ENABLED:-false}
   CI_GITHUB_WEBHOOK_SECRET: ${CI_GITHUB_WEBHOOK_SECRET:-}
-  CI_DEFAULT_BRANCH: ${CI_DEFAULT_BRANCH:-main}
+  CI_DEFAULT_BRANCH: ${CI_DEFAULT_BRANCH:-master}
   # Docker is the default Compose builder. bubblewrap_ssh is also supported: it
   # delegates only the isolated build job over SSH and keeps the watcher, cache,
   # and worker on this rootless stack; native bubblewrap fixtures are never mounted.

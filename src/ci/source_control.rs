@@ -759,7 +759,7 @@ mod http_tests {
             .with_page_limits(1, 4);
         assert_eq!(
             client
-                .pull_request_commits("kurbis-host/Pumpkin", 314)
+                .pull_request_commits("Pumpkin-MC/Pumpkin", 314)
                 .await
                 .unwrap(),
             vec!["0123456789abcdef0123456789abcdef01234567"]
@@ -767,7 +767,7 @@ mod http_tests {
         assert_eq!(
             client
                 .commit_range(
-                    "kurbis-host/Pumpkin",
+                    "Pumpkin-MC/Pumpkin",
                     "0123456789abcdef0123456789abcdef01234567",
                     "fedcba9876543210fedcba9876543210fedcba98",
                 )

@@ -161,15 +161,15 @@ for example `$HOME/.cache/kurbis/ci/workspace-tmpfs`, with exactly
 size, or a different inode limit. Compile and patch workloads always use this
 fixed 5 GiB workspace contract; any custom disk limit is rejected. Build
 input/output files remain separately bounded and are copied with counted reads.
-The native `bubblewrap` backend and Docker backend use `CI_BUILD_CONCURRENCY`
-(bounded to 1-64) for cross-process PostgreSQL slot admission; each slot
-reserves its requested memory plus host system headroom. The remote
-`bubblewrap_ssh` transport currently uses only an in-process semaphore on the
-respond5 coordinator, so that setting is not a host-wide resource fence across
-independent control-plane processes or other SSH clients. Treat remote
-namespace-only builds as single-admission operational capacity until a
-remote-side shared admission coordinator is provisioned; do not describe them
-as memory-, CPU-, or PID-enforced.
+The native `bubblewrap` backend, Docker backend, and remote `bubblewrap_ssh`
+transport use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process
+PostgreSQL slot admission; each slot reserves its requested memory plus host
+system headroom. The SSH transport samples `/proc/meminfo` on lxhalle through
+the pinned SSH connection and fences stale per-job workspaces by lease token,
+so independent control-plane processes share the same admission identity.
+This is coordination and cleanup, not kernel cgroup enforcement: remote
+namespace-only builds still must not be described as memory-, CPU-, or PID-
+enforced.
 
 ## Remote Bubblewrap mode (respond5 watcher → lxhalle builder)
 

@@ -167,6 +167,7 @@ where
     A: ArtifactCache + 'static,
 {
     let runtime = Arc::new(SshBubblewrapBuildRuntime::new(
+        repository.pool(),
         ssh_target,
         runner,
         bwrap,
