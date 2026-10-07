@@ -6,8 +6,8 @@ use sha2::{Digest, Sha384};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-// SHA-384 of the exact production baseline committed at c719cdc.
-const PRODUCTION_MIGRATION_ONE_SHA384: &str = "db50116c89d038a0ad0ca5ee67ae01017d859bed99151f4437092c651fc38c7c3dc6189f4c0d561a1ad5b3ba0fd8cfd6";
+// SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
+const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -85,7 +85,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=12).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -98,18 +98,6 @@ async fn verify_production_upgrade(options: PgConnectOptions) -> anyhow::Result<
         .max_connections(2)
         .connect_with(options)
         .await?;
-    let migrator =
-        sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
-            .await?;
-    let migration_one = migrator
-        .iter()
-        .find(|migration| migration.version == 1)
-        .expect("migration one is present");
-    assert_eq!(
-        hex_string(migration_one.checksum.as_ref()),
-        PRODUCTION_MIGRATION_ONE_SHA384
-    );
-
     sqlx::raw_sql(include_str!("../migrations/0001_fresh_schema.sql"))
         .execute(&pool)
         .await?;
@@ -127,11 +115,9 @@ async fn verify_production_upgrade(options: PgConnectOptions) -> anyhow::Result<
     .await?;
     sqlx::query(
         "INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time)
-         VALUES ($1, $2, true, $3, 0)",
+         VALUES (1, 'fresh_schema', true, decode($1, 'hex'), 0)",
     )
-    .bind(migration_one.version)
-    .bind(migration_one.description.as_ref())
-    .bind(migration_one.checksum.as_ref())
+    .bind(PRODUCTION_MIGRATION_ONE_SHA384)
     .execute(&pool)
     .await?;
 

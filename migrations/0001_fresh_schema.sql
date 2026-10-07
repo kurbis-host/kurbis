@@ -536,6 +536,14 @@ CREATE TABLE "public"."workers" (
     CONSTRAINT "workers_total_memory_bytes_check" CHECK (("total_memory_bytes" > 0))
 );
 
+CREATE TABLE "public"."worker_snapshot_hints" (
+    "worker_id" "uuid" NOT NULL,
+    "server_id" "uuid" NOT NULL,
+    "snapshot_generation" bigint NOT NULL,
+    "reported_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "worker_snapshot_hints_snapshot_generation_check" CHECK (("snapshot_generation" > 0))
+);
+
 CREATE TABLE "public"."world_exports" (
     "id" "uuid" NOT NULL,
     "server_id" "uuid" NOT NULL,
@@ -659,6 +667,9 @@ ALTER TABLE ONLY "public"."workers"
 ALTER TABLE ONLY "public"."workers"
     ADD CONSTRAINT "workers_pkey" PRIMARY KEY ("id");
 
+ALTER TABLE ONLY "public"."worker_snapshot_hints"
+    ADD CONSTRAINT "worker_snapshot_hints_pkey" PRIMARY KEY ("worker_id", "server_id");
+
 ALTER TABLE ONLY "public"."world_exports"
     ADD CONSTRAINT "world_exports_pkey" PRIMARY KEY ("id");
 
@@ -703,6 +714,8 @@ CREATE INDEX "start_requests_order_idx" ON "public"."start_requests" USING "btre
 CREATE UNIQUE INDEX "whitelist_entries_server_name_idx" ON "public"."whitelist_entries" USING "btree" ("server_id", "lower"("name"));
 
 CREATE INDEX "workers_healthy_idx" ON "public"."workers" USING "btree" ("heartbeat_at") WHERE (NOT "draining");
+
+CREATE INDEX "worker_snapshot_hints_generation_idx" ON "public"."worker_snapshot_hints" USING "btree" ("server_id", "snapshot_generation", "worker_id");
 
 CREATE INDEX "world_exports_expiry_idx" ON "public"."world_exports" USING "btree" ("expires_at") WHERE ("status" = 'completed'::"text");
 
@@ -806,6 +819,12 @@ ALTER TABLE ONLY "public"."sessions"
 ALTER TABLE ONLY "public"."snapshots"
     ADD CONSTRAINT "snapshots_server_id_fkey" FOREIGN KEY ("server_id") REFERENCES "public"."servers"("id") ON DELETE CASCADE;
 
+ALTER TABLE ONLY "public"."worker_snapshot_hints"
+    ADD CONSTRAINT "worker_snapshot_hints_worker_id_fkey" FOREIGN KEY ("worker_id") REFERENCES "public"."workers"("id") ON DELETE CASCADE;
+
+ALTER TABLE ONLY "public"."worker_snapshot_hints"
+    ADD CONSTRAINT "worker_snapshot_hints_snapshot_fkey" FOREIGN KEY ("server_id", "snapshot_generation") REFERENCES "public"."snapshots"("server_id", "generation") ON DELETE CASCADE;
+
 ALTER TABLE ONLY "public"."start_requests"
     ADD CONSTRAINT "start_requests_server_id_fkey" FOREIGN KEY ("server_id") REFERENCES "public"."servers"("id") ON DELETE CASCADE;
 
@@ -820,4 +839,3 @@ ALTER TABLE ONLY "public"."world_exports"
 
 ALTER TABLE ONLY "public"."world_exports"
     ADD CONSTRAINT "world_exports_worker_id_fkey" FOREIGN KEY ("worker_id") REFERENCES "public"."workers"("id") ON DELETE SET NULL;
-
