@@ -535,17 +535,58 @@ class RolloutTests(unittest.TestCase):
             if update == {"command": "absent"}:
                 value.pop("command")
             def fake_api(endpoint, params):
-                return value if endpoint == "compose.one" else default
+                if endpoint == "compose.one":
+                    return value
+                if endpoint == "patch.byEntityId":
+                    return []
+                return default
             with self.subTest(update=update), patch.object(deploy, "api", side_effect=fake_api), self.assertRaises(deploy.DeploymentError):
                 deploy.compose_info()
         def safe_api(endpoint, params):
-            return base if endpoint == "compose.one" else default
+            if endpoint == "compose.one":
+                return base
+            if endpoint == "patch.byEntityId":
+                return []
+            return default
         with patch.object(deploy, "api", side_effect=safe_api):
             self.assertEqual(deploy.compose_info()["composeType"], "docker-compose")
         custom_default = {**base, "command": default}
-        with patch.object(deploy, "api", side_effect=lambda endpoint, params: custom_default if endpoint == "compose.one" else default):
+        def custom_api(endpoint, params):
+            if endpoint == "compose.one":
+                return custom_default
+            if endpoint == "patch.byEntityId":
+                return []
+            return default
+        with patch.object(deploy, "api", side_effect=custom_api):
             with self.assertRaisesRegex(deploy.DeploymentError,"custom Compose command"):
                 deploy.compose_info()
+
+    def test_compose_info_rejects_enabled_compose_override_patch(self):
+        base = {"composeId": deploy.COMPOSE_ID, "appName": deploy.PROJECT, "sourceType": "github",
+                "owner": "kurbis-host", "repository": "kurbis", "branch": "main", "composePath": "./compose.yaml",
+                "environment": {"name": "production"}, "composeType": "docker-compose", "command": None,
+                "env": "", "autoDeploy": False}
+        def fake_api(endpoint, params):
+            if endpoint == "compose.one":
+                return base
+            if endpoint == "patch.byEntityId":
+                return [{"patchId": "stale-compose", "filePath": "compose.yaml", "enabled": True}]
+            return "docker compose up -d --build"
+        # A path spelling without the leading ./ is still the same source file.
+        def fake_api_normalized(endpoint, params):
+            if endpoint == "compose.one":
+                return base
+            if endpoint == "patch.byEntityId":
+                return [{"patchId": "stale-compose", "filePath": "./compose.yaml", "enabled": True}]
+            return "docker compose up -d --build"
+        with patch.object(deploy, "api", side_effect=fake_api_normalized), self.assertRaisesRegex(
+            deploy.DeploymentError, "enabled production Compose override"
+        ):
+            deploy.compose_info()
+        with patch.object(deploy, "api", side_effect=fake_api), self.assertRaisesRegex(
+            deploy.DeploymentError, "enabled production Compose override"
+        ):
+            deploy.compose_info()
 
     def test_compose_source_and_auto_deploy_policy_persist(self):
         state = {
@@ -563,6 +604,8 @@ class RolloutTests(unittest.TestCase):
                 return dict(state)
             if endpoint == "compose.getDefaultCommand":
                 return "docker compose up -d --build"
+            if endpoint == "patch.byEntityId":
+                return []
             if endpoint == "compose.update":
                 state["autoDeploy"] = params["autoDeploy"]
                 return {}
@@ -786,6 +829,17 @@ class RolloutTests(unittest.TestCase):
             gateway=services["gateway"]
             self.assertEqual(services["control-plane"]["build"]["args"]["BUILD_REVISION"],"a"*40)
             self.assertEqual(services["panel"]["ports"][0]["host_ip"],"127.0.0.1")
+            control_environment = services["control-plane"]["environment"]
+            self.assertEqual(control_environment["CI_REPOSITORY"],"Pumpkin-MC/Pumpkin")
+            self.assertEqual(control_environment["CI_GITHUB_API_BASE_URL"],"https://api.github.com")
+            for key in ("CI_GITHUB_PAT", "CI_GITHUB_WEBHOOK_ENABLED", "CI_DEFAULT_BRANCH", "CI_BUILDER_BACKEND",
+                        "CI_BUILDER_SSH_TARGET", "CI_BUBBLEWRAP_RUNNER", "CI_BUBBLEWRAP_PATH",
+                        "CI_BUBBLEWRAP_ROOTFS", "CI_BUBBLEWRAP_TOOLCHAIN", "CI_BUBBLEWRAP_WORKSPACE",
+                        "CI_BUBBLEWRAP_SOURCE_PREPARER", "CI_BUILD_CONCURRENCY"):
+                self.assertIn(key, control_environment)
+            self.assertTrue(any(v.get("target") == "/home/kurbis/.ssh" for v in services["control-plane"]["volumes"]))
+            self.assertEqual(gateway["environment"]["BEDROCK_PUBLIC_IP"],"203.0.113.10")
+            self.assertEqual(gateway["environment"]["JAVA_PUBLIC_PORT"],"25565")
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_CERT_FILE"],"/run/kurbis-tls/fullchain.pem")
             self.assertEqual(gateway["environment"]["BEDROCK_TLS_KEY_FILE"],"/run/kurbis-tls/privkey.pem")
             mount=next(v for v in gateway["volumes"] if v.get("target")=="/run/kurbis-tls")
