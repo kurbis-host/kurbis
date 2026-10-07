@@ -109,11 +109,16 @@ impl SshBubblewrapBuildRuntime {
             crate::config::validate_ci_remote_path(value, &format!("remote Bubblewrap {name}"))
                 .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         }
-        let identity = format!(
+        let full_identity = format!(
             "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};rust={rustc_version}",
             runner.display()
         );
-        let admission_identity = format!("bubblewrap_ssh:{identity}");
+        let identity = super::bounded_build_identity(
+            "bubblewrap_namespace_only;transport=ssh",
+            &full_identity,
+            &rustc_version,
+        );
+        let admission_identity = format!("bubblewrap_ssh:{full_identity}");
         let admission = BuildAdmissionCoordinator::for_builder(
             pool,
             admission_identity,

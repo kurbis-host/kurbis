@@ -1,7 +1,22 @@
 //! Trusted host-side preparation and isolated compilation for untrusted Pumpkin commits.
 
 use std::{env, fs, io, path::PathBuf};
+
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+/// Keep immutable builder identities within the database's 255-byte toolchain key limit.
+/// The full identity remains the input to this digest, so changing any operator-owned
+/// Bubblewrap executable, path, manifest, transport, or Rust release produces a new
+/// cache/admission identity without storing unbounded path text in `ci_builds`.
+pub(super) fn bounded_build_identity(
+    label: &str,
+    full_identity: &str,
+    rustc_version: &str,
+) -> String {
+    let digest = Sha256::digest(full_identity.as_bytes());
+    format!("{label};identity_sha256={digest:x};rust={rustc_version}")
+}
 
 /// Create a build-only temporary directory below the current user's private home.
 /// Remote builders must never spill source, patches, or artifacts into a shared
