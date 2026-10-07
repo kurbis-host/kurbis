@@ -7,8 +7,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::{
-    BuildKey, CheckRunClient, CheckRunDetails, CiBuildStage, CiHostname, CiPreviewRepository,
-    CiRefKind,
+    BuildKey, CheckRunClient, CheckRunDetails, CheckRunError, CiBuildStage, CiHostname,
+    CiPreviewRepository, CiRefKind,
     source_control::{PollError, SourceControlClient, SourceRefKind, retry_delay},
 };
 
@@ -475,6 +475,17 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 self.repository
                     .release_check_run_claim(build_id, claim)
                     .await?;
+                if matches!(
+                    error,
+                    CheckRunError::Http { status, .. } if status.as_u16() == 403
+                ) {
+                    tracing::warn!(
+                        build_id = %build_id,
+                        repository,
+                        "GitHub Check Run permission denied; continuing CI poll without external status"
+                    );
+                    return Ok(());
+                }
                 Err(anyhow::anyhow!(
                     "create or recover GitHub check run: {error}"
                 ))
