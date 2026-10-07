@@ -8,7 +8,7 @@ async fn controlled_build_pipeline_verifies_sandbox_caches_artifact_and_deduplic
     use kurbis_hoster::ci::{BuildRequest, ControlledBuildPipeline, SandboxLimits};
     let pool = pool().await;
     let repo = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repo
         .register_repository(&repository_name, "main")
         .await
@@ -202,7 +202,7 @@ async fn object_store_failure_is_retryable_and_reconciles_the_existing_check_run
     use kurbis_hoster::ci::{BuildRequest, ControlledBuildPipeline, SandboxLimits};
     let pool = pool().await;
     let repo = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     repo.register_repository(&repository_name, "main")
         .await
         .unwrap();

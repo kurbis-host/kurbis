@@ -91,7 +91,7 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let root_domain = unique_ci_root_domain();
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -245,7 +245,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -362,7 +362,7 @@ async fn branch_polling_stays_lazy_after_admission_and_ignores_check_run_permiss
 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "master")
         .await
@@ -520,7 +520,7 @@ async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_clo
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -849,7 +849,7 @@ async fn expired_check_run_keeps_only_a_minimal_reconciliation_tombstone() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     repository
         .register_repository(&repository_name, "main")
         .await
@@ -967,7 +967,7 @@ async fn expired_build_lease_fences_every_late_stage_log_and_artifact_write() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     repository
         .register_repository(&repository_name, "main")
         .await
@@ -1077,7 +1077,7 @@ async fn github_webhook_requires_signature_and_persists_delivery_idempotently() 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let watched = repository
-        .register_repository("kurbis-host/Pumpkin", "main")
+        .register_repository("Pumpkin-MC/Pumpkin", "main")
         .await
         .unwrap();
     sqlx::query("DELETE FROM ci_github_webhook_deliveries WHERE repository_id=$1")
@@ -1095,12 +1095,12 @@ async fn github_webhook_requires_signature_and_persists_delivery_idempotently() 
     let delivery_id = Uuid::new_v4();
     let body = serde_json::json!({
         "action": "synchronize",
-        "repository": {"full_name": "kurbis-host/Pumpkin"},
+        "repository": {"full_name": "Pumpkin-MC/Pumpkin"},
         "pull_request": {
             "number": 314,
             "base": {
                 "sha": "fedcba9876543210fedcba9876543210fedcba98",
-                "repo": {"full_name": "kurbis-host/Pumpkin"}
+                "repo": {"full_name": "Pumpkin-MC/Pumpkin"}
             },
             "head": {
                 "sha": "0123456789abcdef0123456789abcdef01234567",
@@ -1220,7 +1220,7 @@ async fn pr_updates_build_only_requested_heads_and_late_events_never_roll_back_a
 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = "kurbis-host/Pumpkin";
+    let repository_name = "Pumpkin-MC/Pumpkin";
     let watched = repository
         .register_repository(repository_name, "main")
         .await
@@ -1359,10 +1359,10 @@ async fn pr_updates_build_only_requested_heads_and_late_events_never_roll_back_a
         let delivery_id = Uuid::new_v4();
         let body = serde_json::json!({
             "action": action,
-            "repository": {"full_name": "kurbis-host/Pumpkin"},
+            "repository": {"full_name": "Pumpkin-MC/Pumpkin"},
             "pull_request": {
                 "number": 314,
-                "base": {"sha": base_sha, "repo": {"full_name": "kurbis-host/Pumpkin"}},
+                "base": {"sha": base_sha, "repo": {"full_name": "Pumpkin-MC/Pumpkin"}},
                 "head": {"sha": sha, "repo": {"full_name": "contributor/Pumpkin"}}
             }
         })
@@ -1488,13 +1488,13 @@ async fn on_demand_full_commit_retries_only_due_transient_failures() {
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     repository
-        .register_repository("kurbis-host/Pumpkin", "main")
+        .register_repository("Pumpkin-MC/Pumpkin", "main")
         .await
         .unwrap();
 
     let transient_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
     let transient_key = BuildKey::new(
-        "kurbis-host/Pumpkin",
+        "Pumpkin-MC/Pumpkin",
         &transient_sha,
         "patch-v1",
         "test-toolchain",
@@ -1545,7 +1545,7 @@ async fn on_demand_full_commit_retries_only_due_transient_failures() {
     let app_state = Arc::get_mut(&mut state).unwrap();
     app_state.ci_build_coordinator = Some(builder);
     app_state.ci_build_identity = Some(CiBuildIdentity {
-        repository: "kurbis-host/Pumpkin".into(),
+        repository: "Pumpkin-MC/Pumpkin".into(),
         patch_fingerprint: "patch-v1".into(),
         toolchain_version: "test-toolchain".into(),
         target_architecture: "x86_64-linux".into(),
@@ -1681,7 +1681,7 @@ async fn on_demand_full_commit_retries_only_due_transient_failures() {
     // manually moves retry_at into the past.
     let permanent_sha = format!("{}{:08x}", Uuid::new_v4().simple(), rand::random::<u32>());
     let permanent_key = BuildKey::new(
-        "kurbis-host/Pumpkin",
+        "Pumpkin-MC/Pumpkin",
         &permanent_sha,
         "patch-v1",
         "test-toolchain",
@@ -1746,9 +1746,9 @@ async fn on_demand_full_commit_retries_only_due_transient_failures() {
     assert_eq!(
         fetches.lock().unwrap().as_slice(),
         &[
-            ("kurbis-host/Pumpkin".into(), transient_sha.clone()),
-            ("kurbis-host/Pumpkin".into(), transient_sha),
-            ("kurbis-host/Pumpkin".into(), permanent_sha),
+            ("Pumpkin-MC/Pumpkin".into(), transient_sha.clone()),
+            ("Pumpkin-MC/Pumpkin".into(), transient_sha),
+            ("Pumpkin-MC/Pumpkin".into(), permanent_sha),
         ],
     );
     pool.close().await;
@@ -1759,7 +1759,7 @@ async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_a
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -1940,7 +1940,7 @@ async fn permanent_build_validation_failure_never_becomes_a_retry_candidate() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -2022,7 +2022,7 @@ async fn exhausted_transient_retry_budget_stays_terminal_after_build_expiry() {
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let key = BuildKey::new(
-        format!("kurbis-host/Pumpkin-{}", Uuid::new_v4()),
+        format!("fixture/Pumpkin-{}", Uuid::new_v4()),
         "89abcdef0123456789abcdef0123456789abcdef",
         "patch-v1",
         "test-toolchain",

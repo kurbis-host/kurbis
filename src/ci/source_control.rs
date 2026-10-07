@@ -588,7 +588,7 @@ mod tests {
     }
     #[test]
     fn source_refs_reject_invalid_values() {
-        assert!(parse_repository("kurbis-host/Pumpkin").is_ok());
+        assert!(parse_repository("Pumpkin-MC/Pumpkin").is_ok());
         assert!(parse_repository("Pumpkin").is_err());
         assert!(
             SourceRef {
@@ -792,7 +792,7 @@ mod http_tests {
             .unwrap()
             .with_api_base_url(format!("http://{address}"));
         let first = client
-            .poll("kurbis-host/Pumpkin", &PollCheckpoint::default())
+            .poll("Pumpkin-MC/Pumpkin", &PollCheckpoint::default())
             .await
             .unwrap();
         assert_eq!(first.refs.len(), 2);
@@ -802,7 +802,7 @@ mod http_tests {
                 && source.name == "copilot/pumpkin-game-tick-research"
         }));
         let unchanged = client
-            .poll("kurbis-host/Pumpkin", &first.checkpoint)
+            .poll("Pumpkin-MC/Pumpkin", &first.checkpoint)
             .await
             .unwrap();
         assert!(unchanged.eager_refs.is_empty());
@@ -830,7 +830,7 @@ mod http_tests {
             .with_api_base_url(format!("http://{address}"))
             .with_page_limits(1, 4);
         let result = client
-            .poll("kurbis-host/Pumpkin", &PollCheckpoint::default())
+            .poll("Pumpkin-MC/Pumpkin", &PollCheckpoint::default())
             .await
             .unwrap();
         assert_eq!(result.refs.len(), 2);
@@ -846,7 +846,7 @@ mod http_tests {
             Some("branch-etag")
         );
         let unchanged = client
-            .poll("kurbis-host/Pumpkin", &result.checkpoint)
+            .poll("Pumpkin-MC/Pumpkin", &result.checkpoint)
             .await
             .unwrap();
         assert!(!unchanged.not_modified);

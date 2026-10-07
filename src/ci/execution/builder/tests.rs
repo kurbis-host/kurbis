@@ -87,7 +87,7 @@ async fn controlled_builder_rejects_a_toolchain_cache_key_mismatch() {
     });
     let builder = RustPumpkinBuilder::new(runtime, &plugin).unwrap();
     let key = BuildKey {
-        repository: "kurbis-host/Pumpkin".into(),
+        repository: "Pumpkin-MC/Pumpkin".into(),
         commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
         patch_fingerprint: "b".repeat(64),
         toolchain_version: "native".into(),
@@ -111,7 +111,7 @@ async fn package_contains_only_validated_runtime_files_and_metadata() {
     fs::write(&binary, fake_elf(62)).unwrap();
     fs::write(&plugin, b"\0asm\x01\0\0\0code").unwrap();
     let key = BuildKey {
-        repository: "kurbis-host/Pumpkin".into(),
+        repository: "Pumpkin-MC/Pumpkin".into(),
         commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
         patch_fingerprint: "b".repeat(64),
         toolchain_version: "rust-1.98@sha256:abc".into(),

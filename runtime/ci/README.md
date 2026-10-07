@@ -38,6 +38,13 @@ control plane intentionally rejects mutable image tags and unsupported native
 Linux architectures. CI source fetching and the Cargo cache seed happen only at
 trusted image-build time; build containers have no outbound network access.
 
+The active CI watcher is allowlisted to `Pumpkin-MC/Pumpkin`; configure
+`CI_REPOSITORY` with that exact owner/repository or startup fails closed.
+Pull-request heads may still come from forks discovered by the allowlisted
+repository. Those fork archives are fetched by immutable commit SHA with the
+same path and response bounds, while branches and full commit aliases stay
+lazy until an explicit preview request.
+
 The image's cargo cache is a bootstrap cache for the pinned upstream lockfiles.
 If a Pumpkin change adds dependencies not in that cache, its build fails closed
 while offline. Updating this image cache is an operator-controlled image rebuild

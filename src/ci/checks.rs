@@ -412,7 +412,7 @@ mod tests {
         let details = CheckRunDetails {
             commit_sha: "a".repeat(40),
             stage: CiBuildStage::Queued,
-            repository: "kurbis-host/Pumpkin".into(),
+            repository: "Pumpkin-MC/Pumpkin".into(),
             artifact_digest: None,
             failure_stage: None,
             failure_message: None,
@@ -444,7 +444,7 @@ mod tests {
         let details = CheckRunDetails {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
             stage: CiBuildStage::Failed,
-            repository: "kurbis-host/Pumpkin".into(),
+            repository: "Pumpkin-MC/Pumpkin".into(),
             artifact_digest: None,
             failure_stage: Some(CiBuildStage::Compiling),
             failure_message: Some("[click](https://evil.example)".into()),
@@ -465,7 +465,7 @@ mod tests {
         let details = CheckRunDetails {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
             stage: CiBuildStage::Ready,
-            repository: "kurbis-host/Pumpkin".into(),
+            repository: "Pumpkin-MC/Pumpkin".into(),
             artifact_digest: Some("sha256:abc".into()),
             failure_stage: None,
             failure_message: None,

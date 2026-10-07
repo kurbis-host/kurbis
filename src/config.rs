@@ -131,13 +131,10 @@ impl CiConfig {
                 && github_pat.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
             "CI_GITHUB_PAT must be a non-empty visible token"
         );
-        let repository = value("CI_REPOSITORY", "kurbis-host/Pumpkin");
+        let repository = value("CI_REPOSITORY", crate::ci::CI_TARGET_REPOSITORY);
+        validate_ci_repository(&repository)?;
         let github_api_base_url = value("CI_GITHUB_API_BASE_URL", "https://api.github.com");
         validate_ci_github_api_base_url(&github_api_base_url)?;
-        ensure!(
-            repository == "kurbis-host/Pumpkin",
-            "CI_REPOSITORY is fixed to kurbis-host/Pumpkin"
-        );
         let patch_fingerprint = checked_in_ci_patch_fingerprint()?;
         let backend = value("CI_BUILDER_BACKEND", "docker");
         let (builder_backend, builder_image, builder_docker_host, toolchain_version) = match backend
@@ -231,7 +228,7 @@ impl CiConfig {
         } else {
             env::current_dir()?.join(plugin_source)
         };
-        let default_branch = value("CI_DEFAULT_BRANCH", "main");
+        let default_branch = value("CI_DEFAULT_BRANCH", "master");
         ensure!(
             !default_branch.trim().is_empty() && default_branch.len() <= 255,
             "CI_DEFAULT_BRANCH must contain 1 to 255 bytes"
@@ -297,9 +294,21 @@ fn required_path(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
-/// Remote Bubblewrap paths are interpolated into OpenSSH's remote command
-/// string. Keep the grammar deliberately narrower than a local filesystem path
-/// so a malformed deployment cannot turn a path into shell syntax.
+pub fn validate_ci_repository(value: &str) -> Result<()> {
+    ensure!(
+        value == crate::ci::CI_TARGET_REPOSITORY,
+        "CI_REPOSITORY is fixed to {}",
+        crate::ci::CI_TARGET_REPOSITORY
+    );
+    Ok(())
+}
+
+/// Validate an absolute path passed to the checked-in remote Bubblewrap runner.
+///
+/// These values are interpolated into an OpenSSH remote command, so accepting
+/// only a small portable path grammar keeps operator configuration from
+/// becoming shell syntax. The runner path is checked separately even though it
+/// is represented as a PathBuf in the config enum.
 pub fn validate_ci_remote_path(value: &str, name: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
@@ -307,7 +316,7 @@ pub fn validate_ci_remote_path(value: &str, name: &str) -> Result<()> {
             && value.starts_with('/')
             && value
                 .bytes()
-                .all(|byte| { byte.is_ascii_alphanumeric() || b"/._-".contains(&byte) }),
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)),
         "{name} must be an absolute remote path containing only [A-Za-z0-9/._-]"
     );
     Ok(())
@@ -1038,8 +1047,34 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 mod tests {
     use super::{
         CommonConfig, GatewayConfig, ObjectStoreConfig, https_public_base_url, parse_bool,
-        validate_ci_remote_path,
+        validate_ci_remote_path, validate_ci_repository,
     };
+
+    #[test]
+    fn ci_repository_is_explicitly_allowlisted_to_upstream_pumpkin() {
+        assert!(validate_ci_repository(crate::ci::CI_TARGET_REPOSITORY).is_ok());
+        assert!(validate_ci_repository("legacy-owner/Pumpkin").is_err());
+        assert!(validate_ci_repository("Pumpkin-MC/other").is_err());
+    }
+
+    #[test]
+    fn remote_bubblewrap_paths_reject_shell_syntax() {
+        assert!(
+            validate_ci_remote_path("/home/ci/kurbis-ci/ci_bubblewrap_runner.py", "runner")
+                .is_ok()
+        );
+        for path in [
+            "relative/runner.py",
+            "/home/ci/ci runner.py",
+            "/home/ci/ci;touch-pwned",
+            "/home/ci/ci$(id)",
+        ] {
+            assert!(
+                validate_ci_remote_path(path, "runner").is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
 
     #[test]
     fn parse_bool_accepts_explicit_values_and_rejects_ambiguous_values() {
@@ -1097,25 +1132,6 @@ mod tests {
         let object_store_debug = format!("{object_store:?}");
         assert!(!object_store_debug.contains("access-secret"));
         assert!(!object_store_debug.contains("object-secret"));
-    }
-
-    #[test]
-    fn remote_bubblewrap_paths_reject_shell_syntax() {
-        assert!(
-            validate_ci_remote_path("/home/ci/kurbis-ci/ci_bubblewrap_runner.py", "runner")
-                .is_ok()
-        );
-        for path in [
-            "relative/runner.py",
-            "/home/ci/ci runner.py",
-            "/home/ci/ci;touch-pwned",
-            "/home/ci/ci$(id)",
-        ] {
-            assert!(
-                validate_ci_remote_path(path, "runner").is_err(),
-                "accepted {path:?}"
-            );
-        }
     }
 
     #[test]

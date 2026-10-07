@@ -58,7 +58,7 @@ async fn ci_downloads_reauthorize_each_bounded_chunk_and_verify_integrity() {
     let pool = pool().await;
     let previews = CiPreviewRepository::new(pool.clone());
     let runtimes = CiPreviewRuntimeRepository::new(pool.clone());
-    let watched_repository = format!("kurbis-host/Pumpkin-stream-{}", Uuid::new_v4());
+    let watched_repository = format!("fixture/Pumpkin-stream-{}", Uuid::new_v4());
     let watched = previews
         .register_repository(&watched_repository, "main")
         .await

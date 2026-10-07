@@ -131,7 +131,7 @@ def create_ci_fixture_artifact(base_image: str, root: Path, bin_dir: Path, previ
         raise RuntimeError(f"unsupported CI fixture architecture: {platform.machine()}")
     commit = "a" * 40
     metadata = json.dumps({
-        "repository": "kurbis-host/Pumpkin",
+        "repository": "Pumpkin-MC/Pumpkin",
         "commit_sha": commit,
         "target_architecture": architecture,
         "format_version": 1,
@@ -659,10 +659,10 @@ def main():
             f"VALUES('{digest}','{object_key}',{len(artifact)},{now_expiry}); "
             f"INSERT INTO ci_builds(id,repository,commit_sha,patch_fingerprint,toolchain_version,"
             f"target_architecture,stage,artifact_digest,expires_at) VALUES('{build_id}',"
-            f"'kurbis-host/Pumpkin','{commit}','proxy-test','proxy-test','{architecture}',"
+            f"'Pumpkin-MC/Pumpkin','{commit}','proxy-test','proxy-test','{architecture}',"
             f"'ready','{digest}',{now_expiry}); "
             f"INSERT INTO ci_preview_aliases(id,repository,commit_sha,kind,hostname,build_id,state,"
-            f"runtime_generation,expires_at) VALUES('{preview_id}','kurbis-host/Pumpkin','{commit}',"
+            f"runtime_generation,expires_at) VALUES('{preview_id}','Pumpkin-MC/Pumpkin','{commit}',"
             f"'commit','proxy-{uuid.UUID(preview_id).hex[:16]}.mc.example.test','{build_id}',"
             f"'booting',1,{now_expiry}); "
             f"INSERT INTO ci_runtime_placements(preview_id,worker_id,generation,lease_token,java_port,"

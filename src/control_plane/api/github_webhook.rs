@@ -10,13 +10,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    ci::{CiGitHubPrDelivery, CiGitHubPrDeliveryResult, CiPreviewRepository, validate_commit_sha},
+    ci::{
+        CI_TARGET_REPOSITORY, CiGitHubPrDelivery, CiGitHubPrDeliveryResult, CiPreviewRepository,
+        validate_commit_sha,
+    },
     control_plane::api::{ApiError, AppState},
 };
 
 const MAX_GITHUB_WEBHOOK_BYTES: usize = 1024 * 1024;
-const TARGET_REPOSITORY: &str = "kurbis-host/Pumpkin";
-
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +87,8 @@ pub(super) async fn ingest(
     if !matches!(event.action.as_str(), "opened" | "reopened" | "synchronize") {
         return Ok(StatusCode::NO_CONTENT);
     }
-    if event.repository.full_name != TARGET_REPOSITORY
-        || event.pull_request.base.repo.full_name != TARGET_REPOSITORY
+    if event.repository.full_name != CI_TARGET_REPOSITORY
+        || event.pull_request.base.repo.full_name != CI_TARGET_REPOSITORY
     {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -101,7 +102,7 @@ pub(super) async fn ingest(
         .head
         .repo
         .map(|repository| repository.full_name)
-        .unwrap_or_else(|| TARGET_REPOSITORY.to_owned());
+        .unwrap_or_else(|| CI_TARGET_REPOSITORY.to_owned());
     validate_repository(&source_repository)
         .map_err(|_| bad_request("invalid pull request source repository"))?;
     validate_commit_sha(&event.pull_request.base.sha)
@@ -110,7 +111,7 @@ pub(super) async fn ingest(
 
     let delivery = CiGitHubPrDelivery {
         delivery_id,
-        repository: TARGET_REPOSITORY.to_owned(),
+        repository: CI_TARGET_REPOSITORY.to_owned(),
         action: event.action,
         pull_request_number: event.pull_request.number,
         source_repository,

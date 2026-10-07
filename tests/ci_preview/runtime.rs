@@ -112,7 +112,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     let pool = pool().await;
     let previews = CiPreviewRepository::new(pool.clone());
     let runtimes = CiPreviewRuntimeRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = previews
         .register_repository(&repository_name, "main")
         .await
@@ -1152,7 +1152,7 @@ async fn stale_first_generation_may_cold_start_and_partial_bootstrap_rehomes_but
     let pool = pool().await;
     let previews = CiPreviewRepository::new(pool.clone());
     let runtimes = CiPreviewRuntimeRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-cold-start-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-cold-start-{}", Uuid::new_v4());
     let watched = previews
         .register_repository(&repository_name, "main")
         .await

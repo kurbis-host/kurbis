@@ -397,10 +397,10 @@ mod tests {
         }
         let path = request.uri().path().to_owned();
         fixture.requests.lock().unwrap().push(path.clone());
-        if path.starts_with("/repos/kurbis-host/Pumpkin/tarball/") {
+        if path.starts_with("/repos/Pumpkin-MC/Pumpkin/tarball/") {
             Response::new(Body::from(fixture.primary.clone()))
         } else if path
-            == "/repos/kurbis-host/Pumpkin/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            == "/repos/Pumpkin-MC/Pumpkin/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         {
             Response::new(Body::from(fixture.tree.clone()))
         } else if path
@@ -447,10 +447,10 @@ mod tests {
 
     #[test]
     fn source_repository_and_commit_are_allowlisted_as_path_components() {
-        assert!(parse_repository("kurbis-host/Pumpkin").is_ok());
-        assert!(parse_repository("kurbis-host/Pumpkin?x=1").is_err());
+        assert!(parse_repository("Pumpkin-MC/Pumpkin").is_ok());
+        assert!(parse_repository("Pumpkin-MC/Pumpkin?x=1").is_err());
         assert!(parse_repository("../evil/Pumpkin").is_err());
-        assert!(parse_repository("kurbis-host/Pumpkin/extra").is_err());
+        assert!(parse_repository("Pumpkin-MC/Pumpkin/extra").is_err());
         assert!(validate_sha(&"a".repeat(40)).is_ok());
         assert!(validate_sha("not-a-sha").is_err());
     }
@@ -461,7 +461,7 @@ mod tests {
         let tree = r#"{"truncated":false,"tree":[{"path":"crates/pumpkin-plugin-wit","mode":"160000","type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#;
         let (source, fixture, server) = start_fixture(tree).await;
         let result = source
-            .fetch_commit_from("kurbis-host/Pumpkin", &"a".repeat(40))
+            .fetch_commit_from("Pumpkin-MC/Pumpkin", &"a".repeat(40))
             .await
             .unwrap();
         let bundle = decode_source_bundle(&result).unwrap();
@@ -475,9 +475,9 @@ mod tests {
         );
         let requests = fixture.requests.lock().unwrap();
         assert!(requests.iter().any(|path| path
-            == "/repos/kurbis-host/Pumpkin/tarball/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            == "/repos/Pumpkin-MC/Pumpkin/tarball/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(requests.iter().any(|path| path
-            == "/repos/kurbis-host/Pumpkin/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            == "/repos/Pumpkin-MC/Pumpkin/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(requests.iter().any(|path| path == "/repos/Pumpkin-MC/pumpkin-plugin-wit/tarball/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
         drop(requests);
         server.abort();
@@ -488,14 +488,14 @@ mod tests {
         let tree = r#"{"truncated":false,"tree":[{"path":"thirdparty/untrusted","mode":"160000","type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#;
         let (source, fixture, server) = start_fixture(tree).await;
         let result = source
-            .fetch_commit_from("kurbis-host/Pumpkin", &"a".repeat(40))
+            .fetch_commit_from("Pumpkin-MC/Pumpkin", &"a".repeat(40))
             .await;
         assert!(result.is_err());
         let requests = fixture.requests.lock().unwrap();
         assert!(
             !requests
                 .iter()
-                .any(|path| path.starts_with("/repos/Pumpkin-MC/"))
+                .any(|path| path.starts_with("/repos/Pumpkin-MC/pumpkin-plugin-wit/"))
         );
         drop(requests);
         server.abort();

@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const CI_ROOT_DOMAIN: &str = "pumpkin.kurbis.host";
+/// The only repository admitted to the active CI watcher. Pull-request head
+/// repositories remain separate source inputs and are validated independently.
+pub const CI_TARGET_REPOSITORY: &str = "Pumpkin-MC/Pumpkin";
 pub const BUILD_TTL_HOURS: i64 = 72;
 pub const POLL_INTERVAL_SECONDS: u64 = 60;
 

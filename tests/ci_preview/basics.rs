@@ -5,7 +5,7 @@ async fn concurrent_build_requests_share_one_durable_ci_build() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let key = BuildKey::new(
         repository_name,
         "0123456789abcdef0123456789abcdef01234567",
@@ -39,7 +39,7 @@ async fn ci_builds_deduplicate_and_stable_aliases_advance_only_when_ready() {
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let root_domain = unique_ci_root_domain();
-    let name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository.register_repository(&name, "main").await.unwrap();
     repository
         .poll_repository(watched.id, &FixtureSource::default())
@@ -52,7 +52,7 @@ async fn ci_builds_deduplicate_and_stable_aliases_advance_only_when_ready() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(source_repository, "kurbis-host/Pumpkin");
+    assert_eq!(source_repository, "Pumpkin-MC/Pumpkin");
     let key = BuildKey::new(
         &name,
         "0123456789abcdef0123456789abcdef01234567",
@@ -215,7 +215,7 @@ async fn public_check_run_status_is_read_only_and_omits_private_diagnostics() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     repository
         .register_repository(&repository_name, "main")
         .await
@@ -296,7 +296,7 @@ async fn first_branch_join_uses_latest_observed_head_after_lobby_was_created() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     let watched = repository
         .register_repository(&repository_name, "main")
         .await
@@ -390,7 +390,7 @@ async fn ci_runtime_assignment_requires_worker_matching_artifact_architecture() 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let root_domain = unique_ci_root_domain();
-    let repository_name = format!("kurbis-host/Pumpkin-{}", Uuid::new_v4());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
     repository
         .register_repository(&repository_name, "main")
         .await

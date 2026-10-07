@@ -56,7 +56,7 @@ impl SourceControlClient for FixtureSource {
                     name: "main".into(),
                     number: None,
                     commit_sha: self.commit_sha.read().unwrap().clone(),
-                    source_repository: Some("kurbis-host/Pumpkin".into()),
+                    source_repository: Some("Pumpkin-MC/Pumpkin".into()),
                     closed: false,
                     deleted: self.deleted.load(std::sync::atomic::Ordering::SeqCst),
                     updated_at: Some(Utc::now()),

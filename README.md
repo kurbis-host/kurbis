@@ -301,8 +301,12 @@ For faster development on this Mac or Linux, use [native host execution](runtime
 
 ## Pumpkin pull-request and branch previews
 
-Set `CI_GITHUB_PAT` to enable the CI poller. Periodic GitHub polling is the
-active event source and runs every 60 seconds with ETag checkpoints. It eagerly
+Set `CI_GITHUB_PAT` to enable the CI poller. The watcher is intentionally
+allowlisted to `Pumpkin-MC/Pumpkin`; `CI_REPOSITORY` is accepted only when it
+matches that exact owner/repository. The default branch is `master` (override it
+only to follow another branch in that same allowlisted repository). Periodic
+GitHub polling is the active event source and runs every 60 seconds with ETag
+checkpoints. It eagerly
 builds and caches only the exact current PR heads that polling observes as
 opened, reopened, or updated, with one build-only Check Run per head. No PR
 ancestors, unrelated commits, branches, or arbitrary commit aliases are

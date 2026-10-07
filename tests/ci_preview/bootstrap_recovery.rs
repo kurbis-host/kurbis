@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 async fn ready_preview(pool: &PgPool, suffix: &str) -> (Uuid, Uuid, String) {
     let previews = CiPreviewRepository::new(pool.clone());
-    let repository = format!("kurbis-host/Pumpkin-{suffix}-{}", Uuid::new_v4());
+    let repository = format!("fixture/Pumpkin-{suffix}-{}", Uuid::new_v4());
     let watched = previews
         .register_repository(&repository, "main")
         .await

@@ -19,7 +19,7 @@ struct WorkerFixture {
 
 async fn ready_preview(pool: &PgPool, suffix: &str) -> (Uuid, String, Uuid, String) {
     let watched = CiPreviewRepository::new(pool.clone())
-        .register_repository(&format!("kurbis-host/Pumpkin-{suffix}"), "main")
+        .register_repository(&format!("fixture/Pumpkin-{suffix}"), "main")
         .await
         .unwrap();
     let repository = watched.repository.clone();
