@@ -54,7 +54,7 @@ and must not be triggered by source-controlled build files.
 
 The host-owned builder image includes the pinned `sccache` release
 (`SCCACHE_VERSION`, default `0.10.0`). Runtime containers mount a rootless-Docker
-named volume whose name is derived from the immutable builder image digest and
+named volume whose name is derived from the configured builder host and
 set `SCCACHE_DIR` to its private `/cache/sccache` directory. The cache is local
 only: no sccache remote backend, credentials, or network access is available in
 the build namespace. `SCCACHE_CACHE_SIZE` is bounded by
@@ -76,7 +76,9 @@ The image build itself should continue to use `tools/docker_build_with_limits.sh
 (BuildKit/buildx). Its layer cache may be retained by the selected BuildKit
 builder, but it is not used as a runtime trust boundary. Rebuild the image when
 `SCCACHE_VERSION`, the Rust release, the Pumpkin revision, or the host-owned
-Dockerfile changes; the image digest then creates a new compiler-cache namespace.
+Dockerfile changes; the sccache key uses the compiler identity and complete rustc invocation, so
+changes to the toolchain, profiles, source, and patches naturally miss old
+entries within the same bounded host cache.
 
 ## Builder host and control-plane topology
 

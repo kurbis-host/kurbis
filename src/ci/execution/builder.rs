@@ -161,7 +161,8 @@ impl DockerRootlessBuildRuntime {
         let compiler_cache_size = super::cache::configured_cache_size().map_err(|error| {
             BuildPipelineError::Sandbox(format!("configure compiler cache size: {error}"))
         })?;
-        let compiler_cache_volume = super::cache::cache_volume_name(&format!("docker:{image}"));
+        let compiler_cache_volume =
+            super::cache::cache_volume_name(&format!("docker:{docker_host}"));
         let admission = BuildAdmissionCoordinator::new(pool, image.clone(), docker_host.clone())
             .with_concurrency(usize::from(build_concurrency))
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
@@ -1163,14 +1164,11 @@ where
         let mut cache_lease = None;
         let mut cache_event = String::new();
         if let (Some(cache), Some(identity)) = (&self.cache, &cache_identity) {
-            match cache.restore(identity, output.path()) {
-                Ok(CacheLookup::Hit) => {
-                    cache_event = format!("build_cache=hit key={}\n", identity.cache_key);
-                }
-                Ok(CacheLookup::Corrupt) => {
-                    cache_event = format!("build_cache=corrupt key={}\n", identity.cache_key);
-                }
-                Ok(CacheLookup::Miss) => match cache.acquire(identity).await {
+            let first_lookup = cache.restore(identity, output.path());
+            if matches!(first_lookup, Ok(CacheLookup::Hit)) {
+                cache_event = format!("build_cache=hit key={}\n", identity.cache_key);
+            } else if matches!(first_lookup, Ok(CacheLookup::Miss | CacheLookup::Corrupt)) {
+                match cache.acquire(identity).await {
                     Ok(lease) => {
                         cache_lease = Some(lease);
                         match cache.restore(identity, output.path()) {
@@ -1180,7 +1178,11 @@ where
                                     identity.cache_key
                                 );
                             }
-                            Ok(CacheLookup::Corrupt | CacheLookup::Miss) => {}
+                            Ok(CacheLookup::Corrupt) => {
+                                cache_event =
+                                    format!("build_cache=corrupt key={}\n", identity.cache_key);
+                            }
+                            Ok(CacheLookup::Miss) => {}
                             Err(error) => {
                                 cache_event = format!("build_cache=read_error error={error}\n");
                             }
@@ -1189,10 +1191,9 @@ where
                     Err(error) => {
                         cache_event = format!("build_cache=lock_error error={error}\n");
                     }
-                },
-                Err(error) => {
-                    cache_event = format!("build_cache=read_error error={error}\n");
                 }
+            } else if let Err(error) = first_lookup {
+                cache_event = format!("build_cache=read_error error={error}\n");
             }
         }
         // Keep the per-key lock alive through compilation and cache publication.
