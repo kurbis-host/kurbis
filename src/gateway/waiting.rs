@@ -5,7 +5,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
-    ci::{CI_ROOT_DOMAIN, CiPreviewState},
+    ci::{CI_ROOT_DOMAIN, CiPreviewState, ci_preview_chat_message, ci_preview_status_message},
     config::GatewayConfig,
     gateway::{
         routes::RouteCache,
@@ -28,6 +28,10 @@ struct WaitingState {
     admission_complete: bool,
     last_ci_admission: Option<Instant>,
     ci_admission_state: Option<CiPreviewState>,
+    /// CI chat notices are keyed by lifecycle state, not rendered text.
+    /// Build logs can change while a state is active and must not spam one
+    /// waiting connection. A reconnect gets a fresh WaitingState.
+    last_ci_state: Option<CiPreviewState>,
 }
 
 impl WaitingState {
@@ -42,6 +46,7 @@ impl WaitingState {
             admission_complete: false,
             last_ci_admission: None,
             ci_admission_state: None,
+            last_ci_state: None,
         }
     }
 
@@ -309,6 +314,13 @@ async fn handle_ci_player(
         && target.state == CiPreviewState::Running
         && let Some((host, port)) = ci_transfer_target(config, player, target)
     {
+        // Java players should see the final running transition in chat before
+        // the transfer packet moves them to the canonical public route. The
+        // Bedrock waiting flow intentionally keeps its existing transfer-only
+        // behavior; Java is the protocol with the lobby/chat requirement.
+        if player.edition == PlayerEdition::Java {
+            send_java_ci_notice(control, config, player, state, target.state, target).await?;
+        }
         control
             .transfer(&config.waiting_control_socket, player.id, &host, port)
             .await?;
@@ -328,30 +340,69 @@ async fn handle_ci_player(
 
     match preview_state {
         Some(CiPreviewState::Failed) => {
+            if player.edition == PlayerEdition::Java
+                && let Some(target) = target.as_ref()
+            {
+                send_java_ci_notice(
+                    control,
+                    config,
+                    player,
+                    state,
+                    CiPreviewState::Failed,
+                    target,
+                )
+                .await?;
+            }
             control
                 .kick(
                     &config.waiting_control_socket,
                     player.id,
-                    "CI preview build failed. Reconnect after a successful build.",
+                    &ci_disconnect_message(
+                        CiPreviewState::Failed,
+                        target
+                            .as_ref()
+                            .and_then(|target| target.failure_message.as_deref()),
+                        target
+                            .as_ref()
+                            .map_or("", |target| target.build_log.as_str()),
+                    ),
                 )
                 .await?;
         }
         Some(CiPreviewState::Expired) | None => {
+            if player.edition == PlayerEdition::Java
+                && let Some(current) = preview_state
+                && let Some(target) = target.as_ref()
+            {
+                send_java_ci_notice(control, config, player, state, current, target).await?;
+            }
             control
                 .kick(
                     &config.waiting_control_socket,
                     player.id,
-                    "CI preview expired or the address is unknown.",
+                    "CI preview expired or the address is unknown. Check the alias and reconnect.",
                 )
                 .await?;
         }
         Some(current) => {
-            let notice = ci_notice(current);
-            if state.last_notice.as_deref() != Some(notice) {
-                control
-                    .message(&config.waiting_control_socket, player.id, notice)
-                    .await?;
-                state.last_notice = Some(notice.to_owned());
+            if player.edition == PlayerEdition::Java {
+                if let Some(target) = target.as_ref() {
+                    send_java_ci_notice(control, config, player, state, current, target).await?;
+                } else if state.last_ci_state != Some(current) {
+                    let notice = ci_preview_chat_message(current, None, "");
+                    control
+                        .message(&config.waiting_control_socket, player.id, &notice)
+                        .await?;
+                    state.last_ci_state = Some(current);
+                }
+            } else {
+                let notice = ci_notice(current);
+                if state.last_notice.as_deref() != Some(notice) {
+                    control
+                        .message(&config.waiting_control_socket, player.id, notice)
+                        .await?;
+                    state.last_notice = Some(notice.to_owned());
+                }
             }
         }
     }
@@ -370,18 +421,48 @@ fn ci_transfer_target(
 }
 
 fn ci_notice(state: CiPreviewState) -> &'static str {
-    match state {
-        CiPreviewState::Lobby | CiPreviewState::Queued => "CI preview queued for its first build…",
-        CiPreviewState::Fetching => "Fetching the exact CI commit…",
-        CiPreviewState::Patching => "Applying Kurbis integration patches…",
-        CiPreviewState::Compiling => "Compiling the CI preview…",
-        CiPreviewState::Packaging => "Packaging the CI preview…",
-        CiPreviewState::Booting | CiPreviewState::Ready => "Starting the CI preview runtime…",
-        CiPreviewState::Running => "CI preview is ready. Transferring you now…",
-        CiPreviewState::Stopping => "CI preview is restarting…",
-        CiPreviewState::Failed => "CI preview build failed.",
-        CiPreviewState::Expired => "CI preview expired.",
-    }
+    ci_preview_status_message(state).chat_message
+}
+
+fn ci_disconnect_message(
+    state: CiPreviewState,
+    failure_message: Option<&str>,
+    build_log: &str,
+) -> String {
+    let message = ci_preview_chat_message(state, failure_message, build_log);
+    format!("{message}\nReconnect after the CI build is fixed.")
+}
+
+fn java_ci_notice_for_transition(
+    state: &WaitingState,
+    current: CiPreviewState,
+    target: &CiRouteTarget,
+) -> Option<String> {
+    (state.last_ci_state != Some(current)).then(|| {
+        ci_preview_chat_message(
+            current,
+            target.failure_message.as_deref(),
+            &target.build_log,
+        )
+    })
+}
+
+async fn send_java_ci_notice(
+    control: &PumpkinControl,
+    config: &GatewayConfig,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+    current: CiPreviewState,
+    target: &CiRouteTarget,
+) -> Result<()> {
+    let Some(notice) = java_ci_notice_for_transition(state, current, target) else {
+        return Ok(());
+    };
+    control
+        .message(&config.waiting_control_socket, player.id, &notice)
+        .await?;
+    state.last_ci_state = Some(current);
+    Ok(())
 }
 
 async fn request_admission(
@@ -478,6 +559,43 @@ fn transfer_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_ci_notice_is_once_per_state_transition_even_when_logs_change() {
+        let mut waiting = WaitingState::new();
+        let target = CiRouteTarget {
+            preview_id: Uuid::new_v4(),
+            hostname: "commit-preview.pumpkin.kurbis.host".into(),
+            repository: "Pumpkin-MC/Pumpkin".into(),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            kind: crate::ci::CiRefKind::Commit,
+            state: CiPreviewState::Compiling,
+            build_id: Uuid::new_v4(),
+            runtime_generation: 0,
+            failure_message: None,
+            build_log: "compile started".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            worker_address: None,
+            java_port: None,
+            bedrock_port: None,
+        };
+        let first = java_ci_notice_for_transition(&waiting, target.state, &target)
+            .expect("first state sends a notice");
+        assert!(first.contains("compile started"));
+        waiting.last_ci_state = Some(target.state);
+
+        let mut changed_log = target.clone();
+        changed_log.build_log = "compile progressed".into();
+        assert!(
+            java_ci_notice_for_transition(&waiting, changed_log.state, &changed_log).is_none(),
+            "log updates within a state must not spam a Java connection"
+        );
+
+        assert!(
+            java_ci_notice_for_transition(&waiting, CiPreviewState::Packaging, &changed_log)
+                .is_some()
+        );
+    }
 
     #[test]
     fn ci_waiting_lobby_covers_every_public_preview_state() {

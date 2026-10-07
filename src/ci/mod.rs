@@ -8,6 +8,7 @@ pub mod repository;
 pub mod runtime;
 pub mod services;
 pub mod source_control;
+pub mod status;
 
 pub use domain::{
     BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CI_TARGET_REPOSITORY, CiBuild, CiBuildFailureClass,
@@ -22,6 +23,10 @@ pub use execution::{
 };
 pub use source_control::{
     PollCheckpoint, PollError, PollResult, SourceControlClient, SourceRef, SourceRefKind,
+};
+pub use status::{
+    CiPreviewStatusMessage, ci_preview_chat_message, ci_preview_status_description,
+    ci_preview_status_message, sanitize_ci_diagnostic,
 };
 
 pub use build::{BuildPipelineError, ControlledBuildPipeline, ControlledBuilder, PatchApplier};

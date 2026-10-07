@@ -13,6 +13,7 @@ use tokio::{
 };
 
 use crate::{
+    ci::{ci_preview_status_description, ci_preview_status_message},
     config::GatewayConfig,
     gateway::{
         route_wait::{RouteLease, RouteProtocol},
@@ -373,37 +374,14 @@ fn ci_status_info(hostname: &str, target: Option<&CiRouteTarget>) -> (&'static s
         return ("unknown", "Unknown CI preview address".into());
     };
     let state = target.state;
-    let label = match state {
-        crate::ci::CiPreviewState::Lobby => "lobby",
-        crate::ci::CiPreviewState::Queued => "queued",
-        crate::ci::CiPreviewState::Fetching => "fetching",
-        crate::ci::CiPreviewState::Patching => "patching",
-        crate::ci::CiPreviewState::Compiling => "compiling",
-        crate::ci::CiPreviewState::Packaging => "packaging",
-        crate::ci::CiPreviewState::Booting => "booting",
-        crate::ci::CiPreviewState::Ready => "ready",
-        crate::ci::CiPreviewState::Running => "online",
-        crate::ci::CiPreviewState::Stopping => "stopping",
-        crate::ci::CiPreviewState::Failed => "failed",
-        crate::ci::CiPreviewState::Expired => "expired",
-    };
-    let mut description = format!("Pumpkin CI preview ({state}) — {}", target.commit_sha);
-    if let Some(failure) = target.failure_message.as_deref() {
-        description.push('\n');
-        description.push_str(&tail_utf8(failure, 512));
-    } else if !target.build_log.is_empty() {
-        description.push('\n');
-        description.push_str(&tail_utf8(&target.build_log, 512));
-    }
+    let label = ci_preview_status_message(state).status_label;
+    let description = ci_preview_status_description(
+        state,
+        &target.commit_sha,
+        target.failure_message.as_deref(),
+        &target.build_log,
+    );
     (label, description)
-}
-
-fn tail_utf8(value: &str, max_bytes: usize) -> String {
-    let mut start = value.len().saturating_sub(max_bytes);
-    while start < value.len() && !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value[start..].to_owned()
 }
 
 async fn handle_ci_status(
@@ -457,10 +435,24 @@ async fn handle_ci_login(
     }
     match admission_state.or_else(|| target.as_ref().map(|target| target.state)) {
         Some(crate::ci::CiPreviewState::Failed) => {
-            send_login_disconnect(&mut client, "CI preview build failed.").await
+            let message = target.as_ref().map_or_else(
+                || "CI preview build failed. Reconnect after the CI build is fixed.".to_owned(),
+                |target| {
+                    crate::ci::ci_preview_chat_message(
+                        target.state,
+                        target.failure_message.as_deref(),
+                        &target.build_log,
+                    )
+                },
+            );
+            send_login_disconnect(&mut client, &message).await
         }
         Some(crate::ci::CiPreviewState::Expired) => {
-            send_login_disconnect(&mut client, "CI preview expired.").await
+            send_login_disconnect(
+                &mut client,
+                "CI preview expired. Check the alias and reconnect.",
+            )
+            .await
         }
         Some(_) => proxy_to_waiting(client, config, handshake).await,
         None => send_login_disconnect(&mut client, "Unknown or expired CI preview address.").await,
@@ -733,6 +725,33 @@ mod tests {
         let (state, description) = ci_status_info("branch-feature.pumpkin.kurbis.host", None);
         assert_eq!(state, "unknown");
         assert_eq!(description, "Unknown CI preview address");
+    }
+
+    #[test]
+    fn ci_status_uses_shared_runtime_mapping_and_safe_latest_diagnostic() {
+        let target = CiRouteTarget {
+            preview_id: uuid::Uuid::new_v4(),
+            hostname: "commit-preview.pumpkin.kurbis.host".into(),
+            repository: "Pumpkin-MC/Pumpkin".into(),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            kind: crate::ci::CiRefKind::Commit,
+            state: crate::ci::CiPreviewState::Compiling,
+            build_id: uuid::Uuid::new_v4(),
+            runtime_generation: 0,
+            failure_message: None,
+            build_log: "compile failed
+TOKEN=must-not-leak"
+                .into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            worker_address: None,
+            java_port: None,
+            bedrock_port: None,
+        };
+        let (state, description) = ci_status_info(&target.hostname, Some(&target));
+        assert_eq!(state, "compiling");
+        assert!(description.contains("Pumpkin CI preview (compiling)"));
+        assert!(description.contains("diagnostic omitted because it contained credential data"));
+        assert!(!description.contains("must-not-leak"));
     }
 
     #[tokio::test]
