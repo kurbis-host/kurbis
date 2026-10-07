@@ -107,6 +107,31 @@ pub trait SourceControlClient: Send + Sync {
     ) -> Result<Vec<u8>, PollError> {
         self.fetch_commit(source_repository, commit_sha).await
     }
+
+    /// Return every commit currently reachable from an open PR's head, in
+    /// GitHub's oldest-first order. The head itself is always included by the
+    /// caller so simple non-GitHub fixtures may use this default.
+    async fn pull_request_commits(
+        &self,
+        _repository: &str,
+        _number: u64,
+    ) -> Result<Vec<String>, PollError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve the exact PR commit range captured by a signed webhook. Unlike
+    /// looking up the mutable PR endpoint later, these two SHAs still identify
+    /// the event's original range after the PR is force-pushed again.
+    async fn commit_range(
+        &self,
+        _source_repository: &str,
+        _base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>, PollError> {
+        validate_commit_sha(head_sha)
+            .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
+        Ok(vec![head_sha.to_owned()])
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +260,77 @@ struct Branch {
 #[derive(Debug, Deserialize)]
 struct BranchCommit {
     sha: String,
+}
+
+impl GitHubSourceControl {
+    async fn collect_commit_pages(
+        &self,
+        path: impl Fn(u32) -> String,
+    ) -> Result<Vec<String>, PollError> {
+        let mut commits = Vec::new();
+        for page in 1..=self.max_pages {
+            let result: Page<CommitSha> = self.collect_page(&path(page), None).await?;
+            let count = result.items.len();
+            append_valid_commit_shas(&mut commits, result.items)?;
+            if count < self.per_page as usize {
+                return Ok(commits);
+            }
+        }
+        Err(PollError::InvalidResponse(format!(
+            "commit enumeration exceeded the configured {}-page safety bound",
+            self.max_pages
+        )))
+    }
+
+    async fn collect_compare_commit_pages(
+        &self,
+        path: impl Fn(u32) -> String,
+    ) -> Result<Vec<String>, PollError> {
+        let mut commits = Vec::new();
+        for page in 1..=self.max_pages {
+            // GitHub's compare endpoint wraps commits in an object, unlike the
+            // pull-request commit endpoint which returns a bare array.
+            let response = self.request(&path(page)).send().await?;
+            if !response.status().is_success() {
+                return Err(Self::decode_error(response).await);
+            }
+            let result: ComparePage = response
+                .json()
+                .await
+                .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
+            let count = result.commits.len();
+            append_valid_commit_shas(&mut commits, result.commits)?;
+            if count < self.per_page as usize {
+                return Ok(commits);
+            }
+        }
+        Err(PollError::InvalidResponse(format!(
+            "commit comparison exceeded the configured {}-page safety bound",
+            self.max_pages
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitSha {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComparePage {
+    commits: Vec<CommitSha>,
+}
+
+fn append_valid_commit_shas(
+    commits: &mut Vec<String>,
+    page: impl IntoIterator<Item = CommitSha>,
+) -> Result<(), PollError> {
+    for commit in page {
+        validate_commit_sha(&commit.sha)
+            .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
+        commits.push(commit.sha);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -389,6 +485,45 @@ impl SourceControlClient for GitHubSourceControl {
         }
         Ok(response.bytes().await?.to_vec())
     }
+
+    async fn pull_request_commits(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<Vec<String>, PollError> {
+        if number == 0 {
+            return Err(PollError::InvalidResponse(
+                "pull request number must be positive".into(),
+            ));
+        }
+        let (owner, name) = parse_repository(repository)?;
+        self.collect_commit_pages(|page| {
+            format!(
+                "/repos/{owner}/{name}/pulls/{number}/commits?per_page={}&page={page}",
+                self.per_page
+            )
+        })
+        .await
+    }
+
+    async fn commit_range(
+        &self,
+        source_repository: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>, PollError> {
+        validate_commit_sha(base_sha)
+            .and_then(|_| validate_commit_sha(head_sha))
+            .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
+        let (owner, name) = parse_repository(source_repository)?;
+        self.collect_compare_commit_pages(|page| {
+            format!(
+                "/repos/{owner}/{name}/compare/{base_sha}...{head_sha}?per_page={}&page={page}",
+                self.per_page
+            )
+        })
+        .await
+    }
 }
 
 fn parse_repository(value: &str) -> Result<(&str, &str), PollError> {
@@ -492,8 +627,8 @@ mod http_tests {
             .unwrap_or_default();
         let is_pr = path.contains("/pulls?");
         let page = path
-            .split("page=")
-            .nth(1)
+            .rsplit("page=")
+            .next()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
         if request
@@ -570,6 +705,78 @@ mod http_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn github_commit_range_fixture(request: Request<Body>) -> axum::response::Response {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let page = path
+            .rsplit("page=")
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1);
+        let body = if path.contains("/pulls/314/commits") {
+            match page {
+                1 => json!([{"sha":"0123456789abcdef0123456789abcdef01234567"}]),
+                _ => json!([]),
+            }
+        } else if path.contains("/compare/") {
+            match page {
+                1 => json!({"commits":[{"sha":"fedcba9876543210fedcba9876543210fedcba98"}]}),
+                _ => json!({"commits":[]}),
+            }
+        } else {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        };
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn github_commit_enumeration_handles_array_and_compare_object_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(any(github_commit_range_fixture)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = GitHubSourceControl::new(Client::new(), "fixture-token")
+            .unwrap()
+            .with_api_base_url(format!("http://{address}"))
+            .with_page_limits(1, 4);
+        assert_eq!(
+            client
+                .pull_request_commits("kurbis-host/Pumpkin", 314)
+                .await
+                .unwrap(),
+            vec!["0123456789abcdef0123456789abcdef01234567"]
+        );
+        assert_eq!(
+            client
+                .commit_range(
+                    "kurbis-host/Pumpkin",
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "fedcba9876543210fedcba9876543210fedcba98",
+                )
+                .await
+                .unwrap(),
+            vec!["fedcba9876543210fedcba9876543210fedcba98"]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

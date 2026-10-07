@@ -64,8 +64,21 @@ impl BuildPipelineError {
         diagnostics: impl Into<String>,
     ) -> Self {
         let diagnostics = diagnostics.into();
-        if status.code().is_none()
-            || status.code().is_some_and(|code| matches!(code, 137 | 143))
+        Self::process_failure_code(stage, status.code(), diagnostics)
+    }
+
+    /// Classify a framed or remote process result when no local ExitStatus is
+    /// available. Remote runners deliberately exit cleanly after serializing a
+    /// bounded failure result, so using the SSH wrapper's status would turn
+    /// timeouts and OOM-style statuses into permanent compiler failures.
+    pub(crate) fn process_failure_code(
+        stage: CiBuildStage,
+        status_code: Option<i32>,
+        diagnostics: impl Into<String>,
+    ) -> Self {
+        let diagnostics = diagnostics.into();
+        if status_code.is_none()
+            || status_code.is_some_and(|code| matches!(code, 124 | 137 | 143))
             || transient_failure_hint(&diagnostics)
         {
             Self::transient(stage, diagnostics)
@@ -726,6 +739,24 @@ mod tests {
                 CiBuildStage::Patching,
                 status,
                 "host-control.patch does not apply cleanly: patch failed",
+            )
+            .failure_class(),
+            CiBuildFailureClass::Permanent
+        );
+        assert_eq!(
+            BuildPipelineError::process_failure_code(
+                CiBuildStage::Compiling,
+                Some(124),
+                "remote Bubblewrap build timed out",
+            )
+            .failure_class(),
+            CiBuildFailureClass::Transient
+        );
+        assert_eq!(
+            BuildPipelineError::process_failure_code(
+                CiBuildStage::Compiling,
+                Some(78),
+                "remote Rust compiler mismatch",
             )
             .failure_class(),
             CiBuildFailureClass::Permanent

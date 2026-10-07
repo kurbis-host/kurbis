@@ -155,7 +155,9 @@ fn gateway_config(control_plane_url: String, waiting_control_socket: PathBuf) ->
             database_url: std::env::var("TEST_DATABASE_URL").expect("disposable TEST_DATABASE_URL"),
         },
         java_listen: "127.0.0.1:0".parse().unwrap(),
+        java_public_port: 25565,
         bedrock_listen: "127.0.0.1:0".parse().unwrap(),
+        bedrock_public_address: "127.0.0.1".parse().unwrap(),
         bedrock_public_port: 19132,
         bedrock_tls_certificate: PathBuf::new(),
         bedrock_tls_private_key: PathBuf::new(),
@@ -465,16 +467,10 @@ async fn first_verified_java_and_bedrock_join_wake_and_transfer_without_reconnec
         routes.invalidate_all().await;
 
         let (expected_host, expected_port): (String, u16) = match edition {
-            PlayerEdition::Java => {
-                let (address, port): (String, i32) = sqlx::query_as(
-                    "SELECT w.address, p.java_port FROM placements p JOIN workers w ON w.id = p.worker_id WHERE p.server_id = $1",
-                )
-                .bind(server_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                (address, u16::try_from(port).unwrap())
-            }
+            // The waiting gateway transfers to the canonical public route,
+            // not the worker's private address/leased port. This keeps the
+            // connection behind the shared Gateway and mirrors production.
+            PlayerEdition::Java => (hostname.clone(), 25565),
             PlayerEdition::Bedrock => (format!("s-{server_id}.{ROOT_DOMAIN}"), 19132),
         };
         wait_for_control_event(

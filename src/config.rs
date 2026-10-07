@@ -193,17 +193,16 @@ impl CiConfig {
                 let toolchain = required("CI_BUBBLEWRAP_TOOLCHAIN")?;
                 let workspace_root = required("CI_BUBBLEWRAP_WORKSPACE")?;
                 let source_preparer = required("CI_BUBBLEWRAP_SOURCE_PREPARER")?;
+                let runner_string = runner.to_string_lossy().into_owned();
                 for (name, value) in [
                     ("CI_BUBBLEWRAP_PATH", &executable),
                     ("CI_BUBBLEWRAP_ROOTFS", &rootfs),
                     ("CI_BUBBLEWRAP_TOOLCHAIN", &toolchain),
                     ("CI_BUBBLEWRAP_WORKSPACE", &workspace_root),
                     ("CI_BUBBLEWRAP_SOURCE_PREPARER", &source_preparer),
+                    ("CI_BUBBLEWRAP_RUNNER", &runner_string),
                 ] {
-                    ensure!(
-                        value.starts_with('/') && !value.contains('\0'),
-                        "{name} must be an absolute remote path without NUL bytes"
-                    );
+                    validate_ci_remote_path(value, name)?;
                 }
                 (
                     CiBuilderBackend::BubblewrapSsh {
@@ -296,6 +295,22 @@ fn required_path(name: &str) -> Result<PathBuf> {
     let value = required(name)?;
     ensure!(!value.contains('\0'), "{name} must not contain NUL bytes");
     Ok(PathBuf::from(value))
+}
+
+/// Remote Bubblewrap paths are interpolated into OpenSSH's remote command
+/// string. Keep the grammar deliberately narrower than a local filesystem path
+/// so a malformed deployment cannot turn a path into shell syntax.
+pub fn validate_ci_remote_path(value: &str, name: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 512
+            && value.starts_with('/')
+            && value
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || b"/._-".contains(&byte) }),
+        "{name} must be an absolute remote path containing only [A-Za-z0-9/._-]"
+    );
+    Ok(())
 }
 
 pub fn validate_ci_github_api_base_url(value: &str) -> Result<()> {
@@ -1023,6 +1038,7 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 mod tests {
     use super::{
         CommonConfig, GatewayConfig, ObjectStoreConfig, https_public_base_url, parse_bool,
+        validate_ci_remote_path,
     };
 
     #[test]
@@ -1081,6 +1097,25 @@ mod tests {
         let object_store_debug = format!("{object_store:?}");
         assert!(!object_store_debug.contains("access-secret"));
         assert!(!object_store_debug.contains("object-secret"));
+    }
+
+    #[test]
+    fn remote_bubblewrap_paths_reject_shell_syntax() {
+        assert!(
+            validate_ci_remote_path("/home/ci/kurbis-ci/ci_bubblewrap_runner.py", "runner")
+                .is_ok()
+        );
+        for path in [
+            "relative/runner.py",
+            "/home/ci/ci runner.py",
+            "/home/ci/ci;touch-pwned",
+            "/home/ci/ci$(id)",
+        ] {
+            assert!(
+                validate_ci_remote_path(path, "runner").is_err(),
+                "accepted {path:?}"
+            );
+        }
     }
 
     #[test]

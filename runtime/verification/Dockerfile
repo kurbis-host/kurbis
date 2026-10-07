@@ -10,7 +10,7 @@ WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --jobs 1 --locked --bins && mkdir /artifacts && \
     cp target/debug/control-plane target/debug/gateway target/debug/worker target/debug/worker-bundle target/debug/api-openapi target/debug/runtime-api-proxy /artifacts/
 FROM docker:28-dind AS docker

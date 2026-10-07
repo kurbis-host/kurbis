@@ -68,11 +68,11 @@ impl SshBubblewrapBuildRuntime {
             ));
         }
         let runner = runner.into();
-        if !runner.is_absolute() || runner.to_string_lossy().contains('\0') {
-            return Err(BuildPipelineError::Sandbox(
-                "remote Bubblewrap runner must be an absolute path".into(),
-            ));
-        }
+        crate::config::validate_ci_remote_path(
+            &runner.to_string_lossy(),
+            "remote Bubblewrap runner",
+        )
+        .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let rustc_version = rustc_version.into();
         if rustc_version.trim().is_empty() {
             return Err(BuildPipelineError::Sandbox(
@@ -91,11 +91,8 @@ impl SshBubblewrapBuildRuntime {
             ("workspace", &workspace_root),
             ("source preparer", &source_preparer),
         ] {
-            if value.trim().is_empty() || !value.starts_with('/') || value.contains('\0') {
-                return Err(BuildPipelineError::Sandbox(format!(
-                    "remote Bubblewrap {name} path is invalid"
-                )));
-            }
+            crate::config::validate_ci_remote_path(value, &format!("remote Bubblewrap {name}"))
+                .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         }
         let slots = usize::from(concurrency.max(1));
         let identity = format!(
@@ -277,7 +274,7 @@ impl SshBubblewrapBuildRuntime {
         if mode != "preflight" && !result.ok {
             let mut remote_stderr = Vec::new();
             stderr.read_to_end(&mut remote_stderr).await.ok();
-            let status = child.wait().await.map_err(|e| {
+            let _status = child.wait().await.map_err(|e| {
                 BuildPipelineError::transient(
                     crate::ci::CiBuildStage::Compiling,
                     format!("wait for remote Bubblewrap SSH job: {e}"),
@@ -286,9 +283,9 @@ impl SshBubblewrapBuildRuntime {
             build_report
                 .stderr
                 .push_str(&String::from_utf8_lossy(&remote_stderr));
-            return Err(BuildPipelineError::process_failure(
+            return Err(BuildPipelineError::process_failure_code(
                 crate::ci::CiBuildStage::Compiling,
-                status,
+                Some(result._status),
                 format!("remote Bubblewrap build failed: {}", build_report.stderr),
             ));
         }

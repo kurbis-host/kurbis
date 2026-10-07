@@ -275,6 +275,25 @@ where
             .await
             .map_err(to_poll_error)
     }
+
+    async fn pull_request_commits(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<Vec<String>, PollError> {
+        self.polling.pull_request_commits(repository, number).await
+    }
+
+    async fn commit_range(
+        &self,
+        source_repository: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>, PollError> {
+        self.polling
+            .commit_range(source_repository, base_sha, head_sha)
+            .await
+    }
 }
 
 #[derive(Debug, Deserialize)]
