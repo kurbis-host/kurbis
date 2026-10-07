@@ -7,8 +7,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::{
-    BuildKey, CheckRunClient, CheckRunDetails, CiBuildStage, CiHostname, CiPreviewRepository,
-    CiRefKind,
+    BuildKey, CheckRunClient, CheckRunDetails, CheckRunError, CiBuildStage, CiHostname,
+    CiPreviewRepository, CiRefKind,
     source_control::{PollError, SourceControlClient, SourceRefKind, retry_delay},
 };
 
@@ -472,18 +472,36 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 Ok(())
             }
             Err(error) => {
-                // Check Runs are an informational side effect. A provider
-                // outage, permission failure, or exhausted rate limit must
-                // never fail admission/build execution. Keep a rate-limited
-                // claim until its short lease expires so the next poll cannot
-                // immediately recreate the same request herd.
-                if !matches!(error, crate::ci::CheckRunError::RateLimited { .. }) {
-                    self.repository
-                        .release_check_run_claim(build_id, claim)
-                        .await?;
+                let rate_limited = matches!(error, CheckRunError::RateLimited { .. });
+                let permission_denied = matches!(
+                    error,
+                    CheckRunError::Http { status, .. } if status == reqwest::StatusCode::FORBIDDEN
+                );
+                if rate_limited {
+                    // Preserve the short claim lease across quota pauses so a
+                    // polling storm cannot recreate the same Check Run request
+                    // before GitHub's reset window has elapsed.
+                    tracing::warn!(
+                        build_id = %build_id,
+                        ?error,
+                        "GitHub Check Run rate limited; continuing CI build without external status"
+                    );
+                    return Ok(());
                 }
-                tracing::warn!(build_id = %build_id, ?error, "GitHub Check Run unavailable; continuing CI build without external status");
-                Ok(())
+                self.repository
+                    .release_check_run_claim(build_id, claim)
+                    .await?;
+                if permission_denied {
+                    tracing::warn!(
+                        build_id = %build_id,
+                        repository,
+                        "GitHub Check Run permission denied; continuing CI poll without external status"
+                    );
+                    return Ok(());
+                }
+                Err(anyhow::anyhow!(
+                    "create or recover GitHub check run: {error}"
+                ))
             }
         }
     }

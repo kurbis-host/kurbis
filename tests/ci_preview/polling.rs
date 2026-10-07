@@ -356,6 +356,94 @@ impl SourceControlClient for MutableBranchSource {
 }
 
 #[tokio::test]
+async fn pull_request_poll_continues_when_check_run_permission_is_denied() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let root_domain = unique_ci_root_domain();
+    let head_sha = "fedcba9876543210fedcba9876543210fedcba98";
+    let source = std::sync::Arc::new(PullRequestFixtureSource {
+        fetches: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        head_sha: std::sync::Arc::new(std::sync::RwLock::new(head_sha.to_owned())),
+    });
+    let components = std::sync::Arc::new(TestBuildComponents::default());
+    let check_runs = std::sync::Arc::new(PermissionDeniedCheckRuns {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let builder = std::sync::Arc::new(
+        ControlledBuildPipeline::new(
+            repository.clone(),
+            source.clone(),
+            components.clone(),
+            components.clone(),
+            std::sync::Arc::new(TestArtifactCache),
+            SandboxLimits {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                cpu_millis: 1000,
+                pid_limit: 512,
+                disk_bytes: 5 * 1024 * 1024 * 1024,
+                process_timeout: std::time::Duration::from_secs(3600),
+            },
+        )
+        .with_check_runs(check_runs.clone())
+        .with_root_domain(root_domain.clone()),
+    );
+    let poller = CiPoller::new(repository.clone(), source)
+        .with_config(CiPollerConfig {
+            root_domain,
+            patch_fingerprint: "patch-v1".into(),
+            toolchain_version: "test-toolchain".into(),
+            target_architecture: "x86_64-linux".into(),
+            public_status_base_url: None,
+        })
+        .with_check_runs(check_runs.clone())
+        .with_builder(builder);
+
+    poller
+        .poll_once(watched.id)
+        .await
+        .expect("Check Run permission failure must not abort PR polling");
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "PR build admission continues even when GitHub Check Runs are unavailable"
+    );
+    assert!(
+        check_runs.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the denied Check Run request is attempted without aborting the poll"
+    );
+    let build_stage: String =
+        sqlx::query_scalar("SELECT stage FROM ci_builds WHERE repository = $1 AND commit_sha = $2")
+            .bind(&repository_name)
+            .bind(head_sha)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(build_stage, "ready");
+    let check_run_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_check_runs WHERE repository = $1 AND external_id IS NOT NULL",
+    )
+    .bind(&repository_name)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        check_run_rows, 0,
+        "permission denial must not persist an external Check Run"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn branch_polling_stays_lazy_after_admission_and_ignores_check_run_permission_errors() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
