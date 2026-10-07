@@ -138,6 +138,30 @@ def validate_compose_execution(info: dict) -> None:
         raise DeploymentError("Dokploy default Compose command contains shell control operators")
 
 
+def validate_compose_patches(info: dict) -> None:
+    # Dokploy applies enabled patches after cloning the Git source and before
+    # running Compose. A stale compose.yaml patch therefore silently replaces
+    # the current source with an older normalized document (and can remove
+    # required environment, build, and mount entries). Keep file-specific
+    # overrides out of the production release path; source control is the sole
+    # authority for the Compose definition.
+    patches = api("patch.byEntityId", {"id": COMPOSE_ID, "type": "compose"})
+    if not isinstance(patches, list) or any(not isinstance(patch, dict) for patch in patches):
+        raise DeploymentError("Dokploy Compose patch inventory is malformed")
+    compose_path = os.path.normpath(str(info.get("composePath", "./compose.yaml")))
+    enabled = [
+        patch for patch in patches
+        if patch.get("enabled") is True
+        and os.path.normpath(str(patch.get("filePath", ""))) == compose_path
+    ]
+    if enabled:
+        patch_ids = ", ".join(str(patch.get("patchId", "<unknown>")) for patch in enabled)
+        raise DeploymentError(
+            "Dokploy has enabled production Compose override patch(es) for "
+            f"{compose_path}: {patch_ids}; remove them before deploying source"
+        )
+
+
 def compose_info() -> dict:
     info = api("compose.one", {"composeId": COMPOSE_ID})
     if not isinstance(info, dict) or info.get("composeId") != COMPOSE_ID or info.get("appName") != PROJECT:
@@ -147,6 +171,7 @@ def compose_info() -> dict:
         raise DeploymentError("Dokploy Git repository or Compose path differs from Kurbis production")
     if not isinstance(info.get("env"), str) or info.get("environment", {}).get("name") != "production":
         raise DeploymentError("Kurbis production Dokploy environment is unavailable")
+    validate_compose_patches(info)
     validate_compose_execution(info)
     return info
 
