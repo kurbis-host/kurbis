@@ -5,30 +5,30 @@
     "provenance_status": "legacy-unproven",
     "services": {
       "control-plane": {
-        "container_id": "b4952f4c5b3a707187f3649fdb412d6d6f3168d2050f5aef0993ab8f80b893a7",
+        "container_id": "0eeabd70ee52b4827587dd4df6799cde01cf01cafe898acdc2787606a4eedfd9",
         "container_name": "kurbis-hoster-fbikvd-control-plane-1",
         "health": "healthy",
         "image": {
           "cmd": null,
-          "created": "2026-10-03T19:39:20.821842623+02:00",
+          "created": "2026-10-07T14:18:49.475330628+02:00",
           "entrypoint": [
             "/usr/local/bin/control-plane"
           ],
-          "image_id": "sha256:18af1e378eeccf07689f8c34b820256d6987d8bbad580207b46dfed5def76a37",
+          "image_id": "sha256:762ae9035209a099baefc4f6ec17f9ae05f4317090874d9e16557ba7f12475af",
           "revision_label": null,
           "rootfs_diff_ids": [
-            "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
-            "sha256:b13d7a8bbcc7597de54cee9bbf2bd2e44649a75df8ec2eb9b5fbb8d7884ecec7",
-            "sha256:5175af98d3ced5a12b5ec634e045606d9245e3bf314be75d0adc1e005068001c",
-            "sha256:c5c6e5a04498a788f9bde67c696807b4c25a34558190943c29b6344a44de7110",
-            "sha256:dabc98ee8017786be74610fa0ac4ec84c28bbee7a34efe02ebd70079767b653c",
-            "sha256:6e2dfc333322bc90209e8d10ceb337e9f14fd8f640744a39be1979f10f9a0d71",
-            "sha256:dd310349af84e37584845b9e35346a4d0bde5d99655989b88aa149df222aad1f"
+            "sha256:e58989146fcec76699871403b9897b5c014af1ccd85f5a9300a215e7975525d7",
+            "sha256:cbb036a818f4800098211e8208778e556b26325a72a42a499217732c0e25ee30",
+            "sha256:a0f27f5256a92f490853dc8aea4cc4e88a43856b68ae18e12a68ccbd76652150",
+            "sha256:417f01c9160cb9fd6ddd57ec7f211d48f4e833a0e54a3b444a51e3916e036779",
+            "sha256:9f956214d424f1644c28f90f42e428edc8d162a288677d4c4603b386318ee249",
+            "sha256:6619036d133a6983e120a158a129199376056afc6a457cc37b7dfb72c2a6986f",
+            "sha256:cd2d03f6aefdec270ef45ba8583d50c496882c441a1eec3ec37a9b5d0582386c"
           ],
           "user": "65532:65532",
           "working_dir": ""
         },
-        "image_id": "sha256:18af1e378eeccf07689f8c34b820256d6987d8bbad580207b46dfed5def76a37",
+        "image_id": "sha256:762ae9035209a099baefc4f6ec17f9ae05f4317090874d9e16557ba7f12475af",
         "image_tag": "melon-hoster:local",
         "payloads": {
           "control_plane": {
@@ -47,30 +47,30 @@
         "status": "running"
       },
       "gateway": {
-        "container_id": "8d1614097b132f7ecfb57777dcfae4a533f0a58ed0e0d40c130fbaa474f4fd48",
+        "container_id": "b9745d723da1dca8e0bb1098c70286ea0b238ef82fbacfc2225f81272893608d",
         "container_name": "kurbis-hoster-fbikvd-gateway-1",
         "health": "none",
         "image": {
           "cmd": null,
-          "created": "2026-10-03T19:39:20.821842623+02:00",
+          "created": "2026-10-07T14:18:49.475330628+02:00",
           "entrypoint": [
             "/usr/local/bin/control-plane"
           ],
-          "image_id": "sha256:18af1e378eeccf07689f8c34b820256d6987d8bbad580207b46dfed5def76a37",
+          "image_id": "sha256:762ae9035209a099baefc4f6ec17f9ae05f4317090874d9e16557ba7f12475af",
           "revision_label": null,
           "rootfs_diff_ids": [
-            "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
-            "sha256:b13d7a8bbcc7597de54cee9bbf2bd2e44649a75df8ec2eb9b5fbb8d7884ecec7",
-            "sha256:5175af98d3ced5a12b5ec634e045606d9245e3bf314be75d0adc1e005068001c",
-            "sha256:c5c6e5a04498a788f9bde67c696807b4c25a34558190943c29b6344a44de7110",
-            "sha256:dabc98ee8017786be74610fa0ac4ec84c28bbee7a34efe02ebd70079767b653c",
-            "sha256:6e2dfc333322bc90209e8d10ceb337e9f14fd8f640744a39be1979f10f9a0d71",
-            "sha256:dd310349af84e37584845b9e35346a4d0bde5d99655989b88aa149df222aad1f"
+            "sha256:e58989146fcec76699871403b9897b5c014af1ccd85f5a9300a215e7975525d7",
+            "sha256:cbb036a818f4800098211e8208778e556b26325a72a42a499217732c0e25ee30",
+            "sha256:a0f27f5256a92f490853dc8aea4cc4e88a43856b68ae18e12a68ccbd76652150",
+            "sha256:417f01c9160cb9fd6ddd57ec7f211d48f4e833a0e54a3b444a51e3916e036779",
+            "sha256:9f956214d424f1644c28f90f42e428edc8d162a288677d4c4603b386318ee249",
+            "sha256:6619036d133a6983e120a158a129199376056afc6a457cc37b7dfb72c2a6986f",
+            "sha256:cd2d03f6aefdec270ef45ba8583d50c496882c441a1eec3ec37a9b5d0582386c"
           ],
           "user": "65532:65532",
           "working_dir": ""
         },
-        "image_id": "sha256:18af1e378eeccf07689f8c34b820256d6987d8bbad580207b46dfed5def76a37",
+        "image_id": "sha256:762ae9035209a099baefc4f6ec17f9ae05f4317090874d9e16557ba7f12475af",
         "image_tag": "melon-hoster:local",
         "payloads": {
           "gateway": {
@@ -101,7 +101,7 @@
         "status": "running"
       },
       "panel": {
-        "container_id": "0b0d533925ff1b95a8e59559faabd5a225fddc3b7b9c08d016f87515a54caa2f",
+        "container_id": "36a036842a3adda41907b47d206c05181b311cc14ce4688879b07381fb5925a9",
         "container_name": "kurbis-hoster-fbikvd-panel-1",
         "health": "healthy",
         "image": {
@@ -110,30 +110,30 @@
             "run",
             "start"
           ],
-          "created": "2026-10-03T19:31:07.550303282+02:00",
+          "created": "2026-10-07T14:11:48.083047024+02:00",
           "entrypoint": [
             "docker-entrypoint.sh"
           ],
-          "image_id": "sha256:cfedd18d196b4c728ba6f07399c46fc4c736637ade659559ab4c88952c62c4a5",
+          "image_id": "sha256:2a478625c589855177630e0aeaa387641d0bb27c13b1e824a3a0978a74fd282c",
           "revision_label": null,
           "rootfs_diff_ids": [
-            "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
-            "sha256:de795e33b0a97c1f296a52caad0b1f6230838ce1e2f6cf5b6a48914b31bc9b2f",
-            "sha256:821663448d9d87a75869c392ae8fcf7c225652826c759a200eaf2eed826b3d06",
-            "sha256:e4ab6a15070bbca77a0ba5afcafd3dd9d5b92ce55a9e9f1b5d467bfaf72560a8",
-            "sha256:d266843a38db9ec6f439526c04846f3652c06ffa0efb7a3264927b39d5255164",
-            "sha256:910a8b94bda8d9fce8275552ebf995b1066a9a1cef2f3044a5d88e10249a8d8c",
-            "sha256:f59497225a5552c437afcc34c90caf7cd12c7013a72ad365693be163a8945328",
-            "sha256:112fb2c8f55269216f9338cfcd62c662df365551e844aea4055ddb4b8a7cadff",
-            "sha256:abbd2ae96e1bd40ab5f9ce3faa7c11b6d314867879657841fcdcfdb2abc78a8b",
-            "sha256:cecd00e161fab97207d1d231ef2ca3be85ed9a8bd4ab9f1f10bdd297277a308a",
-            "sha256:f7c11b23b72490c27a1d78effadad81ea77afeeccf40cb90f1046a463b4cca57",
-            "sha256:b18c52180b4a2dd29d49c39c0e2eb6d9140998afc726d46a4583332fec087e7b"
+            "sha256:e58989146fcec76699871403b9897b5c014af1ccd85f5a9300a215e7975525d7",
+            "sha256:4990a62cab1587a2ed690c9d4f41675b9216d68120e99033d664b558662e90c8",
+            "sha256:3714bbaf32038e259cddcddea09e13fc9aaa1a86a644274a6c6e263b00972240",
+            "sha256:f6becc1249c39a0f6d687460220dcfcf9f2a46d01770a70fc0a8ed4c98a6fd49",
+            "sha256:cae24708e29a74f04cc1ec51fc52e2d283c35f243ab21912e036095a2b50dbde",
+            "sha256:ecd316d502b90764eb63836ae70960ef1c391fd2f39d8f1661ad219359fa3b60",
+            "sha256:52590ddd0b61fbcfa5ccd9cf6ce0d05ba3aaf3468ea8baf3f135113ccb90985b",
+            "sha256:e9a782c82e22f0243fb0ad3740493a80ccc2934d1ad803b13440f7e8094498c5",
+            "sha256:00c731e642c84efbb30fe4f4a698d9b416674b2cb50d1e6ddc16306f2fb10c4b",
+            "sha256:175cf41ee3c7db48a96c2b8924594ef9fcbfdaca0c5583c397d2c67f064f70c1",
+            "sha256:77332e1273414c50736661f4f3b89f19f2cadb8119619c05b8d1ccea0b63fdce",
+            "sha256:cf94de1e6e257e9522a4812e8f55920b6e4512a81b0f9fe439e140273ae66cb9"
           ],
           "user": "node",
           "working_dir": "/app"
         },
-        "image_id": "sha256:cfedd18d196b4c728ba6f07399c46fc4c736637ade659559ab4c88952c62c4a5",
+        "image_id": "sha256:2a478625c589855177630e0aeaa387641d0bb27c13b1e824a3a0978a74fd282c",
         "image_tag": "kurbis-panel:local",
         "payloads": {},
         "ports": {
@@ -251,7 +251,7 @@
       "checkout_head": "f6b05712bb130747060e5cfa049d84ed27020835",
       "compose_env_file_gid": 0,
       "compose_env_file_mode": 420,
-      "compose_env_file_sha256": "7ae9622aac10398ed1be42182099e5990e9062d60fa4859184fcb59e0e7dd775",
+      "compose_env_file_sha256": "d989ab0a1d3d5c70f80a239812c29f149b705ea99f7ec0944c132fbf26135e6a",
       "compose_env_file_uid": 0,
       "modified_inputs": [
         {
@@ -269,7 +269,10 @@
           "path": ".env"
         }
       ],
-      "safe_compose_settings": {}
+      "safe_compose_settings": {
+        "BEDROCK_TLS_HOST_DIRECTORY": "/srv/kurbis/certs",
+        "PANEL_BIND_ADDRESS": "127.0.0.1"
+      }
     },
     "worker": {
       "configured_pumpkin_image": "melon-pumpkin:host-control",
@@ -318,7 +321,7 @@
         "user": "2613:2613",
         "working_dir": "/pumpkin"
       },
-      "main_pid": 3620533,
+      "main_pid": 1006495,
       "process_pumpkin_image": "melon-pumpkin:host-control",
       "service": "kurbis-worker.service",
       "service_active": true,
@@ -336,8 +339,8 @@
       "worker_uid": 0
     }
   },
-  "operator": "Kurbis production release operator",
-  "reason": "Explicit one-time attestation of the known f6b0571-era Respond5 inventory before a guarded migration to SHA-labeled builds. This records legacy artifacts as unproven; exact old image and executable digests are retained solely for rollback and no service or world data is deleted.",
+  "operator": "Codex deployment orchestrator",
+  "reason": "Refresh the guarded rollback attestation after the production rollback image inventory changed; preserve all volumes and require exact source and worker identity before CI enablement.",
   "schema": "kurbis.respond5.legacy-baseline.v1",
   "source_revision_claim": "f6b05712bb130747060e5cfa049d84ed27020835"
 }
