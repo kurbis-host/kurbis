@@ -246,11 +246,18 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
     if ENV_FILE.is_symlink() or env_stat.st_uid != 0 or stat.S_IMODE(env_stat.st_mode) != 0o600:
         raise BaselineError("worker env file must remain root-owned mode 0600")
 
-    pid = int(run_text(["systemctl", "show", "--property=MainPID", "--value", "kurbis-worker.service"]))
-    service_state = run_text(["systemctl", "show", "--property=ActiveState", "--value", "kurbis-worker.service"])
     allowed_states = {"active"} if baseline_schema == LEGACY_BASELINE_SCHEMA else {"active", "activating"}
-    if service_state not in allowed_states or pid <= 1:
-        raise BaselineError("Kurbis worker systemd service is not in an inspectable state")
+    pid = 0
+    service_state = ""
+    deadline = time.monotonic() + (0 if baseline_schema == LEGACY_BASELINE_SCHEMA else 15)
+    while True:
+        pid = int(run_text(["systemctl", "show", "--property=MainPID", "--value", "kurbis-worker.service"]))
+        service_state = run_text(["systemctl", "show", "--property=ActiveState", "--value", "kurbis-worker.service"])
+        if service_state in allowed_states and pid > 1:
+            break
+        if time.monotonic() >= deadline:
+            raise BaselineError("Kurbis worker systemd service is not in an inspectable state")
+        time.sleep(1)
     process_paths = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
