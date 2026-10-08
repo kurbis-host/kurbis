@@ -148,9 +148,42 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(environment["PUMPKIN_IMAGE"], "melon-pumpkin:host-control-" + "a" * 40)
         self.assertEqual(environment["WORKER_ID"], "worker")
 
-    def test_no_mutable_cargo_target_cache_mounts(self):
-        for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
-            self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
+    def test_cargo_target_cache_is_release_scoped_only_for_pumpkin(self):
+        application = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
+        pumpkin = (ROOT / "runtime/pumpkin/Dockerfile").read_text(encoding="utf-8")
+        self.assertNotIn("target=/source/target", application)
+        self.assertIn(
+            "id=kurbis-pumpkin-target-${BUILD_REVISION},target=/source/target,sharing=locked",
+            pumpkin,
+        )
+        self.assertIn(
+            "id=kurbis-pumpkin-plugin-target-${BUILD_REVISION},target=/source/plugins/kurbis-control/target,sharing=locked",
+            pumpkin,
+        )
+        self.assertEqual(pumpkin.count("target=/usr/local/cargo/registry,sharing=locked"), 2)
+        self.assertEqual(pumpkin.count("target=/usr/local/cargo/git,sharing=locked"), 2)
+
+    def test_release_revision_accepts_sha_scoped_pumpkin_target_cache(self):
+        with patch.object(deploy, "run", side_effect=["a" * 40, "", "a" * 40]):
+            self.assertEqual(deploy.release_revision(), "a" * 40)
+
+    def test_remote_timeout_defaults_to_90_minutes_and_supports_safe_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(deploy.remote_command_timeout_seconds(), 5400)
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "7200"}, clear=True):
+            self.assertEqual(deploy.remote_command_timeout_seconds(), 7200)
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "1799"}, clear=True):
+            with self.assertRaisesRegex(deploy.DeploymentError, "must be from"):
+                deploy.remote_command_timeout_seconds()
+
+    def test_remote_uses_keepalive_and_configured_timeout_without_retrying(self):
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "5400"}, clear=True), \
+             patch.object(deploy, "run", return_value="{}") as remote_run:
+            self.assertEqual(deploy.remote("respond5", "baseline"), {})
+        command = remote_run.call_args.args[0]
+        self.assertIn("ServerAliveInterval=30", command)
+        self.assertIn("ServerAliveCountMax=182", command)
+        self.assertEqual(remote_run.call_args.kwargs["timeout"], 5400)
 
     def test_runtime_image_propagates_build_revision_to_binaries_and_label(self):
         dockerfile = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")

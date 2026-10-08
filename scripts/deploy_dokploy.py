@@ -25,6 +25,11 @@ LEGACY_RECOVERY = ROOT / "scripts/dokploy_legacy_worker_recovery.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 PROJECT = "kurbis-hoster-fbikvd"
 EXPECTED_SOURCE = ("github", "kurbis-host", "kurbis", "main", "./compose.yaml")
+DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS = 5400
+REMOTE_COMMAND_TIMEOUT_ENV = "KURBIS_REMOTE_COMMAND_TIMEOUT_SECONDS"
+MIN_REMOTE_COMMAND_TIMEOUT_SECONDS = 1800
+MAX_REMOTE_COMMAND_TIMEOUT_SECONDS = 24 * 60 * 60
+
 SERVICES = {
     "control-plane": "control-plane", "gateway": "gateway", "panel": "panel",
     "waiting-pumpkin": "waiting-pumpkin", "postgres": "postgres",
@@ -57,15 +62,57 @@ def run(command: Sequence[str], *, input_text: str | None = None, cwd: Path | No
     return result.stdout.strip()
 
 
+def remote_command_timeout_seconds() -> int:
+    """Return the bounded SSH lifetime for long-running remote operations.
+
+    Pumpkin's first host-control release build can take close to an hour on a
+    cold respond5 cache. Keep this timeout long enough for that build while
+    retaining an operator override for slower or faster builders. The lower
+    bound deliberately exceeds the old 30-minute cutoff so an accidental
+    override cannot recreate the premature SSH disconnect that left a remote
+    build ambiguous.
+    """
+    raw = os.environ.get(REMOTE_COMMAND_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS
+    try:
+        value = int(raw, 10)
+    except ValueError as error:
+        raise DeploymentError(
+            f"{REMOTE_COMMAND_TIMEOUT_ENV} must be an integer from "
+            f"{MIN_REMOTE_COMMAND_TIMEOUT_SECONDS} to {MAX_REMOTE_COMMAND_TIMEOUT_SECONDS} seconds"
+        ) from error
+    if not MIN_REMOTE_COMMAND_TIMEOUT_SECONDS <= value <= MAX_REMOTE_COMMAND_TIMEOUT_SECONDS:
+        raise DeploymentError(
+            f"{REMOTE_COMMAND_TIMEOUT_ENV} must be from "
+            f"{MIN_REMOTE_COMMAND_TIMEOUT_SECONDS} to {MAX_REMOTE_COMMAND_TIMEOUT_SECONDS} seconds"
+        )
+    return value
+
+
 def release_revision() -> str:
     commit = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"])
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise DeploymentError("release must be a full Git SHA")
     if run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all"]):
         raise DeploymentError("refusing to release a dirty or untracked checkout")
-    for dockerfile in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
-        if "target=/source/target" in dockerfile.read_text(encoding="utf-8"):
-            raise DeploymentError(f"mutable Cargo target cache remains in {dockerfile.name}")
+    pumpkin_dockerfile = ROOT / "runtime/pumpkin/Dockerfile"
+    for dockerfile in (ROOT / "runtime/Dockerfile", pumpkin_dockerfile):
+        text = dockerfile.read_text(encoding="utf-8")
+        if dockerfile != pumpkin_dockerfile:
+            if "target=/source/target" in text:
+                raise DeploymentError("mutable Cargo target cache remains in application Dockerfile")
+            continue
+        # The Pumpkin host-control image may cache its target only under the
+        # immutable source SHA. That keeps retries warm without crossing
+        # release boundaries or weakening the application's stale-artifact
+        # protection.
+        scoped_target_mount = (
+            "id=kurbis-pumpkin-target-${BUILD_REVISION},"
+            "target=/source/target,sharing=locked"
+        )
+        if scoped_target_mount not in text:
+            raise DeploymentError("Pumpkin Cargo target cache is not scoped to BUILD_REVISION")
     remote = run(["git", "-C", str(ROOT), "ls-remote", "origin", "refs/heads/main"], timeout=30).split()
     if not remote or remote[0] != commit:
         raise DeploymentError("release checkout is not exactly origin/main")
@@ -338,8 +385,17 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
                        ("release-environment",release_environment)):
         if value is not None:
             command.extend([f"--{key}", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))])
-    output = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(command)],
-                 input_text=worker_sync_source(), timeout=1800)
+    timeout = remote_command_timeout_seconds()
+    # The remote build emits no output while rustc links Pumpkin. Keep the SSH
+    # session alive instead of letting an idle connection die and leaving the
+    # caller unsure whether a build is still running. The rollout never retries
+    # this operation automatically, so one bounded invocation owns the build.
+    keepalive_count = max(3, (timeout + 29) // 30 + 2)
+    output = run([
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30", f"-o", f"ServerAliveCountMax={keepalive_count}",
+        host, shlex.join(command),
+    ], input_text=worker_sync_source(), timeout=timeout)
     try:
         result = json.loads(output)
     except json.JSONDecodeError as error:
@@ -375,8 +431,13 @@ def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
                       ("candidate-revision",candidate_revision),("mode",mode)):
         if value is not None:
             command.extend([f"--{key}",value if isinstance(value,str) else json.dumps(value,separators=(",",":"))])
-    output=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=10",host,shlex.join(command)],
-               input_text=legacy_remote_source(),timeout=1800)
+    timeout = remote_command_timeout_seconds()
+    keepalive_count = max(3, (timeout + 29) // 30 + 2)
+    output=run([
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30", "-o", f"ServerAliveCountMax={keepalive_count}",
+        host, shlex.join(command),
+    ], input_text=legacy_remote_source(), timeout=timeout)
     try:result=json.loads(output)
     except json.JSONDecodeError as error:raise DeploymentError("respond5 legacy inventory verifier returned invalid JSON") from error
     if not isinstance(result,dict):raise DeploymentError("respond5 legacy inventory verifier returned invalid result")
