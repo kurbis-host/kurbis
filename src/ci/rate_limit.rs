@@ -174,6 +174,7 @@ impl GitHubRateLimitGuard {
             .map(str::to_ascii_lowercase)
             .is_some_and(|body| body.contains("rate limit") || body.contains("secondary rate"));
         let provider_limited = status == StatusCode::TOO_MANY_REQUESTS
+            || retry_header.is_some()
             || (status == StatusCode::FORBIDDEN && body_rate);
         let exhausted = remaining == Some(0);
         let (result, snapshot) = {

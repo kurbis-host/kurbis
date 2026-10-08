@@ -74,7 +74,7 @@ impl CiPreviewRepository {
                 },
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error))?;
+            .map_err(anyhow::Error::new)?;
         // A persisted ETag can survive a restart while the provider returns
         // 304 before this process has rebuilt its in-memory response cache.
         // Rehydrate the durable ref cache instead of interpreting the empty

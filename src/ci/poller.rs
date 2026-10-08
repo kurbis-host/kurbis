@@ -498,11 +498,19 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             match self.poll_once(repository_id).await {
                 Ok(()) => return Ok(()),
                 Err(error) if attempt + 1 < attempts => {
-                    let poll_error = PollError::Http {
-                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                        message: error.to_string(),
-                    };
-                    sleep(retry_delay(&poll_error, attempt)).await;
+                    let delay = error
+                        .downcast_ref::<PollError>()
+                        .map(|poll_error| retry_delay(poll_error, attempt))
+                        .unwrap_or_else(|| {
+                            retry_delay(
+                                &PollError::Http {
+                                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                                    message: error.to_string(),
+                                },
+                                attempt,
+                            )
+                        });
+                    sleep(delay).await;
                     attempt += 1;
                 }
                 Err(error) => return Err(error),
