@@ -44,7 +44,8 @@ async fn ci_builds_deduplicate_and_stable_aliases_advance_only_when_ready() {
     repository
         .poll_repository(watched.id, &FixtureSource::default())
         .await
-        .unwrap();
+        .unwrap()
+        .expect("test poll acquired the repository lease");
     let source_repository: String = sqlx::query_scalar(
         "SELECT source_repository FROM ci_refs WHERE repository_id = $1 AND name = 'main'",
     )

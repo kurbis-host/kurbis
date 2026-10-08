@@ -1,7 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::super::{
@@ -10,6 +15,110 @@ use super::super::{
 };
 use super::rows::WatchedRepositoryRow;
 use super::{CiPreviewRepository, WatchedRepository};
+
+const POLL_LEASE_DURATION: Duration = Duration::from_secs(120);
+const POLL_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Fences one provider poll without retaining a PostgreSQL transaction during
+/// network I/O. Cancellation starts a best-effort asynchronous lease release;
+/// the short lease expiry remains the recovery path if the runtime is stopping.
+struct PollLease {
+    pool: PgPool,
+    repository_id: Uuid,
+    token: Uuid,
+    released: bool,
+}
+
+impl PollLease {
+    fn new(pool: PgPool, repository_id: Uuid, token: Uuid) -> Self {
+        Self {
+            pool,
+            repository_id,
+            token,
+            released: false,
+        }
+    }
+
+    async fn renew(&self) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE ci_watched_repositories
+             SET poll_lease_expires_at = now() + $3::interval, updated_at = now()
+             WHERE id = $1 AND enabled AND poll_lease_token = $2
+               AND poll_lease_expires_at > now()",
+        )
+        .bind(self.repository_id)
+        .bind(self.token)
+        .bind(format!("{} seconds", POLL_LEASE_DURATION.as_secs()))
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            bail!("CI repository poll lease was lost");
+        }
+        Ok(())
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        sqlx::query(
+            "UPDATE ci_watched_repositories
+             SET poll_lease_token = NULL, poll_lease_expires_at = NULL, updated_at = now()
+             WHERE id = $1 AND poll_lease_token = $2",
+        )
+        .bind(self.repository_id)
+        .bind(self.token)
+        .execute(&self.pool)
+        .await?;
+        self.released = true;
+        Ok(())
+    }
+
+    fn mark_committed(&mut self) {
+        self.released = true;
+    }
+
+    fn schedule_release(&self) {
+        let pool = self.pool.clone();
+        let repository_id = self.repository_id;
+        let token = self.token;
+        tokio::spawn(async move {
+            if let Err(error) = sqlx::query(
+                "UPDATE ci_watched_repositories
+                 SET poll_lease_token = NULL, poll_lease_expires_at = NULL, updated_at = now()
+                 WHERE id = $1 AND poll_lease_token = $2",
+            )
+            .bind(repository_id)
+            .bind(token)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%repository_id, ?error, "failed to release cancelled CI repository poll lease");
+            }
+        });
+    }
+}
+
+impl Drop for PollLease {
+    fn drop(&mut self) {
+        if !self.released && tokio::runtime::Handle::try_current().is_ok() {
+            self.schedule_release();
+        }
+    }
+}
+
+async fn poll_with_lease<C: crate::ci::source_control::SourceControlClient + ?Sized>(
+    lease: &PollLease,
+    repository: &str,
+    checkpoint: &PollCheckpoint,
+    source: &C,
+) -> Result<crate::ci::source_control::PollResult> {
+    let poll = source.poll(repository, checkpoint);
+    tokio::pin!(poll);
+    loop {
+        tokio::select! {
+            result = &mut poll => return result.map_err(anyhow::Error::new),
+            _ = sleep(POLL_LEASE_RENEWAL_INTERVAL) => lease.renew().await?,
+        }
+    }
+}
 
 impl CiPreviewRepository {
     pub async fn repository_name(&self, repository_id: Uuid) -> Result<String> {
@@ -44,37 +153,61 @@ impl CiPreviewRepository {
         Ok(row.into())
     }
 
-    /// Poll and persist one repository while holding its row lock. The lock spans the
-    /// provider request and persistence so two pollers cannot interleave checkpoints or
-    /// mark refs from an older page as deleted.
+    /// Poll one repository with a short durable lease. The lease serializes
+    /// provider calls across replicas while all database transactions remain
+    /// bounded to individual claim, renewal, and persistence statements.
     pub async fn poll_repository<C: crate::ci::source_control::SourceControlClient + ?Sized>(
         &self,
         repository_id: Uuid,
         source: &C,
-    ) -> Result<crate::ci::source_control::PollResult> {
-        let mut tx = self.pool.begin().await?;
+    ) -> Result<Option<crate::ci::source_control::PollResult>> {
+        let token = Uuid::new_v4();
         let row = sqlx::query_as::<_, WatchedRepositoryRow>(
-            "SELECT id, repository, default_branch, enabled, etag, branch_etag, pull_request_page,
-                    branch_cursor, last_successful_poll
-             FROM ci_watched_repositories WHERE id = $1 AND enabled FOR UPDATE",
+            "UPDATE ci_watched_repositories
+             SET poll_lease_token = $2,
+                 poll_lease_expires_at = now() + $3::interval, updated_at = now()
+             WHERE id = $1 AND enabled
+               AND (poll_lease_token IS NULL OR poll_lease_expires_at <= now())
+             RETURNING id, repository, default_branch, enabled, etag, branch_etag, pull_request_page,
+                       branch_cursor, last_successful_poll",
         )
         .bind(repository_id)
+        .bind(token)
+        .bind(format!("{} seconds", POLL_LEASE_DURATION.as_secs()))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut lease = PollLease::new(self.pool.clone(), repository_id, token);
+        let checkpoint = PollCheckpoint {
+            etag: row.etag.clone(),
+            branch_etag: row.branch_etag.clone(),
+            pull_request_page: row.pull_request_page.max(1) as u32,
+            branch_cursor: row.branch_cursor.clone(),
+            last_successful_poll: row.last_successful_poll,
+        };
+        let mut poll = match poll_with_lease(&lease, &row.repository, &checkpoint, source).await {
+            Ok(poll) => poll,
+            Err(error) => {
+                if let Err(release_error) = lease.release().await {
+                    tracing::warn!(%repository_id, ?release_error, "failed to release failed CI repository poll lease");
+                }
+                return Err(error);
+            }
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM ci_watched_repositories
+             WHERE id = $1 AND enabled AND poll_lease_token = $2
+               AND poll_lease_expires_at > now()
+             FOR UPDATE",
+        )
+        .bind(repository_id)
+        .bind(token)
         .fetch_optional(&mut *tx)
         .await?
-        .context("watched CI repository not found or disabled")?;
-        let mut poll = source
-            .poll(
-                &row.repository,
-                &PollCheckpoint {
-                    etag: row.etag.clone(),
-                    branch_etag: row.branch_etag.clone(),
-                    pull_request_page: row.pull_request_page.max(1) as u32,
-                    branch_cursor: row.branch_cursor.clone(),
-                    last_successful_poll: row.last_successful_poll,
-                },
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
+        .context("CI repository poll lease expired or was superseded")?;
         // A persisted ETag can survive a restart while the provider returns
         // 304 before this process has rebuilt its in-memory response cache.
         // Rehydrate the durable ref cache instead of interpreting the empty
@@ -146,12 +279,14 @@ impl CiPreviewRepository {
             })
             .cloned()
             .collect();
-        sqlx::query(
-            "UPDATE ci_watched_repositories SET etag = $2, branch_etag = $3,
-                    pull_request_page = $4, branch_cursor = $5, last_successful_poll = $6,
-                    updated_at = now() WHERE id = $1",
+        let updated = sqlx::query(
+            "UPDATE ci_watched_repositories SET etag = $3, branch_etag = $4,
+                    pull_request_page = $5, branch_cursor = $6, last_successful_poll = $7,
+                    poll_lease_token = NULL, poll_lease_expires_at = NULL, updated_at = now()
+             WHERE id = $1 AND poll_lease_token = $2 AND poll_lease_expires_at > now()",
         )
         .bind(repository_id)
+        .bind(token)
         .bind(&poll.checkpoint.etag)
         .bind(&poll.checkpoint.branch_etag)
         .bind(
@@ -162,6 +297,9 @@ impl CiPreviewRepository {
         .bind(poll.checkpoint.last_successful_poll)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            bail!("CI repository poll lease was lost before persistence");
+        }
         let mut seen = HashSet::new();
         for source_ref in &poll.refs {
             let kind = match source_ref.kind {
@@ -202,7 +340,8 @@ impl CiPreviewRepository {
                 .bind(repository_id).bind(kind.as_str()).bind(names).execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        Ok(poll)
+        lease.mark_committed();
+        Ok(Some(poll))
     }
 
     /// Expire stable branch aliases after the complete poll has marked their
