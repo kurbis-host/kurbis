@@ -432,6 +432,10 @@ fn checked_in_ci_patch_fingerprint() -> Result<String> {
             "trusted-plugin/src/menu.rs",
             "plugins/kurbis-control/src/menu.rs",
         ),
+        (
+            "trusted-plugin/src/stats.rs",
+            "plugins/kurbis-control/src/stats.rs",
+        ),
     ] {
         let contents =
             std::fs::read(root.join(relative)).with_context(|| format!("read {relative}"))?;

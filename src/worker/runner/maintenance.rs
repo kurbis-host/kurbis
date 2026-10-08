@@ -109,6 +109,21 @@ impl WorkerRunner {
                 }
             }
 
+            match self.runtime.runtime_stats(&server_dir, generation).await {
+                Ok(stats) => {
+                    if let Err(error) = self
+                        .control_plane
+                        .sync_runtime_stats(server_id, &stats)
+                        .await
+                    {
+                        tracing::warn!(%server_id, ?error, "failed to persist runtime stats");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%server_id, ?error, "failed to read runtime stats");
+                }
+            }
+
             let last = self
                 .last_snapshot
                 .entry(server_id)

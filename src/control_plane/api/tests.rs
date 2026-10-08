@@ -88,6 +88,46 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
     }
 
     assert!(paths.contains_key("/api/v1/servers/{server_id}/commands"));
+    let runtime_stats = &paths["/api/v1/servers/{server_id}/runtime-stats"]["get"];
+    assert!(
+        runtime_stats["security"]
+            .as_array()
+            .is_some_and(|security| {
+                security.iter().any(|requirement| {
+                    requirement.as_object().is_some_and(|requirement| {
+                        requirement.contains_key("serverCapabilityBearer")
+                    })
+                })
+            })
+    );
+    assert_eq!(
+        runtime_stats["responses"]["200"]["content"]["application/json"]["schema"],
+        serde_json::json!({
+            "anyOf": [
+                { "$ref": "#/components/schemas/RuntimeStats" },
+                { "type": "null" }
+            ]
+        })
+    );
+    assert!(schemas.contains_key("RuntimeStats"));
+    for property in [
+        "generation",
+        "cpu_percent",
+        "cpu_limit_millis",
+        "memory_used_bytes",
+        "memory_limit_bytes",
+        "disk_used_bytes",
+        "disk_limit_bytes",
+        "tps",
+        "measured_at",
+    ] {
+        assert!(
+            schemas["RuntimeStats"]["properties"]
+                .get(property)
+                .is_some(),
+            "runtime stats schema is missing {property}"
+        );
+    }
     assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands"));
     assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands/{command_id}"));
     assert!(schemas.contains_key("ConsoleCommandRequest"));
@@ -422,12 +462,14 @@ fn settings_patch_preserves_unspecified_values() {
         "view_distance": 10,
         "simulation_distance": 8,
         "hardcore": false,
-        "whitelist": false
+        "whitelist": false,
+        "tab_stats": false
     }))
     .unwrap();
     let patch: ServerSettingsPatch = serde_json::from_value(serde_json::json!({
         "view_distance": 16,
-        "whitelist": true
+        "whitelist": true,
+        "tab_stats": true
     }))
     .unwrap();
     settings.merge(patch);
@@ -440,7 +482,8 @@ fn settings_patch_preserves_unspecified_values() {
             "view_distance": 16,
             "simulation_distance": 8,
             "hardcore": false,
-            "whitelist": true
+            "whitelist": true,
+            "tab_stats": true
         })
     );
 }

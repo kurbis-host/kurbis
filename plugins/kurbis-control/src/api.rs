@@ -77,7 +77,9 @@ fn is_local_http_authority(authority: &str) -> bool {
             .map_or(authority, |(host, _)| host)
     };
     (host.eq_ignore_ascii_case("kurbis-runtime-api-proxy")
-        && authority.rsplit_once(':').is_some_and(|(_, port)| port == "8080"))
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port == "8080"))
         || host.eq_ignore_ascii_case("localhost")
         || IpAddr::from_str(host).is_ok_and(|address| {
             address.is_loopback()
@@ -173,7 +175,7 @@ pub(crate) fn adjust_setting(key: &str, direction: i8) -> Result<()> {
                 .context("distance setting was not numeric")? as i16;
             Value::Number(current.saturating_add(direction as i16).clamp(2, 32).into())
         }
-        "hardcore" | "whitelist" => {
+        "hardcore" | "whitelist" | "tab_stats" => {
             Value::Bool(!settings.get(key).and_then(Value::as_bool).unwrap_or(false))
         }
         _ => anyhow::bail!("invalid settings key"),
@@ -215,7 +217,7 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<()> {
         {
             Ok(())
         }
-        "hardcore" | "whitelist" if value.as_bool().is_some() => Ok(()),
+        "hardcore" | "whitelist" | "tab_stats" if value.as_bool().is_some() => Ok(()),
         _ => anyhow::bail!("invalid settings key or value"),
     }
 }
@@ -493,6 +495,7 @@ mod tests {
             ("simulation_distance", serde_json::json!(2)),
             ("hardcore", serde_json::json!(true)),
             ("whitelist", serde_json::json!(false)),
+            ("tab_stats", serde_json::json!(true)),
         ] {
             assert!(validate_setting_value(key, &value).is_ok(), "{key}={value}");
         }

@@ -8,6 +8,7 @@ pub mod model;
 pub mod pumpkin_control;
 pub mod routing;
 pub mod runtime_api_proxy;
+pub mod runtime_stats;
 pub mod snapshot;
 pub mod worker;
 pub mod workload_ingress;

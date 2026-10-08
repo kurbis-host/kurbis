@@ -3,6 +3,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant},
 };
 
 use pumpkin_config::op::Op;
@@ -75,6 +76,48 @@ enum Action {
     WhitelistReplace,
     OperatorsReplace,
     ExecuteCommand,
+    Stats,
+}
+
+#[derive(Debug, Serialize)]
+struct HostStats {
+    cpu_percent: Option<f64>,
+    cpu_limit_millis: Option<u64>,
+    memory_used_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    disk_used_bytes: Option<u64>,
+    disk_limit_bytes: Option<u64>,
+    tps: Option<f64>,
+}
+
+#[derive(Default)]
+struct CpuSample {
+    usage_nanos: Option<u64>,
+    at: Option<Instant>,
+}
+
+impl CpuSample {
+    fn observe(
+        &mut self,
+        usage_nanos: Option<u64>,
+        cpu_limit_millis: Option<u64>,
+        at: Instant,
+    ) -> Option<f64> {
+        let value = match (self.usage_nanos, self.at, usage_nanos) {
+            (Some(previous_usage), Some(previous_at), Some(current_usage)) => {
+                normalize_cpu_percent(
+                    previous_usage,
+                    current_usage,
+                    at.saturating_duration_since(previous_at),
+                    cpu_limit_millis,
+                )
+            }
+            _ => None,
+        };
+        self.usage_nanos = usage_nanos;
+        self.at = Some(at);
+        value
+    }
 }
 
 pub fn spawn(server: &Arc<Server>) {
@@ -111,6 +154,7 @@ async fn run(path: PathBuf, token: String, server: Arc<Server>) -> io::Result<()
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     info!("Host control is listening on {}", path.display());
+    let cpu_sample = Arc::new(std::sync::Mutex::new(CpuSample::default()));
 
     loop {
         select! {
@@ -119,8 +163,9 @@ async fn run(path: PathBuf, token: String, server: Arc<Server>) -> io::Result<()
                     Ok((stream, _)) => {
                         let server = server.clone();
                         let token = token.clone();
+                        let cpu_sample = cpu_sample.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle(stream, &token, &server).await {
+                            if let Err(error) = handle(stream, &token, &server, &cpu_sample).await {
                                 warn!("Host control request failed: {error}");
                             }
                         });
@@ -143,7 +188,12 @@ async fn run(path: PathBuf, token: String, server: Arc<Server>) -> io::Result<()
     Ok(())
 }
 
-async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) -> io::Result<()> {
+async fn handle(
+    stream: UnixStream,
+    expected_token: &str,
+    server: &Arc<Server>,
+    cpu_sample: &Arc<std::sync::Mutex<CpuSample>>,
+) -> io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
     let mut bytes = Vec::new();
@@ -181,7 +231,11 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
     if server.snapshot_barrier_active.load(Ordering::Acquire)
         && !matches!(
             &request.action,
-            Action::Status | Action::Players | Action::EndSnapshot | Action::Shutdown
+            Action::Status
+                | Action::Players
+                | Action::Stats
+                | Action::EndSnapshot
+                | Action::Shutdown
         )
     {
         return write_response(
@@ -256,6 +310,13 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
             write_response(
                 &mut write_half,
                 json!({"ok": true, "waiting_players": players}),
+            )
+            .await
+        }
+        Action::Stats => {
+            write_response(
+                &mut write_half,
+                json!({"ok": true, "stats": sample_host_stats(server, cpu_sample)}),
             )
             .await
         }
@@ -543,6 +604,281 @@ async fn handle(stream: UnixStream, expected_token: &str, server: &Arc<Server>) 
             stop_server();
             Ok(())
         }
+    }
+}
+
+fn sample_host_stats(
+    server: &Arc<Server>,
+    cpu_sample: &Arc<std::sync::Mutex<CpuSample>>,
+) -> HostStats {
+    // Keep reading and recording under one lock. Concurrent stats requests can
+    // otherwise read in order but update the baseline out of order, producing
+    // a false counter reset or an interval that does not match its sample.
+    let (cpu_usage_nanos, cpu_limit_millis, cpu_percent) = {
+        let mut previous = cpu_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (usage, limit) = read_cpu_cgroup();
+        let percent = previous.observe(usage, limit, Instant::now());
+        (usage, limit, percent)
+    };
+    let (memory_used_bytes, memory_limit_bytes) = read_memory_cgroup();
+    let (disk_used_bytes, disk_limit_bytes) = read_disk_usage();
+    let tps = normalize_tps(server.get_tps());
+    HostStats {
+        cpu_percent,
+        cpu_limit_millis,
+        memory_used_bytes,
+        memory_limit_bytes,
+        disk_used_bytes,
+        disk_limit_bytes,
+        tps,
+    }
+}
+
+fn read_cpu_cgroup() -> (Option<u64>, Option<u64>) {
+    // A cgroup-v2 mount always exposes these files when the controller is
+    // available. Treat their presence as authoritative, even when one value
+    // is malformed or the quota is unlimited, instead of falling through to
+    // unrelated cgroup-v1 paths and manufacturing a partial sample.
+    let v2_stat = read_text("/sys/fs/cgroup/cpu.stat");
+    let v2_max = read_text("/sys/fs/cgroup/cpu.max");
+    if v2_stat.is_some() || v2_max.is_some() {
+        let usage = v2_stat
+            .as_deref()
+            .and_then(|value| parse_key_value(value, "usage_usec"))
+            .and_then(|value| value.checked_mul(1_000));
+        let limit = v2_max.as_deref().and_then(parse_cpu_max);
+        return (usage, limit);
+    }
+
+    let usage = read_u64("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+        .or_else(|| read_u64("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"));
+    let quota = read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        .or_else(|| read_text("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us"));
+    let period = read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        .or_else(|| read_text("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us"));
+    let limit = match (quota, period) {
+        (Some(quota), Some(period)) => parse_v1_cpu(&quota, &period),
+        _ => None,
+    };
+    (usage, limit)
+}
+
+fn read_memory_cgroup() -> (Option<u64>, Option<u64>) {
+    let v2_current = read_text("/sys/fs/cgroup/memory.current");
+    let v2_limit = read_text("/sys/fs/cgroup/memory.max");
+    if v2_current.is_some() || v2_limit.is_some() {
+        return (
+            v2_current.as_deref().and_then(parse_bytes),
+            v2_limit.as_deref().and_then(parse_limit),
+        );
+    }
+
+    let current = read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    let limit = read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        .as_deref()
+        .and_then(parse_limit);
+    (current, limit)
+}
+
+fn read_disk_usage() -> (Option<u64>, Option<u64>) {
+    let Some(path) = std::env::current_dir().ok() else {
+        return (None, None);
+    };
+    let Ok(bytes) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return (None, None);
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: statvfs initializes the struct on success and the path is a valid C string.
+    let result = unsafe { libc::statvfs(bytes.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return (None, None);
+    }
+    // SAFETY: the successful call above initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    let block_size = match (stat.f_frsize as u64, stat.f_bsize as u64) {
+        (size, _) if size > 0 => size,
+        (_, size) if size > 0 => size,
+        _ => return (None, None),
+    };
+    disk_usage(stat.f_blocks as u64, stat.f_bavail as u64, block_size)
+}
+
+fn disk_usage(
+    total_blocks: u64,
+    available_blocks: u64,
+    block_size: u64,
+) -> (Option<u64>, Option<u64>) {
+    if block_size == 0 {
+        return (None, None);
+    }
+    let total = total_blocks.checked_mul(block_size);
+    let available = available_blocks.checked_mul(block_size);
+    let used = total
+        .zip(available)
+        .and_then(|(total, available)| total.checked_sub(available));
+    (used, total)
+}
+
+fn normalize_cpu_percent(
+    previous_usage_nanos: u64,
+    current_usage_nanos: u64,
+    elapsed: Duration,
+    cpu_limit_millis: Option<u64>,
+) -> Option<f64> {
+    let delta = current_usage_nanos.checked_sub(previous_usage_nanos)?;
+    let elapsed_nanos = elapsed.as_nanos();
+    let limit_millis = cpu_limit_millis?;
+    if elapsed_nanos == 0 || limit_millis == 0 {
+        return None;
+    }
+    let allocation = limit_millis as f64 / 1_000.0;
+    let used_cpus = delta as f64 / elapsed_nanos as f64;
+    Some((used_cpus / allocation * 100.0).clamp(0.0, 100.0))
+}
+
+fn normalize_tps(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then_some(value.min(20.0))
+}
+
+fn read_text(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+fn read_u64(path: &str) -> Option<u64> {
+    read_text(path)?.parse().ok()
+}
+fn parse_key_value(value: &str, key: &str) -> Option<u64> {
+    value.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some(key))
+            .then(|| fields.next()?.parse().ok())
+            .flatten()
+    })
+}
+fn parse_cpu_max(value: &str) -> Option<u64> {
+    let mut fields = value.split_whitespace();
+    let quota = fields.next()?;
+    let period = fields.next()?.parse::<u64>().ok()?;
+    if quota == "max" || period == 0 {
+        return None;
+    }
+    let quota = quota.parse::<u64>().ok()?;
+    Some(quota.checked_mul(1_000)?.checked_div(period)?.max(1))
+}
+fn parse_v1_cpu(quota: &str, period: &str) -> Option<u64> {
+    let quota = quota.parse::<i64>().ok()?;
+    let period = period.parse::<u64>().ok()?;
+    if quota <= 0 || period == 0 {
+        return None;
+    }
+    Some(
+        (quota as u64)
+            .checked_mul(1_000)?
+            .checked_div(period)?
+            .max(1),
+    )
+}
+fn parse_bytes(value: &str) -> Option<u64> {
+    value.trim().parse().ok()
+}
+fn parse_limit(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value == "max" {
+        return None;
+    }
+    let parsed = value.parse::<u64>().ok()?;
+    // Linux uses a very large sentinel for an unlimited v1 memory limit.
+    (parsed < (1_u64 << 60)).then_some(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_effective_v2_cpu_quota_without_rounding_sub_milli_limits_to_zero() {
+        assert_eq!(parse_cpu_max("50000 100000"), Some(500));
+        assert_eq!(parse_cpu_max("200000 100000"), Some(2000));
+        assert_eq!(parse_cpu_max("1 100000"), Some(1));
+        assert_eq!(parse_cpu_max("max 100000"), None);
+        assert_eq!(parse_cpu_max("50000 0"), None);
+    }
+
+    #[test]
+    fn parses_cpu_usage_and_preserves_unavailable_values() {
+        assert_eq!(
+            parse_key_value("usage_usec 42\nuser_usec 7", "usage_usec"),
+            Some(42)
+        );
+        assert_eq!(parse_key_value("usage_usec nope", "usage_usec"), None);
+        assert_eq!(parse_bytes("2048"), Some(2048));
+        assert_eq!(parse_bytes("not-a-number"), None);
+        assert_eq!(parse_limit("max"), None);
+        assert_eq!(parse_limit("9223372036854771712"), None);
+        assert_eq!(parse_limit("4096"), Some(4096));
+    }
+
+    #[test]
+    fn cpu_sample_keeps_usage_and_timestamp_baselines_in_order() {
+        let mut sample = CpuSample::default();
+        let start = Instant::now();
+        assert_eq!(sample.observe(Some(0), Some(500), start), None);
+        assert_eq!(
+            sample.observe(Some(250_000_000), Some(500), start + Duration::from_secs(1)),
+            Some(50.0)
+        );
+        assert_eq!(
+            sample.observe(Some(5), Some(500), start + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            sample.observe(Some(250_000_005), Some(500), start + Duration::from_secs(3)),
+            Some(50.0)
+        );
+        assert_eq!(
+            sample.observe(None, None, start + Duration::from_secs(4)),
+            None
+        );
+        assert_eq!(
+            sample.observe(Some(500_000_005), Some(500), start + Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_cpu_against_effective_quota_and_resets_safely() {
+        let one_second = Duration::from_secs(1);
+        assert_eq!(
+            normalize_cpu_percent(0, 500_000_000, one_second, Some(500)),
+            Some(100.0)
+        );
+        assert_eq!(
+            normalize_cpu_percent(0, 250_000_000, one_second, Some(500)),
+            Some(50.0)
+        );
+        assert_eq!(normalize_cpu_percent(10, 9, one_second, Some(500)), None);
+        assert_eq!(normalize_cpu_percent(0, 1, Duration::ZERO, Some(500)), None);
+        assert_eq!(normalize_cpu_percent(0, 1, one_second, None), None);
+    }
+
+    #[test]
+    fn calculates_disk_usage_from_statvfs_blocks_without_overflow() {
+        assert_eq!(disk_usage(100, 25, 4096), (Some(307_200), Some(409_600)));
+        assert_eq!(disk_usage(u64::MAX, 0, 2), (None, None));
+        assert_eq!(disk_usage(100, 125, 4096), (None, Some(409_600)));
+        assert_eq!(disk_usage(100, 25, 0), (None, None));
+    }
+
+    #[test]
+    fn caps_tps_to_the_protocol_max_and_omits_invalid_values() {
+        assert_eq!(normalize_tps(20.0), Some(20.0));
+        assert_eq!(normalize_tps(22.5), Some(20.0));
+        assert_eq!(normalize_tps(-1.0), None);
+        assert_eq!(normalize_tps(f64::NAN), None);
+        assert_eq!(normalize_tps(f64::INFINITY), None);
     }
 }
 

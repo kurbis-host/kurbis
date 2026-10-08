@@ -1055,7 +1055,9 @@ fn route_allowed(scope: Scope, method: &Method, path: &str, expected_id: Uuid) -
             match segments.get(4..) {
                 Some([]) => matches!(*method, Method::GET | Method::PATCH),
                 Some([resource]) => match *resource {
-                    "players" | "logs" | "activity" | "snapshots" => *method == Method::GET,
+                    "players" | "logs" | "activity" | "snapshots" | "runtime-stats" => {
+                        *method == Method::GET
+                    }
                     "whitelist" => matches!(*method, Method::GET | Method::POST | Method::DELETE),
                     "commands" => *method == Method::POST,
                     _ => false,

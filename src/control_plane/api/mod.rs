@@ -51,6 +51,7 @@ mod openapi;
 mod operators;
 mod player_resolution;
 mod players;
+mod runtime_stats;
 mod server;
 mod server_access;
 mod session;
@@ -489,6 +490,10 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             api_get(players::players),
         )
         .api_route(
+            "/api/v1/servers/{server_id}/runtime-stats",
+            api_get(runtime_stats::runtime_stats),
+        )
+        .api_route(
             "/api/v1/servers/{server_id}/operators",
             api_get(operators::operators)
                 .post_with(operators::add_operator, |operation| {
@@ -562,6 +567,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/worker/control/retained-servers", get(worker_state::retained_servers))
         .route("/internal/worker/control/servers/{server_id}/context", get(worker_state::server_context))
         .route("/internal/worker/control/servers/{server_id}/players", post(worker_state::sync_players))
+        .route("/internal/worker/control/servers/{server_id}/runtime-stats", post(worker_state::sync_runtime_stats))
         .route("/internal/worker/control/servers/{server_id}/logs", post(worker_state::append_logs))
         .route("/internal/worker/control/servers/{server_id}/whitelist-applied", post(worker_state::mark_whitelist_applied))
         .route("/internal/worker/control/servers/{server_id}/operators-applied", post(worker_state::mark_operators_applied))

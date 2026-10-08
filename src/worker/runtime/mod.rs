@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{
@@ -10,11 +10,26 @@ use uuid::Uuid;
 
 use crate::{
     model::PlacementRecord,
-    pumpkin_control::{PlayerStatus, PumpkinControl, WaitingPlayer, WhitelistEntry},
+    pumpkin_control::{HostStats, PlayerStatus, PumpkinControl, WaitingPlayer, WhitelistEntry},
+    runtime_stats::RuntimeStats,
 };
 
 pub mod native;
 pub mod settings;
+
+fn runtime_stats_from_host(stats: HostStats, generation: i64) -> RuntimeStats {
+    RuntimeStats {
+        generation,
+        cpu_percent: stats.cpu_percent,
+        cpu_limit_millis: stats.cpu_limit_millis,
+        memory_used_bytes: stats.memory_used_bytes,
+        memory_limit_bytes: stats.memory_limit_bytes,
+        disk_used_bytes: stats.disk_used_bytes,
+        disk_limit_bytes: stats.disk_limit_bytes,
+        tps: stats.tps,
+        measured_at: chrono::Utc::now(),
+    }
+}
 
 /// Lifecycle and persistence use the same contract for containers and host processes.
 #[async_trait]
@@ -35,6 +50,16 @@ pub trait ServerRuntime: Send + Sync {
 
     async fn server_is_running(&self, server_id: Uuid) -> Result<bool> {
         Ok(self.server_generation(server_id).await?.is_some())
+    }
+
+    async fn runtime_stats(&self, server_dir: &Path, generation: i64) -> Result<RuntimeStats> {
+        ensure!(generation > 0, "runtime generation must be positive");
+        let stats = self
+            .control_for(server_dir)
+            .await?
+            .stats(&self.socket_path(server_dir)?)
+            .await?;
+        Ok(runtime_stats_from_host(stats, generation))
     }
 
     async fn player_status(&self, server_dir: &Path) -> Result<PlayerStatus> {
@@ -142,7 +167,28 @@ fn readiness_timeout_message(last_error: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::readiness_timeout_message;
+    use super::*;
+
+    #[test]
+    fn runtime_stats_use_the_worker_assignment_generation_and_worker_timestamp() {
+        let before = chrono::Utc::now();
+        let stats = runtime_stats_from_host(
+            HostStats {
+                cpu_percent: Some(12.5),
+                cpu_limit_millis: Some(500),
+                memory_used_bytes: Some(100),
+                memory_limit_bytes: None,
+                disk_used_bytes: Some(200),
+                disk_limit_bytes: Some(300),
+                tps: Some(20.0),
+            },
+            7,
+        );
+        let after = chrono::Utc::now();
+        assert_eq!(stats.generation, 7);
+        assert_eq!(stats.cpu_percent, Some(12.5));
+        assert!(stats.measured_at >= before && stats.measured_at <= after);
+    }
 
     #[test]
     fn readiness_timeout_reports_bounded_host_control_error() {

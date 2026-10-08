@@ -4118,6 +4118,152 @@
         ]
       }
     },
+    "/api/v1/servers/{server_id}/runtime-stats": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RuntimeStats"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/servers/{server_id}/operators": {
       "get": {
         "parameters": [
@@ -5339,6 +5485,7 @@
               "hardcore": false,
               "motd": "Hosted by Kurbis",
               "simulation_distance": 8,
+              "tab_stats": false,
               "view_distance": 12,
               "whitelist": false
             }
@@ -5788,6 +5935,80 @@
         "enum": [
           "world",
           "full"
+        ]
+      },
+      "RuntimeStats": {
+        "type": "object",
+        "properties": {
+          "cpu_limit_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "cpu_percent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "disk_limit_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "disk_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "generation": {
+            "description": "The placement generation that produced this sample.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "measured_at": {
+            "description": "Assigned by the control plane when the sample is persisted.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "memory_limit_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "tps": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "generation",
+          "measured_at"
         ]
       },
       "Server": {
@@ -6349,6 +6570,10 @@
             "maximum": 255,
             "minimum": 0
           },
+          "tab_stats": {
+            "type": "boolean",
+            "default": false
+          },
           "view_distance": {
             "type": "integer",
             "format": "uint8",
@@ -6411,6 +6636,13 @@
             "default": null,
             "maximum": 255,
             "minimum": 0
+          },
+          "tab_stats": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": null
           },
           "view_distance": {
             "type": [
