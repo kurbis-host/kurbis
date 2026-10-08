@@ -92,10 +92,17 @@ class RolloutTests(unittest.TestCase):
         for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
             self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
 
-    def test_runtime_image_embeds_full_build_revision_label(self):
+    def test_runtime_image_propagates_build_revision_to_binaries_and_label(self):
         dockerfile = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("ARG BUILD_REVISION=development", dockerfile)
-        self.assertIn("LABEL org.opencontainers.image.revision=${BUILD_REVISION}", dockerfile)
+        builder_start = dockerfile.index("FROM rust:1.98-bookworm AS builder")
+        runtime_start = dockerfile.index("FROM debian:bookworm-slim", builder_start)
+        builder = dockerfile[builder_start:runtime_start]
+        runtime = dockerfile[runtime_start:]
+
+        self.assertIn("ARG BUILD_REVISION=development", builder)
+        self.assertIn("ENV KURBIS_BUILD_REVISION=${BUILD_REVISION}", builder)
+        self.assertIn("ARG BUILD_REVISION=development", runtime)
+        self.assertIn("LABEL org.opencontainers.image.revision=${BUILD_REVISION}", runtime)
 
     def test_legacy_worker_image_bootstraps_to_active_revision_pin_without_touching_data(self):
         revision = "d" * 40

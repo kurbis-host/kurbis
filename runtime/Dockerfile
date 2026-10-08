@@ -1,6 +1,8 @@
 FROM docker:28-cli AS docker-cli
 
 FROM rust:1.98-bookworm AS builder
+ARG BUILD_REVISION=development
+ENV KURBIS_BUILD_REVISION=${BUILD_REVISION}
 ENV CARGO_BUILD_JOBS=2
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
