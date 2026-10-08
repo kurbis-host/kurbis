@@ -39,12 +39,13 @@ COPY src ./src
 COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
+# Keep the BuildKit-mounted /hoster/target cache populated for warm image builds.
 RUN --mount=type=cache,id=kurbis-ci-builder-cargo-registry-${RUST_TOOLCHAIN},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=kurbis-ci-builder-cargo-git-${RUST_TOOLCHAIN},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=kurbis-ci-builder-hoster-target-${RUST_TOOLCHAIN},target=/hoster/target,sharing=locked \
     cargo build --jobs 1 --locked --release --bin ci-source-preparer \
     && install -D -m 0755 target/release/ci-source-preparer /usr/local/bin/ci-source-preparer \
-    && rm -rf /hoster
+    && find /hoster -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf -- {} +
 
 # Seed only the cargo package/git cache from the known upstream baseline and
 # the checked-in trusted control plugin. Runtime compilation remains --offline.

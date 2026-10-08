@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl iptables openssh-client && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /var/lib/kurbis/object-store /home/kurbis/.ssh /opt/kurbis/plugins /opt/kurbis/runtime && chown -R 65532:65532 /var/lib/kurbis/object-store /home/kurbis
+RUN mkdir -p /var/lib/kurbis/object-store /home/kurbis/.ssh /home/kurbis/.cache/kurbis/build-cache /opt/kurbis/plugins /opt/kurbis/runtime && chmod 700 /home/kurbis/.cache/kurbis/build-cache && chown -R 65532:65532 /var/lib/kurbis/object-store /home/kurbis
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 ENV HOME=/home/kurbis
 COPY --from=builder /artifacts/control-plane /usr/local/bin/control-plane

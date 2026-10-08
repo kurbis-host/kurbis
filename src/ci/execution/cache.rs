@@ -29,6 +29,8 @@ const MIN_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STALE_LOCK_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+const STALE_TEMP_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+const PRUNE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_BUILD_LOG_BYTES: u64 = 512 * 1024;
 
@@ -251,7 +253,11 @@ impl BuildCache {
             build_log: bounded_log(build_log),
         };
         let entries = self.root.join("entries");
-        let temporary = entries.join(format!(".tmp-{}", Uuid::new_v4().simple()));
+        let temporary = entries.join(format!(
+            ".tmp-{}-{}",
+            identity.cache_key,
+            Uuid::new_v4().simple()
+        ));
         fs::create_dir(&temporary)?;
         protect_directory(&temporary)?;
         let result = (|| {
@@ -294,23 +300,80 @@ impl BuildCache {
     }
 
     fn prune(&self) -> io::Result<()> {
+        let _prune_lock = match self.acquire_prune_lock()? {
+            Some(lock) => lock,
+            None => return Ok(()),
+        };
+        self.prune_locked(SystemTime::now())
+    }
+
+    fn acquire_prune_lock(&self) -> io::Result<Option<BuildCacheLease>> {
+        let path = self.root.join("locks/prune.lock");
+        let deadline = SystemTime::now() + PRUNE_LOCK_TIMEOUT;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    protect_file(&file)?;
+                    writeln!(
+                        file,
+                        "pid={} created={}",
+                        std::process::id(),
+                        unix_timestamp()
+                    )?;
+                    file.sync_all()?;
+                    return Ok(Some(BuildCacheLease { path, _file: file }));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path)? {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if SystemTime::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn prune_locked(&self, now: SystemTime) -> io::Result<()> {
         let entries = self.root.join("entries");
         let mut candidates = Vec::new();
         let mut total = 0u64;
         for item in fs::read_dir(&entries)? {
             let item = item?;
             let path = item.path();
-            let metadata = item.metadata()?;
-            if !metadata.is_dir() || item.file_name().to_string_lossy().starts_with(".tmp-") {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() {
                 continue;
             }
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let size = directory_size(&path)?;
             total = total.saturating_add(size);
-            candidates.push((
-                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                path,
-                size,
-            ));
+            let name = item.file_name().to_string_lossy().into_owned();
+            if let Some(key) = name
+                .strip_prefix(".tmp-")
+                .and_then(|value| value.split_once('-').map(|pair| pair.0))
+            {
+                let lock = self.root.join("locks").join(format!("{key}.lock"));
+                let active = match fs::metadata(&lock) {
+                    Ok(_) if !lock_is_stale(&lock)? => true,
+                    Ok(_) => {
+                        let _ = fs::remove_file(&lock);
+                        false
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                };
+                if !active && now.duration_since(modified).unwrap_or_default() >= STALE_TEMP_AFTER {
+                    self.remove_entry(&path)?;
+                    total = total.saturating_sub(size);
+                }
+                continue;
+            }
+            candidates.push((modified, path, size));
         }
         candidates.sort_by_key(|(modified, _, _)| *modified);
         for (_, path, size) in candidates {
@@ -701,6 +764,64 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(second);
+    }
+
+    #[test]
+    fn prune_serializes_accounting_and_evicts_old_entries_at_the_bound() {
+        let home = tempdir().unwrap();
+        let root = home.path().join("cache");
+        fs::create_dir_all(root.join("entries")).unwrap();
+        fs::create_dir_all(root.join("locks")).unwrap();
+        let cache = BuildCache {
+            root: root.clone(),
+            max_bytes: 8,
+        };
+        for (name, bytes) in [("old", b"123456".as_slice()), ("new", b"abcdef".as_slice())] {
+            let entry = root.join("entries").join(name);
+            fs::create_dir(&entry).unwrap();
+            fs::write(entry.join("payload"), bytes).unwrap();
+        }
+        cache.prune_locked(SystemTime::now()).unwrap();
+        let remaining = fs::read_dir(root.join("entries")).unwrap().count();
+        assert_eq!(
+            remaining, 1,
+            "prune must account for all entries under its lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_temporary_entries_are_removed_without_deleting_active_entries() {
+        let home = tempdir().unwrap();
+        let root = home.path().join("cache");
+        fs::create_dir_all(root.join("entries")).unwrap();
+        fs::create_dir_all(root.join("locks")).unwrap();
+        let cache = BuildCache {
+            root: root.clone(),
+            max_bytes: DEFAULT_CACHE_BYTES,
+        };
+        let identity = BuildCache::identity(
+            &key(),
+            "runtime",
+            "x86_64-unknown-linux-gnu",
+            b"source",
+            b"plugin",
+        );
+        let stale = root
+            .join("entries")
+            .join(format!(".tmp-{}-old", "d".repeat(64)));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("partial"), b"partial").unwrap();
+        let active = root
+            .join("entries")
+            .join(format!(".tmp-{}-active", identity.cache_key));
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("partial"), b"partial").unwrap();
+        let _lease = cache.acquire(&identity).await.unwrap();
+        cache
+            .prune_locked(SystemTime::now() + STALE_TEMP_AFTER + Duration::from_secs(1))
+            .unwrap();
+        assert!(!stale.exists());
+        assert!(active.exists());
     }
 
     #[tokio::test]

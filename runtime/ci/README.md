@@ -62,6 +62,12 @@ the build namespace. `SCCACHE_CACHE_SIZE` is bounded by
 and a failed/corrupt sccache invocation retries the exact Cargo command once
 without the wrapper. The normal ELF/Wasm validators still gate all outputs.
 
+Compose forwards `CI_BUILD_CACHE_DIR` and `CI_BUILD_CACHE_MAX_BYTES` to the
+control plane and mounts the private named volume `ci-build-cache` at the
+image-prepared mode-0700 path. The volume survives control-plane restarts and
+is not shared with runtime workers. Native `start.sh` deployments should set
+`CI_BUILD_CACHE_DIR` to an equivalent private path below `HOME`.
+
 Set `CI_BUILD_CACHE_DIR` to a mode-0700 directory below the control-plane
 `HOME` to enable the optional exact-output cache. `CI_BUILD_CACHE_MAX_BYTES`
 applies to both this cache and the compiler cache. Each entry is keyed by the
