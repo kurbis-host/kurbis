@@ -2,10 +2,10 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use kurbis_ai_protocol::{now_ms, write_json};
 use serde::Deserialize;
 use tokio::{fs, time};
 use uuid::Uuid;
-use vibe_protocol::{now_ms, write_json};
 
 use crate::{paths::RuntimePaths, progress::Recorder};
 
@@ -21,7 +21,7 @@ struct Response {
 }
 
 pub async fn reload(paths: &RuntimePaths, plugin: &str, job: Uuid) -> anyhow::Result<String> {
-    let root = paths.bridge_data().join("activation");
+    let root = paths.plugin_data().join("activation");
     let ready: Ready = serde_json::from_slice(
         &fs::read(root.join("ready.json"))
             .await
@@ -37,7 +37,7 @@ pub async fn reload(paths: &RuntimePaths, plugin: &str, job: Uuid) -> anyhow::Re
     let request = root.join("requests").join(format!("{id}.json"));
     let result = root.join("results").join(format!("{id}.json"));
     write_json(&request, &serde_json::json!({"plugin": plugin}))?;
-    let mut recorder = Recorder::new(&paths.bridge_data(), job)?;
+    let mut recorder = Recorder::new(&paths.plugin_data(), job)?;
     recorder.step(&format!(
         "Reloading {plugin} through the official server console"
     ))?;
@@ -69,7 +69,7 @@ mod tests {
     async fn stale_runner_is_rejected_before_any_console_request() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temporary.path());
-        let activation = paths.bridge_data().join("activation");
+        let activation = paths.plugin_data().join("activation");
         write_json(
             &activation.join("ready.json"),
             &serde_json::json!({"updated_unix_ms": 0}),

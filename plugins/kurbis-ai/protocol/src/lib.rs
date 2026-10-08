@@ -2,6 +2,19 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
+pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+pub const OPERATOR_AUTHORIZATION_TTL_MS: u128 = 5_000;
+pub const MAX_PLUGIN_DATA_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_QUEUE_JOBS: usize = 64;
+pub const MAX_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_EVENT_LOG_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_EVENT_MESSAGE_BYTES: usize = 8 * 1024;
+pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_WORKSPACE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_MCP_ARGUMENT_BYTES: usize = 16 * 1024;
+pub const MAX_MCP_REQUEST_BYTES: u64 = 32 * 1024;
+pub const MAX_MCP_RESULT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -9,7 +22,8 @@ pub enum JobAction {
     Code,
     Revert,
     Reload,
-    Chat,
+    Ask,
+    Login,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -22,7 +36,62 @@ pub struct JobRequest {
     #[serde(default)]
     pub prompt: String,
     pub player: String,
+    #[serde(default)]
+    pub operator_uuid: Option<Uuid>,
     pub created_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OperatorAuthorizationSnapshot {
+    pub updated_unix_ms: u128,
+    pub operator_uuids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpJobLease {
+    pub job_id: Uuid,
+    pub operator_uuid: Uuid,
+    pub created_unix_ms: u128,
+    pub expires_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpActionRequest {
+    pub id: Uuid,
+    pub job_id: Uuid,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpActionResult {
+    pub id: Uuid,
+    pub job_id: Uuid,
+    pub tool: String,
+    pub operator_uuid: Uuid,
+    pub arguments: serde_json::Value,
+    pub success: bool,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateAuthStatus {
+    CodeAvailable,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PrivateAuthMessage {
+    pub job_id: Uuid,
+    pub player_uuid: Uuid,
+    pub player_name: String,
+    pub status: PrivateAuthStatus,
+    pub verification_url: Option<String>,
+    pub user_code: Option<String>,
+    pub expires_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -82,18 +151,25 @@ pub fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
         !name.contains("--"),
         "plugin name must not contain consecutive '-'"
     );
-    anyhow::ensure!(name != "vibe-bridge", "vibe-bridge is reserved");
+    anyhow::ensure!(name != "kurbis-ai", "kurbis-ai is reserved");
     Ok(())
 }
 
 pub fn validate_request(request: &JobRequest) -> anyhow::Result<()> {
-    validate_plugin_name(&request.plugin)?;
+    if request.action == JobAction::Login {
+        anyhow::ensure!(
+            request.plugin == "kurbis-ai",
+            "login requests must target kurbis-ai"
+        );
+    } else {
+        validate_plugin_name(&request.plugin)?;
+    }
     anyhow::ensure!(
         !request.player.trim().is_empty(),
         "player must not be empty"
     );
     match request.action {
-        JobAction::Code | JobAction::Chat => {
+        JobAction::Code | JobAction::Ask => {
             anyhow::ensure!(
                 !request.prompt.trim().is_empty(),
                 "prompt must not be empty"
@@ -103,13 +179,17 @@ pub fn validate_request(request: &JobRequest) -> anyhow::Result<()> {
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes"
             );
         }
-        JobAction::Revert | JobAction::Reload => {
+        JobAction::Revert | JobAction::Reload | JobAction::Login => {
             anyhow::ensure!(
                 request.prompt.is_empty(),
-                "activation requests must not include a prompt"
+                "non-prompt requests must not include a prompt"
             );
         }
     }
+    anyhow::ensure!(
+        request.operator_uuid.is_some(),
+        "operator identity is required for every action"
+    );
     Ok(())
 }
 
@@ -119,7 +199,7 @@ mod tests {
 
     #[test]
     fn event_pages_do_not_expose_partial_live_records_or_lose_long_unicode_output() {
-        let dir = std::env::temp_dir().join(format!("vibe-events-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("kurbis-ai-events-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("events.jsonl");
         assert!(event_page(&path, 0, 2).unwrap().is_empty());
@@ -150,6 +230,15 @@ mod tests {
     }
 
     #[test]
+    fn truncates_unicode_only_at_codepoint_boundaries() {
+        assert_eq!(truncate_utf8("🎃abc", 0), "");
+        assert_eq!(truncate_utf8("🎃abc", 1), "");
+        assert_eq!(truncate_utf8("🎃abc", 4), "🎃");
+        assert_eq!(truncate_utf8("🎃abc", 6), "🎃ab");
+        assert_eq!(truncate_utf8("🎃abc", 100), "🎃abc");
+    }
+
+    #[test]
     fn settings_reject_invalid_values_and_restore_defaults() {
         let mut settings = Settings::default();
         assert!(settings.validate().is_ok());
@@ -176,6 +265,29 @@ mod tests {
     }
 
     #[test]
+    fn server_control_and_login_require_a_bound_operator() {
+        let mut request = JobRequest {
+            id: Uuid::new_v4(),
+            session_id: None,
+            action: JobAction::Ask,
+            plugin: "server-control".into(),
+            prompt: "spawn a pig".into(),
+            player: "Operator".into(),
+            operator_uuid: None,
+            created_unix_ms: 0,
+        };
+        assert!(validate_request(&request).is_err());
+        request.operator_uuid = Some(Uuid::new_v4());
+        assert!(validate_request(&request).is_ok());
+        request.action = JobAction::Login;
+        request.plugin = "kurbis-ai".into();
+        request.prompt.clear();
+        assert!(validate_request(&request).is_ok());
+        request.operator_uuid = None;
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
     fn validates_plugin_slugs() {
         for valid in ["hello", "hello-world", "a1", "plugin-42"] {
             assert!(validate_plugin_name(valid).is_ok(), "{valid}");
@@ -189,7 +301,7 @@ mod tests {
             "hello--world",
             "a_b",
             "a/b",
-            "vibe-bridge",
+            "kurbis-ai",
         ] {
             assert!(validate_plugin_name(invalid).is_err(), "{invalid}");
         }
@@ -258,6 +370,7 @@ pub struct Turn {
 pub struct Session {
     pub id: Uuid,
     pub thread_id: Option<Uuid>,
+    pub operator_uuid: Uuid,
     pub plugin: String,
     pub player: String,
     pub action: JobAction,
@@ -269,6 +382,22 @@ pub struct Session {
 pub struct Sessions {
     pub sessions: Vec<Session>,
 }
+/// Truncate a UTF-8 string without ever splitting a code point.
+pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    value[..end].to_owned()
+}
+
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

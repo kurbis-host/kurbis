@@ -1,13 +1,18 @@
+use kurbis_ai_protocol::{
+    MAX_EVENT_LOG_BYTES, MAX_EVENT_MESSAGE_BYTES, Progress, ProgressEvent, now_ms, truncate_utf8,
+    write_json,
+};
 use serde_json::{Value, json};
 use std::{io::Write, path::PathBuf};
 use uuid::Uuid;
-use vibe_protocol::{Progress, ProgressEvent, now_ms, write_json};
 
 pub struct Recorder {
     job: Uuid,
     log: std::fs::File,
     snapshot: PathBuf,
     progress: Progress,
+    bytes_written: u64,
+    quota_notified: bool,
 }
 impl Recorder {
     pub fn new(data: &std::path::Path, job: Uuid) -> anyhow::Result<Self> {
@@ -18,19 +23,24 @@ impl Recorder {
             .append(true)
             .open(data.join("events").join(format!("{job}.jsonl")))?;
         let snapshot = data.join("progress").join(format!("{job}.json"));
-        let progress = vibe_protocol::read_json(&snapshot)?;
+        let progress = kurbis_ai_protocol::read_json(&snapshot)?;
+        let bytes_written = log.metadata()?.len();
         Ok(Self {
             job,
             log,
             snapshot,
             progress,
+            bytes_written,
+            quota_notified: bytes_written >= MAX_EVENT_LOG_BYTES,
         })
     }
     pub fn line(&mut self, line: &str, stderr: bool) -> anyhow::Result<()> {
+        let bounded_line = truncate_utf8(line, MAX_EVENT_MESSAGE_BYTES);
         let raw = if stderr {
-            json!({"type":"stderr","text":line})
+            json!({"type":"stderr","text":bounded_line})
         } else {
-            serde_json::from_str(line).unwrap_or_else(|_| json!({"type":"stdout","text":line}))
+            serde_json::from_str(&bounded_line)
+                .unwrap_or_else(|_| json!({"type":"stdout","text":bounded_line}))
         };
         if raw["type"] == "thread.started" {
             self.progress.thread_id = raw["thread_id"]
@@ -44,31 +54,72 @@ impl Recorder {
     pub fn prompt(&mut self, player: &str, prompt: &str) -> anyhow::Result<()> {
         self.record(
             "user.prompt".into(),
-            prompt.into(),
-            json!({"player":player, "prompt":prompt}),
+            truncate_utf8(prompt, MAX_EVENT_MESSAGE_BYTES),
+            json!({"player":player, "prompt":truncate_utf8(prompt, MAX_EVENT_MESSAGE_BYTES)}),
         )
     }
     pub fn step(&mut self, message: &str) -> anyhow::Result<()> {
-        self.record("controller".into(), message.into(), json!({"text":message}))
+        let message = truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES);
+        self.record(
+            "controller".into(),
+            message.clone(),
+            json!({"text":message}),
+        )
     }
     fn record(&mut self, kind: String, message: String, raw: Value) -> anyhow::Result<()> {
-        self.progress.total_events += 1;
-        let event = ProgressEvent {
-            sequence: self.progress.total_events,
+        if self.quota_notified {
+            return Ok(());
+        }
+        let message = truncate_utf8(&message, MAX_EVENT_MESSAGE_BYTES);
+        let mut event = ProgressEvent {
+            sequence: self.progress.total_events.saturating_add(1),
             kind,
             message,
             raw,
             unix_ms: now_ms(),
         };
-        // The complete event is retained on disk and printed, including command output.
-        writeln!(self.log, "{}", serde_json::to_string(&event)?)?;
+        let mut encoded = serde_json::to_vec(&event)?;
+        if self
+            .bytes_written
+            .saturating_add(encoded.len() as u64)
+            .saturating_add(1)
+            > MAX_EVENT_LOG_BYTES
+        {
+            event.kind = "controller".into();
+            event.message = "Job output quota reached; further output was discarded.".into();
+            event.raw = Value::Null;
+            encoded = serde_json::to_vec(&event)?;
+            if self
+                .bytes_written
+                .saturating_add(encoded.len() as u64)
+                .saturating_add(1)
+                <= MAX_EVENT_LOG_BYTES
+            {
+                self.log.write_all(&encoded)?;
+                self.log.write_all(b"\n")?;
+                self.log.flush()?;
+                self.bytes_written = self.bytes_written.saturating_add(encoded.len() as u64 + 1);
+                self.progress.total_events = event.sequence;
+                self.progress.events.push(event.clone());
+                if self.progress.events.len() > 100 {
+                    self.progress.events.remove(0);
+                }
+                write_json(&self.snapshot, &self.progress)?;
+            }
+            self.quota_notified = true;
+            return Ok(());
+        }
+        self.log.write_all(&encoded)?;
+        self.log.write_all(b"\n")?;
         self.log.flush()?;
+        self.bytes_written = self.bytes_written.saturating_add(encoded.len() as u64 + 1);
+        self.progress.total_events = event.sequence;
         println!(
-            "[vibe {} #{}] {}: {}",
+            "[Kurbis AI {} #{}] {}: {}",
             self.job, event.sequence, event.kind, event.message
         );
         let mut preview = event;
-        preview.message = preview.message.chars().take(2000).collect();
+        preview.message = truncate_utf8(&preview.message, 2000);
         preview.raw = Value::Null;
         self.progress.events.push(preview);
         if self.progress.events.len() > 100 {
@@ -131,7 +182,7 @@ mod tests {
                 .unwrap();
         assert_eq!(content.lines().count(), 122);
         assert!(content.contains("output 0"));
-        let preview: Progress = vibe_protocol::read_json(&recorder.snapshot).unwrap();
+        let preview: Progress = kurbis_ai_protocol::read_json(&recorder.snapshot).unwrap();
         assert_eq!(preview.events.len(), 100);
         assert_eq!(preview.total_events, 122);
         assert!(preview.thread_id.is_some());

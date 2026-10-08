@@ -20,7 +20,7 @@ impl Plugin for Probe {
             description: "Reload integration fixture".into(), dependencies: vec![], permissions: vec![] }
     }
     fn on_load(&self, context: Context) -> Result<(), String> {
-        vibe_plugin_support::register_permission(&context, &Permission {
+        pumpkin_plugin_support::register_permission(&context, &Permission {
             node: "reload-probe:command".into(), description: "Fixture command".into(),
             default: PermissionDefault::Op(PermissionLevel::One), children: vec![],
         })?;
@@ -45,10 +45,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 [dependencies]
 pumpkin-plugin-api = {{ path = "{sdk}" }}
-vibe-plugin-support = {{ path = "{root / 'plugin-support'}" }}
+pumpkin-plugin-support = {{ path = "{root / 'plugin-support'}" }}
 [workspace]
 ''')
-    target = root / "vibe-bridge/target"
+    target = root.parent / "target/kurbis-ai-plugin-e2e"
     artifacts = {}
     for version in ("one", "two", "broken", "namespace", "fresh"):
         failure = 'return Err("fixture initialization rejected".into());' if version in ("broken", "fresh") else ""

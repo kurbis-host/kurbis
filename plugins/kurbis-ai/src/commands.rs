@@ -2,6 +2,7 @@ use crate::{
     dashboard::{self, View},
     storage,
 };
+use kurbis_ai_protocol::{JobAction, Sessions, Settings, read_json, write_json};
 use pumpkin_plugin_api::{
     Server,
     command::{
@@ -12,18 +13,18 @@ use pumpkin_plugin_api::{
     text::TextComponent,
 };
 use uuid::Uuid;
-use vibe_protocol::{JobAction, Sessions, Settings, read_json, write_json};
 
 pub fn command() -> Command {
-    Command::new(&["vibe".into()], "Open the Codex workshop.")
+    Command::new(&["ai".into()], "Open Kurbis AI.")
         .execute(Handler("menu"))
         .then(CommandNode::literal("settings").execute(Handler("settings")))
         .then(CommandNode::literal("sessions").execute(Handler("sessions")))
         .then(CommandNode::literal("list").execute(Handler("list")))
         .then(CommandNode::literal("jobs").execute(Handler("jobs")))
         .then(with_prompt("code", "plugin"))
-        .then(with_prompt("chat", "plugin"))
+        .then(with_greedy_prompt("ask"))
         .then(with_prompt("continue", "session"))
+        .then(CommandNode::literal("login").execute(Handler("login")))
         .then(with_id("status", "job"))
         .then(with_id("cancel", "job"))
         .then(with_id("revert", "plugin"))
@@ -56,6 +57,12 @@ fn with_prompt(name: &'static str, arg: &str) -> CommandNode {
             CommandNode::argument("prompt", &ArgumentType::String(StringType::Greedy))
                 .execute(Handler(name)),
         ),
+    )
+}
+fn with_greedy_prompt(name: &'static str) -> CommandNode {
+    CommandNode::literal(name).then(
+        CommandNode::argument("prompt", &ArgumentType::String(StringType::Greedy))
+            .execute(Handler(name)),
     )
 }
 fn arg(args: &ConsumedArgs, name: &str) -> anyhow::Result<String> {
@@ -98,37 +105,48 @@ impl CommandHandler for Handler {
                         }
                     }
                 }
-                "code" | "chat" | "continue" | "revert" | "reload" => {
-                    let prompt = if matches!(self.0, "revert" | "reload") {
+                "code" | "ask" | "continue" | "revert" | "reload" | "login" => {
+                    let prompt = if matches!(self.0, "revert" | "reload" | "login") {
                         String::new()
                     } else {
                         arg(&args, "prompt")?
                     };
+                    let player = sender
+                        .as_player()
+                        .ok_or_else(|| anyhow::anyhow!("Run this action in game"))?;
+                    let operator_uuid =
+                        Uuid::parse_str(&pumpkin_plugin_api::uuid::to_string(player.get_id()))?;
                     let id = if self.0 == "continue" {
                         storage::continue_session(
                             Uuid::parse_str(&arg(&args, "session")?)?,
                             prompt,
-                            sender.get_name(),
+                            player.get_name(),
+                            Some(operator_uuid),
                         )?
                     } else {
-                        let action = match self.0 {
-                            "chat" => JobAction::Chat,
-                            "revert" => JobAction::Revert,
-                            "reload" => JobAction::Reload,
-                            _ => JobAction::Code,
+                        let (action, plugin) = match self.0 {
+                            "ask" => (JobAction::Ask, "server-control".to_owned()),
+                            "login" => (JobAction::Login, "kurbis-ai".to_owned()),
+                            "revert" => (JobAction::Revert, arg(&args, "plugin")?),
+                            "reload" => (JobAction::Reload, arg(&args, "plugin")?),
+                            _ => (JobAction::Code, arg(&args, "plugin")?),
                         };
                         storage::enqueue(
                             action,
-                            arg(&args, "plugin")?,
+                            plugin,
                             prompt,
-                            sender.get_name(),
+                            player.get_name(),
+                            Some(operator_uuid),
                             None,
                         )?
                     };
-                    if let Some(player) = sender.as_player() {
-                        dashboard::watch(&player, id);
-                    }
-                    sender.send_message(TextComponent::text(&format!("Vibe job queued: {id}")));
+                    dashboard::watch(&player, id);
+                    let response = if self.0 == "login" {
+                        format!("Codex device login queued: {id}. Details will be sent privately.")
+                    } else {
+                        format!("Kurbis AI job queued: {id}")
+                    };
+                    sender.send_message(TextComponent::text(&response));
                 }
                 "status" => {
                     let id = Uuid::parse_str(&arg(&args, "job")?)?;
@@ -143,7 +161,7 @@ impl CommandHandler for Handler {
                 }
                 "cancel" => storage::cancel(Uuid::parse_str(&arg(&args, "job")?)?)?,
                 "list" => {
-                    let index: vibe_protocol::PluginIndex =
+                    let index: kurbis_ai_protocol::PluginIndex =
                         read_json(&storage::path("plugins.json"))?;
                     for plugin in index.plugins {
                         sender.send_message(TextComponent::text(&format!(

@@ -81,7 +81,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
     };
     let gui = Gui::new(
         Screen::Generic9x6,
-        TextComponent::text(&format!("Vibe • {name}")),
+        TextComponent::text(&format!("Kurbis AI • {name}")),
     );
     gui.set_allow_grab_items(false);
     gui.set_allow_put_items(false);
@@ -103,7 +103,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             ),
         );
     }
-    menu.button(4, "nether_star", name, "Codex plugin workshop\nOperator access • official Pumpkin\nClick an icon; hover for details", None);
+    menu.button(4, "nether_star", name, "Codex + server-control assistant\nOperator access • official Pumpkin\nClick an icon; hover for details", None);
     menu.button(
         48,
         "compass",
@@ -151,12 +151,19 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             menu.button(
                 31,
                 "paper",
-                "Ask Codex",
-                "Discuss a plugin without installing changes",
-                Some(Action::Input(Input::Chat)),
+                "Ask Kurbis AI",
+                "Ask questions or control the server through MCP tools",
+                Some(Action::Input(Input::Ask)),
             );
             menu.button(
                 33,
+                "ender_eye",
+                "Link Codex account",
+                "Start private device-code login for the shared server-owner account",
+                Some(Action::Login),
+            );
+            menu.button(
+                34,
                 "comparator",
                 "Settings",
                 "Model • reasoning • timeout • chat progress",
@@ -164,7 +171,7 @@ pub fn open(player: &Player, view: View) -> anyhow::Result<()> {
             );
             menu.button(
                 51,
-                "ender_eye",
+                "redstone_torch",
                 "Activation",
                 "Builds and restores activate without a restart",
                 None,

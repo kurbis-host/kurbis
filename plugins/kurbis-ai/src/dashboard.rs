@@ -1,4 +1,7 @@
 use crate::{PERMISSION, storage};
+use kurbis_ai_protocol::{
+    JobAction, PluginIndex, Progress, Sessions, Settings, now_ms, read_json, write_json,
+};
 use pumpkin_plugin_api::{
     Player, Server,
     events::{
@@ -12,9 +15,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use uuid::Uuid;
-use vibe_protocol::{
-    JobAction, PluginIndex, Progress, Sessions, Settings, now_ms, read_json, write_json,
-};
 
 #[derive(Clone)]
 pub enum View {
@@ -36,6 +36,7 @@ enum Action {
     Timeout,
     Verbose,
     Reset,
+    Login,
     Cancel(Uuid),
     Watch(Uuid),
     Activate(JobAction, String),
@@ -43,7 +44,7 @@ enum Action {
 #[derive(Clone)]
 enum Input {
     Code,
-    Chat,
+    Ask,
     Continue(Uuid),
     Model,
 }
@@ -72,7 +73,6 @@ pub fn watch(player: &Player, job: Uuid) {
         .insert(key(player), (job, 0));
 }
 mod menu;
-pub(crate) mod spectator;
 pub use menu::open;
 pub struct Click;
 impl EventHandler<InventoryClickEvent> for Click {
@@ -103,7 +103,7 @@ impl EventHandler<InventoryClickEvent> for Click {
         if let Some(action) = action
             && let Err(error) = act(&event.player, action)
         {
-            tell(&event.player, &format!("Vibe: {error}"));
+            tell(&event.player, &format!("Kurbis AI: {error}"));
         }
         event
     }
@@ -113,7 +113,8 @@ fn act(player: &Player, action: Action) -> anyhow::Result<()> {
         Action::Open(view) => open(player, view)?,
         Action::Input(input) => {
             let instructions = match &input {
-                Input::Code | Input::Chat => "Close this chest and type: plugin-name your prompt",
+                Input::Code => "Close this chest and type: plugin-name your prompt",
+                Input::Ask => "Close this chest and type your question or server action request",
                 Input::Continue(_) => "Close this chest and type your next prompt",
                 Input::Model => "Close this chest and type a model ID, or default",
             };
@@ -136,12 +137,40 @@ fn act(player: &Player, action: Action) -> anyhow::Result<()> {
                 "Watching job events in chat. Toggle live progress in Settings.",
             );
         }
+        Action::Login => {
+            let operator_uuid =
+                Uuid::parse_str(&pumpkin_plugin_api::uuid::to_string(player.get_id()))?;
+            let id = storage::enqueue(
+                JobAction::Login,
+                "kurbis-ai".into(),
+                String::new(),
+                player.get_name(),
+                Some(operator_uuid),
+                None,
+            )?;
+            watch(player, id);
+            tell(
+                player,
+                &format!(
+                    "Codex device login queued: {id}. The URL and code will be sent only to you."
+                ),
+            );
+        }
         Action::Cancel(job) => {
             storage::cancel(job)?;
             tell(player, "Cancellation requested.");
         }
         Action::Activate(action, plugin) => {
-            let id = storage::enqueue(action, plugin, String::new(), player.get_name(), None)?;
+            let operator_uuid =
+                Uuid::parse_str(&pumpkin_plugin_api::uuid::to_string(player.get_id()))?;
+            let id = storage::enqueue(
+                action,
+                plugin,
+                String::new(),
+                player.get_name(),
+                Some(operator_uuid),
+                None,
+            )?;
             watch(player, id);
             tell(player, &format!("Plugin activation queued: {id}."));
         }
@@ -221,7 +250,7 @@ impl EventHandler<PlayerChatEvent> for Chat {
         // Even an expired or deauthorized prompt is consumed privately.
         event.cancelled = true;
         if expires < now_ms() {
-            tell(&event.player, "Prompt expired. Open /vibe to try again.");
+            tell(&event.player, "Prompt expired. Open /ai to try again.");
             return event;
         }
         if !event.player.has_permission(PERMISSION) {
@@ -236,36 +265,46 @@ impl EventHandler<PlayerChatEvent> for Chat {
         match result {
             Ok(Some(job)) => {
                 watch(&event.player, job);
-                tell(&event.player, &format!("Vibe job queued: {job}"));
+                tell(&event.player, &format!("Kurbis AI job queued: {job}"));
             }
             Ok(None) => tell(&event.player, "Model saved. Applies to the next job."),
-            Err(error) => tell(&event.player, &format!("Vibe: {error}")),
+            Err(error) => tell(&event.player, &format!("Kurbis AI: {error}")),
         }
         event
     }
 }
 fn submit(player: &Player, input: Input, message: &str) -> anyhow::Result<Option<Uuid>> {
     let name = player.get_name();
+    let operator_uuid = Uuid::parse_str(&pumpkin_plugin_api::uuid::to_string(player.get_id()))?;
     match input {
-        Input::Code | Input::Chat => {
+        Input::Code => {
             let (plugin, prompt) = message
                 .trim()
                 .split_once(char::is_whitespace)
                 .ok_or_else(|| anyhow::anyhow!("Use: plugin-name your prompt"))?;
-            let action = if matches!(input, Input::Chat) {
-                JobAction::Chat
-            } else {
-                JobAction::Code
-            };
             Ok(Some(storage::enqueue(
-                action,
+                JobAction::Code,
                 plugin.into(),
                 prompt.trim().into(),
                 name,
+                Some(operator_uuid),
                 None,
             )?))
         }
-        Input::Continue(id) => Ok(Some(storage::continue_session(id, message.into(), name)?)),
+        Input::Ask => Ok(Some(storage::enqueue(
+            JobAction::Ask,
+            "server-control".into(),
+            message.trim().into(),
+            name,
+            Some(operator_uuid),
+            None,
+        )?)),
+        Input::Continue(id) => Ok(Some(storage::continue_session(
+            id,
+            message.into(),
+            name,
+            Some(operator_uuid),
+        )?)),
         Input::Model => {
             let mut settings: Settings = read_json(&storage::path("settings.json"))?;
             settings.model = if message.trim() == "default" {
@@ -295,7 +334,76 @@ impl EventHandler<PlayerLeaveEvent> for Leave {
         event
     }
 }
+
+fn poll_private_auth_messages(server: &Server) {
+    let directory = storage::path("private/auth");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten().take(8) {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let message = std::fs::read(&path).ok().and_then(|bytes| {
+            serde_json::from_slice::<kurbis_ai_protocol::PrivateAuthMessage>(&bytes).ok()
+        });
+        let Some(message) = message else {
+            let _ = std::fs::remove_file(path);
+            continue;
+        };
+        if message.expires_unix_ms <= now_ms() {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        let expected_uuid = message.player_uuid.to_string();
+        let Some(player) = server
+            .get_all_players()
+            .into_iter()
+            .find(|player| pumpkin_plugin_api::uuid::to_string(player.get_id()) == expected_uuid)
+        else {
+            continue;
+        };
+        if !player.has_permission(PERMISSION) {
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
+        match message.status {
+            kurbis_ai_protocol::PrivateAuthStatus::CodeAvailable => {
+                let (Some(url), Some(code)) = (message.verification_url, message.user_code) else {
+                    tell(
+                        &player,
+                        "Kurbis AI could not read the device code. Authenticate on the controller host and retry.",
+                    );
+                    continue;
+                };
+                tell(
+                    &player,
+                    &format!("Codex device login (private): open {url} and enter code {code}."),
+                );
+            }
+            kurbis_ai_protocol::PrivateAuthStatus::Completed => {
+                tell(
+                    &player,
+                    "The shared server-owner Codex account is authenticated.",
+                );
+            }
+            kurbis_ai_protocol::PrivateAuthStatus::Cancelled => {
+                tell(&player, "Codex device login was cancelled.");
+            }
+            kurbis_ai_protocol::PrivateAuthStatus::Failed => {
+                tell(
+                    &player,
+                    "Codex device login failed. Authenticate on the controller host and retry.",
+                );
+            }
+        }
+    }
+}
+
 pub fn poll(server: Server) {
+    storage::reauthorize_pending(&server);
+    poll_private_auth_messages(&server);
     let settings: Settings = match read_json(&storage::path("settings.json")) {
         Ok(s) => s,
         Err(_) => return,
@@ -322,7 +430,7 @@ pub fn poll(server: Server) {
         {
             tell(
                 &player,
-                "Earlier events are retained in the job log. Open /vibe log to read them.",
+                "Earlier events are retained in the job log. Open /ai log to read them.",
             );
             sequence = first.sequence - 1;
         }
@@ -335,7 +443,7 @@ pub fn poll(server: Server) {
             tell(
                 &player,
                 &format!(
-                    "[Vibe #{}] {}: {}",
+                    "[Kurbis AI #{}] {}: {}",
                     event.sequence,
                     event.kind,
                     event.message.chars().take(350).collect::<String>()

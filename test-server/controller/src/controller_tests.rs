@@ -31,9 +31,9 @@ async fn plugin_index_only_lists_installed_artifacts() {
         &plugin_dir,
         &[
             "-c",
-            "user.name=Pumpkin Vibe Test",
+            "user.name=Kurbis AI Test",
             "-c",
-            "user.email=pumpkin-vibe-test@localhost",
+            "user.email=kurbis-ai-test@localhost",
             "commit",
             "-m",
             "test fixture",
@@ -86,9 +86,9 @@ async fn reset_plugin_workspace_discards_failed_job_changes() {
         &plugin_dir,
         &[
             "-c",
-            "user.name=Pumpkin Vibe Test",
+            "user.name=Kurbis AI Test",
             "-c",
-            "user.email=pumpkin-vibe-test@localhost",
+            "user.email=kurbis-ai-test@localhost",
             "commit",
             "-m",
             "known good",
@@ -168,8 +168,17 @@ printf '\000asm\015\000\001\000' > target/wasm32-wasip2/release/demo.wasm
             action,
             prompt: prompt.into(),
             player: "Operator".into(),
+            operator_uuid: Some(Uuid::new_v4()),
             created_unix_ms: now_ms(),
         };
+        write_json(
+            &paths.operator_authorizations(),
+            &OperatorAuthorizationSnapshot {
+                updated_unix_ms: now_ms(),
+                operator_uuids: vec![request.operator_uuid.unwrap()],
+            },
+        )
+        .expect("authorization snapshot");
         write_json(
             &paths.requests().join(format!("{}.json", request.id)),
             &request,
@@ -282,7 +291,7 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
         timeout_seconds: 1800,
         chat_progress: true,
     };
-    vibe_protocol::write_json(&paths.bridge_data().join("settings.json"), &settings).unwrap();
+    kurbis_ai_protocol::write_json(&paths.plugin_data().join("settings.json"), &settings).unwrap();
     async fn submit(
         controller: &Controller,
         paths: &RuntimePaths,
@@ -294,9 +303,10 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
             id: Uuid::new_v4(),
             session_id,
             plugin: plugin.into(),
-            action: JobAction::Chat,
+            action: JobAction::Ask,
             prompt: "remember kiwi".into(),
             player: "Operator".into(),
+            operator_uuid: Some(Uuid::new_v4()),
             created_unix_ms: now_ms(),
         };
         if cancelled {
@@ -304,6 +314,14 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
                 .await
                 .unwrap();
         }
+        write_json(
+            &paths.operator_authorizations(),
+            &OperatorAuthorizationSnapshot {
+                updated_unix_ms: now_ms(),
+                operator_uuids: vec![job.operator_uuid.unwrap()],
+            },
+        )
+        .unwrap();
         write_json(&paths.requests().join(format!("{}.json", job.id)), &job).unwrap();
         let _ = controller.run_once().await;
         serde_json::from_slice(
@@ -322,8 +340,8 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
             .join("unwanted-change")
             .exists()
     );
-    let sessions_path = paths.bridge_data().join("sessions.json");
-    let sessions: Sessions = vibe_protocol::read_json(&sessions_path).unwrap();
+    let sessions_path = paths.plugin_data().join("sessions.json");
+    let sessions: Sessions = kurbis_ai_protocol::read_json(&sessions_path).unwrap();
     let thread = sessions.sessions[0].thread_id.unwrap();
     assert_eq!(sessions.sessions[0].id, first.id);
     let second = submit(&controller, &paths, Some(first.id), "demo", false).await;
@@ -347,7 +365,7 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
         .filter(|(_, a)| **a == "-c")
         .map(|(index, _)| index)
         .collect();
-    assert_eq!(config_positions.len(), 2);
+    assert_eq!(config_positions.len(), 4);
     assert!(
         config_positions.iter().all(|index| *index < exec),
         "exec-level config drops global network override"
@@ -355,9 +373,17 @@ pathlib.Path(args[1],'unwanted-change').write_text('chat must not persist this')
     assert!(args.contains(&serde_json::json!(
         "sandbox_workspace_write.network_access=true"
     )));
+    assert!(args.contains(&serde_json::json!("--ignore-user-config")));
+    assert!(
+        args.iter()
+            .any(|argument| argument
+                .as_str()
+                .is_some_and(|value| value.contains("mcp_servers.kurbis_ai")
+                    && value.contains("required=true")))
+    );
     let resume = args.iter().position(|a| a == "resume").unwrap();
     assert_eq!(args[resume + 1], thread.to_string());
-    let sessions: Sessions = vibe_protocol::read_json(&sessions_path).unwrap();
+    let sessions: Sessions = kurbis_ai_protocol::read_json(&sessions_path).unwrap();
     assert_eq!(sessions.sessions.len(), 1);
     assert_eq!(sessions.sessions[0].turns.len(), 2);
     assert_eq!(sessions.sessions[0].thread_id, Some(thread));
@@ -388,10 +414,11 @@ async fn request_queue_orders_by_creation_time_instead_of_random_uuid() {
         let request = JobRequest {
             id,
             session_id: None,
-            action: JobAction::Chat,
+            action: JobAction::Ask,
             plugin: "demo".into(),
             prompt: "hi".into(),
             player: "Op".into(),
+            operator_uuid: Some(Uuid::new_v4()),
             created_unix_ms: created,
         };
         let path = paths.requests().join(format!("{id}.json"));
@@ -416,20 +443,22 @@ async fn interrupted_jobs_are_not_replayed_and_their_threads_remain_resumable() 
     let job = JobRequest {
         id: Uuid::new_v4(),
         session_id: None,
-        action: JobAction::Chat,
+        action: JobAction::Ask,
         plugin: "demo".into(),
         prompt: "hi".into(),
         player: "Op".into(),
+        operator_uuid: Some(Uuid::new_v4()),
         created_unix_ms: 0,
     };
     write_json(&paths.processing().join(format!("{}.json", job.id)), &job).unwrap();
     let thread = Uuid::new_v4();
     write_json(
-        &paths.bridge_data().join("sessions.json"),
+        &paths.plugin_data().join("sessions.json"),
         &Sessions {
             sessions: vec![Session {
                 id: job.id,
                 thread_id: None,
+                operator_uuid: job.operator_uuid.unwrap(),
                 plugin: job.plugin.clone(),
                 player: job.player.clone(),
                 action: job.action.clone(),
@@ -443,7 +472,7 @@ async fn interrupted_jobs_are_not_replayed_and_their_threads_remain_resumable() 
         },
     )
     .unwrap();
-    let mut recorder = crate::progress::Recorder::new(&paths.bridge_data(), job.id).unwrap();
+    let mut recorder = crate::progress::Recorder::new(&paths.plugin_data(), job.id).unwrap();
     recorder
         .line(
             &format!(r#"{{"type":"thread.started","thread_id":"{thread}"}}"#),
@@ -455,7 +484,7 @@ async fn interrupted_jobs_are_not_replayed_and_their_threads_remain_resumable() 
     assert!(controller.next_request().await.unwrap().is_none());
     assert!(!plugin.join("uncommitted").exists());
     let sessions: Sessions =
-        vibe_protocol::read_json(&paths.bridge_data().join("sessions.json")).unwrap();
+        kurbis_ai_protocol::read_json(&paths.plugin_data().join("sessions.json")).unwrap();
     assert_eq!(sessions.sessions[0].thread_id, Some(thread));
     assert_eq!(sessions.sessions[0].turns.len(), 1);
     let result: JobResult = serde_json::from_slice(
@@ -466,4 +495,61 @@ async fn interrupted_jobs_are_not_replayed_and_their_threads_remain_resumable() 
     .unwrap();
     assert_eq!(result.state, JobState::Failed);
     assert!(result.message.contains("restarted"));
+}
+
+#[tokio::test]
+async fn queued_jobs_are_cancelled_when_operator_permission_is_revoked() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(temp.path().join("runtime"));
+    paths.create_dirs().await.unwrap();
+    let controller = Controller::new(paths.clone(), "must-not-run".into(), Duration::from_secs(1));
+    let operator = Uuid::new_v4();
+    let request = JobRequest {
+        id: Uuid::new_v4(),
+        session_id: None,
+        action: JobAction::Ask,
+        plugin: "server-control".into(),
+        prompt: "spawn a pig".into(),
+        player: "Operator".into(),
+        operator_uuid: Some(operator),
+        created_unix_ms: now_ms(),
+    };
+    write_json(
+        &paths.operator_authorizations(),
+        &OperatorAuthorizationSnapshot {
+            updated_unix_ms: now_ms(),
+            operator_uuids: vec![],
+        },
+    )
+    .unwrap();
+    write_json(
+        &paths.requests().join(format!("{}.json", request.id)),
+        &request,
+    )
+    .unwrap();
+    assert!(controller.run_once().await.unwrap());
+    let result: JobResult = serde_json::from_slice(
+        &fs::read(paths.results().join(format!("{}.json", request.id)))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.state, JobState::Cancelled);
+    assert!(result.message.contains("permission was revoked"));
+}
+
+#[tokio::test]
+async fn reset_removes_model_created_nested_git_metadata_before_controller_git_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(temp.path().join("runtime"));
+    paths.create_dirs().await.unwrap();
+    let controller = Controller::new(paths.clone(), "unused".into(), Duration::from_secs(1));
+    let plugin = controller.ensure_plugin_workspace("demo").await.unwrap();
+    let nested_git = plugin.join("nested/.git/hooks");
+    fs::create_dir_all(&nested_git).await.unwrap();
+    fs::write(nested_git.join("pre-commit"), "#!/bin/sh\nexit 99\n")
+        .await
+        .unwrap();
+    reset_plugin_workspace(&plugin).await.unwrap();
+    assert!(!plugin.join("nested/.git").exists());
 }

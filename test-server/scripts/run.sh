@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME="$ROOT/runtime"
 SERVER="$RUNTIME/server"
-CONTROLLER="$ROOT/target/debug/vibe-controller"
+CONTROLLER="$ROOT/target/debug/kurbis-ai-controller"
 PUMPKIN_BIN="$RUNTIME/bin/pumpkin"
 
-if [[ ! -x "$CONTROLLER" || ! -x "$PUMPKIN_BIN" || ! -f "$SERVER/plugins/vibe-bridge.wasm" ]]; then
+if [[ ! -x "$CONTROLLER" || ! -x "$PUMPKIN_BIN" || ! -f "$SERVER/plugins/kurbis-ai.wasm" ]]; then
   "$ROOT/scripts/bootstrap.sh"
 fi
 
