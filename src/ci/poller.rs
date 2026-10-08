@@ -472,12 +472,18 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 Ok(())
             }
             Err(error) => {
-                self.repository
-                    .release_check_run_claim(build_id, claim)
-                    .await?;
-                Err(anyhow::anyhow!(
-                    "create or recover GitHub check run: {error}"
-                ))
+                // Check Runs are an informational side effect. A provider
+                // outage, permission failure, or exhausted rate limit must
+                // never fail admission/build execution. Keep a rate-limited
+                // claim until its short lease expires so the next poll cannot
+                // immediately recreate the same request herd.
+                if !matches!(error, crate::ci::CheckRunError::RateLimited { .. }) {
+                    self.repository
+                        .release_check_run_claim(build_id, claim)
+                        .await?;
+                }
+                tracing::warn!(build_id = %build_id, ?error, "GitHub Check Run unavailable; continuing CI build without external status");
+                Ok(())
             }
         }
     }

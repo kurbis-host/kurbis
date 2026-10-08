@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::super::{
@@ -74,6 +75,46 @@ impl CiPreviewRepository {
             )
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
+        // A persisted ETag can survive a restart while the provider returns
+        // 304 before this process has rebuilt its in-memory response cache.
+        // Rehydrate the durable ref cache instead of interpreting the empty
+        // response as deletion or starving queued PR builds.
+        if poll.not_modified {
+            let cached = sqlx::query_as::<_, (String, String, Option<i64>, String, Option<String>, bool, bool, DateTime<Utc>)>(
+                "SELECT kind, name, number, commit_sha, source_repository, closed, deleted, updated_at
+                 FROM ci_refs WHERE repository_id = $1",
+            )
+            .bind(repository_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut refs = poll.refs;
+            for (kind, name, number, commit_sha, source_repository, closed, deleted, updated_at) in
+                cached
+            {
+                let source_kind = match kind.as_str() {
+                    "pull_request" => SourceRefKind::PullRequest,
+                    "branch" => SourceRefKind::Branch,
+                    _ => continue,
+                };
+                if refs
+                    .iter()
+                    .any(|source| source.kind == source_kind && source.name == name)
+                {
+                    continue;
+                }
+                refs.push(crate::ci::SourceRef {
+                    kind: source_kind,
+                    name,
+                    number: number.and_then(|value| u64::try_from(value).ok()),
+                    commit_sha,
+                    source_repository,
+                    closed,
+                    deleted,
+                    updated_at: Some(updated_at),
+                });
+            }
+            poll.refs = crate::ci::source_control::deduplicate_refs(refs);
+        }
         // GitHub's updated_at is advisory and may be absent or have only
         // second-level precision. The durable ref row is authoritative: an
         // open PR is eager whenever its observed head differs from the prior

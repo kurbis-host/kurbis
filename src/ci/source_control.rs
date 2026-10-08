@@ -1,10 +1,17 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
+
+use super::rate_limit::{GitHubRateLimitConfig, GitHubRateLimitGuard};
 
 use super::domain::{CiRefKind, validate_commit_sha};
 
@@ -141,6 +148,9 @@ pub struct GitHubSourceControl {
     token: String,
     per_page: u32,
     max_pages: u32,
+    rate_limit: Arc<GitHubRateLimitGuard>,
+    response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    request_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 impl GitHubSourceControl {
     pub fn new(client: Client, token: impl Into<String>) -> Result<Self, PollError> {
@@ -156,6 +166,9 @@ impl GitHubSourceControl {
             token,
             per_page: 100,
             max_pages: 100,
+            rate_limit: Arc::new(GitHubRateLimitGuard::new(GitHubRateLimitConfig::default())),
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
+            request_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     pub fn with_api_base_url(mut self, value: impl Into<String>) -> Self {
@@ -167,6 +180,14 @@ impl GitHubSourceControl {
         self.max_pages = max_pages.max(1);
         self
     }
+    pub fn with_rate_limit_guard(mut self, guard: Arc<GitHubRateLimitGuard>) -> Self {
+        self.rate_limit = guard;
+        self
+    }
+    pub fn with_rate_limit_store(mut self, pool: sqlx::PgPool) -> Self {
+        self.rate_limit = Arc::new((*self.rate_limit).clone().with_store(pool));
+        self
+    }
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .get(format!("{}{}", self.api_base_url, path))
@@ -175,21 +196,17 @@ impl GitHubSourceControl {
             .header(header::USER_AGENT, "kurbis-ci-preview")
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
-    async fn decode_error(response: reqwest::Response) -> PollError {
-        let status = response.status();
-        let retry_after = retry_after(&response);
-        let exhausted = response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|value| value.to_str().ok())
-            == Some("0");
-        if status == StatusCode::TOO_MANY_REQUESTS || retry_after.is_some() || exhausted {
-            return PollError::RateLimited { retry_after };
-        }
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "GitHub request failed".into());
+    fn decode_error_parts(status: StatusCode, body: &[u8]) -> PollError {
+        let message = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .map(str::to_owned)
+            })
+            .or_else(|| String::from_utf8(body.to_vec()).ok())
+            .unwrap_or_else(|| "GitHub request failed".into());
         PollError::Http { status, message }
     }
     async fn collect_page<T: for<'de> Deserialize<'de>>(
@@ -197,37 +214,116 @@ impl GitHubSourceControl {
         path: &str,
         etag: Option<&str>,
     ) -> Result<Page<T>, PollError> {
+        let lock = {
+            let mut locks = self.request_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            locks.get(path).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(path.to_owned(), Arc::downgrade(&lock));
+                lock
+            })
+        };
+        if let Ok(leader) = lock.clone().try_lock_owned() {
+            let result = self.collect_page_uncached(path, etag).await;
+            drop(leader);
+            return result;
+        }
+
+        // Coalesce concurrent same-path requests. The follower acquires the
+        // path lock after the leader and reuses its response; weak lock entries
+        // are pruned above so unique commit paths cannot grow this map forever.
+        let _follower = lock.lock().await;
+        if let Some(cached) = self.response_cache.lock().await.get(path).cloned() {
+            let items = serde_json::from_slice(&cached.body)
+                .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
+            return Ok(Page {
+                items,
+                not_modified: etag.is_some() && etag == cached.etag.as_deref(),
+                etag: cached.etag,
+            });
+        }
+        self.collect_page_uncached(path, etag).await
+    }
+
+    async fn collect_page_uncached<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        etag: Option<&str>,
+    ) -> Result<Page<T>, PollError> {
+        let scope = rate_scope(path);
+        self.rate_limit.before_request(&scope).await?;
         let request = self.request(path);
         let request = match etag {
             Some(etag) => request.header(header::IF_NONE_MATCH, etag),
             None => request,
         };
         let response = request.send().await?;
-        if response.status() == StatusCode::NOT_MODIFIED {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?.to_vec();
+        if let Some(delay) = self
+            .rate_limit
+            .observe_response(&scope, status, &headers, &body)
+            .await
+        {
+            return Err(PollError::RateLimited {
+                retry_after: Some(delay),
+            });
+        }
+        if status == StatusCode::NOT_MODIFIED {
+            let cached = self.response_cache.lock().await.get(path).cloned();
+            let Some(cached) = cached else {
+                return Ok(Page {
+                    items: Vec::new(),
+                    etag: etag.map(str::to_owned),
+                    not_modified: true,
+                });
+            };
+            let items = serde_json::from_slice(&cached.body)
+                .map_err(|e| PollError::InvalidResponse(e.to_string()))?;
             return Ok(Page {
-                items: Vec::new(),
-                etag: etag.map(str::to_owned),
+                items,
+                etag: cached.etag,
                 not_modified: true,
             });
         }
-        if !response.status().is_success() {
-            return Err(Self::decode_error(response).await);
+        if !status.is_success() {
+            return Err(Self::decode_error_parts(status, &body));
         }
-        let response_etag = response
-            .headers()
+        let response_etag = headers
             .get(header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let items = response
-            .json()
-            .await
-            .map_err(|e| PollError::InvalidResponse(e.to_string()))?;
+        {
+            let mut cache = self.response_cache.lock().await;
+            if cache.len() >= 128
+                && !cache.contains_key(path)
+                && let Some(oldest) = cache.keys().next().cloned()
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(
+                path.to_owned(),
+                CachedResponse {
+                    body: body.clone(),
+                    etag: response_etag.clone(),
+                },
+            );
+        }
+        let items =
+            serde_json::from_slice(&body).map_err(|e| PollError::InvalidResponse(e.to_string()))?;
         Ok(Page {
             items,
             etag: response_etag,
             not_modified: false,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct CachedResponse {
+    body: Vec<u8>,
+    etag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -290,13 +386,26 @@ impl GitHubSourceControl {
         for page in 1..=self.max_pages {
             // GitHub's compare endpoint wraps commits in an object, unlike the
             // pull-request commit endpoint which returns a bare array.
-            let response = self.request(&path(page)).send().await?;
-            if !response.status().is_success() {
-                return Err(Self::decode_error(response).await);
-            }
-            let result: ComparePage = response
-                .json()
+            let path = path(page);
+            let scope = rate_scope(&path);
+            self.rate_limit.before_request(&scope).await?;
+            let response = self.request(&path).send().await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.bytes().await?.to_vec();
+            if let Some(delay) = self
+                .rate_limit
+                .observe_response(&scope, status, &headers, &body)
                 .await
+            {
+                return Err(PollError::RateLimited {
+                    retry_after: Some(delay),
+                });
+            }
+            if !status.is_success() {
+                return Err(Self::decode_error_parts(status, &body));
+            }
+            let result: ComparePage = serde_json::from_slice(&body)
                 .map_err(|error| PollError::InvalidResponse(error.to_string()))?;
             let count = result.commits.len();
             append_valid_commit_shas(&mut commits, result.commits)?;
@@ -347,12 +456,13 @@ impl SourceControlClient for GitHubSourceControl {
         let mut pr_etag = checkpoint.etag.clone();
         let mut pr_page = 1u32;
         let mut pr_complete = false;
+        let mut pr_not_modified = false;
         for page in 1..=self.max_pages {
             let path = format!(
                 "/repos/{owner}/{name}/pulls?state=all&sort=updated&direction=desc&per_page={}&page={page}",
                 self.per_page
             );
-            let mut result: Page<PullRequest> = self
+            let result: Page<PullRequest> = self
                 .collect_page(
                     &path,
                     if page == 1 {
@@ -362,17 +472,12 @@ impl SourceControlClient for GitHubSourceControl {
                     },
                 )
                 .await?;
-            if result.not_modified && page == 1 {
-                // A collection ETag covers this page, not later pages. Re-fetch
-                // the full collection unconditionally before reconciling refs;
-                // otherwise a changed/deleted later page would be invisible.
-                result = self.collect_page(&path, None).await?;
-            }
             if page == 1 {
                 pr_etag = result.etag;
+                pr_not_modified = result.not_modified;
             }
             if result.items.is_empty() {
-                pr_complete = true;
+                pr_complete = !result.not_modified;
                 break;
             }
             let count = result.items.len();
@@ -399,19 +504,20 @@ impl SourceControlClient for GitHubSourceControl {
             }
             pr_page = page;
             if count < self.per_page as usize {
-                pr_complete = true;
+                pr_complete = !result.not_modified;
                 break;
             }
         }
         let mut branch_etag = checkpoint.branch_etag.clone();
         let mut branch_page = 1u32;
         let mut branches_complete = false;
+        let mut branch_not_modified = false;
         for page in 1..=self.max_pages {
             let path = format!(
                 "/repos/{owner}/{name}/branches?per_page={}&page={page}",
                 self.per_page
             );
-            let mut result: Page<Branch> = self
+            let result: Page<Branch> = self
                 .collect_page(
                     &path,
                     if page == 1 {
@@ -421,14 +527,12 @@ impl SourceControlClient for GitHubSourceControl {
                     },
                 )
                 .await?;
-            if result.not_modified && page == 1 {
-                result = self.collect_page(&path, None).await?;
-            }
             if page == 1 {
                 branch_etag = result.etag;
+                branch_not_modified = result.not_modified;
             }
             if result.items.is_empty() {
-                branches_complete = true;
+                branches_complete = !result.not_modified;
                 break;
             }
             let count = result.items.len();
@@ -448,7 +552,7 @@ impl SourceControlClient for GitHubSourceControl {
             }
             branch_page = page;
             if count < self.per_page as usize {
-                branches_complete = true;
+                branches_complete = !result.not_modified;
                 break;
             }
         }
@@ -462,7 +566,7 @@ impl SourceControlClient for GitHubSourceControl {
                 branch_cursor: Some(branch_page.to_string()),
                 last_successful_poll: Some(Utc::now()),
             },
-            not_modified: false,
+            not_modified: pr_not_modified || branch_not_modified,
             retry_after: None,
             complete_kinds: [
                 pr_complete.then_some(SourceRefKind::PullRequest),
@@ -476,14 +580,26 @@ impl SourceControlClient for GitHubSourceControl {
     async fn fetch_commit(&self, repository: &str, commit_sha: &str) -> Result<Vec<u8>, PollError> {
         validate_commit_sha(commit_sha).map_err(|e| PollError::InvalidResponse(e.to_string()))?;
         let (owner, name) = parse_repository(repository)?;
-        let response = self
-            .request(&format!("/repos/{owner}/{name}/tarball/{commit_sha}"))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::decode_error(response).await);
+        let path = format!("/repos/{owner}/{name}/tarball/{commit_sha}");
+        let scope = rate_scope(&path);
+        self.rate_limit.before_request(&scope).await?;
+        let response = self.request(&path).send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?.to_vec();
+        if let Some(delay) = self
+            .rate_limit
+            .observe_response(&scope, status, &headers, &body)
+            .await
+        {
+            return Err(PollError::RateLimited {
+                retry_after: Some(delay),
+            });
         }
-        Ok(response.bytes().await?.to_vec())
+        if !status.is_success() {
+            return Err(Self::decode_error_parts(status, &body));
+        }
+        Ok(body)
     }
 
     async fn pull_request_commits(
@@ -526,6 +642,12 @@ impl SourceControlClient for GitHubSourceControl {
     }
 }
 
+fn rate_scope(_path: &str) -> &'static str {
+    // These REST operations share GitHub's core quota. ETags remain
+    // endpoint/page-specific; rate-limit state must not be.
+    "github:rest:core"
+}
+
 fn parse_repository(value: &str) -> Result<(&str, &str), PollError> {
     let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
@@ -536,24 +658,6 @@ fn parse_repository(value: &str) -> Result<(&str, &str), PollError> {
         ));
     }
     Ok((owner, name))
-}
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
-    if let Some(delay) = response
-        .headers()
-        .get(header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        return Some(Duration::from_secs(delay));
-    }
-    let reset_at = response
-        .headers()
-        .get("x-ratelimit-reset")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())?;
-    Some(Duration::from_secs(
-        reset_at.saturating_sub(Utc::now().timestamp().max(0) as u64),
-    ))
 }
 pub fn retry_delay(error: &PollError, attempt: u32) -> Duration {
     if let PollError::RateLimited {
@@ -849,7 +953,7 @@ mod http_tests {
             .poll("Pumpkin-MC/Pumpkin", &result.checkpoint)
             .await
             .unwrap();
-        assert!(!unchanged.not_modified);
+        assert!(unchanged.not_modified);
         assert!(
             unchanged.eager_refs.is_empty(),
             "unchanged PR heads stay cached"

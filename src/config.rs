@@ -113,6 +113,9 @@ pub struct CiConfig {
     pub builder_backend: CiBuilderBackend,
     /// Maximum number of concurrent build slots per concrete builder identity.
     pub build_concurrency: u16,
+    pub github_min_request_interval: Duration,
+    pub github_rate_limit_max_backoff: Duration,
+    pub github_rate_limit_jitter: f64,
     pub plugin_source: PathBuf,
 }
 
@@ -221,6 +224,11 @@ impl CiConfig {
             ),
         };
         let build_concurrency = ci_build_concurrency_from_env()?;
+        let github_min_request_interval =
+            ci_github_duration_ms_from_env("CI_GITHUB_MIN_REQUEST_INTERVAL_MS", 2_000)?;
+        let github_rate_limit_max_backoff =
+            ci_github_duration_secs_from_env("CI_GITHUB_RATE_LIMIT_MAX_BACKOFF_SECS", 900)?;
+        let github_rate_limit_jitter = ci_github_jitter_from_env()?;
         let target_architecture = native_linux_target_architecture()?;
         let plugin_source = PathBuf::from(value("CI_PLUGIN_SOURCE", "plugins/kurbis-control"));
         let plugin_source = if plugin_source.is_absolute() {
@@ -245,6 +253,9 @@ impl CiConfig {
             builder_docker_host,
             builder_backend,
             build_concurrency,
+            github_min_request_interval,
+            github_rate_limit_max_backoff,
+            github_rate_limit_jitter,
             plugin_source,
         }))
     }
@@ -265,6 +276,15 @@ impl fmt::Debug for CiConfig {
             .field("builder_docker_host", &self.builder_docker_host)
             .field("builder_backend", &self.builder_backend)
             .field("build_concurrency", &self.build_concurrency)
+            .field(
+                "github_min_request_interval",
+                &self.github_min_request_interval,
+            )
+            .field(
+                "github_rate_limit_max_backoff",
+                &self.github_rate_limit_max_backoff,
+            )
+            .field("github_rate_limit_jitter", &self.github_rate_limit_jitter)
             .field("plugin_source", &self.plugin_source)
             .finish()
     }
@@ -273,6 +293,51 @@ impl fmt::Debug for CiConfig {
 pub fn ci_build_concurrency_from_env() -> Result<u16> {
     crate::ci::execution::parse_build_concurrency(env::var("CI_BUILD_CONCURRENCY").ok().as_deref())
         .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn ci_github_duration_ms_from_env(name: &str, default_ms: u64) -> Result<Duration> {
+    let value = match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an integer number of milliseconds"))?,
+        Err(env::VarError::NotPresent) => default_ms,
+        Err(error) => return Err(error).context(format!("{name} must be valid UTF-8")),
+    };
+    ensure!(
+        value > 0 && value <= 86_400_000,
+        "{name} must be between 1ms and 24h"
+    );
+    Ok(Duration::from_millis(value))
+}
+
+fn ci_github_duration_secs_from_env(name: &str, default_secs: u64) -> Result<Duration> {
+    let value = match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an integer number of seconds"))?,
+        Err(env::VarError::NotPresent) => default_secs,
+        Err(error) => return Err(error).context(format!("{name} must be valid UTF-8")),
+    };
+    ensure!(
+        value >= 60 && value <= 7 * 24 * 60 * 60,
+        "{name} must be between 60s and 7d"
+    );
+    Ok(Duration::from_secs(value))
+}
+
+fn ci_github_jitter_from_env() -> Result<f64> {
+    let value = match env::var("CI_GITHUB_RATE_LIMIT_JITTER") {
+        Ok(value) => value
+            .parse::<f64>()
+            .context("CI_GITHUB_RATE_LIMIT_JITTER must be a number")?,
+        Err(env::VarError::NotPresent) => 0.2,
+        Err(error) => return Err(error).context("CI_GITHUB_RATE_LIMIT_JITTER must be valid UTF-8"),
+    };
+    ensure!(
+        value.is_finite() && (0.0..=1.0).contains(&value),
+        "CI_GITHUB_RATE_LIMIT_JITTER must be between 0 and 1"
+    );
+    Ok(value)
 }
 
 fn exact_ci_rust_release() -> Result<String> {
