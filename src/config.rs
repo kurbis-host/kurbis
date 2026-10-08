@@ -319,7 +319,7 @@ fn ci_github_duration_secs_from_env(name: &str, default_secs: u64) -> Result<Dur
         Err(error) => return Err(error).context(format!("{name} must be valid UTF-8")),
     };
     ensure!(
-        value >= 60 && value <= 7 * 24 * 60 * 60,
+        (60..=7 * 24 * 60 * 60).contains(&value),
         "{name} must be between 60s and 7d"
     );
     Ok(Duration::from_secs(value))

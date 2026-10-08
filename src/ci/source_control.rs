@@ -251,7 +251,7 @@ impl GitHubSourceControl {
         etag: Option<&str>,
     ) -> Result<Page<T>, PollError> {
         let scope = rate_scope(path);
-        self.rate_limit.before_request(&scope).await?;
+        self.rate_limit.before_request(scope).await?;
         let request = self.request(path);
         let request = match etag {
             Some(etag) => request.header(header::IF_NONE_MATCH, etag),
@@ -263,7 +263,7 @@ impl GitHubSourceControl {
         let body = response.bytes().await?.to_vec();
         if let Some(delay) = self
             .rate_limit
-            .observe_response(&scope, status, &headers, &body)
+            .observe_response(scope, status, &headers, &body)
             .await
         {
             return Err(PollError::RateLimited {
@@ -388,14 +388,14 @@ impl GitHubSourceControl {
             // pull-request commit endpoint which returns a bare array.
             let path = path(page);
             let scope = rate_scope(&path);
-            self.rate_limit.before_request(&scope).await?;
+            self.rate_limit.before_request(scope).await?;
             let response = self.request(&path).send().await?;
             let status = response.status();
             let headers = response.headers().clone();
             let body = response.bytes().await?.to_vec();
             if let Some(delay) = self
                 .rate_limit
-                .observe_response(&scope, status, &headers, &body)
+                .observe_response(scope, status, &headers, &body)
                 .await
             {
                 return Err(PollError::RateLimited {
@@ -582,14 +582,14 @@ impl SourceControlClient for GitHubSourceControl {
         let (owner, name) = parse_repository(repository)?;
         let path = format!("/repos/{owner}/{name}/tarball/{commit_sha}");
         let scope = rate_scope(&path);
-        self.rate_limit.before_request(&scope).await?;
+        self.rate_limit.before_request(scope).await?;
         let response = self.request(&path).send().await?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response.bytes().await?.to_vec();
         if let Some(delay) = self
             .rate_limit
-            .observe_response(&scope, status, &headers, &body)
+            .observe_response(scope, status, &headers, &body)
             .await
         {
             return Err(PollError::RateLimited {

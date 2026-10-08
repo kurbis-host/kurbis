@@ -211,7 +211,7 @@ impl GitHubCheckRunClient {
             "github:rest:core"
         };
         self.rate_limit
-            .before_request(&scope)
+            .before_request(scope)
             .await
             .map_err(|error| match error {
                 crate::ci::PollError::RateLimited { retry_after } => {
