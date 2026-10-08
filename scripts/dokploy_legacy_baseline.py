@@ -968,13 +968,14 @@ def migration_record_from_hash(manifest_sha: str) -> dict[str, Any] | None:
     return record
 
 
-def save_baseline_compose_env(inventory: dict[str, Any]) -> dict[str, Any]:
+def save_baseline_compose_env(inventory: dict[str, Any], backup_root: Path | None = None) -> dict[str, Any]:
+    backup_root = backup_root or COMPOSE_ENV_BACKUPS
     source=inventory["source"]
-    if not COMPOSE_ENV_BACKUPS.exists():COMPOSE_ENV_BACKUPS.mkdir(mode=0o700)
-    if COMPOSE_ENV_BACKUPS.is_symlink() or COMPOSE_ENV_BACKUPS.stat().st_uid!=0 or stat.S_IMODE(COMPOSE_ENV_BACKUPS.stat().st_mode)!=0o700:
+    if not backup_root.exists():backup_root.mkdir(mode=0o700, parents=True)
+    if backup_root.is_symlink() or backup_root.stat().st_uid!=0 or stat.S_IMODE(backup_root.stat().st_mode)!=0o700:
         raise BaselineError("baseline environment backup directory must be root-owned mode 0700")
     digest=source["compose_env_file_sha256"]
-    path=COMPOSE_ENV_BACKUPS/f"compose-env-{digest}"
+    path=backup_root/f"compose-env-{digest}"
     content=ENV_FILE_CHECKOUT.read_bytes()
     if sha256_bytes(content)!=digest:raise BaselineError("Dokploy .env changed while inventory was captured")
     if path.is_symlink():raise BaselineError("baseline environment backup cannot be a symlink")
