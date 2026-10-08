@@ -25,7 +25,7 @@ RUN groupadd --gid 65532 kurbis \
     && test "$(getent passwd 65532 | cut -d: -f1)" = kurbis \
     && test "$(getent group 65532 | cut -d: -f1)" = kurbis \
     && test "$(getent passwd 65532 | cut -d: -f6)" = /home/kurbis
-RUN mkdir -p /var/lib/kurbis/object-store /home/kurbis/.ssh /opt/kurbis/plugins /opt/kurbis/runtime && chown -R 65532:65532 /var/lib/kurbis/object-store /home/kurbis
+RUN mkdir -p /var/lib/kurbis/object-store /home/kurbis/.ssh /home/kurbis/.cache/kurbis/build-cache /opt/kurbis/plugins /opt/kurbis/runtime && chmod 700 /home/kurbis/.cache/kurbis/build-cache && chown -R 65532:65532 /var/lib/kurbis/object-store /home/kurbis
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 ENV HOME=/home/kurbis
 COPY --from=builder /artifacts/control-plane /usr/local/bin/control-plane
