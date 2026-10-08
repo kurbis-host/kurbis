@@ -85,7 +85,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=12).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=13).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -152,6 +152,7 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
 
     let expected_tables = [
         "worker_snapshot_hints",
+        "ci_github_rate_limits",
         "operator_entries",
         "server_known_players",
         "console_commands",
