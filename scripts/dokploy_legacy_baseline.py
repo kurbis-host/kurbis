@@ -1031,7 +1031,8 @@ def bootstrap(manifest: dict[str, Any], token: str, *, candidate_revision: str |
         schema = manifest.get("schema")
         if candidate_revision is not None and schema != CURRENT_BASELINE_SCHEMA:
             raise BaselineError("cannot create a legacy attestation from refreshed release source; exact old baseline checkout is required")
-        current=collect_inventory(baseline_schema=schema) if schema == CURRENT_BASELINE_SCHEMA else collect_inventory()
+        current=(collect_inventory(expected_checkout_head=CURRENT_BASELINE_REVISION, baseline_schema=schema)
+                 if schema == CURRENT_BASELINE_SCHEMA else collect_inventory())
         manifest_sha=validate_manifest(manifest,current)
         compose_env_backup=save_baseline_compose_env(current, compose_env_backup_root(schema))
         record={"schema":manifest["schema"],"source_revision_claim":manifest["source_revision_claim"],
