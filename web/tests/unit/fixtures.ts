@@ -27,6 +27,7 @@ export const server: Server = {
     simulation_distance: 8,
     hardcore: false,
     whitelist: false,
+    tab_stats: false,
   },
   storage_bytes: 512 * 1024 * 1024,
   storage_limit_bytes: 5 * 1024 * 1024 * 1024,

@@ -29,6 +29,7 @@ const defaults: SetupValues = {
   simulation_distance: 8,
   hardcore: false,
   whitelist: false,
+  tab_stats: false,
 };
 
 const presetCard =
@@ -61,6 +62,7 @@ export function Setup() {
         simulation_distance: values.simulation_distance,
         hardcore: values.hardcore,
         whitelist: values.whitelist,
+        tab_stats: values.tab_stats,
       };
       const server = await browserApi.createServer({ subdomain: values.subdomain, settings });
       queryClient.setQueryData(queryKeys.server(server.id), server);

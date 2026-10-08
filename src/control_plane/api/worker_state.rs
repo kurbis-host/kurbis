@@ -296,7 +296,7 @@ pub(super) async fn sync_runtime_stats(
                 message,
             )
         })?;
-    lock_current_placement(&mut tx, worker_id, server_id, request.generation).await?;
+    lock_current_active_placement(&mut tx, worker_id, server_id, request.generation).await?;
 
     let mut stats = serde_json::to_value(request.stats).map_err(|_| {
         ApiError::with_code(
@@ -477,20 +477,45 @@ async fn lock_current_placement(
     server_id: Uuid,
     generation: i64,
 ) -> Result<(), ApiError> {
+    lock_current_placement_with_activity(tx, worker_id, server_id, generation, false).await
+}
+
+async fn lock_current_active_placement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    worker_id: Uuid,
+    server_id: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
+    lock_current_placement_with_activity(tx, worker_id, server_id, generation, true).await
+}
+
+async fn lock_current_placement_with_activity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    worker_id: Uuid,
+    server_id: Uuid,
+    generation: i64,
+    require_active: bool,
+) -> Result<(), ApiError> {
     if generation <= 0 {
         return Err(invalid_assignment());
     }
-    let assignment: Option<Uuid> = sqlx::query_scalar(
+    let query = if require_active {
         "SELECT p.server_id FROM placements p JOIN servers s ON s.id = p.server_id
          WHERE p.server_id = $1 AND p.worker_id = $2 AND p.generation = $3
            AND p.active AND s.generation = $3
-         FOR SHARE OF p, s",
-    )
-    .bind(server_id)
-    .bind(worker_id)
-    .bind(generation)
-    .fetch_optional(&mut **tx)
-    .await?;
+         FOR SHARE OF p, s"
+    } else {
+        "SELECT p.server_id FROM placements p JOIN servers s ON s.id = p.server_id
+         WHERE p.server_id = $1 AND p.worker_id = $2 AND p.generation = $3
+           AND s.generation = $3
+         FOR SHARE OF p, s"
+    };
+    let assignment: Option<Uuid> = sqlx::query_scalar(query)
+        .bind(server_id)
+        .bind(worker_id)
+        .bind(generation)
+        .fetch_optional(&mut **tx)
+        .await?;
     if assignment != Some(server_id) {
         return Err(invalid_assignment());
     }

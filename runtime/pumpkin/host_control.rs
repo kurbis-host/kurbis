@@ -614,7 +614,7 @@ fn sample_host_stats(
     // Keep reading and recording under one lock. Concurrent stats requests can
     // otherwise read in order but update the baseline out of order, producing
     // a false counter reset or an interval that does not match its sample.
-    let (cpu_usage_nanos, cpu_limit_millis, cpu_percent) = {
+    let (_cpu_usage_nanos, cpu_limit_millis, cpu_percent) = {
         let mut previous = cpu_sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -766,6 +766,9 @@ fn parse_cpu_max(value: &str) -> Option<u64> {
         return None;
     }
     let quota = quota.parse::<u64>().ok()?;
+    if quota == 0 {
+        return None;
+    }
     Some(quota.checked_mul(1_000)?.checked_div(period)?.max(1))
 }
 fn parse_v1_cpu(quota: &str, period: &str) -> Option<u64> {
@@ -805,6 +808,7 @@ mod tests {
         assert_eq!(parse_cpu_max("1 100000"), Some(1));
         assert_eq!(parse_cpu_max("max 100000"), None);
         assert_eq!(parse_cpu_max("50000 0"), None);
+        assert_eq!(parse_cpu_max("0 100000"), None);
     }
 
     #[test]

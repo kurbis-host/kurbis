@@ -17,6 +17,7 @@ const FIRST_REFRESH_TICKS: u64 = 1;
 const REFRESH_TICKS: u64 = 40;
 const TAB_HEADER: &str = "§6§lKurbis Server";
 const EMPTY_TEXT: &str = "";
+const MAX_TPS: f64 = 20.0;
 
 static TASK_STARTED: OnceLock<()> = OnceLock::new();
 static REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -88,18 +89,24 @@ fn render_snapshot(server: &Server) -> TabSnapshot {
     let cpu = runtime
         .as_ref()
         .and_then(|value| percentage(value, "cpu_percent"))
-        .unwrap_or_else(|| unavailable());
+        .unwrap_or_else(unavailable);
     let memory = runtime
         .as_ref()
         .and_then(|value| bytes_pair(value, "memory_used_bytes", "memory_limit_bytes"))
-        .unwrap_or_else(|| unavailable());
+        .unwrap_or_else(unavailable);
     let disk = runtime
         .as_ref()
         .and_then(|value| bytes_pair(value, "disk_used_bytes", "disk_limit_bytes"))
-        .unwrap_or_else(|| unavailable());
+        .unwrap_or_else(unavailable);
     let tps = finite_nonnegative(server.get_tps())
-        .or_else(|| runtime.as_ref().and_then(|value| number(value, "tps")))
-        .and_then(finite_nonnegative)
+        .map(|value| value.min(MAX_TPS))
+        .or_else(|| {
+            runtime
+                .as_ref()
+                .and_then(|value| number(value, "tps"))
+                .and_then(finite_nonnegative)
+                .map(|value| value.min(MAX_TPS))
+        })
         .map_or_else(unavailable, |value| format!("{value:.1}"));
     let players = server.get_player_count();
 
@@ -175,9 +182,8 @@ fn bytes_pair_from_options(used: Option<u64>, limit: Option<u64>) -> Option<Stri
     let used = used?;
     let used_display = format_gib(used);
     match limit {
-        Some(limit) if limit >= used => Some(format!("{used_display}/{} GB", format_gib(limit))),
-        Some(_) => None,
-        None => Some(format!("{used_display} GB")),
+        Some(limit) if limit >= used => Some(format!("{used_display}/{} GiB", format_gib(limit))),
+        Some(_) | None => None,
     }
 }
 
@@ -244,7 +250,7 @@ mod tests {
         assert_eq!(percentage(&value, "cpu_percent"), None);
         assert_eq!(
             bytes_pair(&value, "memory_used_bytes", "memory_limit_bytes"),
-            Some("0.0 GB".into())
+            None
         );
         assert_eq!(
             bytes_pair(&value, "disk_used_bytes", "disk_limit_bytes"),
@@ -274,7 +280,7 @@ mod tests {
         });
         assert_eq!(
             bytes_pair(&value, "disk_used_bytes", "disk_limit_bytes"),
-            Some("1.0/5.0 GB".into())
+            Some("1.0/5.0 GiB".into())
         );
         assert_eq!(bytes_pair_from_options(Some(8), Some(4)), None);
     }

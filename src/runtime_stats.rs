@@ -59,6 +59,20 @@ impl RuntimeStats {
         {
             return Err("TPS must be finite and between 0 and 20");
         }
+        if self
+            .memory_used_bytes
+            .zip(self.memory_limit_bytes)
+            .is_some_and(|(used, limit)| used > limit)
+        {
+            return Err("memory usage cannot exceed its limit");
+        }
+        if self
+            .disk_used_bytes
+            .zip(self.disk_limit_bytes)
+            .is_some_and(|(used, limit)| used > limit)
+        {
+            return Err("disk usage cannot exceed its limit");
+        }
         Ok(())
     }
 
@@ -81,7 +95,10 @@ pub fn parse_v2_cpu_max(value: &str) -> Option<u64> {
         return None;
     }
     let quota = quota.parse::<u64>().ok()?;
-    Some(quota.saturating_mul(1_000).checked_div(period)?.max(1))
+    if quota == 0 {
+        return None;
+    }
+    Some(quota.checked_mul(1_000)?.checked_div(period)?.max(1))
 }
 
 /// Parse cgroup-v1 `cpu.cfs_quota_us` and `cpu.cfs_period_us` values.
@@ -170,6 +187,12 @@ mod tests {
         invalid = sample();
         invalid.tps = Some(-0.1);
         assert!(invalid.validate().is_err());
+        invalid = sample();
+        invalid.memory_used_bytes = Some(21);
+        assert!(invalid.validate().is_err());
+        invalid = sample();
+        invalid.disk_used_bytes = Some(21);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -178,6 +201,7 @@ mod tests {
         assert_eq!(parse_v2_cpu_max("100000 100000"), Some(1000));
         assert_eq!(parse_v2_cpu_max("max 100000"), None);
         assert_eq!(parse_v2_cpu_max("50000 0"), None);
+        assert_eq!(parse_v2_cpu_max("0 100000"), None);
     }
 
     #[test]
