@@ -6,9 +6,10 @@ x-control-plane-environment: &control-plane-environment
   PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
   ROOT_DOMAIN: ${ROOT_DOMAIN}
   INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+  CI_REPOSITORY: ${CI_REPOSITORY:-Pumpkin-MC/Pumpkin}
   CI_GITHUB_PAT: ${CI_GITHUB_PAT:-}
+  CI_GITHUB_API_BASE_URL: ${CI_GITHUB_API_BASE_URL:-https://api.github.com}
   CI_GITHUB_WEBHOOK_ENABLED: ${CI_GITHUB_WEBHOOK_ENABLED:-false}
-  CI_GITHUB_WEBHOOK_SECRET: ${CI_GITHUB_WEBHOOK_SECRET:-}
   CI_DEFAULT_BRANCH: ${CI_DEFAULT_BRANCH:-master}
   # Docker is the default Compose builder. bubblewrap_ssh is also supported: it
   # delegates only the isolated build job over SSH and keeps the watcher, cache,
