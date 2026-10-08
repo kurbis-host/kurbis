@@ -367,11 +367,12 @@ def legacy_remote_source() -> str:
 
 def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
                   expected_sources: dict | None = None, token: str | None = None,
-                  candidate_image_id: str | None = None, candidate_revision: str | None = None) -> dict:
+                  candidate_image_id: str | None = None, candidate_revision: str | None = None,
+                  mode: str | None = None) -> dict:
     command=["python3","-","--operation",operation]
     for key,value in (("manifest-json",manifest),("expected-sources-json",expected_sources),
                       ("token",token),("candidate-image-id",candidate_image_id),
-                      ("candidate-revision",candidate_revision)):
+                      ("candidate-revision",candidate_revision),("mode",mode)):
         if value is not None:
             command.extend([f"--{key}",value if isinstance(value,str) else json.dumps(value,separators=(",",":"))])
     output=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=10",host,shlex.join(command)],
@@ -610,18 +611,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
                 raise DeploymentError("respond5 host-control Pumpkin image is not pinned to clean source SHA")
             if legacy_manifest is not None:
-                compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
-                    token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
-                if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
-                def mark_worker_bootstrap_attempted() -> None:
-                    nonlocal worker_bootstrap_attempted
-                    worker_bootstrap_attempted=True
-                migrated=dispatch_legacy_worker_bootstrap(
-                    lambda **kwargs:legacy_remote(args.worker_host,"bootstrap-worker",**kwargs),
-                    mark_worker_bootstrap_attempted,
-                    manifest=legacy_manifest,token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
-                if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
-                worker_bootstrap_reconciled=True
+                if legacy_manifest.get("schema") == "kurbis.respond5.current-baseline.v1":
+                    # The migration-safe 1..13 baseline is intentionally allowed to have
+                    # a stale lease: the current 2f94 control plane is the failing side
+                    # of the mixed deployment and is restart-looping before this release.
+                    # Deploy the fixed control plane first; wait_sync then performs the
+                    # single guarded worker transaction against the new API.
+                    baseline = legacy_wait_baseline(legacy_manifest["expected_inventory"])
+                else:
+                    compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
+                        token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                    if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
+                    def mark_worker_bootstrap_attempted() -> None:
+                        nonlocal worker_bootstrap_attempted
+                        worker_bootstrap_attempted=True
+                    migrated=dispatch_legacy_worker_bootstrap(
+                        lambda **kwargs:legacy_remote(args.worker_host,"bootstrap-worker",**kwargs),
+                        mark_worker_bootstrap_attempted,
+                        manifest=legacy_manifest,token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                    if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
+                    worker_bootstrap_reconciled=True
             else:
                 baseline_result=remote(args.worker_host,"baseline")
                 baseline=baseline_result.get("snapshot")

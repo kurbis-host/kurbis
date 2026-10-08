@@ -72,12 +72,13 @@ def reconcile_worker_bootstrap(manifest: dict[str, Any], token: str) -> dict[str
     attestation=load_attestation(manifest)
     expected=attestation["inventory"];baseline_sha=attestation["manifest_sha256"]
     migration=migration_record(manifest)
+    inventory_options = {"baseline_schema": manifest.get("schema")} if manifest.get("schema") == CURRENT_BASELINE_SCHEMA else {}
     if migration is None:
-        current=collect_inventory()
+        current=collect_inventory(**inventory_options)
         verify_attested_legacy_services(current,expected,baseline_sha)
         return {"status":"no-mutation","worker_id":expected["worker"]["worker_id"]}
     if migration.get("status")=="rolled_back":
-        current=collect_inventory()
+        current=collect_inventory(**inventory_options)
         verify_attested_legacy_services(current,expected,baseline_sha)
         return {"status":"rolled-back","worker_id":expected["worker"]["worker_id"]}
     if migration.get("status")=="migrated":

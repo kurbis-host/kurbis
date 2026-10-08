@@ -55,6 +55,28 @@ class LegacyBaselineTests(unittest.TestCase):
             "expected_inventory": inventory,
         }))
 
+    def test_current_migration_safe_baseline_accepts_mixed_2f94_inventory_without_f6_rollback_claim(self):
+        inventory = json.loads(json.dumps(FIXTURE["expected_inventory"]))
+        inventory["source"]["checkout_head"] = legacy.CURRENT_BASELINE_REVISION
+        inventory["source"]["build_revision_env_present"] = True
+        inventory["source"]["safe_compose_settings"]["BUILD_REVISION"] = legacy.CURRENT_BASELINE_REVISION
+        inventory["provenance_status"] = "migration-safe-unproven"
+        for service in ("panel", "waiting-pumpkin"):
+            inventory["services"][service]["image"]["revision_label"] = legacy.CURRENT_BASELINE_REVISION
+        inventory["services"]["waiting-pumpkin"]["payloads"]["build_revision"] = {
+            "sha256": "a" * 64, "size": 40, "value": legacy.CURRENT_BASELINE_REVISION,
+        }
+        manifest = legacy.current_baseline_manifest(inventory)
+        self.assertEqual(manifest["schema"], legacy.CURRENT_BASELINE_SCHEMA)
+        self.assertEqual(legacy.validate_manifest(manifest, inventory), legacy.canonical_hash({
+            "schema": manifest["schema"],
+            "source_revision_claim": manifest["source_revision_claim"],
+            "operator": manifest["operator"],
+            "reason": manifest["reason"],
+            "expected_inventory": inventory,
+        }))
+        self.assertNotEqual(manifest["source_revision_claim"], legacy.LEGACY_REVISION_CLAIM)
+
     def test_deploy_baseline_adapter_preserves_legacy_inventory_without_fake_revision(self):
         snapshot=deploy.legacy_wait_baseline(FIXTURE)
         expected=FIXTURE["expected_inventory"]["services"]
