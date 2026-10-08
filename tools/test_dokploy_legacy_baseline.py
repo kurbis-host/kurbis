@@ -86,6 +86,8 @@ class LegacyBaselineTests(unittest.TestCase):
         self.assertEqual(snapshot["waiting-pumpkin"][0]["health"],"healthy")
         self.assertEqual(snapshot,deploy.legacy_wait_baseline(FIXTURE["expected_inventory"]))
         self.assertEqual(deploy.legacy_revision(FIXTURE),legacy.LEGACY_REVISION_CLAIM)
+        current = {"schema": legacy.CURRENT_BASELINE_SCHEMA, "source_revision_claim": legacy.CURRENT_BASELINE_REVISION}
+        self.assertEqual(deploy.legacy_revision(current), legacy.CURRENT_BASELINE_REVISION)
         stale=json.loads(json.dumps(FIXTURE));stale["source_revision_claim"]="a"*40
         with self.assertRaisesRegex(deploy.DeploymentError,"does not claim"):
             deploy.legacy_revision(stale)

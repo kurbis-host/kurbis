@@ -393,9 +393,15 @@ def legacy_wait_baseline(inventory: dict) -> dict[str,list[dict[str,str]]]:
 
 
 def legacy_revision(manifest: dict) -> str:
-    value=manifest.get("source_revision_claim")
-    if value!="f6b05712bb130747060e5cfa049d84ed27020835":
-        raise DeploymentError("explicit legacy baseline manifest does not claim the reviewed f6b0571 inventory")
+    schema = manifest.get("schema")
+    value = manifest.get("source_revision_claim")
+    allowed = {
+        "kurbis.respond5.legacy-baseline.v1": "f6b05712bb130747060e5cfa049d84ed27020835",
+        "kurbis.respond5.current-baseline.v1": "2f94cc79602d45cfe6f91c629ffc4df48a3674cf",
+    }
+    expected = allowed.get(schema)
+    if expected is None or value != expected:
+        raise DeploymentError("explicit baseline manifest does not claim its reviewed rollback-compatible source")
     return value
 
 
