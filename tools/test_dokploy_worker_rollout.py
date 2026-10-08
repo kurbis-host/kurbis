@@ -92,6 +92,11 @@ class RolloutTests(unittest.TestCase):
         for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
             self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
 
+    def test_runtime_image_embeds_full_build_revision_label(self):
+        dockerfile = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG BUILD_REVISION=development", dockerfile)
+        self.assertIn("LABEL org.opencontainers.image.revision=${BUILD_REVISION}", dockerfile)
+
     def test_legacy_worker_image_bootstraps_to_active_revision_pin_without_touching_data(self):
         revision = "d" * 40
         pinned = f"{sync.PUMPKIN_PREFIX}{revision}"
