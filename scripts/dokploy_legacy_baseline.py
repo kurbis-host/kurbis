@@ -362,7 +362,19 @@ def validate_manifest(manifest: dict[str, Any], current: dict[str, Any]) -> str:
     if not isinstance(operator,str) or not operator.strip() or not isinstance(reason,str) or len(reason.strip())<20:
         raise BaselineError("explicit operator name and meaningful baseline reason are required")
     expected=manifest.get("expected_inventory")
-    if not isinstance(expected,dict) or expected!=current:
+    if not isinstance(expected, dict):
+        raise BaselineError("baseline manifest is missing its expected inventory")
+    if schema == CURRENT_BASELINE_SCHEMA:
+        # A restart-looping pre-release worker changes PID and lease liveness while
+        # the app/image/container identity remains the attested rollback boundary.
+        expected_compare = json.loads(json.dumps(expected))
+        current_compare = json.loads(json.dumps(current))
+        for inventory in (expected_compare, current_compare):
+            inventory.get("worker", {}).pop("main_pid", None)
+            inventory.get("worker", {}).pop("lease", None)
+        if expected_compare != current_compare:
+            raise BaselineError("live inventory differs from exact migration-safe baseline")
+    elif expected != current:
         raise BaselineError("live inventory differs from exact operator-reviewed manifest")
     if current.get("provenance_status") != expected_status: raise BaselineError("baseline provenance status is inconsistent")
     if current.get("compose_id")!=COMPOSE_ID or current.get("project")!=PROJECT:
