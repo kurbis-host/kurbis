@@ -2258,9 +2258,9 @@ async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded
 
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
-    let repository_name = "Pumpkin-MC/Pumpkin";
+    let repository_name = format!("Pumpkin-MC/Pumpkin-test-{}", Uuid::new_v4().simple());
     let watched = repository
-        .register_repository(repository_name, "master")
+        .register_repository(&repository_name, "master")
         .await
         .unwrap();
     let fixture = Pr3865GithubFixture::default();
@@ -2359,7 +2359,7 @@ async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded
     let build_row: (String, Option<String>) = sqlx::query_as(
         "SELECT stage, artifact_digest FROM ci_builds WHERE repository = $1 AND commit_sha = $2",
     )
-    .bind(repository_name)
+    .bind(&repository_name)
     .bind(head_sha)
     .fetch_one(&pool)
     .await
@@ -2372,25 +2372,28 @@ async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded
     let build_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ci_builds WHERE repository = $1 AND commit_sha = $2",
     )
-    .bind(repository_name)
+    .bind(&repository_name)
     .bind(head_sha)
     .fetch_one(&pool)
     .await
     .unwrap();
+    let alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-3865", &root_domain).unwrap();
+    let commit_alias = CiHostname::for_ref(CiRefKind::Commit, head_sha, &root_domain).unwrap();
     let alias_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ci_preview_aliases WHERE repository = $1 AND commit_sha = $2",
+        "SELECT count(*) FROM ci_preview_aliases
+         WHERE repository = $1 AND commit_sha = $2 AND hostname = ANY($3::text[])",
     )
-    .bind(repository_name)
+    .bind(&repository_name)
     .bind(head_sha)
+    .bind([alias.value.clone(), commit_alias.value])
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(build_count, 1);
     assert_eq!(
         alias_count, 2,
-        "immutable commit and stable PR aliases are both durable"
+        "immutable commit and stable PR aliases are both durable for this root domain"
     );
-    let alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-3865", &root_domain).unwrap();
     let preview = repository
         .lookup_preview(&alias.value)
         .await
