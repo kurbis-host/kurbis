@@ -286,27 +286,16 @@ pub(super) async fn sync_runtime_stats(
     // successful stats write after the initial token lookup.
     let mut tx = state.pool.begin().await?;
     let worker_id = worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await?;
-    if request.generation <= 0 {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_runtime_generation",
-            "runtime generation must be positive",
-        ));
-    }
-    request.stats.validate().map_err(|message| {
-        ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_runtime_stats",
-            message,
-        )
-    })?;
-    if request.stats.generation != request.generation {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_runtime_stats",
-            "runtime stats generation does not match the request generation",
-        ));
-    }
+    request
+        .stats
+        .validate_generation(request.generation)
+        .map_err(|message| {
+            ApiError::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_runtime_stats",
+                message,
+            )
+        })?;
     lock_current_placement(&mut tx, worker_id, server_id, request.generation).await?;
 
     let mut stats = serde_json::to_value(request.stats).map_err(|_| {

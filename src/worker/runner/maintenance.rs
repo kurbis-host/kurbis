@@ -30,120 +30,134 @@ impl WorkerRunner {
             .retain(|id, _| online.iter().any(|(server_id, _)| server_id == id));
 
         for (server_id, generation) in online {
-            let server_dir = self.server_dir(server_id);
-            if !self.runtime.server_is_running(server_id).await? {
-                tracing::error!(%server_id, "Pumpkin runtime stopped unexpectedly");
-                self.control_plane
-                    .mark_runtime_lost(
-                        server_id,
-                        generation,
-                        "Pumpkin runtime stopped unexpectedly",
-                    )
-                    .await?;
-                clear_players(&self.control_plane, server_id, generation).await?;
-                self.idle_since.remove(&server_id);
-                self.last_snapshot.remove(&server_id);
-                continue;
+            if let Err(error) = self.maintain_online_server(server_id, generation).await {
+                tracing::warn!(%server_id, ?error, "failed to maintain online server; continuing with other servers");
             }
-            let size = persistent_size(&server_dir)?;
-            if size > SERVER_STORAGE_BYTES {
-                tracing::warn!(%server_id, size, "storage quota exceeded; stopping server");
-                self.control_plane
-                    .command_stop(server_id, generation, "storage_quota")
-                    .await?;
-                continue;
-            }
+        }
+        Ok(())
+    }
 
-            match self.runtime.player_status(&server_dir).await {
-                Ok(status) => {
-                    match self.runtime.players(&server_dir).await {
-                        Ok(players) => {
-                            sync_players(&self.control_plane, server_id, generation, &players)
-                                .await?
+    async fn maintain_online_server(&mut self, server_id: Uuid, generation: i64) -> Result<()> {
+        let server_dir = self.server_dir(server_id);
+        if !self.runtime.server_is_running(server_id).await? {
+            tracing::error!(%server_id, "Pumpkin runtime stopped unexpectedly");
+            self.control_plane
+                .mark_runtime_lost(
+                    server_id,
+                    generation,
+                    "Pumpkin runtime stopped unexpectedly",
+                )
+                .await?;
+            clear_players(&self.control_plane, server_id, generation).await?;
+            self.idle_since.remove(&server_id);
+            self.last_snapshot.remove(&server_id);
+            return Ok(());
+        }
+        let size = persistent_size(&server_dir)?;
+        if size > SERVER_STORAGE_BYTES {
+            tracing::warn!(%server_id, size, "storage quota exceeded; stopping server");
+            self.control_plane
+                .command_stop(server_id, generation, "storage_quota")
+                .await?;
+            return Ok(());
+        }
+
+        match self.runtime.player_status(&server_dir).await {
+            Ok(status) => {
+                match self.runtime.players(&server_dir).await {
+                    Ok(players) => {
+                        if let Err(error) =
+                            sync_players(&self.control_plane, server_id, generation, &players).await
+                        {
+                            tracing::warn!(%server_id, ?error, "failed to persist player presence");
                         }
-                        Err(error) => {
-                            tracing::warn!(%server_id, ?error, "failed to persist player presence")
-                        }
                     }
-                    let context = self
-                        .control_plane
-                        .server_context(server_id, WorkerAssignment::Placement { generation })
-                        .await?;
-                    if let Err(error) = sync_whitelist(
-                        &self.control_plane,
-                        self.runtime.as_ref(),
-                        &context,
-                        &server_dir,
-                        false,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%server_id, ?error, "failed to synchronize whitelist state");
-                    }
-                    if let Err(error) = sync_operators(
-                        &self.control_plane,
-                        self.runtime.as_ref(),
-                        &context,
-                        &server_dir,
-                        false,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%server_id, ?error, "failed to synchronize owner operators");
-                    }
-                    let now = Instant::now();
-                    let idle = self
-                        .idle_since
-                        .entry(server_id)
-                        .or_insert_with(|| IdleTimer::new(&status, now));
-                    if idle.expired(&status, now, self.config.idle_timeout) {
-                        self.control_plane
-                            .command_stop(server_id, generation, "idle_timeout")
-                            .await?;
-                        continue;
+                    Err(error) => {
+                        tracing::warn!(%server_id, ?error, "failed to read player presence")
                     }
                 }
-                Err(error) => {
-                    self.idle_since.remove(&server_id);
-                    tracing::warn!(%server_id, ?error, "failed to read player activity; restarting idle observation");
-                }
-            }
-
-            match self.runtime.runtime_stats(&server_dir, generation).await {
-                Ok(stats) => {
-                    if let Err(error) = self
-                        .control_plane
-                        .sync_runtime_stats(server_id, &stats)
-                        .await
-                    {
-                        tracing::warn!(%server_id, ?error, "failed to persist runtime stats");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%server_id, ?error, "failed to read runtime stats");
-                }
-            }
-
-            let last = self
-                .last_snapshot
-                .entry(server_id)
-                .or_insert_with(|| SnapshotSchedule::new(Instant::now()));
-            if last.due(Instant::now(), self.config.snapshot_interval) {
-                match self
+                let context = self
                     .control_plane
-                    .command_snapshot(server_id, generation, SnapshotReason::Periodic)
+                    .server_context(server_id, WorkerAssignment::Placement { generation })
+                    .await?;
+                if let Err(error) = sync_whitelist(
+                    &self.control_plane,
+                    self.runtime.as_ref(),
+                    &context,
+                    &server_dir,
+                    false,
+                )
+                .await
+                {
+                    tracing::warn!(%server_id, ?error, "failed to synchronize whitelist state");
+                }
+                if let Err(error) = sync_operators(
+                    &self.control_plane,
+                    self.runtime.as_ref(),
+                    &context,
+                    &server_dir,
+                    false,
+                )
+                .await
+                {
+                    tracing::warn!(%server_id, ?error, "failed to synchronize owner operators");
+                }
+                let now = Instant::now();
+                let idle = self
+                    .idle_since
+                    .entry(server_id)
+                    .or_insert_with(|| IdleTimer::new(&status, now));
+                if idle.expired(&status, now, self.config.idle_timeout) {
+                    self.control_plane
+                        .command_stop(server_id, generation, "idle_timeout")
+                        .await?;
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                self.idle_since.remove(&server_id);
+                tracing::warn!(%server_id, ?error, "failed to read player activity; restarting idle observation");
+            }
+        }
+
+        match self
+            .runtime
+            .runtime_stats(server_id, &server_dir, generation)
+            .await
+        {
+            Ok(stats) => {
+                if let Err(error) = self
+                    .control_plane
+                    .sync_runtime_stats(server_id, &stats)
                     .await
                 {
-                    Ok(_) => last.succeeded(Instant::now()),
-                    Err(error) => {
-                        last.failed(Instant::now());
-                        tracing::warn!(%server_id, ?error, "periodic snapshot deferred; retaining the active runtime");
-                    }
+                    tracing::warn!(%server_id, ?error, "failed to persist runtime stats");
                 }
             }
-            if let Err(error) = self.collect_logs(server_id, generation).await {
-                tracing::warn!(%server_id, ?error, "failed to collect runtime logs");
+            Err(error) => {
+                tracing::warn!(%server_id, ?error, "failed to read runtime stats");
             }
+        }
+
+        let last = self
+            .last_snapshot
+            .entry(server_id)
+            .or_insert_with(|| SnapshotSchedule::new(Instant::now()));
+        if last.due(Instant::now(), self.config.snapshot_interval) {
+            match self
+                .control_plane
+                .command_snapshot(server_id, generation, SnapshotReason::Periodic)
+                .await
+            {
+                Ok(_) => last.succeeded(Instant::now()),
+                Err(error) => {
+                    last.failed(Instant::now());
+                    tracing::warn!(%server_id, ?error, "periodic snapshot deferred; retaining the active runtime");
+                }
+            }
+        }
+        if let Err(error) = self.collect_logs(server_id, generation).await {
+            tracing::warn!(%server_id, ?error, "failed to collect runtime logs");
         }
         Ok(())
     }

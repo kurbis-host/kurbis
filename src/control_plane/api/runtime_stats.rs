@@ -31,7 +31,7 @@ pub(super) async fn runtime_stats(
     )
     .bind(server.id)
     .bind(server.generation)
-    .bind(RUNTIME_STATS_FRESHNESS_SECONDS)
+    .bind(RUNTIME_STATS_FRESHNESS_SECONDS as f64)
     .fetch_optional(&state.pool)
     .await?;
     let stats = if let Some(row) = row {

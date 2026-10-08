@@ -56,10 +56,7 @@ impl WorkerControl {
     }
 
     pub async fn sync_runtime_stats(&self, server_id: Uuid, stats: &RuntimeStats) -> Result<()> {
-        ensure!(
-            stats.generation > 0,
-            "runtime stats generation must be positive"
-        );
+        stats.validate().map_err(anyhow::Error::msg)?;
         self.post_no_content(
             &format!("/internal/worker/control/servers/{server_id}/runtime-stats"),
             &RuntimeStatsSyncRequest {

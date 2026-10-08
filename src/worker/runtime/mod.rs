@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{
@@ -52,8 +52,19 @@ pub trait ServerRuntime: Send + Sync {
         Ok(self.server_generation(server_id).await?.is_some())
     }
 
-    async fn runtime_stats(&self, server_dir: &Path, generation: i64) -> Result<RuntimeStats> {
+    async fn runtime_stats(
+        &self,
+        server_id: Uuid,
+        server_dir: &Path,
+        generation: i64,
+    ) -> Result<RuntimeStats> {
         ensure!(generation > 0, "runtime generation must be positive");
+        let runtime_generation = self.server_generation(server_id).await?;
+        if runtime_generation != Some(generation) {
+            bail!(
+                "runtime generation {runtime_generation:?} does not match stats assignment generation {generation}"
+            );
+        }
         let stats = self
             .control_for(server_dir)
             .await?
