@@ -79,8 +79,8 @@ impl CiPreviewRuntimeRepository {
              JOIN ci_builds build ON build.id = alias.build_id
              JOIN ci_artifacts artifact ON artifact.digest = build.artifact_digest
              WHERE alias.id = $1 AND alias.expires_at > now()
-               AND build.stage = 'ready' AND build.expires_at > now()
-               AND artifact.expires_at > now()
+               AND build.stage = 'ready' AND (build.expires_at IS NULL OR build.expires_at > now())
+               AND (artifact.expires_at IS NULL OR artifact.expires_at > now())
              FOR UPDATE OF alias, build",
         )
         .bind(preview_id)
@@ -228,14 +228,14 @@ impl CiPreviewRuntimeRepository {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE ci_builds SET expires_at = GREATEST(expires_at, now() + interval '72 hours'), updated_at = now()
+            "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
              WHERE id = $1",
         )
         .bind(preview.build_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE ci_artifacts artifact SET expires_at = GREATEST(artifact.expires_at, now() + interval '72 hours')
+            "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '72 hours') END
              FROM ci_builds build WHERE build.id = $1 AND artifact.digest = build.artifact_digest",
         )
         .bind(preview.build_id)
@@ -291,7 +291,7 @@ impl CiPreviewRuntimeRepository {
                     JOIN ci_artifacts artifact ON artifact.digest = build.artifact_digest
                     WHERE alias.id = $1 AND alias.runtime_generation = $3
                       AND alias.state = 'booting' AND alias.expires_at > now()
-                      AND build.expires_at > now() AND artifact.expires_at > now())
+                      AND (build.expires_at IS NULL OR build.expires_at > now()) AND (artifact.expires_at IS NULL OR artifact.expires_at > now()))
                AND NOT bootstrap_pending",
         )
         .bind(preview_id)
@@ -466,14 +466,14 @@ impl CiPreviewRuntimeRepository {
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE ci_builds SET expires_at = GREATEST(expires_at, now() + interval '72 hours'), updated_at = now()
+                "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
                  WHERE id = $1",
             )
             .bind(build_id)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE ci_artifacts artifact SET expires_at = GREATEST(artifact.expires_at, now() + interval '72 hours')
+                "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '72 hours') END
                  FROM ci_builds build WHERE build.id = $1 AND artifact.digest = build.artifact_digest",
             )
             .bind(build_id)
@@ -931,8 +931,8 @@ impl CiPreviewRuntimeRepository {
              WHERE runtime.preview_id = $1 AND runtime.worker_id = $2
                AND runtime.generation = $3 AND runtime.lease_token = $4
                AND runtime.state = 'starting' AND NOT runtime.active
-               AND alias.expires_at > now() AND build.expires_at > now()
-               AND artifact.expires_at > now()
+               AND alias.expires_at > now() AND (build.expires_at IS NULL OR build.expires_at > now())
+               AND (artifact.expires_at IS NULL OR artifact.expires_at > now())
              FOR SHARE OF runtime, alias, build, artifact",
         )
         .bind(preview_id)
@@ -959,8 +959,8 @@ impl CiPreviewRuntimeRepository {
              WHERE runtime.preview_id = $1 AND runtime.worker_id = $2
                AND runtime.generation = $3 AND runtime.lease_token = $4
                AND runtime.state = 'starting' AND NOT runtime.active
-               AND alias.expires_at > now() AND build.expires_at > now()
-               AND artifact.expires_at > now()",
+               AND alias.expires_at > now() AND (build.expires_at IS NULL OR build.expires_at > now())
+               AND (artifact.expires_at IS NULL OR artifact.expires_at > now())",
         )
         .bind(preview_id)
         .bind(worker_id)

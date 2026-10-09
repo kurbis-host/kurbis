@@ -126,7 +126,7 @@ pub(super) struct CiBuildValidityRow {
     pub(super) failure_message: Option<String>,
     pub(super) build_log: String,
     pub(super) created_at: DateTime<Utc>,
-    pub(super) expires_at: DateTime<Utc>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
     pub(super) artifact_valid: bool,
 }
 impl CiBuildValidityRow {
@@ -163,7 +163,7 @@ pub(super) struct CiBuildRow {
     pub(super) failure_message: Option<String>,
     pub(super) build_log: String,
     pub(super) created_at: DateTime<Utc>,
-    pub(super) expires_at: DateTime<Utc>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<CiBuildRow> for CiBuild {

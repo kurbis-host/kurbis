@@ -597,6 +597,102 @@ async fn branch_polling_stays_lazy_after_admission_and_ignores_check_run_permiss
 }
 
 #[tokio::test]
+async fn default_branch_poll_eagerly_builds_permanent_main_artifact_without_preview_alias() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiBuildStage, ControlledBuildPipeline, SandboxLimits};
+
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    let source = std::sync::Arc::new(FixtureSource::default());
+    let components = std::sync::Arc::new(TestBuildComponents::default());
+    let builder = std::sync::Arc::new(ControlledBuildPipeline::new(
+        repository.clone(),
+        source.clone(),
+        components.clone(),
+        components.clone(),
+        std::sync::Arc::new(TestArtifactCache),
+        SandboxLimits {
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_millis: 1000,
+            pid_limit: 512,
+            disk_bytes: 5 * 1024 * 1024 * 1024,
+            process_timeout: std::time::Duration::from_secs(3600),
+        },
+    ));
+    let poller = kurbis_hoster::ci::CiPoller::new(repository.clone(), source.clone())
+        .with_config(kurbis_hoster::ci::CiPollerConfig {
+            root_domain: unique_ci_root_domain(),
+            patch_fingerprint: "patch-main-v1".into(),
+            toolchain_version: "test-toolchain".into(),
+            target_architecture: "x86_64-linux".into(),
+            public_status_base_url: Some("https://panel.example.test/ci/previews".into()),
+        })
+        .with_builder(builder);
+
+    poller.poll_once(watched.id).await.unwrap();
+    let commit_sha = source.commit_sha.read().unwrap().clone();
+    let (stage, retention, expires_at, artifact_digest): (
+        String,
+        String,
+        Option<chrono::DateTime<Utc>>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT stage, retention_policy, expires_at, artifact_digest FROM ci_builds
+         WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(&repository_name)
+    .bind(&commit_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stage, "ready");
+    assert_eq!(retention, "permanent");
+    assert!(expires_at.is_none());
+    assert!(artifact_digest.is_some());
+    let aliases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_preview_aliases WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(&repository_name)
+    .bind(&commit_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(aliases, 0, "main build must not create a preview alias");
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    // Re-polling the unchanged default branch reuses the same immutable build
+    // and never recompiles or changes its permanent retention policy.
+    poller.poll_once(watched.id).await.unwrap();
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let (build_count, permanent_count): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE retention_policy = 'permanent')
+         FROM ci_builds WHERE repository = $1 AND commit_sha = $2",
+    )
+    .bind(&repository_name)
+    .bind(&commit_sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((build_count, permanent_count), (1, 1));
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn deleted_branch_expires_its_preview_and_claims_world_cleanup_but_not_closed_prs() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use kurbis_hoster::control_plane::{
@@ -1022,7 +1118,7 @@ async fn expired_check_run_keeps_only_a_minimal_reconciliation_tombstone() {
     assert_eq!(tombstone_count, 1);
 
     let candidate = repository
-        .check_run_reconciliation_candidates(8)
+        .check_run_reconciliation_candidates_for_repository(8, &repository_name)
         .await
         .unwrap()
         .into_iter()
@@ -2013,7 +2109,7 @@ async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_a
         .await
         .unwrap();
     let candidates = repository
-        .check_run_reconciliation_candidates(8)
+        .check_run_reconciliation_candidates_for_repository(8, &repository_name)
         .await
         .unwrap();
     assert!(

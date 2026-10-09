@@ -251,7 +251,7 @@ impl kurbis_hoster::ci::ArtifactCache for TestArtifactCache {
         digest: &str,
         object_key: &str,
         bytes: &[u8],
-        _expires_at: chrono::DateTime<Utc>,
+        _expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<kurbis_hoster::ci::BuildOutput, kurbis_hoster::ci::CiServiceError> {
         Ok(kurbis_hoster::ci::BuildOutput {
             artifact_digest: digest.to_owned(),

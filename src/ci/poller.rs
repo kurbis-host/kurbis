@@ -7,8 +7,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::{
-    BuildKey, CheckRunClient, CheckRunDetails, CheckRunError, CiBuildStage, CiHostname,
-    CiPreviewRepository, CiRefKind,
+    BuildKey, CheckRunClient, CheckRunDetails, CheckRunError, CiBuildRetention, CiBuildStage,
+    CiHostname, CiPreviewRepository, CiRefKind,
     source_control::{PollError, SourceControlClient, SourceRefKind, retry_delay},
 };
 
@@ -85,6 +85,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .poll_repository(repository_id, self.source.as_ref())
             .await?;
         let repository_name = self.repository_name(repository_id).await?;
+        let default_branch = self.repository.default_branch(repository_id).await?;
         let eager_refs = poll.eager_refs;
         // Branch deletion is actionable only after a complete branch poll has
         // durably marked refs deleted. Pull-request close is intentionally not
@@ -96,10 +97,8 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             if source_ref.deleted {
                 continue;
             }
-            let kind = match source_ref.kind {
-                SourceRefKind::PullRequest => CiRefKind::PullRequest,
-                SourceRefKind::Branch => CiRefKind::Branch,
-            };
+            let is_main_branch =
+                source_ref.kind == SourceRefKind::Branch && source_ref.name == default_branch;
             let key = BuildKey::new(
                 &repository_name,
                 &source_ref.commit_sha,
@@ -107,12 +106,41 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 &self.config.toolchain_version,
                 &self.config.target_architecture,
             )?;
-            let (build, _) = self.repository.ensure_build(&key).await?;
+            let retention = if is_main_branch {
+                CiBuildRetention::Permanent
+            } else {
+                CiBuildRetention::Preview
+            };
+            let (build, _) = self
+                .repository
+                .ensure_build_with_retention(&key, retention)
+                .await?;
             let commit_alias = CiHostname::for_ref(
                 CiRefKind::Commit,
                 &source_ref.commit_sha,
                 &self.config.root_domain,
             )?;
+
+            if is_main_branch {
+                // The default Pumpkin branch is a stable build input, not a
+                // preview. It is built on the first source poll after startup,
+                // reusing the exact PR pipeline and its artifact validation while
+                // never creating a preview alias or inheriting its TTL.
+                if let Some(builder) = self.builder.as_ref() {
+                    builder
+                        .ensure_build(crate::ci::BuildRequest {
+                            key,
+                            source_repository: source_ref.source_repository.clone(),
+                            source_archive: Vec::new(),
+                            retention,
+                        })
+                        .await
+                        .map_err(|error| anyhow::anyhow!("main Pumpkin build failed: {error}"))?;
+                }
+                continue;
+            }
+
+            let kind = source_ref.kind.into();
             self.repository
                 .ensure_preview(
                     &repository_name,
@@ -159,8 +187,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     build.id,
                     &source_ref,
                     &repository_name,
-                    &commit_alias,
-                    &stable_alias,
+                    vec![commit_alias.value.clone(), stable_alias.value.clone()],
                 )
                 .await?;
             }
@@ -206,7 +233,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .map_err(|error| anyhow::anyhow!("scheduled CI PR retry failed: {error}"))?;
             }
         }
-        self.reconcile_check_runs().await?;
+        self.reconcile_check_runs(Some(&repository_name)).await?;
         Ok(())
     }
 
@@ -248,7 +275,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 }
             }
         }
-        self.reconcile_check_runs().await?;
+        self.reconcile_check_runs(None).await?;
         Ok(())
     }
 
@@ -322,8 +349,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 build.id,
                 &head,
                 repository,
-                commit_alias,
-                stable_alias,
+                vec![commit_alias.value.clone(), stable_alias.value.clone()],
             )
             .await?;
         }
@@ -333,6 +359,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     key,
                     source_repository: source_ref.source_repository.clone(),
                     source_archive: Vec::new(),
+                    retention: CiBuildRetention::Preview,
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("PR head build failed: {error}"))?;
@@ -340,15 +367,23 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         Ok(())
     }
 
-    async fn reconcile_check_runs(&self) -> Result<()> {
+    async fn reconcile_check_runs(&self, repository: Option<&str>) -> Result<()> {
         let Some(check_runs) = self.check_runs.as_ref() else {
             return Ok(());
         };
-        for candidate in self
-            .repository
-            .check_run_reconciliation_candidates(128)
-            .await?
-        {
+        let candidates = match repository {
+            Some(repository) => {
+                self.repository
+                    .check_run_reconciliation_candidates_for_repository(128, repository)
+                    .await?
+            }
+            None => {
+                self.repository
+                    .check_run_reconciliation_candidates(128)
+                    .await?
+            }
+        };
+        for candidate in candidates {
             let (build_log, expires_at, preview_hostnames) = if candidate.tombstone {
                 (String::new(), None, Vec::new())
             } else {
@@ -356,7 +391,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                     .repository
                     .build_diagnostics(candidate.build_id, &self.config.root_domain)
                     .await?;
-                (build_log, Some(expires_at), preview_hostnames)
+                (build_log, expires_at, preview_hostnames)
             };
             let details_url = self
                 .config
@@ -424,12 +459,8 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         build_id: Uuid,
         source_ref: &crate::ci::SourceRef,
         repository: &str,
-        commit_alias: &CiHostname,
-        stable_alias: &CiHostname,
+        preview_hostnames: Vec<String>,
     ) -> Result<()> {
-        // Keep this invariant at the side-effect boundary as well as at the
-        // poll decision site. A branch or arbitrary commit must never acquire
-        // a GitHub Check Run, even if a future caller passes it here.
         if source_ref.kind != SourceRefKind::PullRequest {
             return Ok(());
         }
@@ -445,7 +476,15 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .config
             .public_status_base_url
             .as_ref()
-            .map(|base| format!("{base}/{}", commit_alias.value));
+            .and_then(|base| {
+                CiHostname::for_ref(
+                    CiRefKind::Commit,
+                    &source_ref.commit_sha,
+                    &self.config.root_domain,
+                )
+                .ok()
+                .map(|alias| format!("{base}/{}", alias.value))
+            });
         let details = CheckRunDetails {
             commit_sha: source_ref.commit_sha.clone(),
             stage: CiBuildStage::Queued,
@@ -454,7 +493,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             failure_stage: None,
             failure_message: None,
             build_log: String::new(),
-            preview_hostnames: vec![commit_alias.value.clone(), stable_alias.value.clone()],
+            preview_hostnames,
             expires_at: None,
             details_url,
         };

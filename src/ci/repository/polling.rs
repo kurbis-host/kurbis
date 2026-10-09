@@ -19,6 +19,14 @@ impl CiPreviewRepository {
             .context("watched CI repository not found")
     }
 
+    pub async fn default_branch(&self, repository_id: Uuid) -> Result<String> {
+        sqlx::query_scalar("SELECT default_branch FROM ci_watched_repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .context("watched CI repository not found")
+    }
+
     pub async fn register_repository(
         &self,
         repository: &str,

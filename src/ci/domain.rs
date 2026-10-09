@@ -10,6 +10,50 @@ pub const CI_ROOT_DOMAIN: &str = "pumpkin.kurbis.host";
 /// repositories remain separate source inputs and are validated independently.
 pub const CI_TARGET_REPOSITORY: &str = "Pumpkin-MC/Pumpkin";
 pub const BUILD_TTL_HOURS: i64 = 72;
+
+/// Retention policy for immutable Pumpkin builds and their content-addressed artifacts.
+/// Preview builds follow the sliding 72-hour cache lifetime; the default-branch build
+/// is permanent until its build key changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBuildRetention {
+    Preview,
+    Permanent,
+}
+
+impl CiBuildRetention {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Permanent => "permanent",
+        }
+    }
+
+    pub fn expires_at(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Preview => Some(now + chrono::Duration::hours(BUILD_TTL_HOURS)),
+            Self::Permanent => None,
+        }
+    }
+}
+
+impl fmt::Display for CiBuildRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CiBuildRetention {
+    type Err = InvalidCiValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "preview" => Ok(Self::Preview),
+            "permanent" => Ok(Self::Permanent),
+            _ => Err(InvalidCiValue::new("unknown CI build retention policy")),
+        }
+    }
+}
 pub const POLL_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -336,7 +380,9 @@ pub struct CiBuild {
     pub failure_message: Option<String>,
     pub build_log: String,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    /// Preview builds expire after the sliding TTL; permanent default-branch builds
+    /// intentionally have no expiration timestamp.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
