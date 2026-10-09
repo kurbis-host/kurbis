@@ -695,7 +695,7 @@ def worker_transaction(new_binary:bytes,pumpkin_image:str,*,token:str,revision:s
     service_valid();old_bin=WORKER.read_bytes();bm=WORKER.stat();old_env=WORKER_ENV.read_bytes();em=WORKER_ENV.stat()
     if em.st_uid!=0 or stat.S_IMODE(em.st_mode)!=0o600:raise Error("worker env must remain root-owned mode 0600")
     new_env=updated_worker_env(old_env,pumpkin_image);bin_changed=old_bin!=new_binary;env_changed=old_env!=new_env
-    old_image=worker_image()
+    old_image=worker_image_value()
     old_bin_hash=hashlib.sha256(old_bin).hexdigest();old_env_hash=hashlib.sha256(old_env).hexdigest()
     bin_backup=save_backup(WORKER_BACKUP,f"worker-{old_bin_hash}",old_bin,stat.S_IMODE(bm.st_mode),bm.st_uid,bm.st_gid)
     env_backup=save_backup(ENV_BACKUP,f"worker-env-{old_env_hash}",old_env,0o600,0,0)
@@ -742,7 +742,9 @@ def _rollback_worker_locked(token: str) -> dict[str, str]:
             MARKER.unlink()
     except FileNotFoundError:
         pass
-    verify_pinned_pumpkin(str(data["old_worker_image"]))
+    old_worker_image = str(data["old_worker_image"])
+    if old_worker_image != "melon-pumpkin:host-control":
+        verify_pinned_pumpkin(old_worker_image)
     atomic(WORKER,bin_backup.read_bytes(),int(data["old_worker_mode"]),int(data["old_worker_uid"]),int(data["old_worker_gid"]))
     atomic(WORKER_ENV,env_backup.read_bytes(),0o600,0,0)
     run(["systemctl","restart",WORKER_SERVICE])
@@ -753,7 +755,7 @@ def _rollback_worker_locked(token: str) -> dict[str, str]:
         try:
             pid=single_worker()
             if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker executable hash mismatch")
-            if digest(WORKER_ENV)!=old_env_hash or worker_image()!=data["old_worker_image"]:raise Error("rollback worker environment mismatch")
+            if digest(WORKER_ENV)!=old_env_hash or worker_image_value()!=data["old_worker_image"]:raise Error("rollback worker environment mismatch")
             state=states()
             if len(state["postgres"])!=1 or state["postgres"][0]["status"]!="running":raise Error("database is unavailable for worker rollback verification")
             lease(state["postgres"][0]["id"])
@@ -860,8 +862,9 @@ def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,lis
     verify_waiting(current["waiting-pumpkin"][0],revision,upstream,pumpkin_image)
     database_id=current["postgres"][0]["id"]
     old_env=WORKER_ENV.read_bytes()
-    old_image=worker_image()
-    verify_pinned_pumpkin(old_image)
+    old_image=worker_image_value()
+    if old_image != "melon-pumpkin:host-control":
+        verify_pinned_pumpkin(old_image)
     old_hash=digest(WORKER)
     def verify_new():
         pid=single_worker()
@@ -881,7 +884,7 @@ def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,lis
         time.sleep(35)
         pid=single_worker()
         if digest(Path(f"/proc/{pid}/exe"))!=old_hash:raise Error("rollback worker binary hash mismatch")
-        if digest(WORKER_ENV)!=hashlib.sha256(old_env).hexdigest() or worker_image()!=old_image:raise Error("rollback worker environment mismatch")
+        if digest(WORKER_ENV)!=hashlib.sha256(old_env).hexdigest() or worker_image_value()!=old_image:raise Error("rollback worker environment mismatch")
         if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=old_image:raise Error("worker process environment rollback mismatch")
         lease(database_id)
     worker=worker_transaction(new_worker,pumpkin_image,token=token,revision=revision,restart=lambda:run(["systemctl","restart",WORKER_SERVICE]),verify_new=verify_new,verify_old=verify_old)

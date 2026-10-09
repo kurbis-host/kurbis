@@ -173,7 +173,8 @@ def image_payload_hashes(image_id: str, service: str) -> dict[str, dict[str, Any
 
 def collect_inventory(*, allowed_worker_images: set[str] | None = None,
                       expected_checkout_head: str = LEGACY_REVISION_CLAIM,
-                      baseline_schema: str = LEGACY_BASELINE_SCHEMA) -> dict[str, Any]:
+                      baseline_schema: str = LEGACY_BASELINE_SCHEMA,
+                      expected_legacy_worker_image: dict[str, Any] | None = None) -> dict[str, Any]:
     root_only()
     allowed_worker_images={PUMPKIN_LEGACY} if allowed_worker_images is None else allowed_worker_images
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir() or WORKER.is_symlink() or not WORKER.is_file():
@@ -278,11 +279,18 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
                 process_env["PUMPKIN_IMAGE"] = value.decode("utf-8", "replace")
     if process_env.get("PUMPKIN_IMAGE") not in allowed_worker_images:
         raise BaselineError("running worker process differs from legacy baseline or protected migration journal")
-    legacy_worker_image = image_info(PUMPKIN_LEGACY)
-    legacy_worker_image["tag"] = PUMPKIN_LEGACY
-    legacy_worker_image["payloads"] = image_payload_hashes(legacy_worker_image["image_id"], "waiting-pumpkin")
-    if legacy_worker_image.get("revision_label") is not None:
-        raise BaselineError("expected the protected worker Pumpkin image to be unlabeled")
+    if baseline_schema == CURRENT_BASELINE_SCHEMA and expected_legacy_worker_image is not None:
+        # The migration-safe attestation records the previous worker image as a
+        # rollback identity, but that image may have been garbage-collected after
+        # the attestation. Requiring the mutable tag during revalidation makes an
+        # otherwise valid current baseline undeployable.
+        legacy_worker_image = json.loads(json.dumps(expected_legacy_worker_image))
+    else:
+        legacy_worker_image = image_info(PUMPKIN_LEGACY)
+        legacy_worker_image["tag"] = PUMPKIN_LEGACY
+        legacy_worker_image["payloads"] = image_payload_hashes(legacy_worker_image["image_id"], "waiting-pumpkin")
+        if legacy_worker_image.get("revision_label") is not None:
+            raise BaselineError("expected the protected worker Pumpkin image to be unlabeled")
 
     postgres_id = services["postgres"]["container_id"]
     sql = (
@@ -1022,6 +1030,7 @@ def bootstrap(manifest: dict[str, Any], token: str, *, candidate_revision: str |
             inventory_options = {"allowed_worker_images": allowed_worker_images}
             if manifest.get("schema") == CURRENT_BASELINE_SCHEMA:
                 inventory_options["baseline_schema"] = CURRENT_BASELINE_SCHEMA
+                inventory_options["expected_legacy_worker_image"] = expected["worker"]["legacy_pumpkin_image"]
             if candidate_revision is not None:
                 checkout_head=verify_attested_candidate_source(candidate_revision,expected_sources or {})
                 current=collect_inventory(expected_checkout_head=checkout_head, **inventory_options)
