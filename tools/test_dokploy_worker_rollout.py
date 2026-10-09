@@ -38,6 +38,66 @@ class NoopOperationLock:
 
 
 class RolloutTests(unittest.TestCase):
+    def test_legacy_app_rollback_accepts_only_verified_baseline_provenance_and_restores_branch(self):
+        revision = "9" * 40
+        candidate = "a" * 40
+        valid_results = (
+            ("legacy-unproven", "kurbis.respond5.legacy-baseline.v1"),
+            ("migration-safe-unproven", "kurbis.respond5.current-baseline.v1"),
+        )
+        for provenance, schema in valid_results:
+            with self.subTest(provenance=provenance):
+                events = []
+                result = {"status": "app-rolled-back", "provenance_status": provenance,
+                          "worker_bundle_restored": True}
+                with patch.object(deploy, "ensure_release_tag", return_value=f"kurbis-release-{revision}"), \
+                     patch.object(deploy, "wait_for_terminal_deployments", side_effect=lambda _timeout: events.append("wait")), \
+                     patch.object(deploy, "source_inputs", return_value={"compose.yaml": "1" * 40}), \
+                     patch.object(deploy, "legacy_remote", side_effect=lambda *args, **kwargs: events.append("rollback") or result), \
+                     patch.object(deploy, "set_branch", side_effect=lambda branch: events.append(("branch", branch))):
+                    actual = deploy.rollback_application(
+                        "respond5", "main", revision, {}, "a" * 32, 60,
+                        legacy_manifest={"schema": schema}, candidate_revision=candidate,
+                    )
+                self.assertIs(actual, result)
+                self.assertEqual(events, ["wait", "rollback", ("branch", "main")])
+
+        invalid = {"status": "app-rolled-back", "provenance_status": "unverified"}
+        with patch.object(deploy, "ensure_release_tag", return_value=f"kurbis-release-{revision}"), \
+             patch.object(deploy, "wait_for_terminal_deployments"), \
+             patch.object(deploy, "source_inputs", return_value={"compose.yaml": "1" * 40}), \
+             patch.object(deploy, "legacy_remote", return_value=invalid), \
+             patch.object(deploy, "set_branch") as set_branch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "exact baseline app/worker digest rollback"):
+                deploy.rollback_application(
+                    "respond5", "main", revision, {}, "a" * 32, 60,
+                    legacy_manifest={"schema": "kurbis.respond5.current-baseline.v1"},
+                    candidate_revision=candidate,
+                )
+        set_branch.assert_not_called()
+
+    def test_current_baseline_worker_sync_uses_fresh_bootstrap_inventory(self):
+        def service(container_id: str, image_id: str) -> dict:
+            return {"container_id": container_id, "image_id": image_id,
+                    "status": "running", "health": "healthy"}
+
+        manifest = {"schema": "kurbis.respond5.current-baseline.v1",
+                    "expected_inventory": {"services": {
+                        "control-plane": service("stale-container", "sha256:stale-image")}}}
+        bootstrap_record = {"inventory": {"services": {
+            "control-plane": service("fresh-container", "sha256:fresh-image")}}}
+
+        baseline = deploy.bootstrap_wait_baseline(bootstrap_record)
+
+        self.assertEqual(baseline["control-plane"], [{
+            "id": "fresh-container", "image": "sha256:fresh-image", "status": "running",
+            "health": "healthy", "revision": "",
+        }])
+        self.assertNotEqual(baseline["control-plane"][0]["id"],
+                            manifest["expected_inventory"]["services"]["control-plane"]["container_id"])
+        with self.assertRaisesRegex(deploy.DeploymentError, "did not return a validated inventory"):
+            deploy.bootstrap_wait_baseline({})
+
     def test_preflight_accepts_only_the_known_legacy_tag_before_verified_bootstrap(self):
         revision = "f" * 40
         state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": revision}]

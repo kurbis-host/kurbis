@@ -392,6 +392,14 @@ def legacy_wait_baseline(inventory: dict) -> dict[str,list[dict[str,str]]]:
             for name,item in inventory["services"].items()}
 
 
+def bootstrap_wait_baseline(record: dict) -> dict[str,list[dict[str,str]]]:
+    """Build worker-sync's baseline from the fresh inventory validated by bootstrap."""
+    inventory=record.get("inventory")
+    if not isinstance(inventory,dict):
+        raise DeploymentError("respond5 bootstrap did not return a validated inventory")
+    return legacy_wait_baseline(inventory)
+
+
 def legacy_revision(manifest: dict) -> str:
     schema = manifest.get("schema")
     value = manifest.get("source_revision_claim")
@@ -444,8 +452,12 @@ def rollback_application(host: str, branch: str, revision: str, baseline: dict, 
         sources=source_inputs(revision)
         result=legacy_remote(host,"rollback-app",manifest=legacy_manifest,expected_sources=sources,token=token,
                              candidate_revision=candidate_revision)
-        if result.get("status")!="app-rolled-back" or result.get("provenance_status")!="legacy-unproven":
-            raise DeploymentError("respond5 did not verify exact legacy app/worker digest rollback")
+        if result.get("status")!="app-rolled-back" or result.get("provenance_status") not in {
+            "legacy-unproven", "migration-safe-unproven",
+        }:
+            raise DeploymentError("respond5 did not verify exact baseline app/worker digest rollback")
+        # Report rollback success only after the configured source branch has been
+        # restored and verified, even when rollback used the migration-safe schema.
         set_branch(branch)
         return result
     wait_for_terminal_deployments(timeout)
@@ -623,7 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # of the mixed deployment and is restart-looping before this release.
                     # Deploy the fixed control plane first; wait_sync then performs the
                     # single guarded worker transaction against the new API.
-                    baseline = legacy_wait_baseline(legacy_manifest["expected_inventory"])
+                    baseline = bootstrap_wait_baseline(legacy_record)
                 else:
                     compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
                         token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
