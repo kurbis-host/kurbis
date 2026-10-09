@@ -5,8 +5,9 @@ use kurbis_hoster::{
     ci::{
         ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiBuildIdentity, CiPoller,
         CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient,
-        GitHubExactSource, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
-        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
+        GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard, GitHubSourceControl,
+        ObjectArtifactCache, POLL_INTERVAL_SECONDS, bubblewrap_pipeline, docker_pipeline,
+        remote_bubblewrap_pipeline,
     },
     config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::{
@@ -39,9 +40,18 @@ async fn main() -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()?;
+        let github_rate_limit = Arc::new(
+            GitHubRateLimitGuard::new(GitHubRateLimitConfig {
+                minimum_interval: ci_config.github_min_request_interval,
+                max_backoff: ci_config.github_rate_limit_max_backoff,
+                jitter: ci_config.github_rate_limit_jitter,
+            })
+            .with_store(pool.clone()),
+        );
         let github_polling =
             GitHubSourceControl::new(client.clone(), ci_config.github_pat.clone())?
-                .with_api_base_url(ci_config.github_api_base_url.clone());
+                .with_api_base_url(ci_config.github_api_base_url.clone())
+                .with_rate_limit_guard(github_rate_limit.clone());
         let source = GitHubExactSource::with_api_base_url(
             std::sync::Arc::new(github_polling),
             ci_config.github_pat.clone(),
@@ -54,6 +64,7 @@ async fn main() -> Result<()> {
         let check_runs = std::sync::Arc::new(
             GitHubCheckRunClient::new(client, ci_config.github_pat)?
                 .with_api_base_url(ci_config.github_api_base_url.clone())
+                .with_rate_limit_guard(github_rate_limit)
                 .with_details_base_url(public_status_base_url.clone())?,
         );
         let artifacts =

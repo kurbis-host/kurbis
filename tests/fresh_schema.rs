@@ -85,7 +85,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=15).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -150,8 +150,34 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
     .await?;
     assert!(snapshot_gc_table);
 
+    let poll_lease_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'ci_watched_repositories'
+           AND column_name IN ('poll_lease_token', 'poll_lease_expires_at')
+         ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        poll_lease_columns,
+        ["poll_lease_expires_at", "poll_lease_token"]
+    );
+
+    let poll_lease_constraint: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'public.ci_watched_repositories'::regclass
+           AND conname = 'ci_watched_repositories_poll_lease_check')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        poll_lease_constraint,
+        "poll lease token and expiry must remain paired"
+    );
+
     let expected_tables = [
         "worker_snapshot_hints",
+        "ci_github_rate_limits",
         "operator_entries",
         "server_known_players",
         "console_commands",

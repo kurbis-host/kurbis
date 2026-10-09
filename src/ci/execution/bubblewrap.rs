@@ -56,6 +56,27 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+cache_mode=disabled
+if command -v sccache >/dev/null 2>&1 && [ -d /cache ]; then
+  mkdir -p /cache/sccache
+  export SCCACHE_DIR=/cache/sccache
+  export SCCACHE_CACHE_SIZE="$KURBIS_BUILD_CACHE_MAX_BYTES"
+  export RUSTC_WRAPPER=sccache
+  cache_mode=sccache
+fi
+cargo_build() {
+  if cargo "$@"; then
+    return 0
+  fi
+  if [ "$cache_mode" = sccache ]; then
+    echo 'build_cache=sccache_error_retry_without_cache'
+    unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
+    cache_mode=disabled-after-error
+    cargo "$@"
+    return $?
+  fi
+  return 1
+}
 actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 [ "$actual_rustc" = "$KURBIS_EXPECTED_RUSTC" ] || {
   echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
@@ -63,15 +84,21 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 }
 # Extraction happens inside the namespace. The host only writes opaque input
 # archives into the private workspace and never interprets untrusted paths.
+build_elapsed_seconds=0
+SECONDS=0
 tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
 tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 cd /work/source
-cargo build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo_build build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo_build build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
+build_elapsed_seconds=$SECONDS
+printf 'build_elapsed_seconds=%s\n' "$build_elapsed_seconds"
+printf 'build_cache=%s\n' "$cache_mode"
+if [ "$cache_mode" != disabled ] && command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 # /work is an operator-provisioned tmpfs with explicit size and inode limits.
 # The host-side preflight rejects ordinary directories before untrusted input.
 printf 'bubblewrap_guarantee=%s\n' "$KURBIS_BWRAP_GUARANTEE"
@@ -130,6 +157,8 @@ pub struct BubblewrapBuildRuntime {
     toolchain: PathBuf,
     workspace_root: PathBuf,
     source_preparer: PathBuf,
+    compiler_cache_root: PathBuf,
+    compiler_cache_size: u64,
     rustc_version: String,
     identity: String,
     bwrap_version: String,
@@ -158,6 +187,15 @@ impl BubblewrapBuildRuntime {
         let toolchain = canonical_directory(&toolchain.into(), "bubblewrap toolchain")?;
         let source_preparer = canonical_executable(&source_preparer.into(), "source preparer")?;
         let workspace_root = private_workspace_root(&workspace_root.into())?;
+        let compiler_cache_root = super::cache::private_cache_root(
+            &workspace_root
+                .parent()
+                .ok_or_else(|| sandbox_error("bubblewrap workspace has no parent"))?
+                .join("compiler-cache"),
+        )
+        .map_err(|error| sandbox_error(format!("configure compiler cache root: {error}")))?;
+        let compiler_cache_size = super::cache::configured_cache_size()
+            .map_err(|error| sandbox_error(format!("configure compiler cache size: {error}")))?;
         if rootfs == Path::new("/") || toolchain == Path::new("/") {
             return Err(sandbox_error(
                 "rootfs and toolchain may not be the host root",
@@ -183,6 +221,8 @@ impl BubblewrapBuildRuntime {
             toolchain,
             workspace_root,
             source_preparer,
+            compiler_cache_root,
+            compiler_cache_size,
             rustc_version: toolchain_version,
             identity,
             bwrap_version,
@@ -379,6 +419,9 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             .arg(&self.toolchain)
             .arg("/toolchain")
             .arg("--bind")
+            .arg(&self.compiler_cache_root)
+            .arg("/cache")
+            .arg("--bind")
             .arg(workspace)
             .arg("/work")
             .arg("--proc")
@@ -524,6 +567,10 @@ printf 'BWRAP_NAMESPACE_PROBE_PASSED\n'
             let envs = [
                 ("KURBIS_RUST_TARGET", target.to_owned()),
                 ("KURBIS_EXPECTED_RUSTC", self.rustc_version.clone()),
+                (
+                    "KURBIS_BUILD_CACHE_MAX_BYTES",
+                    self.compiler_cache_size.to_string(),
+                ),
                 ("KURBIS_BWRAP_GUARANTEE", BUBBLEWRAP_GUARANTEE.to_owned()),
                 (
                     "KURBIS_CGROUP_DELEGATION",

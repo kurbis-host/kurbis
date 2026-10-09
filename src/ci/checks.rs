@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
+
+use super::rate_limit::{GitHubRateLimitConfig, GitHubRateLimitGuard};
 
 use super::domain::{CiBuildStage, validate_commit_sha};
 
@@ -87,6 +90,10 @@ pub enum CheckRunError {
     Invalid(String),
     #[error("GitHub check-run request failed with status {status}: {message}")]
     Http { status: StatusCode, message: String },
+    #[error("GitHub check-run rate limit exceeded; retry after {retry_after:?}")]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("GitHub transport failed: {0}")]
     Transport(#[from] reqwest::Error),
 }
@@ -119,6 +126,7 @@ pub struct GitHubCheckRunClient {
     api_base_url: String,
     details_base_url: Option<String>,
     token: String,
+    rate_limit: Arc<GitHubRateLimitGuard>,
 }
 impl GitHubCheckRunClient {
     pub fn new(client: Client, token: impl Into<String>) -> Result<Self, CheckRunError> {
@@ -131,6 +139,7 @@ impl GitHubCheckRunClient {
             api_base_url: "https://api.github.com".into(),
             details_base_url: None,
             token,
+            rate_limit: Arc::new(GitHubRateLimitGuard::new(GitHubRateLimitConfig::default())),
         })
     }
     pub fn with_details_base_url(
@@ -160,6 +169,14 @@ impl GitHubCheckRunClient {
         self.api_base_url = value.into().trim_end_matches('/').into();
         self
     }
+    pub fn with_rate_limit_guard(mut self, guard: Arc<GitHubRateLimitGuard>) -> Self {
+        self.rate_limit = guard;
+        self
+    }
+    pub fn with_rate_limit_store(mut self, pool: sqlx::PgPool) -> Self {
+        self.rate_limit = Arc::new((*self.rate_limit).clone().with_store(pool));
+        self
+    }
     fn payload(&self, details: &CheckRunDetails) -> CheckRunPayload {
         let mut payload = payload(details);
         if payload.details_url.is_none()
@@ -182,13 +199,70 @@ impl GitHubCheckRunClient {
             .header(header::USER_AGENT, "kurbis-ci-preview")
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
-    async fn error(response: reqwest::Response) -> CheckRunError {
-        let status = response.status();
-        let message = response
-            .text()
+    async fn execute_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<Vec<u8>, CheckRunError> {
+        let scope = if path.contains("/check-runs") {
+            "github:checks:permission"
+        } else {
+            "github:rest:core"
+        };
+        self.rate_limit
+            .before_request(scope)
             .await
-            .unwrap_or_else(|_| "GitHub request failed".into());
-        CheckRunError::Http { status, message }
+            .map_err(|error| match error {
+                crate::ci::PollError::RateLimited { retry_after } => {
+                    CheckRunError::RateLimited { retry_after }
+                }
+                other => CheckRunError::Http {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: other.to_string(),
+                },
+            })?;
+        let mut request = self.request(method, path);
+        if let Some(payload) = payload {
+            request = request.json(&payload);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?.to_vec();
+        // Rate-limit headers belong to GitHub's shared core quota even when
+        // this feature has its own permission circuit breaker.
+        if let Some(delay) = self
+            .rate_limit
+            .observe_response("github:rest:core", status, &headers, &body)
+            .await
+        {
+            return Err(CheckRunError::RateLimited {
+                retry_after: Some(delay),
+            });
+        }
+        if !status.is_success() {
+            let message = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .map(str::to_owned)
+                })
+                .or_else(|| String::from_utf8(body).ok())
+                .unwrap_or_else(|| "GitHub request failed".into());
+            if status == StatusCode::FORBIDDEN {
+                // GitHub returns a plain 403 when the PAT is valid but lacks
+                // Checks write access. Keep this separate from core-quota
+                // state and suppress retries for one bounded lease.
+                self.rate_limit
+                    .pause_for("github:checks:permission", Duration::from_secs(300))
+                    .await;
+            }
+            return Err(CheckRunError::Http { status, message });
+        }
+        Ok(body)
     }
     fn repo(value: &str) -> Result<(&str, &str), CheckRunError> {
         let mut parts = value.split('/');
@@ -326,21 +400,18 @@ impl CheckRunClient for GitHubCheckRunClient {
     ) -> Result<CheckRunId, CheckRunError> {
         details.validate()?;
         let (owner, name) = Self::repo(repository)?;
-        let response = self
-            .request(
+        let body = self
+            .execute_json(
                 reqwest::Method::POST,
                 &format!("/repos/{owner}/{name}/check-runs"),
+                Some(
+                    serde_json::to_value(self.payload(details))
+                        .map_err(|e| CheckRunError::Invalid(e.to_string()))?,
+                ),
             )
-            .json(&self.payload(details))
-            .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::error(response).await);
-        };
         Ok(CheckRunId(
-            response
-                .json::<CreatedCheckRun>()
-                .await
+            serde_json::from_slice::<CreatedCheckRun>(&body)
                 .map_err(|e| CheckRunError::Invalid(e.to_string()))?
                 .id,
         ))
@@ -352,16 +423,14 @@ impl CheckRunClient for GitHubCheckRunClient {
     ) -> Result<CheckRunId, CheckRunError> {
         details.validate()?;
         let (owner, name) = Self::repo(repository)?;
-        let response = self.request(
-            reqwest::Method::GET,
-            &format!("/repos/{owner}/{name}/commits/{}/check-runs?check_name=Pumpkin%20CI%20build&per_page=100", details.commit_sha),
-        ).send().await?;
-        if !response.status().is_success() {
-            return Err(Self::error(response).await);
-        }
-        let existing = response
-            .json::<ExistingCheckRuns>()
-            .await
+        let body = self
+            .execute_json(
+                reqwest::Method::GET,
+                &format!("/repos/{owner}/{name}/commits/{}/check-runs?check_name=Pumpkin%20CI%20build&per_page=100", details.commit_sha),
+                None,
+            )
+            .await?;
+        let existing = serde_json::from_slice::<ExistingCheckRuns>(&body)
             .map_err(|error| CheckRunError::Invalid(error.to_string()))?;
         if let Some(check) = existing
             .check_runs
@@ -385,17 +454,15 @@ impl CheckRunClient for GitHubCheckRunClient {
     ) -> Result<(), CheckRunError> {
         details.validate()?;
         let (owner, name) = Self::repo(repository)?;
-        let response = self
-            .request(
-                reqwest::Method::PATCH,
-                &format!("/repos/{owner}/{name}/check-runs/{}", id.0),
-            )
-            .json(&self.payload(details))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::error(response).await);
-        };
+        self.execute_json(
+            reqwest::Method::PATCH,
+            &format!("/repos/{owner}/{name}/check-runs/{}", id.0),
+            Some(
+                serde_json::to_value(self.payload(details))
+                    .map_err(|e| CheckRunError::Invalid(e.to_string()))?,
+            ),
+        )
+        .await?;
         Ok(())
     }
 }

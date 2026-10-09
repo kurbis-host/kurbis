@@ -4,10 +4,12 @@ pub mod domain;
 pub mod execution;
 pub mod github;
 pub mod poller;
+pub mod rate_limit;
 pub mod repository;
 pub mod runtime;
 pub mod services;
 pub mod source_control;
+pub mod status;
 
 pub use domain::{
     BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CI_TARGET_REPOSITORY, CiBuild, CiBuildFailureClass,
@@ -20,8 +22,13 @@ pub use execution::{
     MAX_COMPRESSED_SOURCE_BYTES, ROOTLESS_BUILD_LIMITS, RustPumpkinBuilder, bubblewrap_pipeline,
     checked_in_patch_fingerprint, docker_pipeline, remote_bubblewrap_pipeline,
 };
+pub use rate_limit::{GitHubRateLimitConfig, GitHubRateLimitDiagnostics, GitHubRateLimitGuard};
 pub use source_control::{
     PollCheckpoint, PollError, PollResult, SourceControlClient, SourceRef, SourceRefKind,
+};
+pub use status::{
+    CiPreviewStatusMessage, ci_preview_chat_message, ci_preview_status_description,
+    ci_preview_status_message, sanitize_ci_diagnostic,
 };
 
 pub use build::{BuildPipelineError, ControlledBuildPipeline, ControlledBuilder, PatchApplier};

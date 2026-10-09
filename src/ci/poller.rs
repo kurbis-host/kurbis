@@ -32,15 +32,16 @@ impl Default for CiPollerConfig {
     }
 }
 
-/// Durable source-control poller. A repository row lock is held by
-/// `poll_repository` across the provider request and persistence, then build
-/// records and immutable aliases are deduplicated by their database keys.
+/// Durable source-control poller. A short local gate and a durable database
+/// lease serialize provider polling without holding a transaction across HTTP;
+/// build records and immutable aliases are deduplicated by their database keys.
 pub struct CiPoller<C> {
     repository: CiPreviewRepository,
     source: Arc<C>,
     config: CiPollerConfig,
     check_runs: Option<Arc<dyn CheckRunClient>>,
     builder: Option<Arc<dyn crate::ci::BuildCoordinator>>,
+    source_poll_gate: Arc<tokio::sync::Mutex<()>>,
 }
 impl<C> Clone for CiPoller<C>
 where
@@ -53,6 +54,7 @@ where
             config: self.config.clone(),
             check_runs: self.check_runs.clone(),
             builder: self.builder.clone(),
+            source_poll_gate: self.source_poll_gate.clone(),
         }
     }
 }
@@ -64,6 +66,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             config: CiPollerConfig::default(),
             check_runs: None,
             builder: None,
+            source_poll_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
     pub fn with_config(mut self, config: CiPollerConfig) -> Self {
@@ -80,10 +83,21 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         self
     }
     pub async fn poll_once(&self, repository_id: Uuid) -> Result<()> {
+        // `run_forever` ticks independently of long build work. Skip a tick
+        // instead of queuing another provider poll while this instance is
+        // already fetching and persisting the repository snapshot. The durable
+        // lease in the repository additionally fences other replicas.
+        let Ok(source_poll_guard) = self.source_poll_gate.clone().try_lock_owned() else {
+            return Ok(());
+        };
         let poll = self
             .repository
             .poll_repository(repository_id, self.source.as_ref())
             .await?;
+        drop(source_poll_guard);
+        let Some(poll) = poll else {
+            return Ok(());
+        };
         let repository_name = self.repository_name(repository_id).await?;
         let default_branch = self.repository.default_branch(repository_id).await?;
         let eager_refs = poll.eager_refs;
@@ -94,7 +108,12 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             .expire_deleted_branch_aliases(repository_id)
             .await?;
         for source_ref in poll.refs {
-            if source_ref.deleted {
+            if source_ref.deleted
+                || (source_ref.kind == SourceRefKind::PullRequest && source_ref.closed)
+            {
+                // Closed historical PRs stay in ci_refs for lifecycle
+                // accounting, but must not seed queued builds or preview
+                // aliases merely because GitHub returns state=all.
                 continue;
             }
             let is_main_branch =
@@ -511,13 +530,26 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 Ok(())
             }
             Err(error) => {
+                let rate_limited = matches!(error, CheckRunError::RateLimited { .. });
+                let permission_denied = matches!(
+                    error,
+                    CheckRunError::Http { status, .. } if status == reqwest::StatusCode::FORBIDDEN
+                );
+                if rate_limited {
+                    // Preserve the short claim lease across quota pauses so a
+                    // polling storm cannot recreate the same Check Run request
+                    // before GitHub's reset window has elapsed.
+                    tracing::warn!(
+                        build_id = %build_id,
+                        ?error,
+                        "GitHub Check Run rate limited; continuing CI build without external status"
+                    );
+                    return Ok(());
+                }
                 self.repository
                     .release_check_run_claim(build_id, claim)
                     .await?;
-                if matches!(
-                    error,
-                    CheckRunError::Http { status, .. } if status.as_u16() == 403
-                ) {
+                if permission_denied {
                     tracing::warn!(
                         build_id = %build_id,
                         repository,
@@ -542,11 +574,19 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             match self.poll_once(repository_id).await {
                 Ok(()) => return Ok(()),
                 Err(error) if attempt + 1 < attempts => {
-                    let poll_error = PollError::Http {
-                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                        message: error.to_string(),
-                    };
-                    sleep(retry_delay(&poll_error, attempt)).await;
+                    let delay = error
+                        .downcast_ref::<PollError>()
+                        .map(|poll_error| retry_delay(poll_error, attempt))
+                        .unwrap_or_else(|| {
+                            retry_delay(
+                                &PollError::Http {
+                                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                                    message: error.to_string(),
+                                },
+                                attempt,
+                            )
+                        });
+                    sleep(delay).await;
                     attempt += 1;
                 }
                 Err(error) => return Err(error),

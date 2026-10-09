@@ -50,6 +50,42 @@ If a Pumpkin change adds dependencies not in that cache, its build fails closed
 while offline. Updating this image cache is an operator-controlled image rebuild
 and must not be triggered by source-controlled build files.
 
+## Compiler cache and BuildKit reuse
+
+The host-owned builder image includes the pinned `sccache` release
+(`SCCACHE_VERSION`, default `0.10.0`). Runtime containers mount a rootless-Docker
+named volume whose name is derived from the configured builder host and
+set `SCCACHE_DIR` to its private `/cache/sccache` directory. The cache is local
+only: no sccache remote backend, credentials, or network access is available in
+the build namespace. `SCCACHE_CACHE_SIZE` is bounded by
+`CI_BUILD_CACHE_MAX_BYTES` (default 8 GiB; accepted range 256 MiB to 64 GiB),
+and a failed/corrupt sccache invocation retries the exact Cargo command once
+without the wrapper. The normal ELF/Wasm validators still gate all outputs.
+
+Compose forwards `CI_BUILD_CACHE_DIR` and `CI_BUILD_CACHE_MAX_BYTES` to the
+control plane and mounts the private named volume `ci-build-cache` at the
+image-prepared mode-0700 path. The volume survives control-plane restarts and
+is not shared with runtime workers. Native `start.sh` deployments should set
+`CI_BUILD_CACHE_DIR` to an equivalent private path below `HOME`.
+
+Set `CI_BUILD_CACHE_DIR` to a mode-0700 directory below the control-plane
+`HOME` to enable the optional exact-output cache. `CI_BUILD_CACHE_MAX_BYTES`
+applies to both this cache and the compiler cache. Each entry is keyed by the
+cache schema, repository, commit, patch fingerprint, target, patched-source
+digest, trusted-plugin digest, and immutable builder identity. Entries are
+written through a per-key create-exclusive lock and atomic rename, pruned by
+oldest modification time at the configured bound, and deleted on metadata or
+digest mismatch. Cache hits are restored only after the normal output validators
+run; this cache is never trusted as executable source code.
+
+The image build itself should continue to use `tools/docker_build_with_limits.sh`
+(BuildKit/buildx). Its layer cache may be retained by the selected BuildKit
+builder, but it is not used as a runtime trust boundary. Rebuild the image when
+`SCCACHE_VERSION`, the Rust release, the Pumpkin revision, or the host-owned
+Dockerfile changes; the sccache key uses the compiler identity and complete rustc invocation, so
+changes to the toolchain, profiles, source, and patches naturally miss old
+entries within the same bounded host cache.
+
 ## Builder host and control-plane topology
 
 The CI control-plane container does not receive a host Docker socket. It uses
@@ -204,8 +240,11 @@ and keep immutable fixtures on a user-owned local filesystem, for example
 `/var/tmp/kurbis-ci-bubblewrap-20261007` (mode `0700`). The accepted fixture
 uses `/usr/bin/bwrap`, a rootfs and Rust 1.98.1 toolchain under that staging
 root, the checked-in source preparer, and the private HOME workspace
-`$HOME/.cache/kurbis/ci/workspace-tmpfs`. `$HOME` on lxhalle is NFS; therefore
-that workspace path is only the operator namespace anchor. The runner mounts an
+`$HOME/.cache/kurbis/ci/workspace-tmpfs`. The Bubblewrap and SSH backends derive
+the persistent compiler cache from its sibling
+`$HOME/.cache/kurbis/ci/compiler-cache`; keep that directory mode 0700 on local
+operator-owned storage, not public `/tmp`. `$HOME` on lxhalle is NFS; therefore
+the workspace path is only the operator namespace anchor. The runner mounts an
 exact `size=5G,nr_inodes=1310720,mode=700` tmpfs over each per-job workspace
 inside its private user/mount namespace. Do not place source, artifacts, or
 Cargo state in bare public `/tmp`; any local staging path must be a dedicated

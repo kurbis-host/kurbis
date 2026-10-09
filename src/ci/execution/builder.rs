@@ -22,6 +22,7 @@ use crate::{
 use super::{
     admission::{BuildAdmissionCoordinator, BuildAdmissionLease, parse_cgroup_memory_events},
     archive::{ArchiveError, MAX_ARTIFACT_BYTES, pack_source_archive},
+    cache::{BuildCache, CacheLookup},
 };
 
 const MAX_BUILD_LOG_BYTES: usize = 512 * 1024;
@@ -49,17 +50,47 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+cache_mode=disabled
+if command -v sccache >/dev/null 2>&1 && [ -d /cache ]; then
+  mkdir -p /cache/sccache
+  export SCCACHE_DIR=/cache/sccache
+  export SCCACHE_CACHE_SIZE="$KURBIS_BUILD_CACHE_MAX_BYTES"
+  export RUSTC_WRAPPER=sccache
+  cache_mode=sccache
+fi
+cargo_build() {
+  if cargo "$@"; then
+    return 0
+  fi
+  # A damaged cache entry must never make a build permanently fail. Retry the
+  # exact command without the optional wrapper; sccache validates entries and
+  # the normal output validators still gate anything that reaches packaging.
+  if [ "$cache_mode" = sccache ]; then
+    echo 'build_cache=sccache_error_retry_without_cache'
+    unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
+    cache_mode=disabled-after-error
+    cargo "$@"
+    return $?
+  fi
+  return 1
+}
 # Only bounded archives created by trusted control-plane preprocessing and the
 # checked-in plugin packer reach this offline extraction step.
+build_elapsed_seconds=0
+SECONDS=0
 tar -xzf /input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
 tar -xzf /input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 cd /work/source
-cargo build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo_build build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo_build build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
+build_elapsed_seconds=$SECONDS
+printf "build_elapsed_seconds=%s\n" "$build_elapsed_seconds"
+printf "build_cache=%s\n" "$cache_mode"
+if [ "$cache_mode" != disabled ] && command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 printf "builder_cgroup_memory\n"
 for file in memory.max memory.swap.max memory.current memory.peak memory.events; do printf "%s=" "$file"; cat "/sys/fs/cgroup/$file" | tr "\n" " "; printf "\n"; done
 printf "builder_storage\n"
@@ -107,6 +138,8 @@ pub struct DockerRootlessBuildRuntime {
     docker_host: String,
     toolchain_version: String,
     expected_rustc: String,
+    compiler_cache_volume: String,
+    compiler_cache_size: u64,
     sandbox: DockerSandbox,
     admission: BuildAdmissionCoordinator,
 }
@@ -125,6 +158,11 @@ impl DockerRootlessBuildRuntime {
         let toolchain_version = toolchain_version.into();
         let expected_rustc = rustc_release_from_identity(&image, &toolchain_version)
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let compiler_cache_size = super::cache::configured_cache_size().map_err(|error| {
+            BuildPipelineError::Sandbox(format!("configure compiler cache size: {error}"))
+        })?;
+        let compiler_cache_volume =
+            super::cache::cache_volume_name(&format!("docker:{docker_host}"));
         let admission = BuildAdmissionCoordinator::new(pool, image.clone(), docker_host.clone())
             .with_concurrency(usize::from(build_concurrency))
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
@@ -134,6 +172,8 @@ impl DockerRootlessBuildRuntime {
             docker_host,
             toolchain_version,
             expected_rustc,
+            compiler_cache_volume,
+            compiler_cache_size,
             sandbox: DockerSandbox,
         })
     }
@@ -212,6 +252,11 @@ impl DockerRootlessBuildRuntime {
             "--tmpfs",
             &format!(
                 "/work:{workspace_options},size={workspace_bytes},nr_inodes=1310720,mode=0700"
+            ),
+            "--mount",
+            &format!(
+                "type=volume,source={},target=/cache,volume-nocopy",
+                self.compiler_cache_volume
             ),
         ]);
         for (key, value) in env_names.iter().zip(env_values) {
@@ -653,6 +698,7 @@ impl DockerRootlessBuildRuntime {
                     "CARGO_PROFILE_RELEASE_DEBUG",
                     "CARGO_PROFILE_RELEASE_OPT_LEVEL",
                     "CARGO_PROFILE_RELEASE_STRIP",
+                    "KURBIS_BUILD_CACHE_MAX_BYTES",
                 ],
                 &[
                     &self.expected_rustc,
@@ -665,6 +711,7 @@ impl DockerRootlessBuildRuntime {
                     "0",
                     "2",
                     "debuginfo",
+                    &self.compiler_cache_size.to_string(),
                 ],
                 source_archive.len().saturating_add(plugin_archive.len()),
                 true,
@@ -1035,6 +1082,7 @@ pub struct RustPumpkinBuilder<R> {
     runtime: Arc<R>,
     plugin_source: PathBuf,
     limits: SandboxLimits,
+    cache: Option<BuildCache>,
 }
 impl<R> RustPumpkinBuilder<R> {
     pub fn new(
@@ -1043,10 +1091,14 @@ impl<R> RustPumpkinBuilder<R> {
     ) -> Result<Self, BuildPipelineError> {
         let plugin_source = plugin_source.into();
         validate_plugin_source(&plugin_source)?;
+        let cache = BuildCache::from_env().map_err(|error| {
+            BuildPipelineError::Sandbox(format!("configure private CI build cache: {error}"))
+        })?;
         Ok(Self {
             runtime,
             plugin_source,
             limits: default_build_limits(),
+            cache,
         })
     }
 
@@ -1100,20 +1152,96 @@ where
         let output = super::private_tempdir("kurbis-ci-artifact-").map_err(|error| {
             BuildPipelineError::transient(crate::ci::CiBuildStage::Packaging, error.to_string())
         })?;
-        let report = self
-            .runtime
-            .compile(
+        let cache_identity = self.cache.as_ref().map(|_| {
+            BuildCache::identity(
+                key,
+                self.runtime.toolchain_version(),
+                target,
                 &patched_source,
                 &plugin_archive,
-                output.path(),
-                target,
-                self.limits,
             )
-            .await?;
+        });
+        let mut cache_lease = None;
+        let mut cache_event = String::new();
+        if let (Some(cache), Some(identity)) = (&self.cache, &cache_identity) {
+            let first_lookup = cache.restore(identity, output.path());
+            if matches!(first_lookup, Ok(CacheLookup::Hit)) {
+                cache_event = format!("build_cache=hit key={}\n", identity.cache_key);
+            } else if matches!(first_lookup, Ok(CacheLookup::Miss | CacheLookup::Corrupt)) {
+                match cache.acquire(identity).await {
+                    Ok(lease) => {
+                        cache_lease = Some(lease);
+                        match cache.restore(identity, output.path()) {
+                            Ok(CacheLookup::Hit) => {
+                                cache_event = format!(
+                                    "build_cache=hit_after_wait key={}\n",
+                                    identity.cache_key
+                                );
+                            }
+                            Ok(CacheLookup::Corrupt) => {
+                                cache_event =
+                                    format!("build_cache=corrupt key={}\n", identity.cache_key);
+                            }
+                            Ok(CacheLookup::Miss) => {}
+                            Err(error) => {
+                                cache_event = format!("build_cache=read_error error={error}\n");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        cache_event = format!("build_cache=lock_error error={error}\n");
+                    }
+                }
+            } else if let Err(error) = first_lookup {
+                cache_event = format!("build_cache=read_error error={error}\n");
+            }
+        }
+        // Keep the per-key lock alive through compilation and cache publication.
+        let _cache_lease = cache_lease;
         let binary = output.path().join("pumpkin");
         let plugin = output.path().join("kurbis-control.wasm");
+        let mut cache_hit = binary.exists() && plugin.exists();
+        if cache_hit
+            && (validate_pumpkin_binary(&binary, &key.target_architecture).is_err()
+                || validate_wasm_plugin(&plugin).is_err())
+        {
+            if let (Some(cache), Some(identity)) = (&self.cache, &cache_identity) {
+                let _ = cache.invalidate(identity);
+            }
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_file(&plugin);
+            cache_event.push_str("build_cache=invalid_entry\n");
+            cache_hit = false;
+        }
+        let report = if cache_hit {
+            BuildProcessReport {
+                stdout: cache_event,
+                stderr: String::new(),
+            }
+        } else {
+            let report = self
+                .runtime
+                .compile(
+                    &patched_source,
+                    &plugin_archive,
+                    output.path(),
+                    target,
+                    self.limits,
+                )
+                .await?;
+            BuildProcessReport {
+                stdout: format!("{}{}", report.stdout, cache_event),
+                stderr: report.stderr,
+            }
+        };
         validate_pumpkin_binary(&binary, &key.target_architecture)?;
         validate_wasm_plugin(&plugin)?;
+        if !cache_hit
+            && let (Some(cache), Some(identity)) = (&self.cache, &cache_identity)
+            && let Err(error) = cache.store(identity, output.path(), &report.bounded_log())
+        {
+            tracing::warn!(cache_key = %identity.cache_key, ?error, "failed to store CI build cache entry");
+        }
         let build_log = report.bounded_log();
         let artifact = package_artifact(&binary, &plugin, key, &build_log)?;
         Ok(ControlledBuildOutput {

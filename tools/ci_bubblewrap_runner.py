@@ -30,6 +30,7 @@ grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
 [ "$HOME" = /work/home ]
 [ ! -e /run/docker.sock ]
 [ ! -e /var/run/docker.sock ]
+[ -d /cache ] && [ ! -L /cache ]
 awk 'NR > 1 && $1 != "lo" { route = 1 } END { exit route }' /proc/net/route
 awk '$NF != "lo" { route = 1 } END { exit route }' /proc/net/ipv6_route
 for tool in rustc cargo gcc tar git strip awk; do
@@ -78,20 +79,47 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+cache_mode=disabled
+if command -v sccache >/dev/null 2>&1 && [ -d /cache ]; then
+  mkdir -p /cache/sccache
+  export SCCACHE_DIR=/cache/sccache
+  export SCCACHE_CACHE_SIZE="$KURBIS_BUILD_CACHE_MAX_BYTES"
+  export RUSTC_WRAPPER=sccache
+  cache_mode=sccache
+fi
+cargo_build() {
+  if cargo "$@"; then
+    return 0
+  fi
+  if [ "$cache_mode" = sccache ]; then
+    echo 'build_cache=sccache_error_retry_without_cache'
+    unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
+    cache_mode=disabled-after-error
+    cargo "$@"
+    return $?
+  fi
+  return 1
+}
 actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 [ "$actual_rustc" = "$KURBIS_EXPECTED_RUSTC" ] || {
   echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
   exit 78
 }
+build_elapsed_seconds=0
+SECONDS=0
 tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
 tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 cd /work/source
-cargo build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo_build build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo build --locked --offline --release --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo_build build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
+build_elapsed_seconds=$SECONDS
+printf 'build_elapsed_seconds=%s\n' "$build_elapsed_seconds"
+printf 'build_cache=%s\n' "$cache_mode"
+if [ "$cache_mode" != disabled ] && command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 printf 'bubblewrap_guarantee=%s\n' "$KURBIS_BWRAP_GUARANTEE"
 printf 'cgroup_delegation=%s\n' "$KURBIS_CGROUP_DELEGATION"
 printf 'workspace_boundary=operator_tmpfs_explicit_size_and_inodes\n'
@@ -137,6 +165,28 @@ def private_workspace_root(value):
     return root
 
 
+def private_cache_root(value):
+    root = Path(value).expanduser()
+    home = Path(os.environ["HOME"]).resolve(strict=True)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root = root.resolve(strict=True)
+    if root == home or not root.is_relative_to(home):
+        raise ValueError("compiler cache root must be below HOME")
+    if str(root) == "/tmp" or str(root).startswith("/tmp/"):
+        raise ValueError("compiler cache root may not use public /tmp")
+    mode = stat.S_IMODE(root.stat().st_mode)
+    if mode != 0o700 or root.stat().st_uid != os.getuid():
+        raise ValueError("compiler cache root must be a mode-0700 directory owned by the namespace user")
+    return root
+
+
+def validate_cache_size(value):
+    size = int(value)
+    if size < 256 * 1024 * 1024 or size > 64 * 1024 * 1024 * 1024:
+        raise ValueError("compiler cache size is outside the bounded range")
+    return size
+
+
 def runner_command(header, workspace, script):
     bwrap = Path(header["bwrap"])
     rootfs = Path(header["rootfs"])
@@ -150,6 +200,7 @@ def runner_command(header, workspace, script):
     env_values = {
         "KURBIS_RUST_TARGET": header["target"],
         "KURBIS_EXPECTED_RUSTC": header["rustc"],
+        "KURBIS_BUILD_CACHE_MAX_BYTES": str(validate_cache_size(header["cache_max_bytes"])),
         "KURBIS_BWRAP_GUARANTEE": "bubblewrap_namespace_only",
         "KURBIS_CGROUP_DELEGATION": "remote_probe",
     }
@@ -157,6 +208,7 @@ def runner_command(header, workspace, script):
         str(bwrap), "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
         "--unshare-ipc", "--unshare-uts", "--unshare-net", "--uid", "0", "--gid", "0",
         "--cap-drop", "ALL", "--ro-bind", str(rootfs), "/", "--ro-bind", str(toolchain), "/toolchain",
+        "--bind", str(private_cache_root(header["cache_root"])), "/cache",
         "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev",
         "--bind", str(workspace / "tmp"), "/tmp", "--bind", str(workspace / "run"), "/run",
         "--bind", str(workspace / "root"), "/root", "--bind", str(workspace / "home"), "/home",
@@ -178,12 +230,13 @@ def main():
         header = json.loads(line)
         if header.get("version") != 1 or header.get("mode") not in ("preflight", "compile"):
             raise ValueError("unsupported job header")
-        if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "workspace_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
+        if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "workspace_root", "cache_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
             raise ValueError("missing job field")
         if not all(c in "0123456789abcdef" for c in header["job_id"].lower()) or len(header["job_id"]) > 64:
             raise ValueError("invalid job id")
         source_len = int(header.get("source_len", 0))
         plugin_len = int(header.get("plugin_len", 0))
+        validate_cache_size(header.get("cache_max_bytes", 0))
         if source_len < 0 or source_len > MAX_SOURCE or plugin_len < 0 or plugin_len > MAX_PLUGIN:
             raise ValueError("framed input exceeds bounds")
         if header["mode"] == "preflight" and (source_len or plugin_len):

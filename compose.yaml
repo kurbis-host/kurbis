@@ -26,6 +26,11 @@ x-control-plane-environment: &control-plane-environment
   CI_BUBBLEWRAP_SOURCE_PREPARER: ${CI_BUBBLEWRAP_SOURCE_PREPARER:-}
   CI_BUBBLEWRAP_RUNNER: ${CI_BUBBLEWRAP_RUNNER:-}
   CI_BUILD_CONCURRENCY: ${CI_BUILD_CONCURRENCY:-2}
+  # Persistent exact-output cache. The named volume is private to the
+  # unprivileged control plane; entries are logically bounded by the cache
+  # implementation and never contain source-controlled executable input.
+  CI_BUILD_CACHE_DIR: ${CI_BUILD_CACHE_DIR:-/home/kurbis/.cache/kurbis/build-cache}
+  CI_BUILD_CACHE_MAX_BYTES: ${CI_BUILD_CACHE_MAX_BYTES:-8589934592}
   CI_PLUGIN_SOURCE: /opt/kurbis/plugins/kurbis-control
   CI_INTEGRATION_SOURCE_ROOT: /opt/kurbis
   GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
@@ -71,6 +76,7 @@ services:
     environment: *control-plane-environment
     volumes:
       - object-store:/var/lib/kurbis/object-store
+      - ci-build-cache:/home/kurbis/.cache/kurbis/build-cache
       # The deployment supplies a root-owned, mode-0700 host directory whose
       # files are owned by UID 65532. Keep the default checkout path for local
       # development, but never bake a private key into the repository.
@@ -177,6 +183,7 @@ volumes:
   postgres-data:
   object-store:
   waiting-control:
+  ci-build-cache:
 
 networks:
   hoster:

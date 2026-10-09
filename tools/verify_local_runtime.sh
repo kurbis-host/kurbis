@@ -53,6 +53,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 "$root/tools/docker_build_with_limits.sh" \
     --file runtime/Dockerfile --tag "$release_image" .
+"$root/tools/verify_runtime_identity.sh" "$release_image"
 "$root/tools/docker_build_with_limits.sh" \
     --file runtime/pumpkin/Dockerfile --tag "$pumpkin_image" .
 "$root/tools/docker_build_with_limits.sh" \

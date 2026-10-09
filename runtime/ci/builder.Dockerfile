@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Trusted, host-owned CI builder image. Never build or consume a Dockerfile from
 # a Pumpkin commit. The resulting image must be published and referenced by its
 # registry sha256 digest in CI_BUILDER_IMAGE.
@@ -5,6 +6,7 @@ ARG RUST_TOOLCHAIN=1.98.1
 FROM rust:1.98-bookworm
 ARG RUST_TOOLCHAIN
 ARG PUMPKIN_REVISION=204a94ed895f041a845630d5a23c094705a0704e
+ARG SCCACHE_VERSION=0.10.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -13,6 +15,16 @@ RUN apt-get update \
     && rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
     && rustup default "${RUST_TOOLCHAIN}" \
     && rustup target add wasm32-wasip2
+
+# sccache is optional at runtime but is part of the trusted image so every
+# build uses the same pinned compiler-cache implementation. The runtime only
+# enables its local disk backend; no remote cache credentials or network are
+# ever present in a build container.
+RUN --mount=type=cache,id=kurbis-ci-builder-cargo-registry-${RUST_TOOLCHAIN},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=kurbis-ci-builder-cargo-git-${RUST_TOOLCHAIN},target=/usr/local/cargo/git,sharing=locked \
+    cargo install --locked --version "${SCCACHE_VERSION}" sccache --root /opt/sccache \
+    && install -m 0755 /opt/sccache/bin/sccache /usr/local/bin/sccache \
+    && rm -rf /opt/sccache
 
 ENV CARGO_HOME=/usr/local/cargo \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -27,9 +39,13 @@ COPY src ./src
 COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
-RUN cargo build --jobs 1 --locked --release --bin ci-source-preparer \
+# Keep the BuildKit-mounted /hoster/target cache populated for warm image builds.
+RUN --mount=type=cache,id=kurbis-ci-builder-cargo-registry-${RUST_TOOLCHAIN},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=kurbis-ci-builder-cargo-git-${RUST_TOOLCHAIN},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=kurbis-ci-builder-hoster-target-${RUST_TOOLCHAIN},target=/hoster/target,sharing=locked \
+    cargo build --jobs 1 --locked --release --bin ci-source-preparer \
     && install -D -m 0755 target/release/ci-source-preparer /usr/local/bin/ci-source-preparer \
-    && rm -rf /hoster
+    && find /hoster -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf -- {} +
 
 # Seed only the cargo package/git cache from the known upstream baseline and
 # the checked-in trusted control plugin. Runtime compilation remains --offline.

@@ -30,6 +30,9 @@ WORKER_LAUNCHER = Path("/usr/local/bin/kurbis-worker")
 PROJECT = "kurbis-hoster-fbikvd"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 LEGACY_REVISION_CLAIM = "f6b05712bb130747060e5cfa049d84ed27020835"
+CURRENT_BASELINE_REVISION = "2f94cc79602d45cfe6f91c629ffc4df48a3674cf"
+LEGACY_BASELINE_SCHEMA = "kurbis.respond5.legacy-baseline.v1"
+CURRENT_BASELINE_SCHEMA = "kurbis.respond5.current-baseline.v1"
 PUMPKIN_LEGACY = "melon-pumpkin:host-control"
 SERVICES = ("control-plane", "gateway", "panel", "waiting-pumpkin", "postgres")
 SERVICE_PAYLOADS = {
@@ -46,6 +49,7 @@ SERVICE_PAYLOADS = {
     "postgres": {},
 }
 AUDIT = ROOT / "legacy-baseline-inventory.json"
+CURRENT_AUDIT = ROOT / "migration-safe-baseline-inventory.json"
 LOCK = Path("/run/lock/kurbis-production-deploy.lock")
 OPERATION_LOCK = Path("/run/lock/kurbis-production-deploy-operation.lock")
 CHECKOUT_BACKUP = ROOT / "deploy-checkout-overrides"
@@ -53,6 +57,7 @@ ENV_FILE_CHECKOUT = CHECKOUT / ".env"
 WORKER_MIGRATION = ROOT / "legacy-baseline-worker-migration.json"
 WORKER_BACKUP = ROOT / "legacy-baseline-worker-backups"
 COMPOSE_ENV_BACKUPS = ROOT / "legacy-baseline-environment"
+CURRENT_COMPOSE_ENV_BACKUPS = ROOT / "migration-safe-baseline-environment"
 
 
 class BaselineError(RuntimeError):
@@ -167,7 +172,9 @@ def image_payload_hashes(image_id: str, service: str) -> dict[str, dict[str, Any
 
 
 def collect_inventory(*, allowed_worker_images: set[str] | None = None,
-                      expected_checkout_head: str = LEGACY_REVISION_CLAIM) -> dict[str, Any]:
+                      expected_checkout_head: str = LEGACY_REVISION_CLAIM,
+                      baseline_schema: str = LEGACY_BASELINE_SCHEMA,
+                      expected_legacy_worker_image: dict[str, Any] | None = None) -> dict[str, Any]:
     root_only()
     allowed_worker_images={PUMPKIN_LEGACY} if allowed_worker_images is None else allowed_worker_images
     if CHECKOUT.is_symlink() or not (CHECKOUT / ".git").is_dir() or WORKER.is_symlink() or not WORKER.is_file():
@@ -203,10 +210,18 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
             "payloads": image_payload_hashes(image_id, service),
             "ports": inspected.get("HostConfig", {}).get("PortBindings", {}),
         }
-        if image.get("revision_label") is not None:
-            raise BaselineError(f"expected legacy-unlabelled image; found revision label on {service}")
+        label = image.get("revision_label")
+        if baseline_schema == LEGACY_BASELINE_SCHEMA:
+            if label is not None:
+                raise BaselineError(f"expected legacy-unlabelled image; found revision label on {service}")
+        elif baseline_schema == CURRENT_BASELINE_SCHEMA:
+            expected_label = CURRENT_BASELINE_REVISION if service in {"panel", "waiting-pumpkin"} else None
+            if label != expected_label:
+                raise BaselineError(f"current migration-safe baseline has unexpected {service} revision label")
+        else:
+            raise BaselineError("unsupported baseline schema")
         if state.get("Status") != "running" or (service != "gateway" and services[service]["health"] != "healthy"):
-            raise BaselineError(f"legacy production service is not healthy: {service}")
+            raise BaselineError(f"baseline production service is not healthy: {service}")
 
     if services["control-plane"]["image_id"] != services["gateway"]["image_id"]:
         raise BaselineError("legacy control-plane and gateway do not share an exact image digest")
@@ -232,9 +247,18 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
     if ENV_FILE.is_symlink() or env_stat.st_uid != 0 or stat.S_IMODE(env_stat.st_mode) != 0o600:
         raise BaselineError("worker env file must remain root-owned mode 0600")
 
-    pid = int(run_text(["systemctl", "show", "--property=MainPID", "--value", "kurbis-worker.service"]))
-    if run_text(["systemctl", "is-active", "kurbis-worker.service"]) != "active" or pid <= 1:
-        raise BaselineError("Kurbis worker systemd service is not active")
+    allowed_states = {"active"} if baseline_schema == LEGACY_BASELINE_SCHEMA else {"active", "activating"}
+    pid = 0
+    service_state = ""
+    deadline = time.monotonic() + (0 if baseline_schema == LEGACY_BASELINE_SCHEMA else 15)
+    while True:
+        pid = int(run_text(["systemctl", "show", "--property=MainPID", "--value", "kurbis-worker.service"]))
+        service_state = run_text(["systemctl", "show", "--property=ActiveState", "--value", "kurbis-worker.service"])
+        if service_state in allowed_states and pid > 1:
+            break
+        if time.monotonic() >= deadline:
+            raise BaselineError("Kurbis worker systemd service is not in an inspectable state")
+        time.sleep(1)
     process_paths = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
@@ -255,11 +279,18 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
                 process_env["PUMPKIN_IMAGE"] = value.decode("utf-8", "replace")
     if process_env.get("PUMPKIN_IMAGE") not in allowed_worker_images:
         raise BaselineError("running worker process differs from legacy baseline or protected migration journal")
-    legacy_worker_image = image_info(PUMPKIN_LEGACY)
-    legacy_worker_image["tag"] = PUMPKIN_LEGACY
-    legacy_worker_image["payloads"] = image_payload_hashes(legacy_worker_image["image_id"], "waiting-pumpkin")
-    if legacy_worker_image.get("revision_label") is not None:
-        raise BaselineError("expected the known legacy worker image to be unlabeled")
+    if baseline_schema == CURRENT_BASELINE_SCHEMA and expected_legacy_worker_image is not None:
+        # The migration-safe attestation records the previous worker image as a
+        # rollback identity, but that image may have been garbage-collected after
+        # the attestation. Requiring the mutable tag during revalidation makes an
+        # otherwise valid current baseline undeployable.
+        legacy_worker_image = json.loads(json.dumps(expected_legacy_worker_image))
+    else:
+        legacy_worker_image = image_info(PUMPKIN_LEGACY)
+        legacy_worker_image["tag"] = PUMPKIN_LEGACY
+        legacy_worker_image["payloads"] = image_payload_hashes(legacy_worker_image["image_id"], "waiting-pumpkin")
+        if legacy_worker_image.get("revision_label") is not None:
+            raise BaselineError("expected the protected worker Pumpkin image to be unlabeled")
 
     postgres_id = services["postgres"]["container_id"]
     sql = (
@@ -275,8 +306,10 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
         'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F "|" -f -',
     ], input_text=sql)
     expected_lease = f"{worker_id}|t|t|1"
-    if lease_result != expected_lease:
+    if baseline_schema == LEGACY_BASELINE_SCHEMA and lease_result != expected_lease:
         raise BaselineError("legacy worker lease is not uniquely active and renewing")
+    if baseline_schema == CURRENT_BASELINE_SCHEMA and not re.fullmatch(re.escape(worker_id) + r"\|[tf]\|[tf]\|[01]", lease_result):
+        raise BaselineError("current baseline worker lease is not uniquely owned")
 
     compose_env={}
     if ENV_FILE_CHECKOUT.is_symlink() or not ENV_FILE_CHECKOUT.is_file():
@@ -302,7 +335,7 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
         },
         "worker": {
             "service": "kurbis-worker.service",
-            "service_active": True,
+            "service_active": service_state in {"active", "activating"},
             "main_pid": pid,
             "worker_id": worker_id,
             "configured_pumpkin_image": values["PUMPKIN_IMAGE"],
@@ -322,7 +355,7 @@ def collect_inventory(*, allowed_worker_images: set[str] | None = None,
             "launcher_sha256": sha256_file(WORKER_LAUNCHER),
             "lease": lease_result,
         },
-        "provenance_status": "legacy-unproven",
+        "provenance_status": "legacy-unproven" if baseline_schema == LEGACY_BASELINE_SCHEMA else "migration-safe-unproven",
     }
 
 
@@ -331,39 +364,63 @@ def canonical_hash(value: dict[str, Any]) -> str:
 
 
 def validate_manifest(manifest: dict[str, Any], current: dict[str, Any]) -> str:
-    if not isinstance(manifest,dict) or manifest.get("schema")!="kurbis.respond5.legacy-baseline.v1":
-        raise BaselineError("legacy baseline manifest schema is unsupported")
-    if manifest.get("source_revision_claim")!=LEGACY_REVISION_CLAIM or current.get("source",{}).get("checkout_head")!=LEGACY_REVISION_CLAIM:
-        raise BaselineError("legacy source claim must remain the reviewed f6b0571 checkout")
+    if not isinstance(manifest, dict):
+        raise BaselineError("baseline manifest is not an object")
+    schema = manifest.get("schema")
+    if schema not in {LEGACY_BASELINE_SCHEMA, CURRENT_BASELINE_SCHEMA}:
+        raise BaselineError("baseline manifest schema is unsupported")
+    claim = LEGACY_REVISION_CLAIM if schema == LEGACY_BASELINE_SCHEMA else CURRENT_BASELINE_REVISION
+    expected_status = "legacy-unproven" if schema == LEGACY_BASELINE_SCHEMA else "migration-safe-unproven"
+    if manifest.get("source_revision_claim") != claim or current.get("source", {}).get("checkout_head") != claim:
+        raise BaselineError("baseline source claim does not match the reviewed checkout")
     operator=manifest.get("operator");reason=manifest.get("reason")
     if not isinstance(operator,str) or not operator.strip() or not isinstance(reason,str) or len(reason.strip())<20:
         raise BaselineError("explicit operator name and meaningful baseline reason are required")
     expected=manifest.get("expected_inventory")
-    if not isinstance(expected,dict) or expected!=current:
+    if not isinstance(expected, dict):
+        raise BaselineError("baseline manifest is missing its expected inventory")
+    if schema == CURRENT_BASELINE_SCHEMA:
+        # A restart-looping pre-release worker changes PID and lease liveness while
+        # the app/image/container identity remains the attested rollback boundary.
+        expected_compare = json.loads(json.dumps(expected))
+        current_compare = json.loads(json.dumps(current))
+        for inventory in (expected_compare, current_compare):
+            inventory.get("worker", {}).pop("main_pid", None)
+            inventory.get("worker", {}).pop("lease", None)
+        if expected_compare != current_compare:
+            raise BaselineError("live inventory differs from exact migration-safe baseline")
+    elif expected != current:
         raise BaselineError("live inventory differs from exact operator-reviewed manifest")
-    if current.get("provenance_status")!="legacy-unproven":raise BaselineError("legacy provenance status is inconsistent")
+    if current.get("provenance_status") != expected_status: raise BaselineError("baseline provenance status is inconsistent")
     if current.get("compose_id")!=COMPOSE_ID or current.get("project")!=PROJECT:
         raise BaselineError("legacy manifest targets the wrong Compose stack")
     source=current.get("source",{})
-    if source.get("checkout_head")!=LEGACY_REVISION_CLAIM or source.get("build_revision_env_present") is not False:
-        raise BaselineError("legacy checkout/BUILD_REVISION state is not the reviewed baseline")
+    if source.get("checkout_head") != claim:
+        raise BaselineError("baseline checkout state is not the reviewed source")
+    if schema == LEGACY_BASELINE_SCHEMA and source.get("build_revision_env_present") is not False:
+        raise BaselineError("legacy checkout unexpectedly contains BUILD_REVISION")
+    if schema == CURRENT_BASELINE_SCHEMA and source.get("safe_compose_settings", {}).get("BUILD_REVISION") != claim:
+        raise BaselineError("current baseline BUILD_REVISION does not match its source claim")
     if not re.fullmatch(r"[0-9a-f]{64}",str(source.get("compose_env_file_sha256",""))):
         raise BaselineError("legacy source environment digest is invalid")
     allowed={"compose.yaml","web/tsconfig.json"}
     for item in source.get("modified_inputs",[]):
         if item.get("path")==".env" and item.get("code")=="!!":continue
         if item.get("path") not in allowed or item.get("code") not in {" M","M ","MM"} or not re.fullmatch(r"[0-9a-f]{64}",str(item.get("sha256",""))):
-            raise BaselineError("legacy checkout includes a modified/untracked build input outside reviewed files")
+            raise BaselineError("baseline checkout includes a modified/untracked build input outside reviewed files")
     if not any(item.get("path")==".env" and item.get("code")=="!!" for item in source.get("modified_inputs",[])):
-        raise BaselineError("legacy checkout requires the ignored Dokploy .env exception")
+        raise BaselineError("baseline checkout requires the ignored Dokploy .env exception")
     services=current.get("services",{})
     if set(services)!=set(SERVICES):raise BaselineError("legacy manifest service inventory is incomplete")
     for name,item in services.items():
         cid=str(item.get("container_id",""));image_id=str(item.get("image_id",""));image=item.get("image",{})
         if not re.fullmatch(r"[0-9a-f]{64}",cid) or not re.fullmatch(r"sha256:[0-9a-f]{64}",image_id):
             raise BaselineError(f"legacy inventory ID/digest malformed: {name}")
-        if image.get("image_id")!=image_id or image.get("revision_label") is not None:
-            raise BaselineError(f"legacy image metadata is not exact/unlabelled: {name}")
+        expected_label = None if schema == LEGACY_BASELINE_SCHEMA or name in {"control-plane", "gateway", "postgres"} else claim
+        if image.get("image_id") != image_id or image.get("revision_label") != expected_label:
+            if schema == LEGACY_BASELINE_SCHEMA:
+                raise BaselineError(f"legacy image metadata is not exact/unlabelled: {name}")
+            raise BaselineError(f"baseline image metadata is not exact for {name}")
         if any(not re.fullmatch(r"sha256:[0-9a-f]{64}",str(layer)) for layer in image.get("rootfs_diff_ids",[])):
             raise BaselineError(f"legacy image layer inventory is malformed: {name}")
         if item.get("status")!="running" or (name!="gateway" and item.get("health")!="healthy"):
@@ -388,18 +445,42 @@ def validate_manifest(manifest: dict[str, Any], current: dict[str, Any]) -> str:
     for key in ("worker_sha256","worker_process_sha256","service_unit_sha256","launcher_sha256","legacy_pumpkin_image"):
         if key=="legacy_pumpkin_image":continue
         if not re.fullmatch(r"[0-9a-f]{64}",str(worker.get(key,""))):raise BaselineError(f"legacy worker digest is invalid: {key}")
-    if worker.get("worker_sha256")!=worker.get("worker_process_sha256") or not re.fullmatch(re.escape(worker_id)+r"\|t\|t\|1",str(worker.get("lease",""))):
-        raise BaselineError("legacy worker executable or lease is inconsistent")
+    if worker.get("worker_sha256") != worker.get("worker_process_sha256"):
+        raise BaselineError("baseline worker executable is inconsistent")
+    lease_pattern = re.escape(worker_id) + (r"\|t\|t\|1" if schema == LEGACY_BASELINE_SCHEMA else r"\|[tf]\|[tf]\|[01]")
+    if not re.fullmatch(lease_pattern, str(worker.get("lease", ""))):
+        raise BaselineError("baseline worker lease is inconsistent")
     legacy_image=worker.get("legacy_pumpkin_image",{})
     if legacy_image.get("tag")!=PUMPKIN_LEGACY or not re.fullmatch(r"sha256:[0-9a-f]{64}",str(legacy_image.get("image_id",""))) or legacy_image.get("revision_label") is not None:
         raise BaselineError("legacy Pumpkin image identity is invalid or unexpectedly labeled")
-    for key in ("pumpkin","wasm","hosted_entrypoint"):
-        if legacy_image.get("payloads",{}).get(key)!=services["waiting-pumpkin"].get("payloads",{}).get(key):
-            raise BaselineError(f"legacy worker/waiting Pumpkin payload differs: {key}")
-    if services["waiting-pumpkin"].get("payloads",{}).get("build_revision") is not None:
+    if schema == LEGACY_BASELINE_SCHEMA:
+        for key in ("pumpkin", "wasm", "hosted_entrypoint"):
+            if legacy_image.get("payloads", {}).get(key) != services["waiting-pumpkin"].get("payloads", {}).get(key):
+                raise BaselineError(f"legacy worker/waiting Pumpkin payload differs: {key}")
+    waiting_revision = services["waiting-pumpkin"].get("payloads", {}).get("build_revision")
+    if schema == LEGACY_BASELINE_SCHEMA and waiting_revision is not None:
         raise BaselineError("legacy waiting image unexpectedly contains a Kurbis build revision")
+    if schema == CURRENT_BASELINE_SCHEMA and waiting_revision is None:
+        raise BaselineError("current waiting image is missing its embedded BUILD_REVISION")
     return canonical_hash({"schema":manifest["schema"],"source_revision_claim":manifest["source_revision_claim"],
                            "operator":operator,"reason":reason,"expected_inventory":expected})
+
+
+def current_baseline_manifest(inventory: dict[str, Any], *, operator: str = "Kurbis production release operator") -> dict[str, Any]:
+    """Build a one-shot manifest for the migration-safe 1..13 live baseline."""
+    if inventory.get("source", {}).get("checkout_head") != CURRENT_BASELINE_REVISION:
+        raise BaselineError("current baseline must be captured from the migration-safe 2f94 checkout")
+    if inventory.get("provenance_status") != "migration-safe-unproven":
+        raise BaselineError("current baseline inventory has the wrong provenance status")
+    manifest = {
+        "schema": CURRENT_BASELINE_SCHEMA,
+        "source_revision_claim": CURRENT_BASELINE_REVISION,
+        "operator": operator,
+        "reason": "Exact live migration-safe 1..13 app/worker baseline for rollback after additive migrations 0014 and 0015; never restore the historical f6 release.",
+        "expected_inventory": inventory,
+    }
+    validate_manifest(manifest, inventory)
+    return manifest
 
 
 def require_lock(token: str) -> None:
@@ -428,23 +509,33 @@ class OperationLock:
         os.close(self.fd)
 
 
+def audit_path(manifest: dict[str, Any]) -> Path:
+    return CURRENT_AUDIT if manifest.get("schema") == CURRENT_BASELINE_SCHEMA else AUDIT
+
+
+def compose_env_backup_root(manifest_or_schema: dict[str, Any] | str) -> Path:
+    schema = manifest_or_schema if isinstance(manifest_or_schema, str) else manifest_or_schema.get("schema")
+    return CURRENT_COMPOSE_ENV_BACKUPS if schema == CURRENT_BASELINE_SCHEMA else COMPOSE_ENV_BACKUPS
+
+
 def load_attestation(manifest: dict[str, Any]) -> dict[str, Any]:
     expected=manifest.get("expected_inventory") if isinstance(manifest,dict) else None
     if not isinstance(expected,dict):raise BaselineError("legacy manifest is missing expected_inventory")
     manifest_sha=validate_manifest(manifest,expected)
-    if not AUDIT.is_file() or AUDIT.is_symlink():
-        raise BaselineError("explicit legacy baseline has not been bootstrapped")
-    info=AUDIT.stat()
+    audit = audit_path(manifest)
+    if not audit.is_file() or audit.is_symlink():
+        raise BaselineError("explicit baseline has not been bootstrapped")
+    info=audit.stat()
     if info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o600:
         raise BaselineError("legacy baseline audit record must be root-owned mode 0600")
-    record=json.loads(AUDIT.read_text(encoding="utf-8"))
+    record=json.loads(audit.read_text(encoding="utf-8"))
     if record.get("manifest_sha256")!=manifest_sha or record.get("inventory")!=expected:
         raise BaselineError("legacy audit record differs from operator-reviewed manifest")
     backup=record.get("compose_env_backup",{})
     if backup.get("sha256")!=expected.get("source",{}).get("compose_env_file_sha256"):
         raise BaselineError("protected baseline environment digest differs from manifest")
     backup_path=Path(backup.get("path",""))
-    if backup_path.is_symlink() or not backup_path.is_file() or backup_path.parent!=COMPOSE_ENV_BACKUPS:
+    if backup_path.is_symlink() or not backup_path.is_file() or backup_path.parent not in {COMPOSE_ENV_BACKUPS, CURRENT_COMPOSE_ENV_BACKUPS}:
         raise BaselineError("baseline Dokploy .env backup is missing or unsafe")
     if backup_path.stat().st_uid!=0 or stat.S_IMODE(backup_path.stat().st_mode)!=0o600 or sha256_file(backup_path)!=backup.get("sha256"):
         raise BaselineError("baseline Dokploy .env backup failed integrity validation")
@@ -756,8 +847,13 @@ def rollback_app(manifest: dict[str, Any], expected_sources: dict[str, str], tok
     with OperationLock():
         record=load_attestation(manifest);expected=record["inventory"];revision=record["source_revision_claim"]
         if not valid_sha(candidate_revision):raise BaselineError("candidate rollback revision must be a full SHA")
-        if revision!=LEGACY_REVISION_CLAIM or not isinstance(expected_sources,dict) or not expected_sources:
-            raise BaselineError("legacy rollback source claim/manifest is invalid")
+        if manifest.get("schema") == CURRENT_BASELINE_SCHEMA:
+            if revision != CURRENT_BASELINE_REVISION:
+                raise BaselineError("current rollback source claim is invalid")
+        elif revision != LEGACY_REVISION_CLAIM:
+            raise BaselineError("legacy rollback source claim is invalid")
+        if not isinstance(expected_sources,dict) or not expected_sources:
+            raise BaselineError("rollback source manifest is invalid")
         current=current_service_inventory()
         validate_rollback_scope(expected,current,candidate_revision)
         restore_baseline_compose_env(record)
@@ -798,7 +894,30 @@ def rollback_app(manifest: dict[str, Any], expected_sources: dict[str, str], tok
             if all(current[name]["status"]=="running" and current[name]["image_id"]==expected["services"][name]["image_id"] and current[name]["health"]==expected["services"][name]["health"] for name in ("control-plane","gateway","panel","waiting-pumpkin")):
                 break
             time.sleep(5)
-        else:raise BaselineError("captured legacy application image rollback timed out")
+        else:raise BaselineError("captured baseline application image rollback timed out")
+        if manifest.get("schema") == CURRENT_BASELINE_SCHEMA:
+            # The current 1..13 baseline is intentionally migration-safe, not f6.
+            # wait_sync owns the worker transaction and rolls it back before this
+            # function runs; verify the exact old executable/config without forcing
+            # another restart while the pre-release lease is known to be stale.
+            worker=expected["worker"]
+            values=worker_values()
+            pid=systemd_worker_pid()
+            process_env=worker_process_environment(pid)
+            if (values.get("PUMPKIN_IMAGE") != PUMPKIN_LEGACY
+                or process_env.get("PUMPKIN_IMAGE") != PUMPKIN_LEGACY
+                or sha256_file(WORKER) != worker["worker_sha256"]
+                or sha256_file(Path(f"/proc/{pid}/exe")) != worker["worker_process_sha256"]):
+                raise BaselineError("current migration-safe worker bundle was not restored")
+            final_services=current_service_inventory()
+            for service in SERVICES:
+                if final_services[service]["image_id"] != expected["services"][service]["image_id"]:
+                    raise BaselineError(f"current rollback digest mismatch: {service}")
+            return {"status":"app-rolled-back","source_revision_claim":revision,
+                    "provenance_status":"migration-safe-unproven",
+                    "image_ids":{name:expected["services"][name]["image_id"] for name in SERVICES},
+                    "worker_id":worker["worker_id"],"worker_sha256":worker["worker_sha256"],
+                    "worker_bundle_restored":True}
         migration=migration_record(manifest)
         if not migration or not migration.get("old_worker_env_backup"):
             raise BaselineError("worker migration backup missing; cannot restore original worker config")
@@ -864,13 +983,14 @@ def migration_record_from_hash(manifest_sha: str) -> dict[str, Any] | None:
     return record
 
 
-def save_baseline_compose_env(inventory: dict[str, Any]) -> dict[str, Any]:
+def save_baseline_compose_env(inventory: dict[str, Any], backup_root: Path | None = None) -> dict[str, Any]:
+    backup_root = backup_root or COMPOSE_ENV_BACKUPS
     source=inventory["source"]
-    if not COMPOSE_ENV_BACKUPS.exists():COMPOSE_ENV_BACKUPS.mkdir(mode=0o700)
-    if COMPOSE_ENV_BACKUPS.is_symlink() or COMPOSE_ENV_BACKUPS.stat().st_uid!=0 or stat.S_IMODE(COMPOSE_ENV_BACKUPS.stat().st_mode)!=0o700:
+    if not backup_root.exists():backup_root.mkdir(mode=0o700, parents=True)
+    if backup_root.is_symlink() or backup_root.stat().st_uid!=0 or stat.S_IMODE(backup_root.stat().st_mode)!=0o700:
         raise BaselineError("baseline environment backup directory must be root-owned mode 0700")
     digest=source["compose_env_file_sha256"]
-    path=COMPOSE_ENV_BACKUPS/f"compose-env-{digest}"
+    path=backup_root/f"compose-env-{digest}"
     content=ENV_FILE_CHECKOUT.read_bytes()
     if sha256_bytes(content)!=digest:raise BaselineError("Dokploy .env changed while inventory was captured")
     if path.is_symlink():raise BaselineError("baseline environment backup cannot be a symlink")
@@ -885,7 +1005,7 @@ def restore_baseline_compose_env(record: dict[str, Any]) -> bool:
     metadata=record.get("compose_env_backup")
     if not isinstance(metadata,dict):raise BaselineError("baseline Dokploy .env backup metadata is missing")
     path=Path(metadata.get("path",""))
-    if path.is_symlink() or not path.is_file() or path.parent!=COMPOSE_ENV_BACKUPS:
+    if path.is_symlink() or not path.is_file() or path.parent not in {COMPOSE_ENV_BACKUPS, CURRENT_COMPOSE_ENV_BACKUPS}:
         raise BaselineError("baseline Dokploy .env backup path is invalid")
     if path.stat().st_uid!=0 or stat.S_IMODE(path.stat().st_mode)!=0o600 or sha256_file(path)!=metadata.get("sha256"):
         raise BaselineError("baseline Dokploy .env backup integrity check failed")
@@ -902,36 +1022,43 @@ def bootstrap(manifest: dict[str, Any], token: str, *, candidate_revision: str |
         expected=manifest.get("expected_inventory") if isinstance(manifest,dict) else None
         if not isinstance(expected,dict):raise BaselineError("legacy manifest is missing expected inventory")
         manifest_sha=validate_manifest(manifest,expected)
-        if AUDIT.is_symlink():raise BaselineError("legacy audit file cannot be a symlink")
-        if AUDIT.exists():
+        audit = audit_path(manifest)
+        if audit.is_symlink():raise BaselineError("baseline audit file cannot be a symlink")
+        if audit.exists():
             attestation=load_attestation(manifest)
             allowed_worker_images=authorized_worker_images_for_inventory(manifest)
+            inventory_options = {"allowed_worker_images": allowed_worker_images}
+            if manifest.get("schema") == CURRENT_BASELINE_SCHEMA:
+                inventory_options["baseline_schema"] = CURRENT_BASELINE_SCHEMA
+                inventory_options["expected_legacy_worker_image"] = expected["worker"]["legacy_pumpkin_image"]
             if candidate_revision is not None:
                 checkout_head=verify_attested_candidate_source(candidate_revision,expected_sources or {})
-                current=collect_inventory(allowed_worker_images=allowed_worker_images,expected_checkout_head=checkout_head)
+                current=collect_inventory(expected_checkout_head=checkout_head, **inventory_options)
                 verify_attested_legacy_services(current,attestation["inventory"],manifest_sha,
                                                 candidate_revision=candidate_revision,inventory_checkout_head=checkout_head)
                 return {"status":"already-recorded","manifest_sha256":manifest_sha,"inventory":current}
-            current=collect_inventory(allowed_worker_images=allowed_worker_images)
+            current=collect_inventory(**inventory_options)
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
             restore_baseline_compose_env(attestation)
-            current=collect_inventory(allowed_worker_images=allowed_worker_images)
+            current=collect_inventory(**inventory_options)
             if current.get("source")!=attestation["inventory"].get("source"):
                 raise BaselineError("protected baseline environment/checkout restoration did not match exact attested source")
             verify_attested_legacy_services(current,attestation["inventory"],manifest_sha)
             return {"status":"already-recorded","manifest_sha256":manifest_sha,"inventory":current}
-        if candidate_revision is not None:
+        schema = manifest.get("schema")
+        if candidate_revision is not None and schema != CURRENT_BASELINE_SCHEMA:
             raise BaselineError("cannot create a legacy attestation from refreshed release source; exact old baseline checkout is required")
-        current=collect_inventory()
+        current=(collect_inventory(expected_checkout_head=CURRENT_BASELINE_REVISION, baseline_schema=schema)
+                 if schema == CURRENT_BASELINE_SCHEMA else collect_inventory())
         manifest_sha=validate_manifest(manifest,current)
-        compose_env_backup=save_baseline_compose_env(current)
-        record={"schema":manifest["schema"],"source_revision_claim":LEGACY_REVISION_CLAIM,
-                "provenance_status":"legacy-unproven","operator":manifest["operator"],
-                "reason":manifest["reason"],"manifest_sha256":manifest_sha,"inventory":current,
-                "compose_env_backup":compose_env_backup}
+        compose_env_backup=save_baseline_compose_env(current, compose_env_backup_root(schema))
+        record={"schema":manifest["schema"],"source_revision_claim":manifest["source_revision_claim"],
+                "provenance_status":"legacy-unproven" if schema == LEGACY_BASELINE_SCHEMA else "migration-safe-unproven",
+                "operator":manifest["operator"],"reason":manifest["reason"],"manifest_sha256":manifest_sha,
+                "inventory":current,"compose_env_backup":compose_env_backup}
         if ROOT.is_symlink() or ROOT.stat().st_uid!=0 or ROOT.stat().st_mode&0o022:
-            raise BaselineError("legacy baseline audit directory is unsafe")
-        atomic_json(AUDIT,record,0o600)
+            raise BaselineError("baseline audit directory is unsafe")
+        atomic_json(audit,record,0o600)
         return {"status":"recorded","manifest_sha256":manifest_sha,"inventory":current}
 
 
@@ -943,10 +1070,14 @@ def main() -> int:
     parser.add_argument("--candidate-image-id")
     parser.add_argument("--candidate-revision")
     parser.add_argument("--token")
+    parser.add_argument("--mode", choices=("legacy", "current"), default="legacy")
     args=parser.parse_args()
     try:
         manifest=json.loads(args.manifest_json) if args.manifest_json else None
-        if args.operation=="capture":result=collect_inventory()
+        if args.operation=="capture":
+            schema = CURRENT_BASELINE_SCHEMA if args.mode == "current" else LEGACY_BASELINE_SCHEMA
+            head = CURRENT_BASELINE_REVISION if args.mode == "current" else LEGACY_REVISION_CLAIM
+            result=collect_inventory(expected_checkout_head=head, baseline_schema=schema)
         elif args.operation=="bootstrap":
             if manifest is None or not args.token:raise BaselineError("operator-reviewed manifest and rollout lock token are required")
             result=bootstrap(manifest,args.token,candidate_revision=args.candidate_revision,

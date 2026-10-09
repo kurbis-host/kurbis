@@ -367,11 +367,12 @@ def legacy_remote_source() -> str:
 
 def legacy_remote(host: str, operation: str, *, manifest: dict | None = None,
                   expected_sources: dict | None = None, token: str | None = None,
-                  candidate_image_id: str | None = None, candidate_revision: str | None = None) -> dict:
+                  candidate_image_id: str | None = None, candidate_revision: str | None = None,
+                  mode: str | None = None) -> dict:
     command=["python3","-","--operation",operation]
     for key,value in (("manifest-json",manifest),("expected-sources-json",expected_sources),
                       ("token",token),("candidate-image-id",candidate_image_id),
-                      ("candidate-revision",candidate_revision)):
+                      ("candidate-revision",candidate_revision),("mode",mode)):
         if value is not None:
             command.extend([f"--{key}",value if isinstance(value,str) else json.dumps(value,separators=(",",":"))])
     output=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=10",host,shlex.join(command)],
@@ -391,10 +392,24 @@ def legacy_wait_baseline(inventory: dict) -> dict[str,list[dict[str,str]]]:
             for name,item in inventory["services"].items()}
 
 
+def bootstrap_wait_baseline(record: dict) -> dict[str,list[dict[str,str]]]:
+    """Build worker-sync's baseline from the fresh inventory validated by bootstrap."""
+    inventory=record.get("inventory")
+    if not isinstance(inventory,dict):
+        raise DeploymentError("respond5 bootstrap did not return a validated inventory")
+    return legacy_wait_baseline(inventory)
+
+
 def legacy_revision(manifest: dict) -> str:
-    value=manifest.get("source_revision_claim")
-    if value!="f6b05712bb130747060e5cfa049d84ed27020835":
-        raise DeploymentError("explicit legacy baseline manifest does not claim the reviewed f6b0571 inventory")
+    schema = manifest.get("schema")
+    value = manifest.get("source_revision_claim")
+    allowed = {
+        "kurbis.respond5.legacy-baseline.v1": "f6b05712bb130747060e5cfa049d84ed27020835",
+        "kurbis.respond5.current-baseline.v1": "2f94cc79602d45cfe6f91c629ffc4df48a3674cf",
+    }
+    expected = allowed.get(schema)
+    if expected is None or value != expected:
+        raise DeploymentError("explicit baseline manifest does not claim its reviewed rollback-compatible source")
     return value
 
 
@@ -437,8 +452,12 @@ def rollback_application(host: str, branch: str, revision: str, baseline: dict, 
         sources=source_inputs(revision)
         result=legacy_remote(host,"rollback-app",manifest=legacy_manifest,expected_sources=sources,token=token,
                              candidate_revision=candidate_revision)
-        if result.get("status")!="app-rolled-back" or result.get("provenance_status")!="legacy-unproven":
-            raise DeploymentError("respond5 did not verify exact legacy app/worker digest rollback")
+        if result.get("status")!="app-rolled-back" or result.get("provenance_status") not in {
+            "legacy-unproven", "migration-safe-unproven",
+        }:
+            raise DeploymentError("respond5 did not verify exact baseline app/worker digest rollback")
+        # Report rollback success only after the configured source branch has been
+        # restored and verified, even when rollback used the migration-safe schema.
         set_branch(branch)
         return result
     wait_for_terminal_deployments(timeout)
@@ -610,18 +629,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
                 raise DeploymentError("respond5 host-control Pumpkin image is not pinned to clean source SHA")
             if legacy_manifest is not None:
-                compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
-                    token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
-                if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
-                def mark_worker_bootstrap_attempted() -> None:
-                    nonlocal worker_bootstrap_attempted
-                    worker_bootstrap_attempted=True
-                migrated=dispatch_legacy_worker_bootstrap(
-                    lambda **kwargs:legacy_remote(args.worker_host,"bootstrap-worker",**kwargs),
-                    mark_worker_bootstrap_attempted,
-                    manifest=legacy_manifest,token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
-                if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
-                worker_bootstrap_reconciled=True
+                if legacy_manifest.get("schema") == "kurbis.respond5.current-baseline.v1":
+                    # The migration-safe 1..13 baseline is intentionally allowed to have
+                    # a stale lease: the current 2f94 control plane is the failing side
+                    # of the mixed deployment and is restart-looping before this release.
+                    # Deploy the fixed control plane first; wait_sync then performs the
+                    # single guarded worker transaction against the new API.
+                    baseline = bootstrap_wait_baseline(legacy_record)
+                else:
+                    compatible=legacy_remote(args.worker_host,"check-worker-compatibility",manifest=legacy_manifest,
+                        token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                    if compatible.get("status")!="compatible":raise DeploymentError("candidate runtime failed exact legacy inventory compatibility checks")
+                    def mark_worker_bootstrap_attempted() -> None:
+                        nonlocal worker_bootstrap_attempted
+                        worker_bootstrap_attempted=True
+                    migrated=dispatch_legacy_worker_bootstrap(
+                        lambda **kwargs:legacy_remote(args.worker_host,"bootstrap-worker",**kwargs),
+                        mark_worker_bootstrap_attempted,
+                        manifest=legacy_manifest,token=token,candidate_image_id=pumpkin["pumpkin_image_id"],candidate_revision=commit)
+                    if migrated.get("status")!="migrated":raise DeploymentError("explicit legacy worker migration did not verify")
+                    worker_bootstrap_reconciled=True
             else:
                 baseline_result=remote(args.worker_host,"baseline")
                 baseline=baseline_result.get("snapshot")
