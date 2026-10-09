@@ -1405,6 +1405,21 @@ async fn pr_updates_build_only_requested_heads_and_late_events_never_roll_back_a
     let pool = pool().await;
     let repository = CiPreviewRepository::new(pool.clone());
     let repository_name = "Pumpkin-MC/Pumpkin";
+    // The webhook consumer reconciles every pending Check Run in the
+    // disposable database. Clear provider reconciliation state first so rows
+    // left by earlier serial tests cannot leak into this mock's assertions.
+    sqlx::query("DELETE FROM ci_check_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ci_check_run_tombstones")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ci_github_webhook_deliveries")
+        .execute(&pool)
+        .await
+        .unwrap();
     let watched = repository
         .register_repository(repository_name, "main")
         .await
