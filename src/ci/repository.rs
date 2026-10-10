@@ -1,12 +1,12 @@
 use super::source_control::PollCheckpoint;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::domain::{
-    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildFailureClass, CiBuildStage, CiHostname, CiPreview,
-    CiPreviewState, CiRefKind, validate_commit_sha,
+    BUILD_TTL_HOURS, BuildKey, CiBuild, CiBuildFailureClass, CiBuildQueueState, CiBuildStage,
+    CiHostname, CiPreview, CiPreviewState, CiRefKind, validate_commit_sha,
 };
 
 mod github_webhook;
@@ -52,6 +52,32 @@ pub struct CiRefRecord {
     pub closed: bool,
     pub deleted: bool,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A fenced claim on the mutable desired-build queue. The claim token and
+/// expiry are required for every completion so a timed-out worker cannot commit
+/// a result after another worker has reclaimed the request.
+#[derive(Debug, Clone)]
+pub struct CiBuildQueueClaim {
+    pub id: Uuid,
+    pub claim_token: Uuid,
+    pub build_id: Uuid,
+    pub pull_request_number: i64,
+    pub attempt: i32,
+    pub lease_expires_at: DateTime<Utc>,
+    pub request: super::services::BuildRequest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CiBuildQueueMetrics {
+    pub pending: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub superseded: i64,
+    pub cancelled: i64,
+    pub stale_running: i64,
+    pub oldest_pending_age_seconds: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -158,6 +184,391 @@ impl CiPreviewRepository {
         };
         tx.commit().await?;
         Ok((row.try_into()?, inserted))
+    }
+
+    /// Enqueue the current desired build for one pull request. The queue is
+    /// keyed by repository and PR number, not by commit, so a new head fences
+    /// every older pending/running/retry request as superseded before inserting
+    /// the new desired request. Historical terminal rows remain available for
+    /// diagnostics and bounded garbage collection.
+    pub async fn enqueue_pull_request_build(
+        &self,
+        repository: &str,
+        pull_request_number: i64,
+        key: &BuildKey,
+        source_repository: Option<&str>,
+    ) -> Result<Uuid> {
+        if pull_request_number <= 0 {
+            bail!("pull request number must be positive");
+        }
+        if key.repository != repository {
+            bail!("queue repository does not match build key repository");
+        }
+        key.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let (build, _) = self.ensure_build(key).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '2s'")
+            .execute(&mut *tx)
+            .await?;
+        let repository_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM ci_watched_repositories WHERE repository = $1 AND enabled FOR UPDATE",
+        )
+        .bind(repository)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("watched CI repository is not enabled")?;
+        let lock_key = format!("{repository}:{pull_request_number}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+        let existing: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, commit_sha, state FROM ci_build_queue
+             WHERE repository_id = $1 AND pull_request_number = $2 FOR UPDATE",
+        )
+        .bind(repository_id)
+        .bind(pull_request_number)
+        .fetch_all(&mut *tx)
+        .await?;
+        if let Some((id, _commit_sha, _state)) = existing
+            .iter()
+            .find(|(_, commit_sha, state)| commit_sha == &key.commit_sha && state != "superseded")
+        {
+            sqlx::query(
+                "UPDATE ci_build_queue SET source_repository = COALESCE($2, source_repository),
+                        requested_at = CASE WHEN state = 'pending' THEN now() ELSE requested_at END,
+                        updated_at = now() WHERE id = $1",
+            )
+            .bind(id)
+            .bind(source_repository)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(*id);
+        }
+        sqlx::query(
+            "UPDATE ci_build_queue
+             SET state = 'superseded', claim_token = NULL, claim_expires_at = NULL,
+                 retry_at = NULL, finished_at = COALESCE(finished_at, now()), updated_at = now()
+             WHERE repository_id = $1 AND pull_request_number = $2
+               AND state IN ('pending', 'running', 'failed')",
+        )
+        .bind(repository_id)
+        .bind(pull_request_number)
+        .execute(&mut *tx)
+        .await?;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO ci_build_queue(repository_id, pull_request_number, commit_sha,
+                    build_id, source_repository, state)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             RETURNING id",
+        )
+        .bind(repository_id)
+        .bind(pull_request_number)
+        .bind(&key.commit_sha)
+        .bind(build.id)
+        .bind(source_repository)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Reclaim expired queue leases, fence requests whose PR head is no longer
+    /// current, and atomically claim a bounded batch. Every transaction is
+    /// short; no provider or builder work occurs while rows are locked.
+    pub async fn claim_pull_request_builds(
+        &self,
+        repository: &str,
+        limit: i64,
+        lease_duration: Duration,
+    ) -> Result<Vec<CiBuildQueueClaim>> {
+        if !(1..=128).contains(&limit) {
+            bail!("invalid CI build queue claim limit");
+        }
+        if lease_duration <= Duration::zero() {
+            bail!("CI build queue lease duration must be positive");
+        }
+        let seconds = lease_duration.num_seconds().max(1);
+        let repository_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM ci_watched_repositories WHERE repository = $1 AND enabled",
+        )
+        .bind(repository)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("watched CI repository is not enabled")?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '2s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE ci_build_queue SET state = 'pending', claim_token = NULL,
+                    claim_expires_at = NULL, retry_at = now(),
+                    last_error = COALESCE(last_error, 'queue lease expired'), updated_at = now()
+             WHERE repository_id = $1 AND state = 'running'
+               AND claim_expires_at IS NOT NULL AND claim_expires_at <= now()",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE ci_build_queue queue SET state = 'pending', retry_at = NULL, updated_at = now()
+             WHERE queue.repository_id = $1 AND queue.state = 'failed'
+               AND queue.failure_class = 'transient' AND queue.retry_at IS NOT NULL
+               AND queue.retry_at <= now()",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await?;
+        // A provider poll persists the authoritative ref row before scheduling
+        // its build. If that row says the PR is closed, deleted, or on another
+        // head, never waste a worker slot on the stale request.
+        sqlx::query(
+            "UPDATE ci_build_queue queue SET state = 'superseded', claim_token = NULL,
+                    claim_expires_at = NULL, finished_at = COALESCE(finished_at, now()), updated_at = now()
+             WHERE queue.repository_id = $1 AND queue.state = 'pending'
+               AND EXISTS (
+                    SELECT 1 FROM ci_refs ref
+                    WHERE ref.repository_id = queue.repository_id AND ref.kind = 'pull_request'
+                      AND ref.number = queue.pull_request_number
+                      AND (ref.closed OR ref.deleted OR ref.commit_sha <> queue.commit_sha)
+               )",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await?;
+        let claim_token = Uuid::new_v4();
+        let rows = sqlx::query_as::<_, CiBuildQueueClaimRow>(
+            "WITH candidates AS (
+                 SELECT queue.id
+                 FROM ci_build_queue queue
+                 WHERE queue.repository_id = $1 AND queue.state = 'pending'
+                   AND (queue.retry_at IS NULL OR queue.retry_at <= now())
+                 ORDER BY queue.requested_at, queue.id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $2
+             )
+             UPDATE ci_build_queue queue
+             SET state = 'running', claim_token = $3,
+                 claim_expires_at = now() + $4 * interval '1 second',
+                 attempt = queue.attempt + 1, started_at = COALESCE(queue.started_at, now()),
+                 updated_at = now()
+             FROM candidates, ci_builds build
+             WHERE queue.id = candidates.id AND build.id = queue.build_id
+             RETURNING queue.id, queue.repository_id::text AS repository, queue.pull_request_number,
+                       queue.commit_sha, build.patch_fingerprint, build.toolchain_version,
+                       build.target_architecture, queue.build_id, queue.source_repository,
+                       queue.state, queue.attempt, queue.claim_token, queue.claim_expires_at",
+        )
+        .bind(repository_id)
+        .bind(limit)
+        .bind(claim_token)
+        .bind(seconds)
+        .fetch_all(&mut *tx)
+        .await?;
+        // The repository text is selected separately because queue rows store the
+        // watched-repository FK as the concurrency boundary.
+        let rows = if rows.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, CiBuildQueueClaimRow>(
+                "SELECT queue.id, watched.repository, queue.pull_request_number, queue.commit_sha,
+                        build.patch_fingerprint, build.toolchain_version, build.target_architecture,
+                        queue.build_id, queue.source_repository, queue.state, queue.attempt,
+                        queue.claim_token, queue.claim_expires_at
+                 FROM ci_build_queue queue
+                 JOIN ci_watched_repositories watched ON watched.id = queue.repository_id
+                 JOIN ci_builds build ON build.id = queue.build_id
+                 WHERE queue.claim_token = $1 AND queue.state = 'running'
+                 ORDER BY queue.requested_at, queue.id",
+            )
+            .bind(claim_token)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let claim_token = row.claim_token;
+                let lease_expires_at = row.claim_expires_at;
+                let key = BuildKey::new(
+                    row.repository,
+                    row.commit_sha,
+                    row.patch_fingerprint,
+                    row.toolchain_version,
+                    row.target_architecture,
+                )?;
+                Ok(CiBuildQueueClaim {
+                    id: row.id,
+                    claim_token,
+                    build_id: row.build_id,
+                    pull_request_number: row.pull_request_number,
+                    attempt: row.attempt,
+                    lease_expires_at,
+                    request: super::services::BuildRequest {
+                        key,
+                        source_repository: row.source_repository,
+                        source_archive: Vec::new(),
+                        retention: super::domain::CiBuildRetention::Preview,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub async fn renew_pull_request_build_claim(
+        &self,
+        queue_id: Uuid,
+        claim_token: Uuid,
+        lease_duration: Duration,
+    ) -> Result<bool> {
+        if lease_duration <= Duration::zero() {
+            bail!("CI build queue lease duration must be positive");
+        }
+        let rows = sqlx::query(
+            "UPDATE ci_build_queue SET claim_expires_at = now() + $3 * interval '1 second', updated_at = now()
+             WHERE id = $1 AND claim_token = $2 AND state = 'running' AND claim_expires_at > now()",
+        )
+        .bind(queue_id)
+        .bind(claim_token)
+        .bind(lease_duration.num_seconds().max(1))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows == 1)
+    }
+
+    pub async fn complete_pull_request_build(
+        &self,
+        queue_id: Uuid,
+        claim_token: Uuid,
+        succeeded: bool,
+        failure_class: Option<CiBuildFailureClass>,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let (state, retry_sql) = if succeeded {
+            (CiBuildQueueState::Succeeded.to_string(), "NULL")
+        } else {
+            (
+                CiBuildQueueState::Failed.to_string(),
+                "CASE WHEN $4 = 'transient' THEN now() + CASE WHEN attempt <= 1 THEN interval '1 minute' WHEN attempt = 2 THEN interval '2 minutes' ELSE interval '4 minutes' END ELSE NULL END",
+            )
+        };
+        let error = error.map(|value| value.chars().take(8192).collect::<String>());
+        let failure_class = failure_class.map(|value| value.to_string());
+        let query = format!(
+            "UPDATE ci_build_queue SET state = $3, failure_class = $4, last_error = $5,
+                    retry_at = {retry_sql}, claim_token = NULL, claim_expires_at = NULL,
+                    finished_at = now(), updated_at = now()
+             WHERE id = $1 AND claim_token = $2 AND state = 'running' AND claim_expires_at > now()"
+        );
+        let rows = sqlx::query(&query)
+            .bind(queue_id)
+            .bind(claim_token)
+            .bind(state)
+            .bind(failure_class)
+            .bind(error)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(rows == 1)
+    }
+
+    pub async fn complete_pull_request_build_from_build_error(
+        &self,
+        claim: &CiBuildQueueClaim,
+        error: &str,
+    ) -> Result<bool> {
+        let class = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT failure_class FROM ci_builds WHERE id = $1",
+        )
+        .bind(claim.build_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(CiBuildFailureClass::Transient);
+        self.complete_pull_request_build(
+            claim.id,
+            claim.claim_token,
+            false,
+            Some(class),
+            Some(error),
+        )
+        .await
+    }
+
+    pub async fn cancel_pull_request_build(&self, queue_id: Uuid) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE ci_build_queue SET state = 'cancelled', claim_token = NULL,
+                    claim_expires_at = NULL, retry_at = NULL, finished_at = now(), updated_at = now()
+             WHERE id = $1 AND state IN ('pending', 'running', 'failed')",
+        )
+        .bind(queue_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows == 1)
+    }
+
+    pub async fn gc_pull_request_build_queue(&self, repository: &str, limit: i64) -> Result<u64> {
+        if !(1..=512).contains(&limit) {
+            bail!("invalid CI build queue GC limit");
+        }
+        let rows = sqlx::query(
+            "WITH candidates AS (
+                 SELECT queue.id
+                 FROM ci_build_queue queue
+                 JOIN ci_watched_repositories watched ON watched.id = queue.repository_id
+                 WHERE watched.repository = $1
+                   AND queue.state IN ('succeeded', 'failed', 'superseded', 'cancelled')
+                   AND queue.finished_at IS NOT NULL
+                   AND queue.finished_at <= now() - interval '7 days'
+                 ORDER BY queue.finished_at, queue.id
+                 FOR UPDATE OF queue SKIP LOCKED
+                 LIMIT $2
+             )
+             DELETE FROM ci_build_queue queue USING candidates
+             WHERE queue.id = candidates.id",
+        )
+        .bind(repository)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    pub async fn pull_request_build_queue_metrics(
+        &self,
+        repository: Option<&str>,
+    ) -> Result<CiBuildQueueMetrics> {
+        let row: (i64, i64, i64, i64, i64, i64, i64, Option<f64>) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE queue.state = 'pending'),
+                    count(*) FILTER (WHERE queue.state = 'running'),
+                    count(*) FILTER (WHERE queue.state = 'succeeded'),
+                    count(*) FILTER (WHERE queue.state = 'failed'),
+                    count(*) FILTER (WHERE queue.state = 'superseded'),
+                    count(*) FILTER (WHERE queue.state = 'cancelled'),
+                    count(*) FILTER (WHERE queue.state = 'running' AND queue.claim_expires_at <= now()),
+                    min(EXTRACT(EPOCH FROM (now() - queue.requested_at))) FILTER (WHERE queue.state = 'pending')
+             FROM ci_build_queue queue
+             JOIN ci_watched_repositories watched ON watched.id = queue.repository_id
+             WHERE ($1::text IS NULL OR watched.repository = $1)",
+        )
+        .bind(repository)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(CiBuildQueueMetrics {
+            pending: row.0,
+            running: row.1,
+            succeeded: row.2,
+            failed: row.3,
+            superseded: row.4,
+            cancelled: row.5,
+            stale_running: row.6,
+            oldest_pending_age_seconds: row.7.map(|age| age.max(0.0) as i64),
+        })
     }
 
     /// Return only durable, due retries for current open PR heads. This is

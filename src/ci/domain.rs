@@ -140,6 +140,62 @@ impl FromStr for CiBuildFailureClass {
     }
 }
 
+/// Durable desired-build lifecycle. Queue state is intentionally separate from
+/// the immutable build pipeline stage: a newer PR head can supersede an older
+/// build without rewriting that build's diagnostics or artifact history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBuildQueueState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Superseded,
+    Cancelled,
+}
+
+impl CiBuildQueueState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Superseded | Self::Cancelled
+        )
+    }
+
+    pub const fn is_claimable(self) -> bool {
+        matches!(self, Self::Pending | Self::Failed)
+    }
+}
+
+impl fmt::Display for CiBuildQueueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl FromStr for CiBuildQueueState {
+    type Err = InvalidCiValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "superseded" => Ok(Self::Superseded),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(InvalidCiValue::new("unknown CI build queue state")),
+        }
+    }
+}
+
 impl CiBuildStage {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Ready | Self::Failed | Self::Expired)
@@ -546,5 +602,33 @@ mod tests {
         assert!(CiBuildStage::Packaging.can_transition_to(CiBuildStage::Ready));
         assert!(!CiBuildStage::Ready.can_transition_to(CiBuildStage::Compiling));
         assert!(!CiBuildStage::Failed.can_transition_to(CiBuildStage::Ready));
+    }
+
+    #[test]
+    fn build_queue_states_are_explicit_and_terminal() {
+        let states = [
+            (CiBuildQueueState::Pending, false, true),
+            (CiBuildQueueState::Running, false, false),
+            (CiBuildQueueState::Succeeded, true, false),
+            (CiBuildQueueState::Failed, true, true),
+            (CiBuildQueueState::Superseded, true, false),
+            (CiBuildQueueState::Cancelled, true, false),
+        ];
+        for (state, terminal, claimable) in states {
+            assert_eq!(state.is_terminal(), terminal, "{state}");
+            assert_eq!(state.is_claimable(), claimable, "{state}");
+            assert_eq!(
+                state.to_string().parse::<CiBuildQueueState>().unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_and_cancelled_queue_states_cannot_be_claimed() {
+        assert!(!CiBuildQueueState::Superseded.is_claimable());
+        assert!(!CiBuildQueueState::Cancelled.is_claimable());
+        assert!("running".parse::<CiBuildQueueState>().is_ok());
+        assert!("legacy".parse::<CiBuildQueueState>().is_err());
     }
 }

@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -227,30 +227,11 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             }
         }
         if let Some(builder) = self.builder.as_ref() {
-            // The durable queue is necessary even when the GitHub collections
-            // return 304: a process can die after admitting a PR head but before
-            // starting its build, and the next poll must recover that exact head
-            // without asking GitHub to emit another event.
-            for request in self
-                .repository
-                .queued_pull_request_builds(&repository_name)
-                .await?
-            {
-                builder
-                    .ensure_build(request)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("queued CI PR build failed: {error}"))?;
-            }
-            for request in self
-                .repository
-                .due_pull_request_build_retries(&repository_name)
-                .await?
-            {
-                builder
-                    .ensure_build(request)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("scheduled CI PR retry failed: {error}"))?;
-            }
+            // Queue claims are fenced in PostgreSQL and recovered after a
+            // process restart. Provider polling never holds a transaction while
+            // the builder performs network or compiler work.
+            self.drain_pull_request_queue(&repository_name, builder.as_ref())
+                .await?;
         }
         self.reconcile_check_runs(Some(&repository_name)).await?;
         Ok(())
@@ -372,18 +353,97 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             )
             .await?;
         }
+        let pull_request_number: i64 = source_ref
+            .number
+            .map(i64::try_from)
+            .transpose()?
+            .or_else(|| {
+                crate::ci::domain::parse_pr_number(&source_ref.name)
+                    .ok()
+                    .and_then(|value| i64::try_from(value).ok())
+            })
+            .context("pull request number is required for CI queue admission")?;
+        self.repository
+            .enqueue_pull_request_build(
+                repository,
+                pull_request_number,
+                &key,
+                source_ref.source_repository.as_deref(),
+            )
+            .await?;
         if let Some(builder) = self.builder.as_ref() {
-            builder
-                .ensure_build(crate::ci::BuildRequest {
-                    key,
-                    source_repository: source_ref.source_repository.clone(),
-                    source_archive: Vec::new(),
-                    retention: CiBuildRetention::Preview,
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("PR head build failed: {error}"))?;
+            self.drain_pull_request_queue(repository, builder.as_ref())
+                .await?;
         }
         Ok(())
+    }
+
+    async fn drain_pull_request_queue(
+        &self,
+        repository: &str,
+        builder: &dyn crate::ci::BuildCoordinator,
+    ) -> Result<()> {
+        loop {
+            let claims = self
+                .repository
+                .claim_pull_request_builds(repository, 32, ChronoDuration::minutes(30))
+                .await?;
+            if claims.is_empty() {
+                return Ok(());
+            }
+            for claim in claims {
+                let heartbeat_repository = self.repository.clone();
+                let queue_id = claim.id;
+                let claim_token = claim.claim_token;
+                let heartbeat = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        match heartbeat_repository
+                            .renew_pull_request_build_claim(
+                                queue_id,
+                                claim_token,
+                                ChronoDuration::minutes(30),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => {
+                                tracing::warn!(%queue_id, ?error, "CI build queue lease heartbeat failed")
+                            }
+                        }
+                    }
+                });
+                let result = builder.ensure_build(claim.request.clone()).await;
+                heartbeat.abort();
+                match result {
+                    Ok(_) => {
+                        if !self
+                            .repository
+                            .complete_pull_request_build(
+                                claim.id,
+                                claim.claim_token,
+                                true,
+                                None,
+                                None,
+                            )
+                            .await?
+                        {
+                            tracing::debug!(queue_id = %claim.id, "CI build queue claim expired before success was recorded");
+                        }
+                    }
+                    Err(error) => {
+                        self.repository
+                            .complete_pull_request_build_from_build_error(
+                                &claim,
+                                &error.to_string(),
+                            )
+                            .await?;
+                        return Err(anyhow::anyhow!("queued CI PR build failed: {error}"));
+                    }
+                }
+            }
+        }
     }
 
     async fn reconcile_check_runs(&self, repository: Option<&str>) -> Result<()> {
