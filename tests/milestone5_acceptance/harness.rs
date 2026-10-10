@@ -481,16 +481,16 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
         "repeat PR observations must coalesce by build key"
     );
     assert_eq!(build.stage, CiBuildStage::Queued);
-    // Observation alone is metadata, not build work. A current-head demand
-    // marks the exact immutable row requested; only then is it recoverable by
-    // the durable queue after a poller restart.
+    // Poll recovery admits the open PR head into the durable queue even when
+    // the build row predates queue admission. Repeating explicit demand is
+    // idempotent and leaves exactly one queued request.
     assert_eq!(
         repository
             .queued_pull_request_builds(REPOSITORY)
             .await
             .unwrap()
             .len(),
-        0
+        1
     );
     repository
         .enqueue_pull_request_build(REPOSITORY, 5005, &key, Some("contributor/Pumpkin"))
