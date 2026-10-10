@@ -129,31 +129,6 @@ Heading: **Pick a name. That's the whole signup.**
 - Portal: **Already in the game? Step through.** Button: Open dashboard. Small: Sign in with Google / Discord.
 - Portal shimmer transition; colours shift red. Falling past the bottom loops to the sky.
 
-## The page is a game HUD
-
-All page chrome is a Minecraft-style heads-up display laid over the world, so the visitor "plays" the page in first person while descending. The HUD is the navigation; there is no conventional header or footer nav. Layout and behaviour follow the familiar game HUD; all art, icons and the pixel font are original (no Mojang textures, fonts or logo).
-
-| HUD element            | Position                     | On this page                                                                                                                                                                                                                                                                        |
-| ---------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hotbar**             | bottom centre                | Navigation. One slot per layer group, each with an original icon (pumpkin, dirt, torch, pickaxe, spawner, chest, diamond, bedrock, portal). Selected slot follows scroll. Keys 1-9 and click jump to a layer. Hovering a slot shows an item tooltip: layer name plus one lore line. |
-| **XP bar**             | above hotbar                 | Scroll progress. The level number is the current layer number. XP orbs fly to the bar when an achievement fires.                                                                                                                                                                    |
-| **Hearts and hunger**  | above hotbar, left and right | Decoration with a gag: hearts are full ("nothing here can hurt you"); clicking bedrock costs half a heart that regenerates. Hunger uses pumpkin icons.                                                                                                                              |
-| **Crosshair**          | centre                       | Desktop cursor target. Turns into a pickaxe over ores and dirt blocks, with a crack animation while mining. On touch devices the tap replaces it.                                                                                                                                   |
-| **Advancement toasts** | top right                    | "Achievement get: Touched grass / Dirt enthusiast / Found the cave". Each states a true fact or a clear joke.                                                                                                                                                                       |
-| **Chat**               | bottom left                  | Receives the toasts' text and in-world jokes as chat lines (fading). `T` or `/` opens the input; a few easter-egg commands reply (`/help`, `/kurbis`). Not required for any function.                                                                                               |
-| **Boss bar**           | top centre                   | Appears in the cave layer as the idle countdown ("Server naps in 04:12", sped up in the demo) and disappears after.                                                                                                                                                                 |
-| **F3 debug screen**    | top left                     | Toggled with `F3` anywhere. Shows XYZ (Y matches the depth meter), FPS, the current layer, and, open by default in the Diamonds layer, the platform stats (see Diamonds). Replaces the old side Y-meter.                                                                            |
-| **Inventory** (`E`)    | centre panel                 | Secondary links: Sign in, Open dashboard, Discord, Not affiliated with Mojang or Microsoft.                                                                                                                                                                                         |
-| **Game menu** (`Esc`)  | centre panel                 | Back to game, Jump to portal, Options: reduce motion, sound (off by default), night. This is where accessibility toggles live.                                                                                                                                                      |
-
-Rules for the HUD:
-
-- Everything is real, focusable DOM (buttons, a `nav` for the hotbar, a labelled live region for chat). Keyboard shortcuts are shortcuts only; every action has a visible control.
-- HUD never covers the layer's content: it hugs the viewport edges, and text over art keeps AA contrast with a pixel shadow.
-- Mobile: hotbar stays, shrunk; XP bar stays; hearts, hunger, chat and F3 collapse into the inventory and menu. Crosshair is hidden.
-- `prefers-reduced-motion`: no crack animation, particles or orbs; toasts appear instantly; the HUD itself is static.
-- Name availability ("Free" / "Taken") in the Nether CTA needs a public check endpoint; confirm the behaviour.
-
 ## Technical direction (proposal)
 
 - Next.js 16 App Router, route group `(marketing)`, server component page with the existing `getSessionOrNull` redirect to `/app` for signed-in users.
