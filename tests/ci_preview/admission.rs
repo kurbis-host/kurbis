@@ -228,7 +228,7 @@ async fn running_pr_alias_is_not_rebound_to_a_new_patch_candidate() {
     let commit_sha = "0123456789abcdef0123456789abcdef01234567";
     sqlx::query(
         "INSERT INTO ci_refs(repository_id, kind, name, number, source_repository, commit_sha)
-         VALUES($1, 'pull_request', 'pr-3865', 3865, 'Pumpkin-MC/Pumpkin', $2)",
+         VALUES($1, 'pull_request', 'pr-3866', 3866, 'Pumpkin-MC/Pumpkin', $2)",
     )
     .bind(watched.id)
     .bind(commit_sha)
@@ -260,18 +260,23 @@ async fn running_pr_alias_is_not_rebound_to_a_new_patch_candidate() {
         .attach_artifact(old_build.id, "sha256:running", "ci/running.tar", 1)
         .await
         .unwrap();
-    let alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-3865", CI_ROOT_DOMAIN).unwrap();
-    let ready = repository
+    let alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-3866", CI_ROOT_DOMAIN).unwrap();
+    repository
         .ensure_preview(
             &repository_name,
             commit_sha,
             CiRefKind::PullRequest,
-            Some("pr-3865"),
+            Some("pr-3866"),
             &alias,
             old_build.id,
         )
         .await
         .unwrap();
+    repository
+        .advance_stable_aliases_for_build(old_build.id, CI_ROOT_DOMAIN)
+        .await
+        .unwrap();
+    let ready = repository.lookup_preview(&alias.value).await.unwrap().unwrap();
     assert_eq!(ready.state, CiPreviewState::Ready);
     let running = repository.mark_preview_running(ready.id).await.unwrap();
 
