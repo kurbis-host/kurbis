@@ -247,9 +247,10 @@ stack, then updates the separate systemd-managed host worker from the deployed
 application image. It verifies the worker binary, Pumpkin runtime, and renewing
 worker lease, and rolls the worker and app back together if verification fails.
 Set `TEST_DATABASE_URL` to a disposable PostgreSQL database for the required
-release regression. The first migration from the current unlabelled Respond5
-baseline additionally requires the reviewed manifest described in the rollout
-guide; do not enable Dokploy's direct auto-deploy path for production.
+release regression; the release path has one canonical source-provenance flow
+and no historical baseline/rollback mode. For stranded CI coordination rows, use
+the bounded, dry-run-first procedure in [`deployment/ci-cleanup.md`](deployment/ci-cleanup.md);
+never reset production data with broad SQL or Compose volume deletion.
 
 ## Configuration
 

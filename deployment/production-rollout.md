@@ -1,12 +1,31 @@
 # Production rollout policy
 
-Use `scripts/deploy_dokploy.py` for a Kurbis production release. It accepts only a clean checkout exactly matching `origin/main`, runs the rollout behavior suite and the database-backed `first_join_flow` regression before changing Dokploy or respond5, then deploys an immutable `kurbis-release-<full-sha>` tag. The runner stages and validates the complete tracked source manifest on respond5 and rejects untracked or ignored Docker-context inputs; the sole ignored-file exception is the Dokploy `.env`, which Docker context ignore rules must exclude.
+Use `scripts/deploy_dokploy.py` for every Kurbis production release. There is one
+canonical release path: a clean checkout exactly matching `origin/main`, a
+verified Dokploy Compose configuration, an immutable
+`kurbis-release-<full-sha>` tag, and a coordinated Respond5 worker update.
+Historical baseline manifests and one-time migration/rollback aliases are not
+supported and are intentionally absent from this repository.
 
-The script requires Dokploy's `docker-compose` mode and an unset custom `command`; it queries Dokploy's `compose.getDefaultCommand` API and verifies that the generated default is the build-enabled command. Stack mode does not support this repository's build directives, and custom commands must not bypass Dokploy's build behavior. It also rejects any enabled Dokploy patch targeting `compose.yaml`: Dokploy applies those patches after cloning Git, so a stale normalized patch can silently remove current `BEDROCK_PUBLIC_IP`, CI runtime environment, build arguments, or SSH mounts. The Compose file in Git is the sole production source of truth. The script deliberately keeps Dokploy's production `autoDeploy` setting disabled. That is persistent policy, not a temporary toggle: production changes are initiated only by the verified manual rollout path. The script temporarily selects the immutable release tag, checks the deployment and runtime provenance, then restores the configured source branch (`main`). It restores the previous `BUILD_REVISION` when a rollout is not accepted; on success, it retains the accepted revision pin. The production TLS directory and localhost-only panel bind are maintained in the Dokploy environment.
+The release gate runs the rollout behavior suite and the database-backed
+`first_join_flow` regression before mutating Dokploy or Respond5. Set
+`TEST_DATABASE_URL` to a disposable PostgreSQL database; if it is unset or the
+regression fails, the release stops before production changes.
 
-For the one-time unlabelled production transition only, run the guarded release with `--legacy-baseline-manifest deployment/legacy-baseline-respond5.json`. That explicit flag rechecks the full operator-reviewed current inventory and writes a root-owned `legacy-baseline-inventory.json` attestation with `provenance_status=legacy-unproven`; it does not add or claim an OCI source label for any old image. If live digests, payload hashes, worker ID/executable/config/lease, service state, or the approved checkout differ, it refuses before migration. The manifest contains digests/IDs but no `.env` contents or OAuth/API credentials. The remote preflight makes a root-owned mode-0600 recovery copy of the exact Dokploy `.env` under `/srv/kurbis/legacy-baseline-environment/`; it is not returned, logged, or added to the repository, and is used only to restore the attested environment if a guarded rollback is needed.
+Dokploy must use `docker-compose` mode with no custom command. The runner
+verifies Dokploy's generated build-enabled command, rejects enabled patches for
+`compose.yaml`, and keeps `autoDeploy` disabled. Git is the sole source of
+truth for Compose, build arguments, CI configuration, TLS mounts, and worker
+settings. The release temporarily selects the immutable tag, validates the
+healthy stack and worker lease, then restores the configured `main` source
+branch. A failed rollout keeps the lock and transaction evidence until both app
+and worker recovery are verified.
 
-Before the new application deploy, respond5 builds Pumpkin from the clean, pinned release archive and requires the actual runtime payload hashes (Pumpkin executable, Kurbis WASM plugin, hosted entrypoint) to match both the attested old mutable worker image and the live waiting image. Only then it tags that same verified artifact with the candidate full source SHA, changes the protected worker config, restarts the worker, and verifies unchanged worker executable plus a renewing lease. Migration is journaled and retryable; any mismatch or failed check restores the previous config/service. No server or world data is touched.
+Respond5 builds the pinned Pumpkin runtime from the exact release source and
+checks the executable, WASM plugin, hosted entrypoint, OCI labels, embedded
+revision, worker configuration, and renewing lease. Recovery uses only the
+verified previous SHA and never removes PostgreSQL data, named volumes, worlds,
+or object-store data.
 
 Respond5 writes the accepted-release marker only after app and waiting-Pumpkin OCI labels and embedded revisions match the selected SHA, the waiting container's actual Pumpkin executable matches the independently built host-control image, and the worker binary/environment/lease transaction is verified. If post-deploy worker verification fails or its SSH response is lost, the wrapper idempotently restores the previous worker bundle and asks Dokploy to redeploy the prior app revision. For the one-time legacy path, rollback is constrained to the captured old image digests or images labeled with the attempted candidate SHA; it restores exact local image tags with `docker compose up --no-build --no-deps`, leaves Postgres and named volumes untouched, then restores the captured worker executable and protected legacy config. It verifies all exact service image digests, health, worker ID/executable/config and renewing lease before considering recovery verified. Legacy recovery remains explicitly marked `legacy-unproven`; only a later successful SHA-labeled release creates a source-proven marker. An unverified rollback retains protected transaction state; do not treat it as a successful release.
 
@@ -34,3 +53,5 @@ health contract), every service image and OCI revision matches the manifest,
 and the worker executable, protected environment, identity, and database lease
 still match. The manifest itself is content-addressed and tamper-checked before
 `deployed-release.json` is written.
+
+For stranded CI coordination rows, use the bounded, dry-run-first procedure in [`ci-cleanup.md`](ci-cleanup.md). It releases only expired coordination markers and requires an exact confirmation phrase, an immutable candidate audit file, and a verified PostgreSQL backup reference before applying changes.
