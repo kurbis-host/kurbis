@@ -138,10 +138,19 @@ impl PumpkinControl {
         Ok(())
     }
 
+    /// Keep the lifecycle status in the existing action-bar surface and ask
+    /// the runtime to mirror it into Java chat. The runtime decides whether a
+    /// second packet is needed for the connected edition, so Bedrock clients do
+    /// not receive duplicate system messages.
     pub async fn message(&self, socket: &Path, player_id: Uuid, message: &str) -> Result<()> {
         self.request(
             socket,
-            json!({"action":"message", "player_id":player_id, "message":message}),
+            json!({
+                "action":"message",
+                "player_id":player_id,
+                "message":message,
+                "chat":true,
+            }),
         )
         .await?;
         Ok(())
@@ -251,6 +260,41 @@ impl PumpkinControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn message_request_requests_a_chat_copy() {
+        use std::path::PathBuf;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let path = PathBuf::from("/tmp").join(format!("kurbis-message-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let player_id = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["action"], "message");
+            assert_eq!(request["player_id"], player_id.to_string());
+            assert_eq!(request["message"], "Queued for build…");
+            assert_eq!(request["chat"], true);
+            write_half.write_all(b"{\"ok\":true}\n").await.unwrap();
+        });
+
+        PumpkinControl::new("test-token".into())
+            .message(&path, player_id, "Queued for build…")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn host_control_reports_verified_java_and_bedrock_identities_per_connection() {
