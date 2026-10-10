@@ -70,8 +70,11 @@ services:
     build:
       context: .
       dockerfile: runtime/Dockerfile
+      # List form makes Compose read BUILD_REVISION from the --env-file even
+      # when Dokploy invokes Compose through env -i. Mapping interpolation
+      # otherwise falls back to development in that environment.
       args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+        - BUILD_REVISION
     entrypoint: [/usr/local/bin/control-plane]
     environment: *control-plane-environment
     volumes:
@@ -101,8 +104,11 @@ services:
       context: .
       dockerfile: runtime/pumpkin/Dockerfile
       target: waiting
+      # List form makes Compose read BUILD_REVISION from the --env-file even
+      # when Dokploy invokes Compose through env -i. Mapping interpolation
+      # otherwise falls back to development in that environment.
       args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+        - BUILD_REVISION
     environment:
       PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
@@ -161,8 +167,11 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      # List form makes Compose read BUILD_REVISION from the --env-file even
+      # when Dokploy invokes Compose through env -i. Mapping interpolation
+      # otherwise falls back to development in that environment.
       args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+        - BUILD_REVISION
     ports:
       - ${PANEL_BIND_ADDRESS:-127.0.0.1}:${PANEL_PORT}:3000
     environment:
