@@ -86,7 +86,7 @@ async fn production_like_snapshot_upgrades_without_losing_runtime_rows_or_proven
             sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
                 .fetch_all(&pool)
                 .await?;
-        assert!(versions.last().copied().unwrap_or_default() >= 16);
+        assert!(versions.last().copied().unwrap_or_default() >= 17);
         assert_eq!(
             versions,
             (1..=versions.last().copied().unwrap_or_default()).collect::<Vec<_>>()

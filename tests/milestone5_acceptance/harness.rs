@@ -6,10 +6,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use kurbis_hoster::ci::{
-    ArtifactCache, BuildKey, BuildPipelineError, BuildRequest, CheckRunClient, CiBuildStage,
-    CiHostname, CiPoller, CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeCoordinator,
-    CiPreviewRuntimeHost, CiPreviewRuntimeRepository, CiPreviewState, CiRefKind,
-    CiRuntimePlacement, CiRuntimeState, ControlledBuildOutput, ControlledBuildPipeline,
+    ArtifactCache, BuildKey, BuildPipelineError, BuildRequest, CheckRunClient, CiBuildRetention,
+    CiBuildStage, CiHostname, CiPoller, CiPollerConfig, CiPreviewRepository,
+    CiPreviewRuntimeCoordinator, CiPreviewRuntimeHost, CiPreviewRuntimeRepository, CiPreviewState,
+    CiRefKind, CiRuntimePlacement, CiRuntimeState, ControlledBuildOutput, ControlledBuildPipeline,
     ControlledBuilder, PatchApplier, PollCheckpoint, PollError, PollResult, RuntimeCapability,
     SandboxLimits, SourceControlClient, SourceRef, SourceRefKind,
 };
@@ -183,7 +183,7 @@ impl ArtifactCache for LocalArtifactCache {
         digest: &str,
         object_key: &str,
         bytes: &[u8],
-        expires_at: chrono::DateTime<Utc>,
+        expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<kurbis_hoster::ci::BuildOutput, kurbis_hoster::ci::CiServiceError> {
         self.cache.put(digest, object_key, bytes, expires_at).await
     }
@@ -492,7 +492,10 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
             .len(),
         0
     );
-    assert!(repository.mark_build_requested(build.id).await.unwrap());
+    repository
+        .enqueue_pull_request_build(REPOSITORY, 5005, &key, Some("contributor/Pumpkin"))
+        .await
+        .unwrap();
     assert_eq!(
         repository
             .queued_pull_request_builds(REPOSITORY)
@@ -546,6 +549,7 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
         key: key.clone(),
         source_repository: Some("contributor/Pumpkin".to_owned()),
         source_archive: Vec::new(),
+        retention: CiBuildRetention::Preview,
     };
     let (left, right) = tokio::join!(
         build_pipeline.run(request.clone()),
@@ -785,6 +789,7 @@ async fn failed_remote_build_and_failed_runtime_start_leave_no_ready_or_live_rou
         key,
         source_repository: Some("contributor/Pumpkin".to_owned()),
         source_archive: Vec::new(),
+        retention: CiBuildRetention::Preview,
     };
     assert!(build_pipeline.run(request).await.is_err());
     let (stage, digest, _log, retry_count) = query_build(&pool, build.id).await;
@@ -827,6 +832,7 @@ async fn failed_remote_build_and_failed_runtime_start_leave_no_ready_or_live_rou
         .unwrap(),
         source_repository: Some("contributor/Pumpkin".to_owned()),
         source_archive: Vec::new(),
+        retention: CiBuildRetention::Preview,
     };
     build_pipeline.run(request).await.unwrap();
     repository
@@ -877,7 +883,7 @@ impl ArtifactCache for BadDigestCache {
         _digest: &str,
         object_key: &str,
         bytes: &[u8],
-        _expires_at: chrono::DateTime<Utc>,
+        _expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<kurbis_hoster::ci::BuildOutput, kurbis_hoster::ci::CiServiceError> {
         Ok(kurbis_hoster::ci::BuildOutput {
             artifact_digest: "not-the-content-digest".to_owned(),
@@ -950,6 +956,7 @@ async fn artifact_receipt_digest_mismatch_fails_closed_before_ready_alias() {
         key,
         source_repository: Some("contributor/Pumpkin".to_owned()),
         source_archive: b"source".to_vec(),
+        retention: CiBuildRetention::Preview,
     };
     let error = build_pipeline
         .run(request)

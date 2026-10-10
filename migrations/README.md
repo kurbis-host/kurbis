@@ -9,7 +9,7 @@ SQLx SHA-384 checksum for every migration and a SHA-256 over the ordered
 inventory. The release gate refuses to run with a missing, duplicated, renamed,
 or modified migration entry.
 
-The history currently ends at version 16. The stable CI-build retention change
+The history currently ends at version 17. The stable CI-build retention change
 is version 16 because version 14 is already the deployed repository-poll lease
 migration; an earlier un-applied duplicate-number candidate was removed before
 this manifest was introduced. The runtime-stats migration is version 15. This

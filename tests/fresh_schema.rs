@@ -10,7 +10,7 @@ use uuid::Uuid;
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 const MIGRATION_MANIFEST_SHA256: &str =
-    "a2c70e5506eeb7ffe6bf72bc612e9634a016fef9dd0505c9ee5d738335ecde80";
+    "de4f66bbd5ee591e254c969f899e86f32e35604fbf629b6dbab5365a3c73e024";
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -38,7 +38,7 @@ fn migration_manifest_is_canonical_and_append_only() {
         .iter()
         .map(|record| record["version"].as_i64().expect("migration version"))
         .collect();
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
     let mut payload = value.as_object().expect("manifest object").clone();
     payload.remove("manifest_sha256");
     let canonical = format!(
@@ -136,7 +136,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -215,7 +215,7 @@ async fn verify_applied_history_upgrade(options: PgConnectOptions) -> anyhow::Re
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
     pool.close().await;
