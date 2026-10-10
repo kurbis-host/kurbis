@@ -166,6 +166,7 @@ where
     S: SourceControlClient + 'static,
     A: ArtifactCache + 'static,
 {
+    super::CheckedInPumpkinPatcher::verify_runtime_dependencies()?;
     let runtime = Arc::new(SshBubblewrapBuildRuntime::new(
         repository.pool(),
         ssh_target,

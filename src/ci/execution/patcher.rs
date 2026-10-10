@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, process::Command as HostCommand};
 
 use tokio::process::Command;
 
@@ -12,6 +12,7 @@ const HOST_CONTROL_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/host-
 const SNAPSHOT_BARRIER_PATCH: &[u8] =
     include_bytes!("../../../runtime/pumpkin/snapshot-barrier.patch");
 const NETHERNET_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/nethernet-gateway.patch");
+const HOST_PATCHER_CAPABILITY: &[u8] = b"git-runtime-v1";
 const HOST_CONTROL_RS: &[u8] = include_bytes!("../../../runtime/pumpkin/host_control.rs");
 const PUMPKIN_REVISION: &[u8] = include_bytes!("../../../runtime/pumpkin/REVISION");
 const PLUGIN_0: &[u8] = include_bytes!("../../../plugins/kurbis-control/Cargo.toml");
@@ -28,6 +29,7 @@ const PLUGIN_7: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/menu
 pub fn checked_in_patch_fingerprint() -> String {
     let mut hasher = blake3::Hasher::new();
     for (name, bytes) in [
+        ("host-patcher-capability", HOST_PATCHER_CAPABILITY),
         ("pumpkin-revision", PUMPKIN_REVISION),
         ("host-control.patch", HOST_CONTROL_PATCH),
         ("snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH),
@@ -54,6 +56,29 @@ pub fn checked_in_patch_fingerprint() -> String {
 pub struct CheckedInPumpkinPatcher;
 
 impl CheckedInPumpkinPatcher {
+    /// Verify the host dependency used by the patcher before exposing CI.
+    ///
+    /// Remote Bubblewrap compilation still performs source patching in the
+    /// control-plane process, so a runtime image without Git cannot be
+    /// considered CI-capable even when the remote builder is healthy.
+    pub fn verify_runtime_dependencies() -> Result<(), BuildPipelineError> {
+        let output = HostCommand::new("git")
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                BuildPipelineError::Sandbox(format!(
+                    "CI patcher requires git in the control-plane runtime: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(BuildPipelineError::Sandbox(format!(
+                "CI patcher git preflight failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     async fn apply_patch(
         root: &Path,
         filename: &str,
@@ -235,6 +260,11 @@ fn archive_error(error: ArchiveError) -> BuildPipelineError {
 mod tests {
     use super::*;
     use crate::ci::PatchApplier;
+
+    #[test]
+    fn patcher_runtime_dependency_preflight_succeeds_when_git_is_available() {
+        CheckedInPumpkinPatcher::verify_runtime_dependencies().unwrap();
+    }
 
     #[test]
     fn patch_fingerprint_is_derived_from_every_checked_in_input() {
