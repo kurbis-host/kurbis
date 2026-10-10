@@ -276,7 +276,11 @@ async fn running_pr_alias_is_not_rebound_to_a_new_patch_candidate() {
         .advance_stable_aliases_for_build(old_build.id, CI_ROOT_DOMAIN)
         .await
         .unwrap();
-    let ready = repository.lookup_preview(&alias.value).await.unwrap().unwrap();
+    let ready = repository
+        .lookup_preview(&alias.value)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ready.state, CiPreviewState::Ready);
     let running = repository.mark_preview_running(ready.id).await.unwrap();
 
