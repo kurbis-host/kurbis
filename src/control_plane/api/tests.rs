@@ -317,6 +317,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
         },
         http: reqwest::Client::new(),
         object_store: Arc::new(object_store::memory::InMemory::new()),
+        supervision: crate::control_plane::supervision::SupervisorRegistry::new(),
     })
 }
 

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use aide::{
     axum::{
@@ -12,6 +12,7 @@ use aide::{
 };
 use axum::{
     Json, Router,
+    extract::State,
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -22,7 +23,6 @@ use reqwest::Client;
 use schemars::JsonSchema;
 use serde::Serialize;
 use sqlx::PgPool;
-use tokio::time::sleep;
 use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 use crate::config::ControlPlaneConfig;
@@ -32,6 +32,7 @@ use super::lifecycle::LifecycleFailure;
 use super::{
     auth,
     lifecycle::{Lifecycle, LifecycleCommandError},
+    supervision::SupervisorRegistry,
 };
 
 mod account;
@@ -101,6 +102,8 @@ pub struct AppState {
     pub config: ControlPlaneConfig,
     pub http: Client,
     pub object_store: Arc<dyn ObjectStore>,
+    /// Read-only lifecycle projection for supervised non-HTTP workers.
+    pub supervision: SupervisorRegistry,
 }
 
 #[derive(Debug)]
@@ -311,9 +314,26 @@ fn add_security_schemes(
     )
 }
 
+async fn healthz(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.supervision.is_healthy().await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.supervision.is_ready().await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 fn api_router() -> ApiRouter<Arc<AppState>> {
     ApiRouter::new()
-        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .api_route(
             "/auth/{provider}/login",
             api_get_with(auth::login, |operation| {
@@ -669,15 +689,4 @@ pub fn router(state: Arc<AppState>) -> Router {
             auth::renew_session_cookie,
         ))
         .with_state(state)
-}
-
-pub fn spawn_queue_drain(lifecycle: Lifecycle) {
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = lifecycle.drain_queue_once().await {
-                tracing::error!(?error, "failed to drain start queue");
-            }
-            sleep(Duration::from_secs(2)).await;
-        }
-    });
 }

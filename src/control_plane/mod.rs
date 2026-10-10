@@ -5,3 +5,4 @@ pub mod lifecycle;
 pub mod maintenance;
 pub mod object_cleanup;
 pub mod snapshots;
+pub mod supervision;

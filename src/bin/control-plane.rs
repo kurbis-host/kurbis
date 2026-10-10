@@ -1,24 +1,41 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use kurbis_hoster::{
     ci::{
-        ArtifactCache, BuildCoordinator, CI_RUNTIME_IDLE_SECONDS, CiBuildIdentity, CiPoller,
-        CiPollerConfig, CiPreviewRepository, CiPreviewRuntimeRepository, GitHubCheckRunClient,
-        GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard, GitHubSourceControl,
-        ObjectArtifactCache, POLL_INTERVAL_SECONDS, bubblewrap_pipeline, docker_pipeline,
-        remote_bubblewrap_pipeline,
+        BuildCoordinator, CiBuildIdentity, CiPoller, CiPollerConfig, CiPreviewRepository,
+        GitHubCheckRunClient, GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard,
+        GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, PollError,
+        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
     },
     config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
+    control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
     control_plane::{
-        api::{AppState, router, spawn_queue_drain},
+        api::{AppState, router},
         lifecycle::Lifecycle,
-        maintenance::{
-            WorkerMaintenance, cleanup_stale_ci_preview_deletions, spawn_worker_maintenance,
-        },
+        maintenance::{CiPreviewMaintenance, WorkerMaintenance},
     },
     db, init_tracing,
 };
+
+fn classify_ci_poll_failure(error: Error) -> WorkerError {
+    let Some(poll_error) = error.downcast_ref::<PollError>() else {
+        return WorkerError::retryable(error);
+    };
+    match poll_error {
+        PollError::InvalidResponse(_) => WorkerError::fatal(error),
+        PollError::Http { status, .. }
+            if *status == reqwest::StatusCode::UNAUTHORIZED
+                || *status == reqwest::StatusCode::FORBIDDEN
+                || *status == reqwest::StatusCode::NOT_FOUND =>
+        {
+            WorkerError::fatal(error)
+        }
+        PollError::Http { .. } | PollError::RateLimited { .. } | PollError::Transport(_) => {
+            WorkerError::retryable(error)
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,8 +45,52 @@ async fn main() -> Result<()> {
     let pool = db::connect(&config.common.database_url).await?;
     db::migrate(&pool).await?;
     let lifecycle = Lifecycle::new(pool.clone());
-    spawn_queue_drain(lifecycle.clone());
-    spawn_worker_maintenance(WorkerMaintenance::new(pool.clone(), object_store.clone()));
+    let supervision = SupervisorRegistry::new();
+    let mut workers = Supervisor::new(supervision.clone());
+    let queue_lifecycle = lifecycle.clone();
+    workers.spawn(
+        "start-queue",
+        SupervisorConfig::required(std::time::Duration::from_secs(2)),
+        move || {
+            let lifecycle = queue_lifecycle.clone();
+            async move {
+                lifecycle
+                    .drain_queue_once()
+                    .await
+                    .map(|_| ())
+                    .map_err(WorkerError::retryable)
+            }
+        },
+    );
+    let maintenance = WorkerMaintenance::new(pool.clone(), object_store.clone());
+    workers.spawn(
+        "worker-maintenance",
+        SupervisorConfig::required(std::time::Duration::from_secs(30)),
+        move || {
+            let maintenance = maintenance.clone();
+            async move {
+                match maintenance.run_once().await {
+                    Ok(report) => {
+                        if report.operations_assigned > 0
+                            || report.exports_assigned > 0
+                            || report.exports_requeued > 0
+                            || report.exports_expired > 0
+                            || report.garbage_collection.chunks_deleted > 0
+                            || report.garbage_collection.manifests_deleted > 0
+                            || report.garbage_collection.exports_deleted > 0
+                            || report.garbage_collection.staging_deleted > 0
+                            || report.ci_world_snapshot_gc_completed > 0
+                            || report.github_webhook_processed_gc_deleted > 0
+                        {
+                            tracing::info!(?report, "worker maintenance completed");
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(WorkerError::retryable(error)),
+                }
+            }
+        },
+    );
     let mut ci_build_coordinator: Option<Arc<dyn BuildCoordinator>> = None;
     let mut ci_build_identity: Option<CiBuildIdentity> = None;
     if let Some(ci_config) = CiConfig::from_env()? {
@@ -154,55 +215,15 @@ async fn main() -> Result<()> {
             toolchain_version: effective_toolchain_version.clone(),
             target_architecture: ci_config.target_architecture.clone(),
         });
-        let expiry_repository = ci_repository.clone();
-        let runtime_repository = CiPreviewRuntimeRepository::new(pool.clone());
-        let artifact_cache = ObjectArtifactCache::new(pool.clone(), object_store.clone());
-        let ci_runtime_object_store = object_store.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let now = chrono::Utc::now();
-                if let Err(error) = expiry_repository.expire(now).await {
-                    tracing::error!(?error, "failed to expire CI preview metadata");
-                }
-                // Claiming these rows is the control-plane-to-worker lifecycle
-                // signal. Assigned workers perform graceful idle stops or
-                // generation-fenced world deletion during their next reconcile.
-                if let Err(error) = runtime_repository.claim_expired(now, 128).await {
-                    tracing::error!(?error, "failed to queue expired CI runtime cleanup");
-                }
-                if let Err(error) = cleanup_stale_ci_preview_deletions(
-                    &runtime_repository,
-                    ci_runtime_object_store.clone(),
-                    128,
-                )
-                .await
-                {
-                    tracing::error!(
-                        ?error,
-                        "failed to reclaim expired CI worlds from stale workers"
-                    );
-                }
-                // Rehome checkpointed runtimes before the idle claimant can
-                // transition a stale worker's placement to `stopping`.
-                if let Err(error) = runtime_repository.reconcile_stale_workers(128).await {
-                    tracing::error!(?error, "failed to reconcile stale CI preview workers");
-                }
-                if let Err(error) = runtime_repository
-                    .claim_idle(chrono::Duration::seconds(CI_RUNTIME_IDLE_SECONDS), 128)
-                    .await
-                {
-                    tracing::error!(?error, "failed to queue idle CI runtime shutdown");
-                }
-                if let Err(error) = runtime_repository.request_due_world_snapshots(128).await {
-                    tracing::error!(?error, "failed to request periodic CI world snapshots");
-                }
-                if let Err(error) = artifact_cache.delete_expired(now).await {
-                    tracing::error!(?error, "failed to delete expired CI artifacts");
-                }
-            }
-        });
+        let ci_maintenance = CiPreviewMaintenance::new(pool.clone(), object_store.clone());
+        workers.spawn(
+            "ci-preview-maintenance",
+            SupervisorConfig::required(std::time::Duration::from_secs(60)),
+            move || {
+                let maintenance = ci_maintenance.clone();
+                async move { maintenance.run_once().await.map_err(WorkerError::retryable) }
+            },
+        );
         let ci_poller = CiPoller::new(ci_repository, std::sync::Arc::new(source))
             .with_check_runs(check_runs)
             .with_config(CiPollerConfig {
@@ -218,22 +239,34 @@ async fn main() -> Result<()> {
         // its delivery consumer merely because a PAT is configured.
         if config.ci_github_webhook_enabled {
             let webhook_poller = ci_poller.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(error) = webhook_poller.drain_github_webhooks_once().await {
-                        tracing::error!(
-                            ?error,
-                            "failed to process queued GitHub PR webhook deliveries"
-                        );
+            workers.spawn(
+                "ci-github-webhook",
+                SupervisorConfig::optional(std::time::Duration::from_secs(2)),
+                move || {
+                    let webhook_poller = webhook_poller.clone();
+                    async move {
+                        webhook_poller
+                            .drain_github_webhooks_once()
+                            .await
+                            .map_err(WorkerError::retryable)
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            });
+                },
+            );
         }
-        tokio::spawn(ci_poller.run_forever(
-            watched.id,
-            std::time::Duration::from_secs(POLL_INTERVAL_SECONDS),
-        ));
+        let repository_id = watched.id;
+        workers.spawn(
+            format!("ci-poller:{repository_id}"),
+            SupervisorConfig::required(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)),
+            move || {
+                let poller = ci_poller.clone();
+                async move {
+                    poller
+                        .poll_with_retry(repository_id, 3)
+                        .await
+                        .map_err(classify_ci_poll_failure)
+                }
+            },
+        );
     }
     let listen = config.listen;
     let state = Arc::new(AppState {
@@ -243,6 +276,7 @@ async fn main() -> Result<()> {
         lifecycle,
         config,
         object_store,
+        supervision,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
@@ -250,6 +284,11 @@ async fn main() -> Result<()> {
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "control plane listening");
-    axum::serve(listener, router(state)).await?;
+    let server = axum::serve(listener, router(state)).into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        result = workers.run() => result?,
+    }
     Ok(())
 }

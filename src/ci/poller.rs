@@ -593,24 +593,18 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             }
         }
     }
+    /// Poll the watched repository at a fixed cadence without detaching work.
+    /// Callers that need process-level lifecycle ownership should run this
+    /// future from their supervisor and retain its join handle.
     pub async fn run_forever(self, repository_id: Uuid, interval: Duration) -> Result<()>
     where
         C: Clone,
     {
         let interval = interval.max(Duration::from_secs(1));
         let mut poll_tick = tokio::time::interval(interval);
-        // Build execution is deliberately detached from the source watcher. A
-        // remote Bubblewrap compile can take tens of minutes; awaiting it here
-        // would stop ETag polling, Check Run reconciliation, and recovery of
-        // other PR heads on this control-plane process.
         loop {
             poll_tick.tick().await;
-            let poller = self.clone();
-            tokio::spawn(async move {
-                if let Err(error) = poller.poll_with_retry(repository_id, 3).await {
-                    tracing::error!(?error, %repository_id, "CI source-control poll failed");
-                }
-            });
+            self.poll_with_retry(repository_id, 3).await?;
         }
     }
 }

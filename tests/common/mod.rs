@@ -52,6 +52,7 @@ pub fn api_state(
         },
         http: reqwest::Client::new(),
         object_store,
+        supervision: kurbis_hoster::control_plane::supervision::SupervisorRegistry::new(),
     })
 }
 
