@@ -103,10 +103,9 @@ async fn spawn_host_control(
                     Some("message") => {
                         let mut state = state.lock().await;
                         if let Some(message) = request["message"].as_str() {
+                            state.messages.push(message.to_owned());
                             if request["chat"].as_bool() == Some(true) {
                                 state.chat_messages.push(message.to_owned());
-                            } else {
-                                state.messages.push(message.to_owned());
                             }
                         }
                         json!({"ok": true})
