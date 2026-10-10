@@ -274,6 +274,47 @@ impl CiPreviewRepository {
         Ok(id)
     }
 
+    /// Recover build rows created before queue admission was introduced, and
+    /// any legacy row inserted while a coordinator was unavailable. This is
+    /// deliberately idempotent: the queue remains the scheduling authority and
+    /// existing desired rows are untouched.
+    pub async fn recover_unqueued_pull_request_builds(&self, repository: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO public.ci_build_queue(
+                repository_id, pull_request_number, commit_sha, build_id,
+                source_repository, state, retry_at, failure_class, last_error,
+                requested_at, started_at, finished_at
+             )
+             SELECT DISTINCT ON (watched.id, ref.number)
+                    watched.id, ref.number, build.commit_sha, build.id,
+                    ref.source_repository,
+                    CASE WHEN build.stage = 'failed' THEN 'failed' ELSE 'pending' END,
+                    build.retry_at, build.failure_class, build.failure_message,
+                    build.created_at, NULL, NULL
+             FROM public.ci_refs ref
+             JOIN public.ci_watched_repositories watched ON watched.id = ref.repository_id
+             JOIN public.ci_builds build
+               ON build.repository = watched.repository AND build.commit_sha = ref.commit_sha
+             WHERE watched.repository = $1 AND watched.enabled
+               AND ref.kind = 'pull_request' AND ref.number IS NOT NULL
+               AND NOT ref.closed AND NOT ref.deleted
+               AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging', 'failed')
+               AND (build.stage <> 'failed' OR build.failure_class = 'transient')
+               AND NOT EXISTS (
+                   SELECT 1 FROM public.ci_build_queue existing
+                   WHERE existing.repository_id = watched.id
+                     AND existing.pull_request_number = ref.number
+                     AND existing.state IN ('pending', 'running', 'failed')
+               )
+             ORDER BY watched.id, ref.number, build.updated_at DESC, build.id
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(repository)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Reclaim expired queue leases, fence requests whose PR head is no longer
     /// current, and atomically claim a bounded batch. Every transaction is
     /// short; no provider or builder work occurs while rows are locked.

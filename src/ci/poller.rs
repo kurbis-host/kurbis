@@ -372,6 +372,20 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             )
             .await?;
         if let Some(builder) = self.builder.as_ref() {
+            // Webhooks can arrive before the provider poll that updates
+            // `ci_refs`. Build this exact signed head before queue claiming
+            // applies the stale-head fence; the immutable build lease still
+            // coalesces duplicate deliveries and the durable queue remains
+            // available for restart/retry recovery.
+            builder
+                .ensure_build(crate::ci::BuildRequest {
+                    key,
+                    source_repository: source_ref.source_repository.clone(),
+                    source_archive: Vec::new(),
+                    retention: CiBuildRetention::Preview,
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("queued CI PR build failed: {error}"))?;
             self.drain_pull_request_queue(repository, builder.as_ref())
                 .await?;
         }
@@ -383,6 +397,13 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         repository: &str,
         builder: &dyn crate::ci::BuildCoordinator,
     ) -> Result<()> {
+        // Queue migration recovers rows that predate the queue table, but a
+        // process can also admit a legacy build between migrations and its next
+        // poll. Reconcile those rows before claiming work so no admitted PR is
+        // stranded merely because queue insertion was unavailable at admission.
+        self.repository
+            .recover_unqueued_pull_request_builds(repository)
+            .await?;
         loop {
             let claims = self
                 .repository
