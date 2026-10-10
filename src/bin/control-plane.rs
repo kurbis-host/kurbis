@@ -7,7 +7,6 @@ use kurbis_hoster::{
         GitHubCheckRunClient, GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard,
         GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, PollError,
         bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
-
     },
     config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
