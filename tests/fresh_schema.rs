@@ -85,7 +85,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=15).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -173,6 +173,18 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
     assert!(
         poll_lease_constraint,
         "poll lease token and expiry must remain paired"
+    );
+
+    let requested_at_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'ci_builds'
+           AND column_name = 'requested_at')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        requested_at_column,
+        "CI queue demand marker must be migrated"
     );
 
     let expected_tables = [

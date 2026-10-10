@@ -41,6 +41,7 @@ pub struct SshBubblewrapBuildRuntime {
     toolchain: String,
     workspace_root: String,
     source_preparer: String,
+    patch_fingerprint: String,
     compiler_cache_root: String,
     compiler_cache_size: u64,
     rustc_version: String,
@@ -88,6 +89,10 @@ impl SshBubblewrapBuildRuntime {
         let toolchain = toolchain.into();
         let workspace_root = workspace_root.into();
         let source_preparer = source_preparer.into();
+        // The source preparer is an operator-mounted executable. Carry the
+        // host-compiled fingerprint into every remote preflight so a stale
+        // preparer cannot silently diverge from the patcher used for admission.
+        let patch_fingerprint = crate::ci::checked_in_patch_fingerprint();
         let compiler_cache_root = std::path::Path::new(&workspace_root)
             .parent()
             .ok_or_else(|| {
@@ -110,7 +115,7 @@ impl SshBubblewrapBuildRuntime {
                 .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         }
         let full_identity = format!(
-            "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};rust={rustc_version}",
+            "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};patch={patch_fingerprint};rust={rustc_version}",
             runner.display()
         );
         let identity = super::bounded_build_identity(
@@ -140,6 +145,7 @@ impl SshBubblewrapBuildRuntime {
             toolchain,
             workspace_root,
             source_preparer,
+            patch_fingerprint,
             compiler_cache_root,
             compiler_cache_size,
             rustc_version,
@@ -223,6 +229,7 @@ impl SshBubblewrapBuildRuntime {
             rootfs: self.rootfs.clone(),
             toolchain: self.toolchain.clone(),
             source_preparer: self.source_preparer.clone(),
+            patch_fingerprint: self.patch_fingerprint.clone(),
             cache_root: self.compiler_cache_root.clone(),
             cache_max_bytes: self.compiler_cache_size,
             source_len: source.len(),
@@ -501,6 +508,7 @@ struct JobHeader {
     rootfs: String,
     toolchain: String,
     source_preparer: String,
+    patch_fingerprint: String,
     cache_root: String,
     cache_max_bytes: u64,
     source_len: usize,

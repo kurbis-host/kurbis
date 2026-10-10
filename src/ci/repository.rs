@@ -147,6 +147,7 @@ impl CiPreviewRepository {
              WHERE build.repository = $1 AND watched.repository = build.repository
                AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
                AND build.stage = 'failed' AND build.failure_class = 'transient'
+               AND build.requested_at IS NOT NULL
                AND build.retry_count <= $2 AND build.retry_at <= now()
                AND build.expires_at > now()
              GROUP BY build.id
@@ -193,21 +194,42 @@ impl CiPreviewRepository {
         repository: &str,
     ) -> Result<Vec<super::services::BuildRequest>> {
         let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
-            "SELECT build.repository, build.commit_sha, build.patch_fingerprint,
-                    build.toolchain_version, build.target_architecture,
-                    COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository
-             FROM ci_builds build
-             JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
-             JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
-             WHERE watched.repository = $1 AND watched.enabled
-               AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
-               AND build.repository = watched.repository
-               AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
-               AND build.expires_at > now()
-               AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
-             GROUP BY build.id
-             ORDER BY build.updated_at, build.id
-             LIMIT 128",
+            "WITH requested AS (
+                 SELECT build.repository, build.commit_sha, build.patch_fingerprint,
+                        build.toolchain_version, build.target_architecture,
+                        COALESCE(max(ref_row.source_repository), max(build.repository)) AS source_repository,
+                        build.requested_at, max(ref_row.updated_at) AS ref_updated_at
+                 FROM ci_builds build
+                 JOIN ci_refs ref_row ON ref_row.commit_sha = build.commit_sha
+                 JOIN ci_watched_repositories watched ON watched.id = ref_row.repository_id
+                 WHERE watched.repository = $1 AND watched.enabled
+                   AND ref_row.kind = 'pull_request' AND NOT ref_row.closed AND NOT ref_row.deleted
+                   AND build.repository = watched.repository
+                   AND build.requested_at IS NOT NULL
+                   AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging')
+                   AND build.expires_at > now()
+                   AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
+                 GROUP BY build.id
+             ), recent AS (
+                 SELECT repository, commit_sha, patch_fingerprint, toolchain_version,
+                        target_architecture, source_repository
+                 FROM requested
+                 WHERE ref_updated_at >= now() - interval '15 minutes'
+                 ORDER BY ref_updated_at DESC, requested_at, commit_sha
+                 LIMIT 96
+             ), aged AS (
+                 SELECT repository, commit_sha, patch_fingerprint, toolchain_version,
+                        target_architecture, source_repository
+                 FROM requested
+                 WHERE ref_updated_at < now() - interval '15 minutes' OR ref_updated_at IS NULL
+                 ORDER BY requested_at, commit_sha
+                 LIMIT 32
+             )
+             SELECT repository, commit_sha, patch_fingerprint, toolchain_version,
+                    target_architecture, source_repository FROM recent
+             UNION ALL
+             SELECT repository, commit_sha, patch_fingerprint, toolchain_version,
+                    target_architecture, source_repository FROM aged"
         )
         .bind(repository)
         .fetch_all(&self.pool)
@@ -256,6 +278,22 @@ impl CiPreviewRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(due.unwrap_or(false))
+    }
+
+    /// Mark a build as explicitly requested so a poller restart can recover it.
+    /// Source polling creates build identities for stable PR aliases, but those
+    /// identities are not work until a current-head event, webhook, or preview
+    /// join asks the coordinator to run them.
+    pub async fn mark_build_requested(&self, build_id: Uuid) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE ci_builds SET requested_at = COALESCE(requested_at, now()), updated_at = now()
+             WHERE id = $1 AND stage NOT IN ('ready', 'expired')",
+        )
+        .bind(build_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
     }
 
     pub async fn claim_build(

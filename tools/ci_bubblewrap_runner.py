@@ -53,6 +53,11 @@ rustc --target "$KURBIS_RUST_TARGET" -C strip=debuginfo /work/tmp/rust-link-prob
 wasm_libdir="$(rustc --print target-libdir --target wasm32-wasip2)"
 test -d "$wasm_libdir" || { echo "WASI target libraries unavailable: $wasm_libdir" >&2; exit 78; }
 test -x /work/.ci-source-preparer || { echo "trusted source preparer unavailable" >&2; exit 78; }
+preparer_fingerprint="$(/work/.ci-source-preparer --print-fingerprint)" || { echo "trusted source preparer fingerprint probe failed" >&2; exit 78; }
+[ "$preparer_fingerprint" = "$KURBIS_EXPECTED_PATCH_FINGERPRINT" ] || {
+  echo "trusted source preparer fingerprint mismatch: expected $KURBIS_EXPECTED_PATCH_FINGERPRINT, got $preparer_fingerprint" >&2
+  exit 78
+}
 mkdir -p /work/tmp/tar-source /work/tmp/tar-dest
 printf probe > /work/tmp/tar-source/probe
 tar -czf /work/tmp/archive-probe.tar.gz -C /work/tmp/tar-source .
@@ -200,6 +205,7 @@ def runner_command(header, workspace, script):
     env_values = {
         "KURBIS_RUST_TARGET": header["target"],
         "KURBIS_EXPECTED_RUSTC": header["rustc"],
+        "KURBIS_EXPECTED_PATCH_FINGERPRINT": header["patch_fingerprint"],
         "KURBIS_BUILD_CACHE_MAX_BYTES": str(validate_cache_size(header["cache_max_bytes"])),
         "KURBIS_BWRAP_GUARANTEE": "bubblewrap_namespace_only",
         "KURBIS_CGROUP_DELEGATION": "remote_probe",
@@ -230,7 +236,7 @@ def main():
         header = json.loads(line)
         if header.get("version") != 1 or header.get("mode") not in ("preflight", "compile"):
             raise ValueError("unsupported job header")
-        if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "workspace_root", "cache_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
+        if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "patch_fingerprint", "workspace_root", "cache_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
             raise ValueError("missing job field")
         if not all(c in "0123456789abcdef" for c in header["job_id"].lower()) or len(header["job_id"]) > 64:
             raise ValueError("invalid job id")

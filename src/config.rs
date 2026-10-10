@@ -138,7 +138,11 @@ impl CiConfig {
         validate_ci_repository(&repository)?;
         let github_api_base_url = value("CI_GITHUB_API_BASE_URL", "https://api.github.com");
         validate_ci_github_api_base_url(&github_api_base_url)?;
-        let patch_fingerprint = checked_in_ci_patch_fingerprint()?;
+        // Keep the admission key identical to the fingerprint enforced by the
+        // host-compiled source preparer.  Do not duplicate the list of trusted
+        // patch/plugin inputs here: a second hash implementation can silently
+        // admit a build key that the preparer rejects (or vice versa).
+        let patch_fingerprint = crate::ci::checked_in_patch_fingerprint();
         let backend = value("CI_BUILDER_BACKEND", "docker");
         let (builder_backend, builder_image, builder_docker_host, toolchain_version) = match backend
             .as_str()
@@ -437,75 +441,6 @@ fn optional_bool(name: &str, default: bool) -> Result<bool> {
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error).context(format!("{name} must be valid UTF-8")),
     }
-}
-
-fn checked_in_ci_patch_fingerprint() -> Result<String> {
-    let roots = [
-        env::var_os("CI_INTEGRATION_SOURCE_ROOT").map(PathBuf::from),
-        Some(env::current_dir()?),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
-    ]
-    .into_iter()
-    .flatten();
-    let root = roots
-        .into_iter()
-        .find(|root| {
-            root.join("runtime/pumpkin/host-control.patch").is_file()
-                && root
-                    .join("runtime/pumpkin/nethernet-gateway.patch")
-                    .is_file()
-        })
-        .context("checked-in Pumpkin integration patches were not found")?;
-    let mut hasher = blake3::Hasher::new();
-    for (label, relative) in [
-        ("pumpkin-revision", "runtime/pumpkin/REVISION"),
-        ("host-control.patch", "runtime/pumpkin/host-control.patch"),
-        (
-            "nethernet-gateway.patch",
-            "runtime/pumpkin/nethernet-gateway.patch",
-        ),
-        ("host_control.rs", "runtime/pumpkin/host_control.rs"),
-        (
-            "trusted-plugin/Cargo.toml",
-            "plugins/kurbis-control/Cargo.toml",
-        ),
-        (
-            "trusted-plugin/Cargo.lock",
-            "plugins/kurbis-control/Cargo.lock",
-        ),
-        (
-            "trusted-plugin/src/actions.rs",
-            "plugins/kurbis-control/src/actions.rs",
-        ),
-        (
-            "trusted-plugin/src/api.rs",
-            "plugins/kurbis-control/src/api.rs",
-        ),
-        (
-            "trusted-plugin/src/chat.rs",
-            "plugins/kurbis-control/src/chat.rs",
-        ),
-        (
-            "trusted-plugin/src/command.rs",
-            "plugins/kurbis-control/src/command.rs",
-        ),
-        (
-            "trusted-plugin/src/lib.rs",
-            "plugins/kurbis-control/src/lib.rs",
-        ),
-        (
-            "trusted-plugin/src/menu.rs",
-            "plugins/kurbis-control/src/menu.rs",
-        ),
-    ] {
-        let contents =
-            std::fs::read(root.join(relative)).with_context(|| format!("read {relative}"))?;
-        hasher.update(&(label.len() as u64).to_be_bytes());
-        hasher.update(label.as_bytes());
-        hasher.update(&(contents.len() as u64).to_be_bytes());
-        hasher.update(&contents);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn native_linux_target_architecture() -> Result<String> {

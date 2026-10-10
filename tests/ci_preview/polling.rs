@@ -270,6 +270,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     .unwrap();
     let (queued, _) = repository.ensure_build(&key).await.unwrap();
     assert_eq!(queued.stage, CiBuildStage::Queued);
+    repository.mark_build_requested(queued.id).await.unwrap();
 
     let source = std::sync::Arc::new(EmptyPollSource);
     let components = std::sync::Arc::new(TestBuildComponents::default());
@@ -2832,10 +2833,10 @@ async fn historical_closed_pull_requests_are_not_requeued_as_stale_builds() {
         .queued_pull_request_builds(&repository_name)
         .await
         .unwrap();
-    assert_eq!(queued_prs.len(), 1);
     assert_eq!(
-        queued_prs[0].key.commit_sha,
-        "fedcba9876543210fedcba9876543210fedcba98"
+        queued_prs.len(),
+        0,
+        "source observation alone must not turn historical PR identities into recoverable build work"
     );
     pool.close().await;
 }
