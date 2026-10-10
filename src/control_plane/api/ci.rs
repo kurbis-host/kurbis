@@ -70,6 +70,130 @@ pub(super) async fn public_status(
     Ok(response)
 }
 
+async fn ensure_pull_request_preview_on_demand(
+    state: &AppState,
+    repository: &CiPreviewRepository,
+    existing: CiPreview,
+) -> Result<CiPreview, ApiError> {
+    // Stable PR aliases are intentionally immutable from the admission path:
+    // a new host patch set must first produce a verified immutable commit
+    // artifact. The build pipeline advances the PR alias only after that
+    // artifact is ready, using advance_stable_aliases_for_build's ref and
+    // runtime guards.
+    if matches!(
+        existing.state,
+        CiPreviewState::Booting | CiPreviewState::Running | CiPreviewState::Stopping
+    ) {
+        return Ok(existing);
+    }
+    let Some(identity) = state.ci_build_identity.as_ref() else {
+        return Ok(existing);
+    };
+    let Some(builder) = state.ci_build_coordinator.as_ref() else {
+        return Ok(existing);
+    };
+    if existing.repository != identity.repository {
+        return Ok(existing);
+    }
+
+    let key = BuildKey::new(
+        &identity.repository,
+        &existing.commit_sha,
+        &identity.patch_fingerprint,
+        &identity.toolchain_version,
+        &identity.target_architecture,
+    )
+    .map_err(|error| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_ci_commit",
+            error.to_string(),
+        )
+    })?;
+    let (build, _) = repository
+        .ensure_build(&key)
+        .await
+        .map_err(ApiError::from)?;
+    let commit_alias = CiHostname::for_ref(
+        CiRefKind::Commit,
+        &existing.commit_sha,
+        crate::ci::CI_ROOT_DOMAIN,
+    )
+    .map_err(|error| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_ci_commit",
+            error.to_string(),
+        )
+    })?;
+    // Keep the stable PR alias on its previous artifact while the candidate
+    // build runs. The immutable commit alias is the only alias rebound here;
+    // even that alias is left alone if it already has an active runtime.
+    let commit_preview = repository
+        .lookup_preview(&commit_alias.value)
+        .await
+        .map_err(ApiError::from)?;
+    let commit_is_active = commit_preview.as_ref().is_some_and(|preview| {
+        matches!(
+            preview.state,
+            CiPreviewState::Booting | CiPreviewState::Running | CiPreviewState::Stopping
+        )
+    });
+    if !commit_is_active {
+        repository
+            .ensure_preview(
+                &identity.repository,
+                &existing.commit_sha,
+                CiRefKind::Commit,
+                None,
+                &commit_alias,
+                build.id,
+            )
+            .await
+            .map_err(ApiError::from)?;
+    }
+
+    if build.stage == crate::ci::CiBuildStage::Ready {
+        repository
+            .advance_stable_aliases_for_build(build.id, crate::ci::CI_ROOT_DOMAIN)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(repository
+            .lookup_preview(&existing.alias.value)
+            .await
+            .map_err(ApiError::from)?
+            .unwrap_or(existing));
+    }
+
+    let retry_due = if build.stage == crate::ci::CiBuildStage::Failed {
+        repository
+            .is_build_retry_due(build.id)
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        false
+    };
+    let should_start = !matches!(
+        build.stage,
+        crate::ci::CiBuildStage::Ready | crate::ci::CiBuildStage::Failed
+    ) || retry_due;
+    if should_start {
+        let builder = builder.clone();
+        let request = BuildRequest {
+            key,
+            source_repository: Some(identity.repository.clone()),
+            source_archive: Vec::new(),
+        };
+        let build_id = build.id;
+        tokio::spawn(async move {
+            if let Err(error) = builder.ensure_build(request).await {
+                tracing::error!(build_id = %build_id, ?error, "on-demand immutable CI PR build failed");
+            }
+        });
+    }
+    Ok(existing)
+}
+
 async fn ensure_commit_preview_on_demand(
     state: &AppState,
     repository: &CiPreviewRepository,
@@ -207,16 +331,20 @@ pub(super) async fn admit(
         .lookup_preview(&request.hostname)
         .await
         .map_err(ApiError::from)?;
-    let is_commit_alias = existing
-        .as_ref()
-        .is_some_and(|preview| preview.alias.kind == CiRefKind::Commit);
-    let preview = if existing.is_none() || is_commit_alias {
-        ensure_commit_preview_on_demand(&state, &repository, &request.hostname, existing.clone())
-            .await?
-            .or(existing)
-    } else {
-        existing
-    };
+    let preview = match existing.clone() {
+        Some(preview) if preview.alias.kind == CiRefKind::PullRequest => {
+            Some(ensure_pull_request_preview_on_demand(&state, &repository, preview).await?)
+        }
+        Some(preview) if preview.alias.kind == CiRefKind::Commit => {
+            ensure_commit_preview_on_demand(&state, &repository, &request.hostname, Some(preview))
+                .await?
+        }
+        None => {
+            ensure_commit_preview_on_demand(&state, &repository, &request.hostname, None).await?
+        }
+        Some(preview) => Some(preview),
+    }
+    .or(existing);
     let Some(preview) = preview else {
         return Err(ApiError::with_code(
             StatusCode::NOT_FOUND,
