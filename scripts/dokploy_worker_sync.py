@@ -36,6 +36,7 @@ CHECKOUT_BACKUP = ROOT / "deploy-checkout-overrides"
 WORKER_BACKUP = ROOT / "worker-rollbacks"
 ENV_BACKUP = ROOT / "worker-bundle-rollbacks"
 MARKER = ROOT / "deployed-release.json"
+RELEASE_MANIFESTS = ROOT / "release-manifests"
 TRANSACTIONS = ROOT / "worker-release-transactions"
 LEGACY = (b"identity_not_linked", b"Link this Minecraft account")
 ADMISSION = b"Join with online Minecraft authentication enabled to create it"
@@ -81,6 +82,60 @@ def digest(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def release_manifest_hash(value: dict) -> str:
+    payload = dict(value)
+    payload.pop("manifest_sha256", None)
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def persist_immutable_release_manifest(value: dict) -> Path:
+    if ROOT.is_symlink() or ROOT.stat().st_uid != 0 or ROOT.stat().st_mode & 0o022:
+        raise Error("release manifest root is unsafe")
+    if not RELEASE_MANIFESTS.exists():
+        RELEASE_MANIFESTS.mkdir(mode=0o700)
+    if (RELEASE_MANIFESTS.is_symlink() or RELEASE_MANIFESTS.stat().st_uid != 0
+            or stat.S_IMODE(RELEASE_MANIFESTS.stat().st_mode) != 0o700):
+        raise Error("release manifest directory ownership/mode invalid")
+    revision = str(value["source_revision"])
+    path = RELEASE_MANIFESTS / f"{revision}.json"
+    content = (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
+    if path.exists():
+        if path.is_symlink() or path.read_bytes() != content:
+            raise Error("immutable release manifest already exists with different contents")
+        return path
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chown(path, 0, 0)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def validate_release_manifest(value: dict) -> None:
+    if value.get("schema") != "kurbis.release-manifest.v1":
+        raise Error("release manifest schema is invalid")
+    if not valid_sha(str(value.get("source_revision", ""))):
+        raise Error("release manifest source revision is invalid")
+    for key in ("migration_manifest_sha256", "environment_revision", "manifest_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key, ""))):
+            raise Error(f"release manifest digest is invalid: {key}")
+    if value.get("status") != "verified" or release_manifest_hash(value) != value.get("manifest_sha256"):
+        raise Error("release manifest is not verified or has been tampered with")
+    keys = value.get("environment_keys")
+    if not isinstance(keys, list) or keys != sorted(set(str(key) for key in keys)):
+        raise Error("release manifest environment key inventory is invalid")
+    image_ids = value.get("service_image_ids")
+    if not isinstance(image_ids, dict) or set(image_ids) != set(SERVICES):
+        raise Error("release manifest service image inventory is incomplete")
 
 
 def identity() -> str:
@@ -197,7 +252,9 @@ def pending_worker_transactions() -> list[Path]:
         record=json.loads(path.read_text(encoding="utf-8"))
         if record.get("status")=="accepted":
             if (marker.get("source_revision")==record.get("source_revision") and marker.get("deployment_id")==record.get("deployment_id")
-                and digest(WORKER)==record.get("new_worker_sha256") and worker_image_value()==record.get("new_pumpkin_image")):
+                and digest(WORKER)==record.get("new_worker_sha256")
+                and digest(WORKER_ENV)==record.get("new_worker_env_sha256")
+                and worker_image_value()==record.get("new_pumpkin_image")):
                 path.unlink()
                 continue
             raise Error("accepted worker transaction does not match current release marker/runtime")
@@ -701,7 +758,8 @@ def worker_transaction(new_binary:bytes,pumpkin_image:str,*,token:str,revision:s
     env_backup=save_backup(ENV_BACKUP,f"worker-env-{old_env_hash}",old_env,0o600,0,0)
     transaction={"token":token,"source_revision":revision,"old_worker_sha256":old_bin_hash,"old_worker_env_sha256":old_env_hash,
         "old_worker_mode":stat.S_IMODE(bm.st_mode),"old_worker_uid":bm.st_uid,"old_worker_gid":bm.st_gid,
-        "old_worker_image":old_image,"new_worker_sha256":hashlib.sha256(new_binary).hexdigest(),"new_pumpkin_image":pumpkin_image}
+        "old_worker_image":old_image,"new_worker_sha256":hashlib.sha256(new_binary).hexdigest(),
+        "new_worker_env_sha256":hashlib.sha256(new_env).hexdigest(),"new_pumpkin_image":pumpkin_image}
     tx_path=write_transaction(token,transaction)
     try:
         mutate_worker_bundle(
@@ -715,7 +773,9 @@ def worker_transaction(new_binary:bytes,pumpkin_image:str,*,token:str,revision:s
         if error.rollback_verified:
             tx_path.unlink(missing_ok=True)
         raise
-    return {"worker_sha256":hashlib.sha256(new_binary).hexdigest(),"worker_changed":str(bin_changed or env_changed).lower(),
+    return {"worker_sha256":hashlib.sha256(new_binary).hexdigest(),
+        "worker_env_sha256":hashlib.sha256(new_env).hexdigest(),
+        "worker_changed":str(bin_changed or env_changed).lower(),
         "rollback_worker_sha256":old_bin_hash,"rollback_worker_env_sha256":old_env_hash}
 
 
@@ -888,7 +948,11 @@ def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,lis
         if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=old_image:raise Error("worker process environment rollback mismatch")
         lease(database_id)
     worker=worker_transaction(new_worker,pumpkin_image,token=token,revision=revision,restart=lambda:run(["systemctl","restart",WORKER_SERVICE]),verify_new=verify_new,verify_old=verify_old)
-    return {"status":"verified","image_id":image,"pumpkin_image":pumpkin_image,"pumpkin_image_id":pumpkin_id,"pumpkin_sha256":pumpkin_sha,**app_hashes,**worker,"worker_id":worker_id(),"worker_lease_verified":"true","worker_pid":str(single_worker())}
+    return {"status":"verified","image_id":image,"pumpkin_image":pumpkin_image,
+        "pumpkin_image_id":pumpkin_id,"pumpkin_sha256":pumpkin_sha,
+        "service_image_ids":{name: current[name][0]["image"] for name in SERVICES},
+        **app_hashes,**worker,"worker_id":worker_id(),"worker_lease_verified":"true",
+        "worker_pid":str(single_worker())}
 
 def wait_sync(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
     with OperationLock():
@@ -930,8 +994,15 @@ def verify_app_revision(revision: str, expected_ids: dict[str, list[dict[str, st
 
 def mark(receipt:str,token:str)->dict[str,str]:
     require_lock(token);data=json.loads(receipt)
-    required=("source_revision","deployment_id","image_id","control_plane_sha256","gateway_sha256","worker_sha256","worker_id","worker_lease_verified","pumpkin_image_id","pumpkin_image","pumpkin_sha256","worker_pid","rollback_worker_sha256","rollback_worker_env_sha256","release_tag","source_archive_sha256","host_control_pumpkin_image")
-    if data.get("status")!="verified" or any(not data.get(key) for key in required):raise Error("release receipt is incomplete")
+    required=("schema","source_revision","deployment_id","image_id","control_plane_sha256","gateway_sha256",
+              "worker_sha256","worker_env_sha256","worker_id","worker_lease_verified","pumpkin_image_id",
+              "pumpkin_image","pumpkin_sha256","worker_pid","rollback_worker_sha256",
+              "rollback_worker_env_sha256","release_tag","source_archive_sha256","host_control_pumpkin_image",
+              "migration_manifest_sha256","environment_revision","environment_keys","manifest_sha256",
+              "service_image_ids")
+    if any(key not in data or data.get(key) in (None, "", []) for key in required):
+        raise Error("release receipt is incomplete")
+    validate_release_manifest(data)
     revision=data["source_revision"]
     if not valid_sha(revision) or data["release_tag"]!=f"kurbis-release-{revision}":raise Error("release receipt source SHA/tag is invalid")
     if data.get("worker_lease_verified")!="true" or data.get("host_control_pumpkin_image")!=data.get("pumpkin_image_id"):
@@ -939,6 +1010,9 @@ def mark(receipt:str,token:str)->dict[str,str]:
     for key in ("control_plane_sha256","gateway_sha256","worker_sha256","pumpkin_sha256","rollback_worker_sha256","rollback_worker_env_sha256","source_archive_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}",str(data.get(key,""))):raise Error(f"release receipt has invalid digest: {key}")
     current=states();cp=current["control-plane"];gw=current["gateway"]
+    expected_images=data["service_image_ids"]
+    if any(len(current[name])!=1 or current[name][0]["image"]!=expected_images[name] for name in SERVICES):
+        raise Error("active service image differs from verified release manifest")
     if len(cp)!=1 or len(gw)!=1 or cp[0]["image"]!=gw[0]["image"] or cp[0]["image"]!=data["image_id"]:raise Error("active application image differs from verified receipt")
     if cp[0]["revision"]!=revision or gw[0]["revision"]!=revision:raise Error("active application revision differs from verified receipt")
     if any(len(current[name])!=1 or current[name][0]["status"]!="running" or (name!="gateway" and current[name][0]["health"]!="healthy") for name in SERVICES):raise Error("production service health failed before acceptance marker")
@@ -947,7 +1021,10 @@ def mark(receipt:str,token:str)->dict[str,str]:
     hashes,_=verify_application_image(data["image_id"],revision)
     if any(data.get(key)!=value for key,value in hashes.items()):raise Error("application executable hashes differ from receipt")
     pid=single_worker()
-    if str(pid)!=str(data.get("worker_pid")) or digest(Path(f"/proc/{pid}/exe"))!=data["worker_sha256"]:raise Error("worker PID/hash changed before release marker")
+    if str(pid)!=str(data.get("worker_pid")) or digest(Path(f"/proc/{pid}/exe"))!=data["worker_sha256"]:
+        raise Error("worker PID/hash changed before release marker")
+    if digest(WORKER_ENV)!=data["worker_env_sha256"]:
+        raise Error("worker environment digest changed before release marker")
     if identity()!=data.get("worker_id") or worker_image()!=data["pumpkin_image"]:raise Error("worker identity/environment differs from verified receipt")
     lease(current["postgres"][0]["id"])
     upstream=run(["git","-C",str(CHECKOUT),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
@@ -958,10 +1035,14 @@ def mark(receipt:str,token:str)->dict[str,str]:
     tx_path=transaction_path(token)
     if not tx_path.is_file() or tx_path.is_symlink():raise Error("pending worker transaction is missing")
     tx=json.loads(tx_path.read_text(encoding="utf-8"))
-    if tx.get("source_revision")!=revision or tx.get("old_worker_sha256")!=data["rollback_worker_sha256"] or tx.get("old_worker_env_sha256")!=data["rollback_worker_env_sha256"]:
+    if (tx.get("source_revision")!=revision
+        or tx.get("old_worker_sha256")!=data["rollback_worker_sha256"]
+        or tx.get("old_worker_env_sha256")!=data["rollback_worker_env_sha256"]
+        or tx.get("new_worker_env_sha256")!=data["worker_env_sha256"]):
         raise Error("worker transaction and release receipt provenance differ")
     tx["deployment_id"]=data["deployment_id"]
     atomic(tx_path,(json.dumps(tx,sort_keys=True)+"\n").encode(),0o600,0,0)
+    persist_immutable_release_manifest(data)
     atomic(MARKER,(json.dumps(data,sort_keys=True)+"\n").encode(),0o600,0,0)
     return {"status":"marked","path":str(MARKER)}
 
@@ -969,9 +1050,15 @@ def mark(receipt:str,token:str)->dict[str,str]:
 def finalize_worker(token: str, revision: str, receipt: str) -> dict[str, str]:
     require_lock(token)
     data=json.loads(receipt)
+    validate_release_manifest(data)
     if data.get("source_revision")!=revision or data.get("status")!="verified":raise Error("finalized worker receipt does not match release")
     marker=json.loads(MARKER.read_text(encoding="utf-8"))
-    if marker.get("source_revision")!=revision or marker.get("deployment_id")!=data.get("deployment_id"):raise Error("acceptance marker does not match worker transaction")
+    if (marker.get("source_revision")!=revision
+        or marker.get("deployment_id")!=data.get("deployment_id")
+        or marker.get("manifest_sha256")!=data.get("manifest_sha256")
+        or release_manifest_hash(marker)!=marker.get("manifest_sha256")):
+        raise Error("acceptance marker does not match worker transaction")
+    persist_immutable_release_manifest(data)
     tx_path=transaction_path(token)
     if not tx_path.is_file() or tx_path.is_symlink():raise Error("pending worker transaction is missing")
     tx=json.loads(tx_path.read_text(encoding="utf-8"))

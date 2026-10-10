@@ -586,7 +586,16 @@ class RolloutTests(unittest.TestCase):
             "worker_pid": "123", "rollback_worker_sha256": "5" * 64,
             "rollback_worker_env_sha256": "6" * 64, "release_tag": f"kurbis-release-{revision}",
             "source_archive_sha256": "7" * 64, "host_control_pumpkin_image": "sha256:pumpkin",
+            "schema": "kurbis.release-manifest.v1", "worker_env_sha256": "8" * 64,
+            "migration_manifest_sha256": "9" * 64, "environment_revision": "a" * 64,
+            "environment_keys": ["BUILD_REVISION"],
+            "service_image_ids": {
+                "control-plane": "sha256:expected", "gateway": "sha256:expected",
+                "panel": "sha256:expected", "waiting-pumpkin": "sha256:expected",
+                "postgres": "sha256:expected",
+            },
         }
+        receipt["manifest_sha256"] = sync.release_manifest_hash(receipt)
         mixed = {name: [{"id": name, "image": "sha256:wrong", "status": "running", "health": "healthy", "revision": revision}]
                  for name in sync.SERVICES}
         mixed["control-plane"][0]["image"] = "sha256:expected"
@@ -965,12 +974,14 @@ class RolloutTests(unittest.TestCase):
         with patch.dict(os.environ, {"TEST_DATABASE_URL": "postgres://disposable"}), patch.object(deploy, "run") as run_mock:
             deploy.run_release_tests()
         commands = [entry.args[0] for entry in run_mock.call_args_list]
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 4)
         self.assertEqual(commands[0][1:4], ["-m", "unittest", "discover"])
         self.assertIn("test_dokploy_worker_rollout.py", commands[0])
         self.assertEqual(commands[1][1:4], ["-m", "unittest", "discover"])
         self.assertIn("test_dokploy_legacy_baseline.py", commands[1])
-        self.assertEqual(commands[2][1:5], ["test", "--locked", "--test", "first_join_flow"])
+        self.assertEqual(commands[2][1:4], ["-m", "unittest", "discover"])
+        self.assertIn("test_release_manifest.py", commands[2])
+        self.assertEqual(commands[3][1:5], ["test", "--locked", "--test", "first_join_flow"])
 
 
 if __name__ == "__main__":

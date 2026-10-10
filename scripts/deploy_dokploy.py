@@ -17,7 +17,13 @@ import urllib.request
 from pathlib import Path
 from typing import Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from migration_manifest import validate_manifest
+from release_manifest import build_release_manifest
+
 ROOT = Path(__file__).resolve().parents[1]
+MIGRATION_MANIFEST = ROOT / "migrations/MANIFEST.json"
 REMOTE = ROOT / "scripts/dokploy_worker_sync.py"
 WORKER_TLS = ROOT / "scripts/dokploy_worker_tls.py"
 LEGACY_REMOTE = ROOT / "scripts/dokploy_legacy_baseline.py"
@@ -70,6 +76,13 @@ def release_revision() -> str:
     if not remote or remote[0] != commit:
         raise DeploymentError("release checkout is not exactly origin/main")
     return commit
+
+
+def migration_manifest_sha256() -> str:
+    try:
+        return validate_manifest(ROOT / "migrations", MIGRATION_MANIFEST)
+    except ValueError as error:
+        raise DeploymentError(f"migration manifest is not immutable or current: {error}") from error
 
 
 def source_inputs(commit: str) -> dict[str, str]:
@@ -283,10 +296,12 @@ def wait_for_terminal_deployments(timeout: int) -> None:
 
 
 def run_release_tests() -> None:
+    migration_manifest_sha256()
     if not os.environ.get("TEST_DATABASE_URL"):
         raise DeploymentError("TEST_DATABASE_URL is required for the disposable first-join database regression")
     run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_dokploy_worker_rollout.py"], cwd=ROOT, timeout=300)
     run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_dokploy_legacy_baseline.py"], cwd=ROOT, timeout=300)
+    run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_release_manifest.py"], cwd=ROOT, timeout=300)
     run(["cargo", "test", "--locked", "--test", "first_join_flow", "--", "--test-threads=1"], cwd=ROOT, timeout=900)
 
 
@@ -570,6 +585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     branch = "main"
     commit = ""
     baseline_revision = ""
+    migration_hash = ""
     baseline: dict | None = None
     receipt: dict | None = None
     legacy_manifest: dict | None = None
@@ -587,6 +603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.compose_id != COMPOSE_ID:
                 raise DeploymentError("only approved Kurbis production Compose target is allowed")
             expected = source_inputs(commit)
+            migration_hash = migration_manifest_sha256()
             run_release_tests()
             if args.legacy_baseline_manifest:
                 try:legacy_manifest=json.loads(args.legacy_baseline_manifest.read_text(encoding="utf-8"))
@@ -670,6 +687,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt.update(status="verified",source_revision=commit,deployment_id=deployment_id,
                            host_control_pumpkin_image=pumpkin.get("pumpkin_image_id"),
                            source_archive_sha256=pumpkin.get("archive_sha256"),release_tag=tag)
+            receipt = build_release_manifest(
+                receipt,
+                migration_manifest_sha256=migration_hash,
+                environment_values={"BUILD_REVISION": commit, **ENV_UPDATES},
+            )
             if release_revision()!=commit:raise DeploymentError("origin/main or local release checkout changed during rollout")
             set_branch(branch)
             accepted=remote(args.worker_host,"accept-stage",token=token,revision=commit)
