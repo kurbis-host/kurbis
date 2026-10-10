@@ -278,6 +278,19 @@ fn handle_health(state: ProxyState) -> StatusCode {
 }
 
 #[test]
+fn proxy_dependency_preflight_fails_closed_for_external_http_and_accepts_valid_paths() {
+    // The production worker's rootless Docker daemon is separate from the
+    // Compose daemon. Local service-alias HTTP is therefore only acceptable
+    // on a worker-side internal bridge; a routed bridge must use HTTPS.
+    let local = Url::parse("http://control-plane:8080").unwrap();
+    assert!(validate_runtime_dependency_configuration(true, &local).is_ok());
+    assert!(validate_runtime_dependency_configuration(false, &local).is_err());
+
+    let remote = Url::parse("https://control.example").unwrap();
+    assert!(validate_runtime_dependency_configuration(false, &remote).is_ok());
+}
+
+#[test]
 fn proxy_egress_requires_ipv4_bridge_and_remote_https() {
     let internal = serde_json::json!({
         "Driver": "bridge",

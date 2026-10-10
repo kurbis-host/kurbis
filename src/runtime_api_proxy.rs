@@ -136,10 +136,7 @@ pub async fn start_container(
     Scope::parse(scope)?;
     let upstream_url = validate_upstream_url(upstream, allow_insecure_upstream)?;
     let internal_egress = verify_egress_network(egress_network).await?;
-    ensure!(
-        internal_egress || upstream_url.scheme() == "https",
-        "non-internal runtime API egress requires an HTTPS control-plane upstream"
-    );
+    validate_runtime_dependency_configuration(internal_egress, &upstream_url)?;
 
     let generation_label = format!("kurbis.generation={generation}");
     let runtime_label = format!("kurbis.runtime_api_proxy={scoped_id}");
@@ -309,6 +306,55 @@ pub async fn start_container(
         let _ = remove_container(scoped_id, generation).await;
         return Err(error);
     }
+    Ok(())
+}
+
+/// Verify the worker-side resources required before a server operation can
+/// start.  The worker and Dokploy Compose stack intentionally use different
+/// Docker daemons in production, so a network or proxy image that exists in
+/// Compose is not evidence that the rootless worker daemon can use it.  Run
+/// this check while the worker is booting (before it acquires its lease), not
+/// after a player has already been left in `starting`.
+pub async fn verify_runtime_dependencies(
+    proxy_image: &str,
+    egress_network: &str,
+    upstream: &str,
+    allow_insecure_upstream: bool,
+) -> Result<()> {
+    let upstream = validate_upstream_url(upstream, allow_insecure_upstream)?;
+    let internal = verify_egress_network(egress_network).await?;
+    validate_runtime_dependency_configuration(internal, &upstream)?;
+
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new("docker")
+            .args(["image", "inspect", proxy_image, "--format", "{{.Id}}"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("inspect runtime API proxy image timed out")??;
+    if !output.status.success() {
+        bail!(
+            "runtime API proxy image {proxy_image} is unavailable to the worker Docker daemon: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    ensure!(
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "runtime API proxy image {proxy_image} has no immutable image ID"
+    );
+    Ok(())
+}
+
+fn validate_runtime_dependency_configuration(internal: bool, upstream: &Url) -> Result<()> {
+    ensure!(
+        internal || upstream.scheme() == "https",
+        "a non-internal runtime API egress network requires an HTTPS control-plane upstream"
+    );
     Ok(())
 }
 

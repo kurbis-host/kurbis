@@ -455,6 +455,18 @@ fn control_socket_alias_for_server(server_id: Uuid) -> PathBuf {
 
 impl DockerRuntime {
     pub async fn verify_sandbox(&self) -> Result<()> {
+        // The worker's rootless Docker daemon is separate from the Compose
+        // daemon that runs the control plane.  Verify both the egress network
+        // and the proxy image against the daemon this worker will actually
+        // use, before the worker acquires a lease and accepts placements.
+        runtime_api_proxy::verify_runtime_dependencies(
+            &self.runtime_api_proxy_image,
+            &self.runtime_api_proxy_egress_network,
+            &self.runtime_api_proxy_upstream,
+            self.runtime_api_proxy_allow_insecure,
+        )
+        .await
+        .context("verify managed-plugin runtime API proxy dependencies")?;
         self.sandbox
             .verify_with_limits(
                 &self.image,
