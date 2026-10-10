@@ -6,7 +6,8 @@ use kurbis_hoster::{
         BuildCoordinator, CiBuildIdentity, CiPoller, CiPollerConfig, CiPreviewRepository,
         GitHubCheckRunClient, GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard,
         GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, PollError,
-        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
+        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
+
     },
     config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
@@ -184,7 +185,7 @@ async fn main() -> Result<()> {
                     workspace_root,
                     source_preparer,
                 } => {
-                    let (pipeline, identity) = remote_bubblewrap_pipeline(
+                    let (pipeline, identity) = remote_bubblewrap_pipeline_ready(
                         CiPreviewRepository::new(pool.clone()),
                         Arc::new(source.clone()),
                         artifacts.clone(),
@@ -199,7 +200,8 @@ async fn main() -> Result<()> {
                         ci_config.plugin_source.clone(),
                         ci_config.build_concurrency,
                         Some(check_runs.clone()),
-                    )?;
+                    )
+                    .await?;
                     (
                         Arc::new(
                             pipeline.with_public_status_base_url(public_status_base_url.clone()),

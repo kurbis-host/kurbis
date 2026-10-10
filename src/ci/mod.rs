@@ -21,6 +21,7 @@ pub use execution::{
     CheckedInPumpkinPatcher, DockerRootlessBuildRuntime, GitHubExactSource,
     MAX_COMPRESSED_SOURCE_BYTES, ROOTLESS_BUILD_LIMITS, RustPumpkinBuilder, bubblewrap_pipeline,
     checked_in_patch_fingerprint, docker_pipeline, remote_bubblewrap_pipeline,
+    remote_bubblewrap_pipeline_ready,
 };
 pub use rate_limit::{GitHubRateLimitConfig, GitHubRateLimitDiagnostics, GitHubRateLimitGuard};
 pub use source_control::{

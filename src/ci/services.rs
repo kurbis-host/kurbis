@@ -81,7 +81,7 @@ pub trait ArtifactCache: Send + Sync {
     async fn delete_expired(&self, now: DateTime<Utc>) -> Result<u64, CiServiceError>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxLimits {
     pub memory_bytes: u64,
     pub cpu_millis: u64,
