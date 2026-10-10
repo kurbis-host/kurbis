@@ -112,9 +112,20 @@ async fn ensure_commit_preview_on_demand(
         .ensure_build(&key)
         .await
         .map_err(ApiError::from)?;
+    // A commit alias may have been created under an older host patch fingerprint.
+    // Rebind only non-running aliases to the current immutable build key so a
+    // source-preparer/host rollout can recover queued previews without ever
+    // moving an active runtime to a different artifact identity.
     let preview = match existing {
-        Some(preview) => preview,
-        None => repository
+        Some(preview)
+            if matches!(
+                preview.state,
+                CiPreviewState::Booting | CiPreviewState::Running | CiPreviewState::Stopping
+            ) =>
+        {
+            preview
+        }
+        _ => repository
             .ensure_preview(
                 &identity.repository,
                 label,
