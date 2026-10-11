@@ -57,6 +57,7 @@ pub struct CiPreviewWorker {
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
     runtime_api_proxy_allow_insecure: bool,
+    runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
 }
 
 impl CiPreviewWorker {
@@ -77,6 +78,7 @@ impl CiPreviewWorker {
         runtime_api_proxy_upstream: String,
         runtime_api_proxy_egress_network: String,
         runtime_api_proxy_allow_insecure: bool,
+        runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
     ) -> Self {
         let runtime_root = root.join("ci-preview-runtime");
         let storage = StorageManager::new(root.join("ci-preview-storage"), storage_mode);
@@ -97,6 +99,7 @@ impl CiPreviewWorker {
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
+            runtime_api_relay,
         }
     }
 
@@ -199,6 +202,7 @@ impl CiPreviewWorker {
                 &network,
                 &self.runtime_api_proxy_egress_network,
                 self.runtime_api_proxy_allow_insecure,
+                Some(self.runtime_api_relay.socket_path()),
             )
             .await?;
             let container = container_name(placement.preview_id);
@@ -358,6 +362,7 @@ impl CiPreviewWorker {
             &network,
             &self.runtime_api_proxy_egress_network,
             self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
         )
         .await?;
         let published_ports = PublishedWorkloadPorts {

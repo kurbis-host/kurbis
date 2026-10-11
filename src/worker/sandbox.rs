@@ -1,4 +1,8 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -843,6 +847,35 @@ pub async fn ensure_rootless_volume_owner(path: &Path, uid: u32, gid: u32) -> Re
         bail!("failed to assign workload storage to the rootless Docker user");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub async fn rootless_docker_socket() -> Result<PathBuf> {
+    let endpoint = docker_output([
+        "context",
+        "inspect",
+        "--format",
+        "{{(index .Endpoints \"docker\").Host}}",
+    ])
+    .await?;
+    let endpoint = endpoint.trim();
+    let socket = endpoint
+        .strip_prefix("unix://")
+        .context("production workloads require a local Unix Docker socket, not a remote daemon")?;
+    let path = PathBuf::from(socket);
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .context("cannot inspect the local rootless Docker socket")?;
+    ensure!(
+        metadata.file_type().is_socket() && metadata.uid() != 0,
+        "Docker socket must be a non-root-owned rootless daemon socket"
+    );
+    Ok(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn rootless_docker_socket() -> Result<PathBuf> {
+    bail!("rootless workload sandbox requires a Linux worker host")
 }
 
 #[cfg(target_os = "linux")]

@@ -10,6 +10,7 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    os::unix::fs::FileTypeExt,
     process::Stdio,
     str::FromStr,
     sync::{
@@ -55,6 +56,9 @@ const IP_TABLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_GET_ATTEMPTS: usize = 2;
 const SCOPE_SERVER: &str = "server";
 const SCOPE_CI: &str = "ci";
+pub(crate) const PROXY_SCOPE_HEADER: &str = "x-kurbis-proxy-scope";
+pub(crate) const PROXY_ID_HEADER: &str = "x-kurbis-proxy-id";
+pub(crate) const RELAY_SOCKET_ENV: &str = "KURBIS_RUNTIME_API_PROXY_RELAY_SOCKET";
 
 #[derive(Clone, Debug)]
 struct ProxyConfig {
@@ -63,20 +67,28 @@ struct ProxyConfig {
     scope: Scope,
     expected_id: Uuid,
     expected_capability_hash: [u8; 32],
+    relay_socket: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Scope {
+pub(crate) enum Scope {
     Server,
     Ci,
 }
 
 impl Scope {
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             SCOPE_SERVER => Ok(Self::Server),
             SCOPE_CI => Ok(Self::Ci),
             _ => bail!("runtime API proxy scope must be server or ci"),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => SCOPE_SERVER,
+            Self::Ci => SCOPE_CI,
         }
     }
 }
@@ -102,16 +114,19 @@ pub async fn start_container(
     runtime_network: &str,
     egress_network: &str,
     allow_insecure_upstream: bool,
+    relay_socket: Option<&std::path::Path>,
 ) -> Result<()> {
     ensure!(
         generation > 0,
         "runtime API proxy generation must be positive"
     );
     let name = container_name(scoped_id, generation);
-    ensure!(
-        runtime_network != egress_network,
-        "runtime and proxy egress networks must differ"
-    );
+    if relay_socket.is_none() {
+        ensure!(
+            runtime_network != egress_network,
+            "runtime and proxy egress networks must differ"
+        );
+    }
     ensure!(
         valid_token(capability),
         "runtime API proxy capability has invalid format"
@@ -124,6 +139,9 @@ pub async fn start_container(
         "runtime API proxy image reference is invalid"
     );
     for network in [runtime_network, egress_network] {
+        if relay_socket.is_some() && network == egress_network {
+            continue;
+        }
         ensure!(
             !network.starts_with('-')
                 && !network.is_empty()
@@ -135,85 +153,114 @@ pub async fn start_container(
     }
     Scope::parse(scope)?;
     let upstream_url = validate_upstream_url(upstream, allow_insecure_upstream)?;
-    let internal_egress = verify_egress_network(egress_network).await?;
-    validate_runtime_dependency_configuration(internal_egress, &upstream_url)?;
+    if relay_socket.is_none() {
+        let internal_egress = verify_egress_network(egress_network).await?;
+        validate_runtime_dependency_configuration(internal_egress, &upstream_url)?;
+    } else {
+        let metadata = tokio::fs::metadata(relay_socket.expect("checked above")).await?;
+        ensure!(
+            metadata.file_type().is_socket(),
+            "runtime API relay socket is unavailable"
+        );
+    }
 
     let generation_label = format!("kurbis.generation={generation}");
     let runtime_label = format!("kurbis.runtime_api_proxy={scoped_id}");
     let allow_insecure = allow_insecure_upstream.to_string();
     let listen = format!("0.0.0.0:{SERVICE_PORT}");
     let hash = blake3::hash(capability.as_bytes()).to_hex().to_string();
+    let mut docker_args = vec![
+        "run".to_owned(),
+        "--detach".to_owned(),
+        "--name".to_owned(),
+        name.clone(),
+        "--restart".to_owned(),
+        "no".to_owned(),
+        "--network".to_owned(),
+        runtime_network.to_owned(),
+        "--network-alias".to_owned(),
+        SERVICE_HOSTNAME.to_owned(),
+        "--memory".to_owned(),
+        "128m".to_owned(),
+        "--memory-swap".to_owned(),
+        "128m".to_owned(),
+        "--cpus".to_owned(),
+        "0.25".to_owned(),
+        "--pids-limit".to_owned(),
+        "64".to_owned(),
+        "--user".to_owned(),
+        "0:0".to_owned(),
+    ];
+    if relay_socket.is_none() {
+        docker_args.extend(["--cap-add".into(), "NET_ADMIN".into()]);
+    }
+    docker_args.extend([
+        "--cap-add".into(),
+        "SETUID".into(),
+        "--cap-add".into(),
+        "SETGID".into(),
+        "--cap-add".into(),
+        "SETPCAP".into(),
+        "--read-only".into(),
+        "--security-opt".into(),
+        "no-new-privileges:true".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--tmpfs".into(),
+        "/tmp:rw,noexec,nosuid,nodev,size=4m".into(),
+        "--health-cmd".into(),
+        "/usr/local/bin/runtime-api-proxy --health-check".into(),
+        "--health-interval".into(),
+        "1s".into(),
+        "--health-timeout".into(),
+        "1s".into(),
+        "--health-retries".into(),
+        "45".into(),
+        "--health-start-period".into(),
+        "45s".into(),
+        "--label".into(),
+        generation_label.clone(),
+        "--label".into(),
+        runtime_label.clone(),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_LISTEN={listen}"),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_UPSTREAM={upstream}"),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_ALLOW_INSECURE={allow_insecure}"),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_SCOPE={scope}"),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_ID={scoped_id}"),
+        "--env".into(),
+        format!("KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH={hash}"),
+    ]);
+    if let Some(relay_socket) = relay_socket {
+        let relay_dir = relay_socket
+            .parent()
+            .context("runtime API relay socket has no parent")?;
+        docker_args.extend([
+            "--env".into(),
+            format!(
+                "{RELAY_SOCKET_ENV}={}",
+                "/run/kurbis-runtime-api/relay.sock"
+            ),
+            "--mount".into(),
+            format!(
+                "type=bind,source={},target=/run/kurbis-runtime-api,readonly",
+                relay_dir.display()
+            ),
+        ]);
+    }
+    docker_args.extend([
+        "--entrypoint".into(),
+        "/usr/local/bin/runtime-api-proxy".into(),
+        image.to_owned(),
+    ]);
     let output = timeout(
         Duration::from_secs(30),
         Command::new("docker")
-            .args([
-                "run",
-                "--detach",
-                "--name",
-                &name,
-                "--restart",
-                "no",
-                "--network",
-                runtime_network,
-                "--network-alias",
-                SERVICE_HOSTNAME,
-                "--memory",
-                "128m",
-                "--memory-swap",
-                "128m",
-                "--cpus",
-                "0.25",
-                "--pids-limit",
-                "64",
-                // Root is container-namespace root only. The process installs its
-                // namespace-local OUTPUT policy, then irreversibly drops privileges.
-                "--user",
-                "0:0",
-                "--cap-add",
-                "NET_ADMIN",
-                "--cap-add",
-                "SETUID",
-                "--cap-add",
-                "SETGID",
-                "--cap-add",
-                "SETPCAP",
-                "--read-only",
-                "--security-opt",
-                "no-new-privileges:true",
-                "--cap-drop",
-                "ALL",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=4m",
-                "--health-cmd",
-                "/usr/local/bin/runtime-api-proxy --health-check",
-                "--health-interval",
-                "1s",
-                "--health-timeout",
-                "1s",
-                "--health-retries",
-                "45",
-                "--health-start-period",
-                "45s",
-                "--label",
-                &generation_label,
-                "--label",
-                &runtime_label,
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_LISTEN={listen}"),
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_UPSTREAM={upstream}"),
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_ALLOW_INSECURE={allow_insecure}"),
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_SCOPE={scope}"),
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_ID={scoped_id}"),
-                "--env",
-                &format!("KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH={hash}"),
-                "--entrypoint",
-                "/usr/local/bin/runtime-api-proxy",
-                image,
-            ])
+            .args(&docker_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -239,34 +286,37 @@ pub async fn start_container(
         );
     }
 
-    let connect = match timeout(
-        Duration::from_secs(30),
-        Command::new("docker")
-            .args(["network", "connect", egress_network, &name])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
+    if relay_socket.is_none() {
+        let connect = match timeout(
+            Duration::from_secs(30),
+            Command::new("docker")
+                .args(["network", "connect", egress_network, &name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let _ = remove_container(scoped_id, generation).await;
+                return Err(error).context("attach runtime API proxy to its egress network");
+            }
+            Err(error) => {
+                let _ = remove_container(scoped_id, generation).await;
+                return Err(error)
+                    .context("attach runtime API proxy to its egress network timed out");
+            }
+        };
+        if !connect.status.success() {
             let _ = remove_container(scoped_id, generation).await;
-            return Err(error).context("attach runtime API proxy to its egress network");
+            bail!(
+                "failed to attach runtime API proxy to egress network {egress_network}: {}",
+                String::from_utf8_lossy(&connect.stderr).trim()
+            );
         }
-        Err(error) => {
-            let _ = remove_container(scoped_id, generation).await;
-            return Err(error).context("attach runtime API proxy to its egress network timed out");
-        }
-    };
-    if !connect.status.success() {
-        let _ = remove_container(scoped_id, generation).await;
-        bail!(
-            "failed to attach runtime API proxy to egress network {egress_network}: {}",
-            String::from_utf8_lossy(&connect.stderr).trim()
-        );
     }
 
     // Readiness is owned by the proxy process: its egress policy is installed
@@ -320,10 +370,19 @@ pub async fn verify_runtime_dependencies(
     egress_network: &str,
     upstream: &str,
     allow_insecure_upstream: bool,
+    relay_socket: Option<&std::path::Path>,
 ) -> Result<()> {
     let upstream = validate_upstream_url(upstream, allow_insecure_upstream)?;
-    let internal = verify_egress_network(egress_network).await?;
-    validate_runtime_dependency_configuration(internal, &upstream)?;
+    if relay_socket.is_none() {
+        let internal = verify_egress_network(egress_network).await?;
+        validate_runtime_dependency_configuration(internal, &upstream)?;
+    } else {
+        let metadata = tokio::fs::metadata(relay_socket.expect("checked above")).await?;
+        ensure!(
+            metadata.file_type().is_socket(),
+            "runtime API relay socket is unavailable"
+        );
+    }
 
     let output = timeout(
         Duration::from_secs(15),
@@ -562,12 +621,27 @@ pub fn container_name(scoped_id: Uuid, generation: i64) -> String {
 /// and allowed through the namespace firewall before the process drops root.
 pub async fn run_from_env() -> Result<()> {
     let config = ProxyConfig::from_env()?;
-    let addresses = resolve_upstream_until_available(&config.upstream).await?;
-    validate_resolved_addresses(&config.upstream, &addresses)?;
-    install_egress_firewall(&config.upstream, &addresses).await?;
+    let addresses = if config.relay_socket.is_some() {
+        Vec::new()
+    } else {
+        let addresses = resolve_upstream_until_available(&config.upstream).await?;
+        validate_resolved_addresses(&config.upstream, &addresses)?;
+        install_egress_firewall(&config.upstream, &addresses).await?;
+        addresses
+    };
     drop_proxy_privileges()?;
 
-    let client = build_pinned_client(&config.upstream, &addresses)?;
+    let client = if let Some(socket) = config.relay_socket.as_ref() {
+        Client::builder()
+            .unix_socket(socket.clone())
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(UPSTREAM_TIMEOUT)
+            .build()
+            .context("build Unix-socket runtime API relay client")?
+    } else {
+        build_pinned_client(&config.upstream, &addresses)?
+    };
     let upstream_healthy = Arc::new(AtomicBool::new(false));
     let state = ProxyState {
         config,
@@ -1019,12 +1093,16 @@ impl ProxyConfig {
         let hash = env::var("KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH")
             .context("KURBIS_RUNTIME_API_PROXY_CAPABILITY_HASH is required")?;
         let hash = hex_decode_32(&hash).context("invalid runtime API proxy capability hash")?;
+        let relay_socket = env::var(RELAY_SOCKET_ENV)
+            .ok()
+            .map(std::path::PathBuf::from);
         Ok(Self {
             listen,
             upstream,
             scope,
             expected_id,
             expected_capability_hash: hash,
+            relay_socket,
         })
     }
 }
@@ -1064,7 +1142,7 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
     }
 
     let query = request.uri().query().map(str::to_owned);
-    let headers = request.headers().clone();
+    let mut headers = request.headers().clone();
     let upstream = match upstream_url(&state.config.upstream, &path, query.as_deref()) {
         Ok(url) => url,
         Err(_) => return status(StatusCode::BAD_GATEWAY),
@@ -1073,6 +1151,15 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
         Ok(body) => body,
         Err(_) => return status(StatusCode::PAYLOAD_TOO_LARGE),
     };
+    headers.insert(
+        PROXY_SCOPE_HEADER,
+        axum::http::HeaderValue::from_static(state.config.scope.as_str()),
+    );
+    headers.insert(
+        PROXY_ID_HEADER,
+        axum::http::HeaderValue::from_str(&state.config.expected_id.to_string())
+            .expect("uuid header is valid"),
+    );
     let result = forward(&state, method, headers, body, upstream).await;
     match result {
         Ok(response) => response,
@@ -1082,7 +1169,7 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
     }
 }
 
-fn route_allowed(scope: Scope, method: &Method, path: &str, expected_id: Uuid) -> bool {
+pub(crate) fn route_allowed(scope: Scope, method: &Method, path: &str, expected_id: Uuid) -> bool {
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -1255,7 +1342,7 @@ fn constant_time_hash_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
-fn valid_token(token: &str) -> bool {
+pub(crate) fn valid_token(token: &str) -> bool {
     token.len() == 43
         && token
             .bytes()
@@ -1285,6 +1372,7 @@ fn is_loopback_or_local_http_host(host: Option<&str>) -> bool {
     host.is_some_and(|host| {
         host.eq_ignore_ascii_case("host.docker.internal")
             || host.eq_ignore_ascii_case("control-plane")
+            || host.eq_ignore_ascii_case("runtime-api-relay")
             || host.eq_ignore_ascii_case("localhost")
             || host == "127.0.0.1"
             || host == "[::1]"

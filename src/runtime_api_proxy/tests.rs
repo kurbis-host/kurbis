@@ -198,6 +198,7 @@ async fn capability_proxy_forwards_allowed_request_and_blocks_scope_escape() {
         scope: Scope::Server,
         expected_id,
         expected_capability_hash: *blake3::hash(token.as_bytes()).as_bytes(),
+        relay_socket: None,
     };
     let proxy_listener = TcpListener::bind(config.listen).await.unwrap();
     let proxy_address = proxy_listener.local_addr().unwrap();
@@ -265,6 +266,7 @@ fn health_is_not_ready_until_the_pinned_upstream_health_check_succeeds() {
         scope: Scope::Server,
         expected_id,
         expected_capability_hash: [0; 32],
+        relay_socket: None,
     };
     let make_state = |healthy| ProxyState {
         config: config.clone(),
@@ -427,6 +429,7 @@ async fn upstream_redirect_is_not_followed_or_exposed_to_the_workload() {
             scope: Scope::Server,
             expected_id: id(),
             expected_capability_hash: *blake3::hash(token.as_bytes()).as_bytes(),
+            relay_socket: None,
         },
         client: build_pinned_client(&upstream_url, &[upstream_address.ip()]).unwrap(),
         upstream_healthy: Arc::new(AtomicBool::new(true)),

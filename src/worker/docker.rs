@@ -43,6 +43,7 @@ pub struct DockerRuntime {
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
     runtime_api_proxy_allow_insecure: bool,
+    runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
 }
 
 impl DockerRuntime {
@@ -60,6 +61,7 @@ impl DockerRuntime {
         runtime_api_proxy_upstream: String,
         runtime_api_proxy_egress_network: String,
         runtime_api_proxy_allow_insecure: bool,
+        runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
     ) -> Result<Self> {
         let ingress = GatewayIngressPolicy::new(gateway_address)?;
         crate::runtime_api_proxy::validate_upstream_url(
@@ -80,6 +82,7 @@ impl DockerRuntime {
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
+            runtime_api_relay,
         })
     }
 
@@ -155,6 +158,7 @@ impl ServerRuntime for DockerRuntime {
                     &network,
                     &self.runtime_api_proxy_egress_network,
                     self.runtime_api_proxy_allow_insecure,
+                    Some(self.runtime_api_relay.socket_path()),
                 )
                 .await?;
                 let ports = workload_ports(self.public_address, self.signal_address, placement)?;
@@ -261,6 +265,7 @@ impl ServerRuntime for DockerRuntime {
             &network,
             &self.runtime_api_proxy_egress_network,
             self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
         )
         .await
         {
@@ -464,6 +469,7 @@ impl DockerRuntime {
             &self.runtime_api_proxy_egress_network,
             &self.runtime_api_proxy_upstream,
             self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
         )
         .await
         .context("verify managed-plugin runtime API proxy dependencies")?;
