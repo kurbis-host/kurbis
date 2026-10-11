@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
