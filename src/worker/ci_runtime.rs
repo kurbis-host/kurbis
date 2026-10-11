@@ -254,7 +254,7 @@ impl CiPreviewWorker {
         validate_quota_volume(&world, CI_RUNTIME_DISK_BYTES as u64)
             .await
             .context("CI world must have a hard quota filesystem")?;
-        let (daemon_uid, daemon_gid) = self.sandbox.rootless_daemon_identity().await?;
+        let (daemon_uid, daemon_gid) = self.sandbox.rootless_container_identity(2613, 2613).await?;
         ensure_rootless_volume_owner(&world, daemon_uid, daemon_gid).await?;
         let runtime_dir = self.runtime_dir(placement.preview_id);
         remove_owned_runtime_dir(&self.runtime_root, placement.preview_id)?;
@@ -646,7 +646,8 @@ impl CiPreviewWorker {
             };
             let world = self.storage.path(placement.preview_id);
             self.storage.reset(placement.preview_id).await?;
-            let (daemon_uid, daemon_gid) = self.sandbox.rootless_daemon_identity().await?;
+            let (daemon_uid, daemon_gid) =
+                self.sandbox.rootless_container_identity(2613, 2613).await?;
             unpack_world_snapshot(
                 &snapshot_path,
                 &world,

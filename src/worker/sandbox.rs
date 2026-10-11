@@ -815,6 +815,10 @@ impl DockerSandbox {
     pub async fn rootless_daemon_identity(&self) -> Result<(u32, u32)> {
         rootless_daemon_identity().await
     }
+
+    pub async fn rootless_container_identity(&self, uid: u32, gid: u32) -> Result<(u32, u32)> {
+        rootless_container_identity(uid, gid).await
+    }
 }
 
 pub async fn ensure_rootless_volume_owner(path: &Path, uid: u32, gid: u32) -> Result<()> {
@@ -826,9 +830,11 @@ pub async fn ensure_rootless_volume_owner(path: &Path, uid: u32, gid: u32) -> Re
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("rootless workload storage must be a real directory");
     }
-    if metadata.uid() == uid && metadata.gid() == gid {
-        return Ok(());
-    }
+    // The top-level directory can already be owned by the rootless daemon while
+    // restored snapshots contain root-owned descendants. Always reconcile the
+    // complete tree before bind-mounting it into a workload; checking only the
+    // root directory lets hosted-entrypoint fail later with a misleading
+    // permission error when it installs managed plugins.
     let status = timeout(
         DOCKER_COMMAND_TIMEOUT,
         Command::new("chown")
@@ -872,6 +878,72 @@ pub async fn rootless_docker_socket() -> Result<PathBuf> {
         "Docker socket must be a non-root-owned rootless daemon socket"
     );
     Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+pub async fn rootless_container_identity(
+    container_uid: u32,
+    container_gid: u32,
+) -> Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let endpoint = docker_output([
+        "context",
+        "inspect",
+        "--format",
+        "{{(index .Endpoints \"docker\").Host}}",
+    ])
+    .await?;
+    let socket = endpoint
+        .trim()
+        .strip_prefix("unix://")
+        .context("production workloads require a local Unix Docker socket")?;
+    let metadata = tokio::fs::metadata(socket).await?;
+    let username = rootless_owner_name(metadata.uid())?;
+    let uid = subordinate_id("/etc/subuid", &username, container_uid)?;
+    let gid = subordinate_id("/etc/subgid", &username, container_gid)?;
+    Ok((uid, gid))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn rootless_container_identity(
+    _container_uid: u32,
+    _container_gid: u32,
+) -> Result<(u32, u32)> {
+    bail!("rootless workload sandbox requires a Linux worker host")
+}
+
+#[cfg(target_os = "linux")]
+fn rootless_owner_name(uid: u32) -> Result<String> {
+    let output = std::process::Command::new("id")
+        .args(["-nu", &uid.to_string()])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "cannot resolve rootless Docker owner name"
+    );
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn subordinate_id(path: &str, username: &str, value: u32) -> Result<u32> {
+    for line in std::fs::read_to_string(path)?.lines() {
+        let mut parts = line.split(':');
+        if parts.next() != Some(username) {
+            continue;
+        }
+        let start: u32 = parts
+            .next()
+            .context("invalid subordinate id range")?
+            .parse()?;
+        let count: u32 = parts
+            .next()
+            .context("invalid subordinate id range")?
+            .parse()?;
+        if value < count {
+            return start.checked_add(value).context("subordinate id overflow");
+        }
+    }
+    bail!("rootless Docker subordinate id range does not cover container id {value}")
 }
 
 #[cfg(not(target_os = "linux"))]

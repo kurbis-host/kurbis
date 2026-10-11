@@ -208,10 +208,17 @@ impl ServerRuntime for DockerRuntime {
             ),
         )
         .await?;
-        let (runtime_uid, runtime_gid) = self.sandbox.rootless_daemon_identity().await?;
+        let (runtime_uid, runtime_gid) =
+            self.sandbox.rootless_container_identity(2613, 2613).await?;
         ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
         persist_runtime_generation(&self.root, server_id, placement.generation).await?;
         prepare_control_socket_alias(server_id, server_dir).await?;
+        // ServerAccess writes managed plugin files as the worker account after
+        // the initial volume preparation. Reconcile the full tree immediately
+        // before bind-mounting it into the non-root Pumpkin process.
+        let (runtime_uid, runtime_gid) =
+            self.sandbox.rootless_container_identity(2613, 2613).await?;
+        ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
 
         let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
         let volume = format!(
