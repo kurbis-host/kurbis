@@ -2,12 +2,15 @@ use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
 
-use sha2::{Digest, Sha384};
+use serde_json::Value;
+use sha2::{Digest, Sha256, Sha384};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
 
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
+const MIGRATION_MANIFEST_SHA256: &str =
+    "9845ea4bffbfb208d789b45f4f74050efdbbb683856f2b06cbdd61c7741b7022";
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -20,6 +23,42 @@ fn production_migration_one_checksum_is_immutable() {
         checksum, PRODUCTION_MIGRATION_ONE_SHA384,
         "migration 0001 is production state and must never be edited; append a new migration instead"
     );
+}
+
+#[test]
+fn migration_manifest_is_canonical_and_append_only() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/MANIFEST.json");
+    let value: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read migration manifest"))
+            .expect("parse migration manifest");
+    assert_eq!(value["schema"], "kurbis.migration-manifest.v1");
+    assert_eq!(value["manifest_sha256"], MIGRATION_MANIFEST_SHA256);
+    let migrations = value["migrations"].as_array().expect("migration records");
+    let versions: Vec<i64> = migrations
+        .iter()
+        .map(|record| record["version"].as_i64().expect("migration version"))
+        .collect();
+    assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+    let mut payload = value.as_object().expect("manifest object").clone();
+    payload.remove("manifest_sha256");
+    let canonical = format!(
+        "{}\n",
+        serde_json::to_string(&payload).expect("canonical manifest")
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        MIGRATION_MANIFEST_SHA256
+    );
+    for record in migrations {
+        let filename = record["filename"].as_str().expect("migration filename");
+        let source = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations")
+                .join(filename),
+        )
+        .expect("read migration source");
+        assert_eq!(format!("{:x}", Sha384::digest(source)), record["sha384"]);
+    }
 }
 
 #[tokio::test]
@@ -44,6 +83,18 @@ async fn production_database_with_only_migration_one_upgrades_without_editing_ba
     })
     .await
     .expect("production migration upgrade assertions");
+}
+
+#[tokio::test]
+async fn production_database_with_applied_history_runs_only_pending_migrations() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to a disposable local PostgreSQL instance");
+    let options = PgConnectOptions::from_str(&database_url).expect("valid TEST_DATABASE_URL");
+    with_disposable_database(options, |options| async move {
+        verify_applied_history_upgrade(options).await
+    })
+    .await
+    .expect("production applied-history migration assertions");
 }
 
 async fn with_disposable_database<F, Fut>(options: PgConnectOptions, test: F) -> anyhow::Result<()>
@@ -85,7 +136,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=18).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -122,6 +173,49 @@ async fn verify_production_upgrade(options: PgConnectOptions) -> anyhow::Result<
     .await?;
 
     kurbis_hoster::db::migrate(&pool).await?;
+    assert_migration_one_checksum(&pool).await?;
+    assert_schema_objects(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn verify_applied_history_upgrade(options: PgConnectOptions) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await?;
+    let migrator =
+        sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+            .await?;
+    for migration in migrator.iter().filter(|migration| migration.version < 17) {
+        sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await?;
+    }
+    sqlx::query(
+        "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY, description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    for migration in migrator.iter().filter(|migration| migration.version < 17) {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time)
+             VALUES ($1, $2, true, $3, 0)",
+        )
+        .bind(migration.version)
+        .bind(migration.description.as_ref())
+        .bind(migration.checksum.as_ref())
+        .execute(&pool)
+        .await?;
+    }
+    kurbis_hoster::db::migrate(&pool).await?;
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(versions, (1..=18).collect::<Vec<_>>());
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
     pool.close().await;
@@ -175,6 +269,18 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
         "poll lease token and expiry must remain paired"
     );
 
+    let retention_policy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'ci_builds'
+           AND column_name = 'retention_policy')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        retention_policy,
+        "stable build retention migration must be present"
+    );
+
     let requested_at_column: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns
          WHERE table_schema = 'public' AND table_name = 'ci_builds'
@@ -185,6 +291,17 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
     assert!(
         requested_at_column,
         "CI queue demand marker must be migrated"
+    );
+
+    let build_queue_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'ci_build_queue')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        build_queue_table,
+        "fenced CI build queue migration must be present"
     );
 
     let expected_tables = [

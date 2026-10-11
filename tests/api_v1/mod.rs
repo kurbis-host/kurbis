@@ -5,4 +5,5 @@ mod events;
 mod exports;
 mod resources;
 mod routing;
+mod runtime_stats;
 mod support;

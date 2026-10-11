@@ -10,8 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ci::{
-    BuildKey, BuildRequest, CiHostname, CiPreview, CiPreviewRepository, CiPreviewRuntimeRepository,
-    CiPreviewState, CiRefKind, RuntimeLease,
+    BuildKey, BuildRequest, CiBuildRetention, CiHostname, CiPreview, CiPreviewRepository,
+    CiPreviewRuntimeRepository, CiPreviewState, CiRefKind, RuntimeLease,
 };
 
 use super::{ApiError, AppState, internal::require_internal};
@@ -183,6 +183,7 @@ async fn ensure_pull_request_preview_on_demand(
             key,
             source_repository: Some(identity.repository.clone()),
             source_archive: Vec::new(),
+            retention: CiBuildRetention::Preview,
         };
         let build_id = build.id;
         tokio::spawn(async move {
@@ -279,6 +280,7 @@ async fn ensure_commit_preview_on_demand(
             key,
             source_repository: Some(identity.repository.clone()),
             source_archive: Vec::new(),
+            retention: CiBuildRetention::Preview,
         };
         let build_id = build.id;
         tokio::spawn(async move {

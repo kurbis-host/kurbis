@@ -38,89 +38,8 @@ class NoopOperationLock:
 
 
 class RolloutTests(unittest.TestCase):
-    def test_legacy_app_rollback_accepts_only_verified_baseline_provenance_and_restores_branch(self):
-        revision = "9" * 40
-        candidate = "a" * 40
-        valid_results = (
-            ("legacy-unproven", "kurbis.respond5.legacy-baseline.v1"),
-            ("migration-safe-unproven", "kurbis.respond5.current-baseline.v1"),
-        )
-        for provenance, schema in valid_results:
-            with self.subTest(provenance=provenance):
-                events = []
-                result = {"status": "app-rolled-back", "provenance_status": provenance,
-                          "worker_bundle_restored": True}
-                with patch.object(deploy, "ensure_release_tag", return_value=f"kurbis-release-{revision}"), \
-                     patch.object(deploy, "wait_for_terminal_deployments", side_effect=lambda _timeout: events.append("wait")), \
-                     patch.object(deploy, "source_inputs", return_value={"compose.yaml": "1" * 40}), \
-                     patch.object(deploy, "legacy_remote", side_effect=lambda *args, **kwargs: events.append("rollback") or result), \
-                     patch.object(deploy, "set_branch", side_effect=lambda branch: events.append(("branch", branch))):
-                    actual = deploy.rollback_application(
-                        "respond5", "main", revision, {}, "a" * 32, 60,
-                        legacy_manifest={"schema": schema}, candidate_revision=candidate,
-                    )
-                self.assertIs(actual, result)
-                self.assertEqual(events, ["wait", "rollback", ("branch", "main")])
 
-        invalid = {"status": "app-rolled-back", "provenance_status": "unverified"}
-        with patch.object(deploy, "ensure_release_tag", return_value=f"kurbis-release-{revision}"), \
-             patch.object(deploy, "wait_for_terminal_deployments"), \
-             patch.object(deploy, "source_inputs", return_value={"compose.yaml": "1" * 40}), \
-             patch.object(deploy, "legacy_remote", return_value=invalid), \
-             patch.object(deploy, "set_branch") as set_branch:
-            with self.assertRaisesRegex(deploy.DeploymentError, "exact baseline app/worker digest rollback"):
-                deploy.rollback_application(
-                    "respond5", "main", revision, {}, "a" * 32, 60,
-                    legacy_manifest={"schema": "kurbis.respond5.current-baseline.v1"},
-                    candidate_revision=candidate,
-                )
-        set_branch.assert_not_called()
 
-    def test_current_baseline_worker_sync_uses_fresh_bootstrap_inventory(self):
-        def service(container_id: str, image_id: str) -> dict:
-            return {"container_id": container_id, "image_id": image_id,
-                    "status": "running", "health": "healthy"}
-
-        manifest = {"schema": "kurbis.respond5.current-baseline.v1",
-                    "expected_inventory": {"services": {
-                        "control-plane": service("stale-container", "sha256:stale-image")}}}
-        bootstrap_record = {"inventory": {"services": {
-            "control-plane": service("fresh-container", "sha256:fresh-image")}}}
-
-        baseline = deploy.bootstrap_wait_baseline(bootstrap_record)
-
-        self.assertEqual(baseline["control-plane"], [{
-            "id": "fresh-container", "image": "sha256:fresh-image", "status": "running",
-            "health": "healthy", "revision": "",
-        }])
-        self.assertNotEqual(baseline["control-plane"][0]["id"],
-                            manifest["expected_inventory"]["services"]["control-plane"]["container_id"])
-        with self.assertRaisesRegex(deploy.DeploymentError, "did not return a validated inventory"):
-            deploy.bootstrap_wait_baseline({})
-
-    def test_preflight_accepts_only_the_known_legacy_tag_before_verified_bootstrap(self):
-        revision = "f" * 40
-        state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": revision}]
-                 for name in sync.SERVICES}
-        def fake_run(args, **kwargs):
-            if args[:3] == ["docker", "image", "inspect"]:
-                return f"sha256:app|{revision}" if args[3] == "sha256:app" else "sha256:legacy"
-            if args[:3] == ["git", "-C", str(sync.CHECKOUT)]:
-                return "upstream-pin"
-            raise AssertionError(args)
-        with patch.object(sync, "OperationLock", NoopOperationLock), patch.object(sync, "root_only"), patch.object(sync, "service_valid"), patch.object(sync, "identity", return_value="worker"), \
-             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "states", return_value=state), \
-             patch.object(sync, "image_for_app", return_value="sha256:app"), patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
-             patch.object(sync, "run", side_effect=fake_run), \
-             patch.object(sync, "verify_worker_binary_in_app_image", return_value="1" * 64), \
-             patch.object(sync, "worker_image_value", return_value="melon-pumpkin:host-control"), \
-             patch.object(sync, "single_worker", return_value=77), patch.object(sync, "worker_process_environment", return_value={"PUMPKIN_IMAGE": "melon-pumpkin:host-control"}), \
-             patch.object(sync, "digest", return_value="1" * 64), patch.object(sync, "lease"):
-            result = sync.baseline_preflight()
-        self.assertEqual(result["status"], "preflight")
-        self.assertEqual(result["worker_image"], "melon-pumpkin:host-control")
-        self.assertEqual(result["app_revision"], revision)
-        self.assertEqual(result["snapshot"], state)
 
     def test_strict_baseline_rejects_worker_pumpkin_from_another_app_revision(self):
         active = "f" * 40
@@ -147,6 +66,19 @@ class RolloutTests(unittest.TestCase):
             environment = sync.worker_process_environment(123)
         self.assertEqual(environment["PUMPKIN_IMAGE"], "melon-pumpkin:host-control-" + "a" * 40)
         self.assertEqual(environment["WORKER_ID"], "worker")
+
+    def test_canonical_release_has_no_legacy_deployment_paths(self):
+        for relative in (
+            "scripts/dokploy_legacy_baseline.py",
+            "scripts/dokploy_legacy_worker_recovery.py",
+            "deployment/legacy-baseline-respond5.json",
+            "tests/fixtures/respond5_legacy_baseline_inventory.json",
+            "tools/test_dokploy_legacy_baseline.py",
+        ):
+            self.assertFalse((ROOT / relative).exists(), relative)
+        source = (ROOT / "scripts/deploy_dokploy.py").read_text(encoding="utf-8")
+        self.assertNotIn("legacy_baseline", source)
+        self.assertNotIn("--legacy", source)
 
     def test_cargo_target_cache_is_release_scoped_only_for_pumpkin(self):
         application = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
@@ -197,82 +129,7 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("ARG BUILD_REVISION=development", runtime)
         self.assertIn("LABEL org.opencontainers.image.revision=${BUILD_REVISION}", runtime)
 
-    def test_legacy_worker_image_bootstraps_to_active_revision_pin_without_touching_data(self):
-        revision = "d" * 40
-        pinned = f"{sync.PUMPKIN_PREFIX}{revision}"
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            worker = root / "worker"
-            env = root / "worker.env"
-            data = root / "server-data" / "world.db"
-            data.parent.mkdir()
-            worker.write_bytes(b"current worker executable")
-            env.write_text(f"export PUMPKIN_IMAGE=melon-pumpkin:host-control\n", encoding="utf-8")
-            env.chmod(0o600)
-            data.write_bytes(b"do not delete or rewrite")
-            original_digest = sync.digest
-            def fake_digest(path):
-                if str(path) == "/proc/4321/exe":
-                    return hashlib.sha256(worker.read_bytes()).hexdigest()
-                return original_digest(Path(path))
-            def fake_atomic(path, content, mode, uid=0, gid=0):
-                Path(path).write_bytes(content)
-                Path(path).chmod(mode)
-            runtime_state = {name: [{"id": name, "image": "sha256:app" if name != "waiting-pumpkin" else "sha256:waiting",
-                                      "status": "running", "health": "healthy", "revision": revision}]
-                             for name in sync.SERVICES}
-            def fake_run(args, **kwargs):
-                if args[:3] == ["docker", "image", "inspect"]:
-                    return f"sha256:waiting|{revision}" if args[3] == "sha256:waiting" else "sha256:legacy"
-                if args[:2] == ["systemctl", "restart"]:
-                    return ""
-                raise AssertionError(args)
-            with patch.object(sync, "WORKER", worker), patch.object(sync, "WORKER_ENV", env), patch.object(sync, "OperationLock", NoopOperationLock), \
-                 patch.object(sync, "require_lock"), patch.object(sync, "states", return_value=runtime_state), \
-                 patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
-                 patch.object(sync, "single_worker", return_value=4321), \
-                 patch.object(sync, "worker_process_environment", side_effect=lambda pid: {"PUMPKIN_IMAGE": sync.worker_image_value()}), \
-                 patch.object(sync, "lease"), patch.object(sync, "time") as mock_time, \
-                 patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "atomic", side_effect=fake_atomic), \
-                 patch.object(sync, "verify_pumpkin", return_value=("sha256:pinned", "same-pumpkin-binary")), \
-                 patch.object(sync, "pumpkin_runtime_payload_hashes", return_value={"pumpkin": "same-pumpkin-binary", "plugin": "same-wasm", "entrypoint": "same-entrypoint"}), \
-                 patch.object(sync, "digest", side_effect=fake_digest):
-                mock_time.sleep.return_value = None
-                result = sync.bootstrap_worker_image("a" * 32, revision, pinned, "upstream-pin")
-            self.assertEqual(result["status"], "bootstrapped")
-            self.assertEqual(env.read_text(encoding="utf-8"), f"export PUMPKIN_IMAGE={pinned}\n")
-            self.assertEqual(worker.read_bytes(), b"current worker executable")
-            self.assertEqual(data.read_bytes(), b"do not delete or rewrite")
 
-    def test_legacy_worker_image_bootstrap_refuses_executable_mismatch_without_mutation(self):
-        revision = "e" * 40
-        pinned = f"{sync.PUMPKIN_PREFIX}{revision}"
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            worker, env = root / "worker", root / "worker.env"
-            worker.write_bytes(b"worker")
-            original_env = b"export PUMPKIN_IMAGE=melon-pumpkin:host-control\n"
-            env.write_bytes(original_env)
-            env.chmod(0o600)
-            runtime_state = {name: [{"id": name, "image": "sha256:app" if name != "waiting-pumpkin" else "sha256:waiting",
-                                      "status": "running", "health": "healthy", "revision": revision}]
-                             for name in sync.SERVICES}
-            def fake_run(args, **kwargs):
-                if args[:3] == ["docker", "image", "inspect"]:
-                    return f"sha256:waiting|{revision}" if args[3] == "sha256:waiting" else "sha256:legacy"
-                raise AssertionError(args)
-            with patch.object(sync, "WORKER", worker), patch.object(sync, "WORKER_ENV", env), patch.object(sync, "OperationLock", NoopOperationLock), \
-                 patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "verify_pumpkin", return_value=("sha256:pinned", "new-binary")), \
-                 patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "states", return_value=runtime_state), \
-                 patch.object(sync, "verify_image_revision"), patch.object(sync, "verify_waiting"), \
-                 patch.object(sync, "pumpkin_runtime_payload_hashes", side_effect=[
-                     {"pumpkin": "new-binary", "plugin": "legacy-wasm", "entrypoint": "same-entrypoint"},
-                     {"pumpkin": "new-binary", "plugin": "new-wasm", "entrypoint": "same-entrypoint"},
-                 ]), \
-                 self.assertRaisesRegex(sync.Error, "differs from source-pinned"):
-                sync.bootstrap_worker_image("a" * 32, revision, pinned, "upstream-pin")
-            self.assertEqual(env.read_bytes(), original_env)
-            self.assertEqual(worker.read_bytes(), b"worker")
 
     def test_run_bytes_preserves_git_nul_records_and_leading_status_spaces(self):
         output = sync.run_bytes(["python3", "-c", "import sys; sys.stdout.buffer.write(bytes([32,77,32,99,111,109,112,111,115,101,46,121,97,109,108,0,33,33,32,46,101,110,118,0]))"])
@@ -619,7 +476,16 @@ class RolloutTests(unittest.TestCase):
             "worker_pid": "123", "rollback_worker_sha256": "5" * 64,
             "rollback_worker_env_sha256": "6" * 64, "release_tag": f"kurbis-release-{revision}",
             "source_archive_sha256": "7" * 64, "host_control_pumpkin_image": "sha256:pumpkin",
+            "schema": "kurbis.release-manifest.v1", "worker_env_sha256": "8" * 64,
+            "migration_manifest_sha256": "9" * 64, "environment_revision": "a" * 64,
+            "environment_keys": ["BUILD_REVISION"],
+            "service_image_ids": {
+                "control-plane": "sha256:expected", "gateway": "sha256:expected",
+                "panel": "sha256:expected", "waiting-pumpkin": "sha256:expected",
+                "postgres": "sha256:expected",
+            },
         }
+        receipt["manifest_sha256"] = sync.release_manifest_hash(receipt)
         mixed = {name: [{"id": name, "image": "sha256:wrong", "status": "running", "health": "healthy", "revision": revision}]
                  for name in sync.SERVICES}
         mixed["control-plane"][0]["image"] = "sha256:expected"
@@ -744,64 +610,9 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("KEEP=value", saved[0])
         self.assertIs(state["autoDeploy"], False)
 
-    def test_fresh_release_tag_is_created_and_verified_before_legacy_bootstrap(self):
-        revision="f"*40
-        tag=f"kurbis-release-{revision}"
-        remote_tags=set()
-        events=[]
-        def ensure_tag(sha):
-            events.append("ensure-release-tag")
-            self.assertEqual(sha,revision)
-            remote_tags.add(tag)  # Simulates a fresh SHA with no prior remote tag.
-            return tag
-        def legacy_bootstrap():
-            events.append("legacy-bootstrap")
-            self.assertIn(tag,remote_tags,"attestation must follow creation/verification of the candidate tag")
-            return {"status":"already-recorded"}
-        result=deploy.bootstrap_legacy_with_release_tag(revision,ensure_tag,legacy_bootstrap)
-        self.assertEqual(result["status"],"already-recorded")
-        self.assertEqual(events,["ensure-release-tag","legacy-bootstrap"])
 
-    def test_legacy_bootstrap_refuses_candidate_tag_resolving_to_wrong_sha(self):
-        with self.assertRaisesRegex(deploy.DeploymentError,"does not resolve"):
-            deploy.bootstrap_legacy_with_release_tag("f"*40,lambda _sha:"kurbis-release-"+"e"*40,lambda:None)
 
-    def test_lost_legacy_bootstrap_response_reconciles_before_predeploy_unlock(self):
-        state={"worker":"legacy"};attempted=False
-        def on_attempt():
-            nonlocal attempted
-            attempted=True
-        def remote_bootstrap(**_kwargs):
-            state["worker"]="migrated"
-            raise TimeoutError("SSH response lost after worker migration")
-        with self.assertRaisesRegex(TimeoutError,"after worker migration"):
-            deploy.dispatch_legacy_worker_bootstrap(remote_bootstrap,on_attempt,token="token")
-        self.assertTrue(attempted)
-        def reconcile(**_kwargs):
-            self.assertEqual(state["worker"],"migrated")
-            return {"status":"migrated-reconciled"}
-        result=deploy.reconcile_legacy_worker_bootstrap(reconcile,token="token")
-        self.assertEqual(result["status"],"migrated-reconciled")
-        # A Dokploy branch/environment API failure after mutation is still pre-deploy:
-        # reconciliation keeps the worker retryable without running app rollback.
-        reconciled=[]
-        try:
-            raise deploy.DeploymentError("simulated set_branch/update_build_revision API failure")
-        except deploy.DeploymentError:
-            accepted=deploy.reconcile_predeployment_worker_bootstrap(
-                lambda:reconciled.append("migrated-reconciled"),attempted=True,
-                deployment_attempted=False,marked=False)
-        self.assertTrue(accepted)
-        self.assertEqual(reconciled,["migrated-reconciled"])
-        self.assertFalse(deploy.should_rollback_failed_release(deployment_attempted=False,marked=False))
-        self.assertTrue(deploy.rollout_unlock_safe(deployment_attempted=False,marked=False,rollback_verified=False,
-            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=accepted))
 
-    def test_predeploy_failure_cannot_unlock_unreconciled_worker_bootstrap(self):
-        self.assertFalse(deploy.rollout_unlock_safe(deployment_attempted=False,marked=False,rollback_verified=False,
-            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=False))
-        self.assertFalse(deploy.rollout_unlock_safe(deployment_attempted=True,marked=False,rollback_verified=False,
-            worker_bootstrap_attempted=True,worker_bootstrap_reconciled=True))
 
     def test_lost_wait_response_rolls_back_worker_before_prior_app_revision(self):
         state = {"worker": "old", "app": "new"}
@@ -870,12 +681,6 @@ class RolloutTests(unittest.TestCase):
         self.assertFalse(raised.exception.worker_rolled_back)
         self.assertEqual(actions, ["worker", "app"])
 
-    def test_verified_legacy_app_restore_can_reconcile_lost_worker_rollback_ack(self):
-        result=deploy.rollback_failed_release(
-            lambda: (_ for _ in ()).throw(TimeoutError("SSH response lost")),
-            lambda: {"status":"app-rolled-back","worker_bundle_restored":True},
-        )
-        self.assertEqual(result["status"],"app-rolled-back")
 
     def test_rollback_waits_for_superseded_deployment_to_finish(self):
         samples = [
@@ -975,12 +780,6 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("def verify_bedrock_tls_assets",source)
         compile(source,"<respond5-worker-sync-stdin>","exec")
 
-    def test_legacy_remote_payload_inlines_recovery_module_and_compiles(self):
-        source=deploy.legacy_remote_source()
-        self.assertNotIn("__LEGACY_HEARTBEAT_HELPERS__",source)
-        self.assertEqual(source.count("from __future__ import annotations"),1)
-        self.assertIn("def verify_restarted_worker_impl",source)
-        compile(source,"<respond5-legacy-stdin>","exec")
 
     def test_remote_sends_only_reviewed_release_environment_overrides(self):
         overrides={"BUILD_REVISION":"a"*40,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs",
@@ -1002,8 +801,9 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(commands[0][1:4], ["-m", "unittest", "discover"])
         self.assertIn("test_dokploy_worker_rollout.py", commands[0])
         self.assertEqual(commands[1][1:4], ["-m", "unittest", "discover"])
-        self.assertIn("test_dokploy_legacy_baseline.py", commands[1])
+        self.assertIn("test_release_manifest.py", commands[1])
         self.assertEqual(commands[2][1:5], ["test", "--locked", "--test", "first_join_flow"])
+
 
 
 if __name__ == "__main__":

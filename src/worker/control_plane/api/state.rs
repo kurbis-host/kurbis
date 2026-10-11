@@ -14,6 +14,7 @@ use crate::{
     },
     model::{ObservedState, SnapshotReason, SnapshotRecord},
     pumpkin_control::WaitingPlayer,
+    runtime_stats::RuntimeStats,
 };
 
 use super::super::{EmptyRequest, WorkerControl};
@@ -50,6 +51,18 @@ impl WorkerControl {
         self.get_json_with_assignment(
             &format!("/internal/worker/control/servers/{server_id}/context"),
             assignment,
+        )
+        .await
+    }
+
+    pub async fn sync_runtime_stats(&self, server_id: Uuid, stats: &RuntimeStats) -> Result<()> {
+        stats.validate().map_err(anyhow::Error::msg)?;
+        self.post_no_content(
+            &format!("/internal/worker/control/servers/{server_id}/runtime-stats"),
+            &RuntimeStatsSyncRequest {
+                generation: stats.generation,
+                stats,
+            },
         )
         .await
     }
@@ -319,6 +332,13 @@ struct AcquireLeaseRequest {
 #[serde(deny_unknown_fields)]
 struct LeaseResponse {
     worker_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeStatsSyncRequest<'a> {
+    generation: i64,
+    stats: &'a RuntimeStats,
 }
 
 #[derive(Debug, Serialize)]

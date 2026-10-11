@@ -5,7 +5,9 @@ use super::*;
 #[tokio::test]
 async fn controlled_build_pipeline_verifies_sandbox_caches_artifact_and_deduplicates() {
     let _test_guard = CI_TEST_LOCK.lock().await;
-    use kurbis_hoster::ci::{BuildRequest, ControlledBuildPipeline, SandboxLimits};
+    use kurbis_hoster::ci::{
+        BuildRequest, CiBuildRetention, ControlledBuildPipeline, SandboxLimits,
+    };
     let pool = pool().await;
     let repo = CiPreviewRepository::new(pool.clone());
     let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
@@ -56,6 +58,7 @@ async fn controlled_build_pipeline_verifies_sandbox_caches_artifact_and_deduplic
         key: key.clone(),
         source_repository: None,
         source_archive: b"pinned-source-archive".to_vec(),
+        retention: CiBuildRetention::Preview,
     };
     let built = pipeline.run(request.clone()).await.unwrap();
     assert_eq!(built.stage, CiBuildStage::Ready);
@@ -121,7 +124,7 @@ async fn object_artifact_cache_verifies_content_and_removes_expired_blobs() {
             &digest,
             &key,
             bytes,
-            Utc::now() + chrono::Duration::hours(72),
+            Some(Utc::now() + chrono::Duration::hours(72)),
         )
         .await
         .unwrap();
@@ -132,7 +135,7 @@ async fn object_artifact_cache_verifies_content_and_removes_expired_blobs() {
     );
     assert!(
         cache
-            .put("wrong-digest", "ci/test/wrong.tar", bytes, Utc::now())
+            .put("wrong-digest", "ci/test/wrong.tar", bytes, Some(Utc::now()))
             .await
             .is_err()
     );
@@ -159,7 +162,7 @@ impl kurbis_hoster::ci::ArtifactCache for FailOnceArtifactCache {
         digest: &str,
         object_key: &str,
         bytes: &[u8],
-        _expires_at: chrono::DateTime<Utc>,
+        _expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<kurbis_hoster::ci::BuildOutput, kurbis_hoster::ci::CiServiceError> {
         if self
             .failures_left
@@ -199,7 +202,9 @@ impl kurbis_hoster::ci::ArtifactCache for FailOnceArtifactCache {
 #[tokio::test]
 async fn object_store_failure_is_retryable_and_reconciles_the_existing_check_run() {
     let _test_guard = CI_TEST_LOCK.lock().await;
-    use kurbis_hoster::ci::{BuildRequest, ControlledBuildPipeline, SandboxLimits};
+    use kurbis_hoster::ci::{
+        BuildRequest, CiBuildRetention, ControlledBuildPipeline, SandboxLimits,
+    };
     let pool = pool().await;
     let repo = CiPreviewRepository::new(pool.clone());
     let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
@@ -246,6 +251,7 @@ async fn object_store_failure_is_retryable_and_reconciles_the_existing_check_run
         key: key.clone(),
         source_repository: None,
         source_archive: b"pinned-source-archive".to_vec(),
+        retention: CiBuildRetention::Preview,
     };
     assert!(pipeline.run(request.clone()).await.is_err());
     let (stage, failure_class, retry_count): (String, String, i32) =
@@ -282,5 +288,83 @@ async fn object_store_failure_is_retryable_and_reconciles_the_existing_check_run
         Some(&CiBuildStage::Ready),
         "the existing Check Run is reconciled to success after retry"
     );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn permanent_build_promotion_reuses_ready_artifact_without_expiry() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    use kurbis_hoster::ci::{CiBuildRetention, CiBuildStage};
+    let pool = pool().await;
+    let repo = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
+    repo.register_repository(&repository_name, "master")
+        .await
+        .unwrap();
+    let key = BuildKey::new(
+        &repository_name,
+        "0123456789abcdef0123456789abcdef01234567",
+        "patch-v1",
+        "native",
+        "x86_64-linux",
+    )
+    .unwrap();
+    let (build, _) = repo.ensure_build(&key).await.unwrap();
+    for stage in [
+        CiBuildStage::Fetching,
+        CiBuildStage::Patching,
+        CiBuildStage::Compiling,
+        CiBuildStage::Packaging,
+    ] {
+        repo.transition_build(build.id, stage, None).await.unwrap();
+    }
+    let artifact = b"stable-pumpkin-artifact";
+    let digest = blake3::hash(artifact).to_hex().to_string();
+    repo.attach_artifact(
+        build.id,
+        &digest,
+        &format!("ci/{digest}.tar"),
+        artifact.len() as i64,
+    )
+    .await
+    .unwrap();
+    let ready = repo
+        .transition_build(build.id, CiBuildStage::Ready, None)
+        .await
+        .unwrap();
+
+    let (promoted, inserted) = repo
+        .ensure_build_with_retention(&key, CiBuildRetention::Permanent)
+        .await
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(promoted.id, ready.id);
+    assert_eq!(promoted.stage, CiBuildStage::Ready);
+    assert_eq!(promoted.artifact_digest.as_deref(), Some(digest.as_str()));
+    assert!(promoted.expires_at.is_none());
+
+    let (retention, build_expiry, artifact_expiry): (String, Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT build.retention_policy, build.expires_at, artifact.expires_at
+             FROM ci_builds build JOIN ci_artifacts artifact ON artifact.digest = build.artifact_digest
+             WHERE build.id = $1",
+        )
+        .bind(build.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(retention, "permanent");
+    assert!(build_expiry.is_none());
+    assert!(artifact_expiry.is_none());
+
+    repo.expire(Utc::now() + chrono::Duration::days(365))
+        .await
+        .unwrap();
+    let retained_stage: String = sqlx::query_scalar("SELECT stage FROM ci_builds WHERE id = $1")
+        .bind(build.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(retained_stage, "ready");
     pool.close().await;
 }

@@ -76,7 +76,7 @@ class Console:
         # The release's SingleWord command parser accepts filenames but not '/'.
         # A private hard link gives the official loader a legal filename without
         # copying bytes or changing the installed artifact's atomicity.
-        alias = artifact.parent.parent / (".vibe-load-" + uuid.uuid4().hex + ".wasm")
+        alias = artifact.parent.parent / (".kurbis-ai-load-" + uuid.uuid4().hex + ".wasm")
         os.link(artifact, alias)
         try:
             self.execute(
@@ -89,7 +89,7 @@ class Console:
 
 
 def run(runtime, binary):
-    data = runtime / "server/plugins/data/vibe-bridge"
+    data = runtime / "server/plugins/data/kurbis-ai"
     requests = data / "activation/requests"
     results = data / "activation/results"
     ready = data / "activation/ready.json"
@@ -122,7 +122,7 @@ def run(runtime, binary):
                 try:
                     request = json.loads(path.read_text())
                     plugin = request["plugin"]
-                    if not isinstance(plugin, str) or not NAME.fullmatch(plugin) or "--" in plugin or plugin == "vibe-bridge":
+                    if not isinstance(plugin, str) or not NAME.fullmatch(plugin) or "--" in plugin or plugin == "kurbis-ai":
                         raise ValueError("Invalid or protected plugin name")
                     artifact = runtime / "server/plugins" / (plugin + ".wasm")
                     if not artifact.is_file() or artifact.is_symlink():

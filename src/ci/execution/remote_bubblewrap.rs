@@ -8,8 +8,8 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -26,11 +26,112 @@ use super::{
     admission::{AbandonedBuildCleaner, BuildAdmissionCoordinator, HostMemoryProbe},
     archive::{MAX_ARTIFACT_BYTES, MAX_COMPRESSED_SOURCE_BYTES},
     builder::{BuildProcessReport, RootlessBuildRuntime},
+    profile::BuildResourceProfile,
 };
 use crate::ci::{BuildPipelineError, SandboxLimits};
 
 const MAX_PLUGIN_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_LINE: usize = 256 * 1024;
+const CAPABILITY_LEASE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+const REMOTE_PROTOCOL_VERSION: u8 = 2;
+
+/// Evidence returned by the remote helper before CI is marked ready.
+///
+/// These values are deliberately measured on the builder, not copied from
+/// deployment configuration.  The capability fingerprint is therefore tied
+/// to the actual account, immutable inputs, workspace mount, and toolchain.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RemoteBuilderCapability {
+    pub protocol_version: u8,
+    pub host_uid: u32,
+    pub host_gid: u32,
+    pub sandbox_uid: u32,
+    pub sandbox_gid: u32,
+    pub bwrap_hash: String,
+    pub rootfs_hash: String,
+    pub toolchain_hash: String,
+    pub source_preparer_hash: String,
+    pub rustc_version: String,
+    pub workspace_bytes: u64,
+    pub workspace_inodes: u64,
+    pub memory_total_bytes: u64,
+    pub memory_available_bytes: u64,
+    pub cgroup_mode: String,
+    pub smoke_build: bool,
+    pub artifact_transfer: bool,
+    pub artifact_execution: bool,
+}
+
+impl RemoteBuilderCapability {
+    fn validate(&self, profile: BuildResourceProfile, expected_rustc: &str) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported remote capability protocol {}",
+                self.protocol_version
+            ));
+        }
+        if self.host_uid == 0 || self.host_gid == 0 {
+            return Err("remote builder must use a non-root host UID/GID".into());
+        }
+        if self.sandbox_uid != 0 || self.sandbox_gid != 0 {
+            return Err("remote Bubblewrap sandbox did not enter UID/GID 0 namespace".into());
+        }
+        for (name, value) in [
+            ("Bubblewrap", &self.bwrap_hash),
+            ("rootfs", &self.rootfs_hash),
+            ("toolchain", &self.toolchain_hash),
+            ("source preparer", &self.source_preparer_hash),
+        ] {
+            if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("remote {name} hash is not a SHA-256 digest"));
+            }
+        }
+        if self.rustc_version != expected_rustc {
+            return Err(format!(
+                "remote rustc mismatch: expected {expected_rustc}, got {}",
+                self.rustc_version
+            ));
+        }
+        if self.workspace_bytes != profile.limits.disk_bytes
+            || self.workspace_inodes != profile.workspace_inodes
+        {
+            return Err("remote workspace does not match the registered resource profile".into());
+        }
+        if !matches!(
+            self.cgroup_mode.as_str(),
+            "delegated" | "available_not_delegated" | "unavailable"
+        ) {
+            return Err("remote cgroup capability has an unknown mode".into());
+        }
+        if !self.smoke_build || !self.artifact_transfer || !self.artifact_execution {
+            return Err(
+                "remote builder smoke build, artifact transfer, or artifact execution failed"
+                    .into(),
+            );
+        }
+        profile.validate_measured_capacity(self.memory_available_bytes, self.memory_total_bytes)
+    }
+
+    fn fingerprint(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("remote capability is serializable");
+        blake3::hash(&encoded).to_hex().to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteBuilderCapabilityLease {
+    capability: RemoteBuilderCapability,
+    fingerprint: String,
+    expires_at: Instant,
+}
+
+impl RemoteBuilderCapabilityLease {
+    fn is_valid(&self, profile: BuildResourceProfile, expected_rustc: &str) -> bool {
+        Instant::now() < self.expires_at
+            && self.capability.validate(profile, expected_rustc).is_ok()
+            && self.fingerprint == self.capability.fingerprint()
+    }
+}
 
 #[derive(Clone)]
 pub struct SshBubblewrapBuildRuntime {
@@ -46,6 +147,8 @@ pub struct SshBubblewrapBuildRuntime {
     compiler_cache_size: u64,
     rustc_version: String,
     identity: String,
+    profile: BuildResourceProfile,
+    capability: Arc<RwLock<Option<RemoteBuilderCapabilityLease>>>,
     admission: BuildAdmissionCoordinator,
 }
 
@@ -63,6 +166,9 @@ impl SshBubblewrapBuildRuntime {
         rustc_version: impl Into<String>,
         concurrency: u16,
     ) -> Result<Self, BuildPipelineError> {
+        let mut profile = BuildResourceProfile::default_rootless();
+        profile.concurrency = concurrency;
+        profile.validate().map_err(BuildPipelineError::Sandbox)?;
         let target = target.into();
         if target.trim().is_empty()
             || target.len() > 255
@@ -150,12 +256,74 @@ impl SshBubblewrapBuildRuntime {
             compiler_cache_size,
             rustc_version,
             identity,
+            profile,
+            capability: Arc::new(RwLock::new(None)),
             admission,
         })
     }
 
     pub fn build_identity(&self) -> &str {
         &self.identity
+    }
+
+    pub fn capability(&self) -> Option<RemoteBuilderCapability> {
+        self.capability
+            .read()
+            .ok()
+            .and_then(|lease| lease.as_ref().map(|lease| lease.capability.clone()))
+    }
+
+    fn assert_capability_lease(&self) -> Result<(), BuildPipelineError> {
+        let lease = self.capability.read().map_err(|_| {
+            BuildPipelineError::Sandbox(
+                "remote Bubblewrap capability lease lock was poisoned".into(),
+            )
+        })?;
+        match lease.as_ref() {
+            Some(lease) if lease.is_valid(self.profile, &self.rustc_version) => Ok(()),
+            Some(_) => Err(BuildPipelineError::Sandbox(
+                "remote Bubblewrap capability lease expired or no longer matches the profile"
+                    .into(),
+            )),
+            None => Err(BuildPipelineError::Sandbox(
+                "remote Bubblewrap capability has not been registered; CI is not ready".into(),
+            )),
+        }
+    }
+
+    /// Register the remote builder only after its measured preflight and
+    /// smoke-build contract succeeds. Production startup calls this before it
+    /// publishes a CI coordinator, so a broken builder cannot look ready.
+    pub async fn register_capability(&self) -> Result<RemoteBuilderCapability, BuildPipelineError> {
+        let snapshot = probe_remote_memory(&self.target).await?;
+        self.profile
+            .validate_measured_capacity(snapshot.available_bytes, snapshot.total_bytes)
+            .map_err(BuildPipelineError::Sandbox)?;
+        let lease = self
+            .admission
+            .acquire(self.profile.memory_bytes())
+            .await
+            .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
+        let token = lease.token();
+        let result = self
+            .run_job(
+                "preflight",
+                &token,
+                &lease,
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                self.profile.limits,
+                None,
+            )
+            .await;
+        lease.release().await;
+        result?;
+        self.capability().ok_or_else(|| {
+            BuildPipelineError::Sandbox(
+                "remote preflight completed without a capability lease".into(),
+            )
+        })
     }
 
     fn ssh_command(&self) -> Command {
@@ -219,7 +387,7 @@ impl SshBubblewrapBuildRuntime {
             .assert_alive()
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         let header = JobHeader {
-            version: 1,
+            version: REMOTE_PROTOCOL_VERSION,
             mode: mode.to_owned(),
             job_id: job_id.to_owned(),
             target: target.to_owned(),
@@ -235,6 +403,15 @@ impl SshBubblewrapBuildRuntime {
             source_len: source.len(),
             plugin_len: plugin.len(),
             timeout_seconds: limits.process_timeout.as_secs().clamp(1, 90 * 60),
+            profile_memory_bytes: self.profile.limits.memory_bytes,
+            profile_workspace_bytes: self.profile.limits.disk_bytes,
+            profile_workspace_inodes: self.profile.workspace_inodes,
+            profile_concurrency: self.profile.concurrency,
+            capability_fingerprint: self
+                .capability
+                .read()
+                .ok()
+                .and_then(|lease| lease.as_ref().map(|lease| lease.fingerprint.clone())),
         };
         let mut child = self
             .command()
@@ -316,12 +493,43 @@ impl SshBubblewrapBuildRuntime {
                 "remote Bubblewrap result header is missing or oversized",
             ));
         }
-        let result: JobResult = serde_json::from_slice(&line).map_err(|e| {
+        let mut result: JobResult = serde_json::from_slice(&line).map_err(|e| {
             BuildPipelineError::transient(
                 crate::ci::CiBuildStage::Compiling,
                 format!("decode remote Bubblewrap result: {e}"),
             )
         })?;
+        if mode == "preflight" {
+            let mut capability = result.capability.take().ok_or_else(|| {
+                BuildPipelineError::permanent(
+                    crate::ci::CiBuildStage::Compiling,
+                    "remote Bubblewrap preflight did not return a capability report",
+                )
+            })?;
+            let (host_uid, host_gid) = probe_remote_identity(&self.target).await?;
+            capability.host_uid = host_uid;
+            capability.host_gid = host_gid;
+            capability
+                .validate(self.profile, &self.rustc_version)
+                .map_err(|error| {
+                    BuildPipelineError::permanent(
+                        crate::ci::CiBuildStage::Compiling,
+                        format!("remote Bubblewrap capability rejected: {error}"),
+                    )
+                })?;
+            let fingerprint = capability.fingerprint();
+            if let Ok(mut slot) = self.capability.write() {
+                *slot = Some(RemoteBuilderCapabilityLease {
+                    capability,
+                    fingerprint,
+                    expires_at: Instant::now() + CAPABILITY_LEASE_TTL,
+                });
+            } else {
+                return Err(BuildPipelineError::Sandbox(
+                    "remote Bubblewrap capability lease lock was poisoned".into(),
+                ));
+            }
+        }
         lease
             .assert_alive()
             .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
@@ -514,6 +722,11 @@ struct JobHeader {
     source_len: usize,
     plugin_len: usize,
     timeout_seconds: u64,
+    profile_memory_bytes: u64,
+    profile_workspace_bytes: u64,
+    profile_workspace_inodes: u64,
+    profile_concurrency: u16,
+    capability_fingerprint: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct JobArtifact {
@@ -529,6 +742,8 @@ struct JobResult {
     stdout: String,
     stderr: String,
     artifacts: Vec<JobArtifact>,
+    #[serde(default)]
+    capability: Option<RemoteBuilderCapability>,
 }
 
 #[async_trait]
@@ -538,6 +753,13 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
     }
 
     async fn verify_sandbox(&self, limits: SandboxLimits) -> Result<(), BuildPipelineError> {
+        self.assert_capability_lease()?;
+        if limits != self.profile.limits {
+            return Err(BuildPipelineError::Sandbox(
+                "remote Bubblewrap workload limits differ from the registered resource profile"
+                    .into(),
+            ));
+        }
         let lease = self
             .admission
             .acquire(limits.memory_bytes)
@@ -568,6 +790,13 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
         target: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
+        self.assert_capability_lease()?;
+        if limits != self.profile.limits {
+            return Err(BuildPipelineError::Sandbox(
+                "remote Bubblewrap workload limits differ from the registered resource profile"
+                    .into(),
+            ));
+        }
         let lease = self
             .admission
             .acquire(limits.memory_bytes)
@@ -685,6 +914,67 @@ impl AbandonedBuildCleaner for RemoteWorkspaceCleaner {
     }
 }
 
+async fn probe_remote_memory(
+    target: &str,
+) -> Result<super::admission::HostMemorySnapshot, BuildPipelineError> {
+    RemoteHostMemoryProbe {
+        target: target.to_owned(),
+    }
+    .snapshot()
+    .await
+    .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))
+}
+
+async fn probe_remote_identity(target: &str) -> Result<(u32, u32), BuildPipelineError> {
+    let mut command = ssh_base_command(target);
+    let output = timeout(
+        Duration::from_secs(30),
+        command
+            .args(["sh", "-c", "printf '%s\n%s\n' \"$(id -u)\" \"$(id -g)\""])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            "remote Bubblewrap UID/GID probe timed out",
+        )
+    })?
+    .map_err(|error| {
+        BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!("remote Bubblewrap UID/GID probe failed: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(BuildPipelineError::transient(
+            crate::ci::CiBuildStage::Compiling,
+            format!(
+                "remote Bubblewrap UID/GID probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let values = stdout.lines().map(str::trim).collect::<Vec<_>>();
+    if values.len() != 2 {
+        return Err(BuildPipelineError::Sandbox(
+            "remote Bubblewrap UID/GID probe returned malformed output".into(),
+        ));
+    }
+    let uid = values[0].parse::<u32>().map_err(|_| {
+        BuildPipelineError::Sandbox("remote Bubblewrap UID probe returned a non-integer".into())
+    })?;
+    let gid = values[1].parse::<u32>().map_err(|_| {
+        BuildPipelineError::Sandbox("remote Bubblewrap GID probe returned a non-integer".into())
+    })?;
+    Ok((uid, gid))
+}
+
 fn ssh_base_command(target: &str) -> Command {
     let mut command = Command::new("ssh");
     command.args([
@@ -705,4 +995,52 @@ fn ssh_base_command(target: &str) -> Command {
         target,
     ]);
     command
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn capability() -> RemoteBuilderCapability {
+        RemoteBuilderCapability {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            host_uid: 1000,
+            host_gid: 1000,
+            sandbox_uid: 0,
+            sandbox_gid: 0,
+            bwrap_hash: "a".repeat(64),
+            rootfs_hash: "b".repeat(64),
+            toolchain_hash: "c".repeat(64),
+            source_preparer_hash: "d".repeat(64),
+            rustc_version: "1.98.1".into(),
+            workspace_bytes: BuildResourceProfile::default_rootless().limits.disk_bytes,
+            workspace_inodes: BuildResourceProfile::default_rootless().workspace_inodes,
+            memory_total_bytes: 32 * 1024 * 1024 * 1024,
+            memory_available_bytes: 32 * 1024 * 1024 * 1024,
+            cgroup_mode: "available_not_delegated".into(),
+            smoke_build: true,
+            artifact_transfer: true,
+            artifact_execution: true,
+        }
+    }
+
+    #[test]
+    fn capability_requires_non_root_remote_account_and_all_smoke_evidence() {
+        let profile = BuildResourceProfile::default_rootless();
+        assert!(capability().validate(profile, "1.98.1").is_ok());
+        let mut invalid = capability();
+        invalid.host_uid = 0;
+        assert!(invalid.validate(profile, "1.98.1").is_err());
+        let mut invalid = capability();
+        invalid.artifact_transfer = false;
+        assert!(invalid.validate(profile, "1.98.1").is_err());
+    }
+
+    #[test]
+    fn capability_fingerprint_changes_when_immutable_inputs_change() {
+        let first = capability();
+        let mut second = first.clone();
+        second.toolchain_hash = "e".repeat(64);
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
 }

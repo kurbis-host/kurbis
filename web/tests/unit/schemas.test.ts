@@ -11,6 +11,7 @@ const valid = {
   simulation_distance: 8,
   hardcore: false,
   whitelist: true,
+  tab_stats: false,
 };
 
 describe("server forms", () => {

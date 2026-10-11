@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::Context;
@@ -9,16 +8,12 @@ use tokio::process::Command;
 
 use crate::ci::{BuildPipelineError, SandboxLimits};
 
+use super::super::profile::BuildResourceProfile;
+
 pub(super) const MAX_PLUGIN_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn default_build_limits() -> SandboxLimits {
-    SandboxLimits {
-        memory_bytes: 10 * 1024 * 1024 * 1024,
-        cpu_millis: 2000,
-        pid_limit: 512,
-        disk_bytes: 5 * 1024 * 1024 * 1024,
-        process_timeout: Duration::from_secs(90 * 60),
-    }
+    BuildResourceProfile::default_rootless().limits
 }
 
 pub fn toolchain_identity(image: &str, rustc_release: &str) -> anyhow::Result<String> {

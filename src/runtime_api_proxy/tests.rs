@@ -58,6 +58,10 @@ fn normal_scope_allows_only_server_capability_routes() {
         (Method::GET, format!("/api/v1/servers/{expected}/logs")),
         (Method::GET, format!("/api/v1/servers/{expected}/activity")),
         (Method::GET, format!("/api/v1/servers/{expected}/snapshots")),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/runtime-stats"),
+        ),
         (Method::GET, format!("/api/v1/servers/{expected}/whitelist")),
         (
             Method::POST,
@@ -93,6 +97,10 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
         ),
         (Method::GET, format!("/internal/ci/previews/{expected}")),
         (Method::GET, format!("/api/v1/servers/{expected}/operators")),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/runtime-stats"),
+        ),
     ] {
         assert!(
             !route_allowed(Scope::Server, &method, &path, expected),

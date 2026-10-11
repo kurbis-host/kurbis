@@ -35,6 +35,7 @@ export function serverToSettingsValues(server: Server): SettingsFormValues {
     simulation_distance: server.settings.simulation_distance,
     hardcore: server.settings.hardcore,
     whitelist: server.settings.whitelist,
+    tab_stats: server.settings.tab_stats,
   };
 }
 

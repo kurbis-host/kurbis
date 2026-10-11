@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::domain::{BuildKey, CiBuild, CiBuildStage, CiPreview, CiPreviewState};
+use super::domain::{BuildKey, CiBuild, CiBuildRetention, CiBuildStage, CiPreview, CiPreviewState};
 
 /// Immutable build identity pinned to the service's checked-in integration patch
-/// and native target. API admission uses this only after a concrete commit is
-/// requested; it does not authorize eager branch or ancestor builds.
+/// and native target. API admission uses this for concrete commit previews;
+/// the source poller separately promotes the configured default branch to the
+/// permanent main build identity.
 #[derive(Debug, Clone)]
 pub struct CiBuildIdentity {
     pub repository: String,
@@ -26,6 +27,9 @@ pub struct BuildRequest {
     /// Fork PR builds fetch only this repository's exact PR head commit. The build key remains scoped to the watched base repository.
     pub source_repository: Option<String>,
     pub source_archive: Vec<u8>,
+    /// Preview requests retain the historical sliding TTL; the watched default
+    /// branch uses permanent retention and never creates a preview alias.
+    pub retention: CiBuildRetention,
 }
 
 #[derive(Debug, Clone)]
@@ -71,13 +75,13 @@ pub trait ArtifactCache: Send + Sync {
         digest: &str,
         object_key: &str,
         bytes: &[u8],
-        expires_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<BuildOutput, CiServiceError>;
     async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CiServiceError>;
     async fn delete_expired(&self, now: DateTime<Utc>) -> Result<u64, CiServiceError>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxLimits {
     pub memory_bytes: u64,
     pub cpu_millis: u64,
@@ -258,7 +262,7 @@ impl ArtifactCache for ObjectArtifactCache {
         digest: &str,
         object_key: &str,
         bytes: &[u8],
-        expires_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<BuildOutput, CiServiceError> {
         let actual_digest = blake3::hash(bytes).to_hex().to_string();
         if digest != actual_digest
@@ -279,7 +283,7 @@ impl ArtifactCache for ObjectArtifactCache {
         let size_bytes = i64::try_from(bytes.len()).map_err(|_| {
             CiServiceError::InvalidArtifact("artifact exceeds signed size range".into())
         })?;
-        sqlx::query("INSERT INTO ci_artifacts(digest, object_key, size_bytes, expires_at) VALUES($1,$2,$3,$4) ON CONFLICT(digest) DO UPDATE SET object_key=EXCLUDED.object_key, size_bytes=EXCLUDED.size_bytes, expires_at=GREATEST(ci_artifacts.expires_at, EXCLUDED.expires_at)")
+        sqlx::query("INSERT INTO ci_artifacts(digest, object_key, size_bytes, expires_at) VALUES($1,$2,$3,$4) ON CONFLICT(digest) DO UPDATE SET object_key=EXCLUDED.object_key, size_bytes=EXCLUDED.size_bytes, expires_at=CASE WHEN ci_artifacts.expires_at IS NULL OR EXCLUDED.expires_at IS NULL THEN NULL ELSE GREATEST(ci_artifacts.expires_at, EXCLUDED.expires_at) END")
             .bind(digest).bind(object_key).bind(size_bytes).bind(expires_at).execute(&self.pool).await.map_err(|e| CiServiceError::Internal(e.to_string()))?;
         Ok(BuildOutput {
             artifact_digest: actual_digest,
@@ -289,7 +293,7 @@ impl ArtifactCache for ObjectArtifactCache {
     }
     async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CiServiceError> {
         let object_key: Option<String> = sqlx::query_scalar(
-            "SELECT object_key FROM ci_artifacts WHERE digest=$1 AND expires_at > now()",
+            "SELECT object_key FROM ci_artifacts WHERE digest=$1 AND (expires_at IS NULL OR expires_at > now())",
         )
         .bind(digest)
         .fetch_optional(&self.pool)
@@ -323,7 +327,7 @@ impl ArtifactCache for ObjectArtifactCache {
             .await
             .map_err(|e| CiServiceError::Internal(e.to_string()))?;
         let expired: Vec<(String, String)> = sqlx::query_as(
-            "SELECT artifact.digest, artifact.object_key FROM ci_artifacts artifact\n             WHERE artifact.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM ci_builds build WHERE build.artifact_digest = artifact.digest AND build.expires_at > $1)\n             ORDER BY artifact.expires_at LIMIT 128 FOR UPDATE OF artifact SKIP LOCKED",
+            "SELECT artifact.digest, artifact.object_key FROM ci_artifacts artifact\n             WHERE artifact.expires_at IS NOT NULL AND artifact.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM ci_builds build WHERE build.artifact_digest = artifact.digest AND (build.expires_at IS NULL OR build.expires_at > $1))\n             ORDER BY artifact.expires_at LIMIT 128 FOR UPDATE OF artifact SKIP LOCKED",
         ).bind(now).fetch_all(&mut *tx).await.map_err(|e| CiServiceError::Internal(e.to_string()))?;
         for (digest, object_key) in &expired {
             let path = object_store::path::Path::parse(object_key)

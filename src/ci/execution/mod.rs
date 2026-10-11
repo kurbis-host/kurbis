@@ -82,10 +82,12 @@ mod builder;
 mod cache;
 mod patcher;
 mod production;
+mod profile;
 mod remote_bubblewrap;
 mod source;
 
 pub(crate) use admission::parse_build_concurrency;
+pub use profile::{BUILD_WORKSPACE_BYTES, BUILD_WORKSPACE_INODES, BuildResourceProfile};
 
 pub use archive::{
     ArchiveError, MAX_ARTIFACT_BYTES, MAX_COMPRESSED_SOURCE_BYTES, MAX_EXPANDED_SOURCE_BYTES,
@@ -104,5 +106,6 @@ pub use source::GitHubExactSource;
 
 pub use production::{
     ROOTLESS_BUILD_LIMITS, bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline,
+    remote_bubblewrap_pipeline_ready,
 };
 pub use remote_bubblewrap::SshBubblewrapBuildRuntime;

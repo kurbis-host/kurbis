@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use object_store::{ObjectStore, path::Path as ObjectPath};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ci::{CiPreviewRepository, CiPreviewRuntimeRepository},
+    ci::{ArtifactCache, CiPreviewRepository, CiPreviewRuntimeRepository, ObjectArtifactCache},
     control_plane::object_cleanup::delete_if_present,
     control_plane::snapshots::{GarbageCollection, SnapshotStore},
 };
@@ -130,6 +131,54 @@ pub async fn cleanup_ci_world_snapshot_garbage(
         return Err(error).context("drain CI world snapshot garbage queue");
     }
     Ok(completed)
+}
+
+#[derive(Clone)]
+pub struct CiPreviewMaintenance {
+    expiry_repository: CiPreviewRepository,
+    runtime_repository: CiPreviewRuntimeRepository,
+    artifact_cache: ObjectArtifactCache,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl CiPreviewMaintenance {
+    pub fn new(pool: PgPool, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            expiry_repository: CiPreviewRepository::new(pool.clone()),
+            runtime_repository: CiPreviewRuntimeRepository::new(pool.clone()),
+            artifact_cache: ObjectArtifactCache::new(pool, object_store.clone()),
+            object_store,
+        }
+    }
+
+    pub async fn run_once(&self) -> Result<()> {
+        let now = Utc::now();
+        self.expiry_repository.expire(now).await?;
+        // Claiming these rows is the control-plane-to-worker lifecycle signal.
+        // Assigned workers perform graceful idle stops or generation-fenced
+        // world deletion during their next reconcile.
+        self.runtime_repository.claim_expired(now, 128).await?;
+        cleanup_stale_ci_preview_deletions(
+            &self.runtime_repository,
+            self.object_store.clone(),
+            128,
+        )
+        .await?;
+        // Rehome checkpointed runtimes before the idle claimant can transition
+        // a stale worker's placement to `stopping`.
+        self.runtime_repository.reconcile_stale_workers(128).await?;
+        self.runtime_repository
+            .claim_idle(
+                chrono::Duration::seconds(crate::ci::CI_RUNTIME_IDLE_SECONDS),
+                128,
+            )
+            .await?;
+        self.runtime_repository
+            .request_due_world_snapshots(128)
+            .await?;
+        self.artifact_cache.delete_expired(now).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -469,30 +518,4 @@ async fn lock_healthy_worker(
     .bind(worker_id)
     .fetch_optional(&mut **tx)
     .await?)
-}
-
-pub fn spawn_worker_maintenance(maintenance: WorkerMaintenance) {
-    tokio::spawn(async move {
-        loop {
-            match maintenance.run_once().await {
-                Ok(report) => {
-                    if report.operations_assigned > 0
-                        || report.exports_assigned > 0
-                        || report.exports_requeued > 0
-                        || report.exports_expired > 0
-                        || report.garbage_collection.chunks_deleted > 0
-                        || report.garbage_collection.manifests_deleted > 0
-                        || report.garbage_collection.exports_deleted > 0
-                        || report.garbage_collection.staging_deleted > 0
-                        || report.ci_world_snapshot_gc_completed > 0
-                        || report.github_webhook_processed_gc_deleted > 0
-                    {
-                        tracing::info!(?report, "worker maintenance completed");
-                    }
-                }
-                Err(error) => tracing::error!(?error, "worker maintenance failed"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        }
-    });
 }

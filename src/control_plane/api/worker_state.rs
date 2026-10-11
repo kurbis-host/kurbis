@@ -12,6 +12,7 @@ use crate::{
     contracts::worker::{WorkerAssignment, WorkerServerContext, WorkerServerState},
     model::{DesiredState, ObservedState},
     pumpkin_control::{PlayerEdition, WaitingPlayer, WhitelistEntry},
+    runtime_stats::RuntimeStats,
 };
 
 use super::{ApiError, AppState, worker_auth};
@@ -267,6 +268,65 @@ pub(super) struct PlayersSyncRequest {
     players: Vec<WaitingPlayer>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuntimeStatsSyncRequest {
+    generation: i64,
+    stats: RuntimeStats,
+}
+
+pub(super) async fn sync_runtime_stats(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
+    Json(request): Json<RuntimeStatsSyncRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Authenticate and lock the exact credential row in the same transaction
+    // that fences the placement. This prevents lease rotation from racing a
+    // successful stats write after the initial token lookup.
+    let mut tx = state.pool.begin().await?;
+    let worker_id = worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await?;
+    request
+        .stats
+        .validate_generation(request.generation)
+        .map_err(|message| {
+            ApiError::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_runtime_stats",
+                message,
+            )
+        })?;
+    lock_current_active_placement(&mut tx, worker_id, server_id, request.generation).await?;
+
+    let mut stats = serde_json::to_value(request.stats).map_err(|_| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_runtime_stats",
+            "runtime stats could not be serialized",
+        )
+    })?;
+    // The worker may carry a local observation time for diagnostics, but the
+    // control plane's database clock is the sole timestamp authority.
+    if let Some(object) = stats.as_object_mut() {
+        object.remove("measured_at");
+    }
+    sqlx::query(
+        "INSERT INTO server_runtime_stats(server_id, generation, stats, measured_at)
+         VALUES($1, $2, $3, now())
+         ON CONFLICT(server_id) DO UPDATE
+         SET generation = EXCLUDED.generation,
+             stats = EXCLUDED.stats,
+             measured_at = EXCLUDED.measured_at",
+    )
+    .bind(server_id)
+    .bind(request.generation)
+    .bind(stats)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(super) async fn sync_players(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -417,19 +477,45 @@ async fn lock_current_placement(
     server_id: Uuid,
     generation: i64,
 ) -> Result<(), ApiError> {
+    lock_current_placement_with_activity(tx, worker_id, server_id, generation, false).await
+}
+
+async fn lock_current_active_placement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    worker_id: Uuid,
+    server_id: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
+    lock_current_placement_with_activity(tx, worker_id, server_id, generation, true).await
+}
+
+async fn lock_current_placement_with_activity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    worker_id: Uuid,
+    server_id: Uuid,
+    generation: i64,
+    require_active: bool,
+) -> Result<(), ApiError> {
     if generation <= 0 {
         return Err(invalid_assignment());
     }
-    let assignment: Option<Uuid> = sqlx::query_scalar(
+    let query = if require_active {
         "SELECT p.server_id FROM placements p JOIN servers s ON s.id = p.server_id
-         WHERE p.server_id = $1 AND p.worker_id = $2 AND p.generation = $3 AND s.generation = $3
-         FOR SHARE OF p, s",
-    )
-    .bind(server_id)
-    .bind(worker_id)
-    .bind(generation)
-    .fetch_optional(&mut **tx)
-    .await?;
+         WHERE p.server_id = $1 AND p.worker_id = $2 AND p.generation = $3
+           AND p.active AND s.generation = $3
+         FOR SHARE OF p, s"
+    } else {
+        "SELECT p.server_id FROM placements p JOIN servers s ON s.id = p.server_id
+         WHERE p.server_id = $1 AND p.worker_id = $2 AND p.generation = $3
+           AND s.generation = $3
+         FOR SHARE OF p, s"
+    };
+    let assignment: Option<Uuid> = sqlx::query_scalar(query)
+        .bind(server_id)
+        .bind(worker_id)
+        .bind(generation)
+        .fetch_optional(&mut **tx)
+        .await?;
     if assignment != Some(server_id) {
         return Err(invalid_assignment());
     }

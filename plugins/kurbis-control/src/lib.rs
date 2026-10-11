@@ -3,6 +3,7 @@ mod api;
 mod chat;
 mod command;
 mod menu;
+mod stats;
 
 use std::{
     fs::{self, File},
@@ -90,6 +91,7 @@ impl Plugin for KurbisControl {
     fn on_load(&self, context: Context) -> Result<(), String> {
         let config_path = Path::new(&context.get_data_folder()).join("config.json");
         let config = Config::load(&config_path)?;
+        let is_ci_preview = config.ci_preview;
         CONFIG
             .set(config)
             .map_err(|_| "plugin config was initialized more than once".to_owned())?;
@@ -125,6 +127,14 @@ impl Plugin for KurbisControl {
             EventPriority::High,
             true,
         )?;
+        if !is_ci_preview {
+            context.register_event_handler::<pumpkin_plugin_api::events::PlayerJoinEvent, _>(
+                stats::Join,
+                EventPriority::Normal,
+                true,
+            )?;
+            stats::start(&context);
+        }
         Ok(())
     }
 }

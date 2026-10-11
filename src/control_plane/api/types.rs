@@ -38,6 +38,8 @@ pub struct ServerSettings {
     pub simulation_distance: u8,
     pub hardcore: bool,
     pub whitelist: bool,
+    #[serde(default)]
+    pub tab_stats: bool,
 }
 
 impl Default for ServerSettings {
@@ -50,6 +52,7 @@ impl Default for ServerSettings {
             simulation_distance: 8,
             hardcore: false,
             whitelist: false,
+            tab_stats: false,
         }
     }
 }
@@ -64,6 +67,7 @@ pub(super) struct ServerSettingsPatch {
     simulation_distance: Option<u8>,
     hardcore: Option<bool>,
     whitelist: Option<bool>,
+    tab_stats: Option<bool>,
 }
 
 impl ServerSettings {
@@ -107,6 +111,9 @@ impl ServerSettings {
         }
         if let Some(value) = patch.whitelist {
             self.whitelist = value;
+        }
+        if let Some(value) = patch.tab_stats {
+            self.tab_stats = value;
         }
     }
 

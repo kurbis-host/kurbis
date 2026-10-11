@@ -1,10 +1,11 @@
 use std::{path::PathBuf, time::Duration};
+use uuid::Uuid;
 
 use clap::Parser;
-use vibe_controller::{controller::Controller, paths::RuntimePaths};
+use kurbis_ai_controller::{controller::Controller, paths::RuntimePaths};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Codex backend for the Pumpkin Vibe test server")]
+#[command(version, about = "Codex backend for the Kurbis AI test server")]
 struct Args {
     #[arg(long, default_value = "../runtime")]
     runtime: PathBuf,
@@ -17,16 +18,31 @@ struct Args {
 
     #[arg(long)]
     once: bool,
+
+    #[arg(long, requires = "job_id")]
+    mcp_server: bool,
+
+    #[arg(long)]
+    job_id: Option<Uuid>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let controller = Controller::new(
-        RuntimePaths::new(args.runtime),
-        args.codex,
-        Duration::from_secs(args.timeout_seconds),
+    let paths = RuntimePaths::new(args.runtime);
+    if args.mcp_server {
+        return kurbis_ai_controller::mcp::serve_stdio(
+            paths,
+            args.job_id
+                .expect("clap requires --job-id for --mcp-server"),
+        )
+        .await;
+    }
+    anyhow::ensure!(
+        args.job_id.is_none(),
+        "--job-id is only valid with --mcp-server"
     );
+    let controller = Controller::new(paths, args.codex, Duration::from_secs(args.timeout_seconds));
 
     if args.once {
         let processed = controller.run_once().await?;

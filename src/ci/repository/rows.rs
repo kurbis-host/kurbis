@@ -126,7 +126,7 @@ pub(super) struct CiBuildValidityRow {
     pub(super) failure_message: Option<String>,
     pub(super) build_log: String,
     pub(super) created_at: DateTime<Utc>,
-    pub(super) expires_at: DateTime<Utc>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
     pub(super) artifact_valid: bool,
 }
 impl CiBuildValidityRow {
@@ -163,7 +163,7 @@ pub(super) struct CiBuildRow {
     pub(super) failure_message: Option<String>,
     pub(super) build_log: String,
     pub(super) created_at: DateTime<Utc>,
-    pub(super) expires_at: DateTime<Utc>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<CiBuildRow> for CiBuild {
@@ -240,4 +240,20 @@ impl TryFrom<CiPreviewRow> for CiPreview {
             expires_at: row.expires_at,
         })
     }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub(super) struct CiBuildQueueClaimRow {
+    pub(super) id: Uuid,
+    pub(super) repository: String,
+    pub(super) pull_request_number: i64,
+    pub(super) commit_sha: String,
+    pub(super) patch_fingerprint: String,
+    pub(super) toolchain_version: String,
+    pub(super) target_architecture: String,
+    pub(super) build_id: Uuid,
+    pub(super) source_repository: Option<String>,
+    pub(super) attempt: i32,
+    pub(super) claim_token: Uuid,
+    pub(super) claim_expires_at: DateTime<Utc>,
 }

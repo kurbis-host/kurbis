@@ -21,6 +21,7 @@ MAX_SOURCE = 256 * 1024 * 1024
 MAX_PLUGIN = 64 * 1024 * 1024
 MAX_ARTIFACT = 1024 * 1024 * 1024
 MAX_LOG = 512 * 1024
+REMOTE_PROTOCOL_VERSION = 2
 
 PREFLIGHT_SCRIPT = r"""
 set -eu
@@ -50,6 +51,10 @@ strip /work/out/c-link-probe
 printf 'fn main() {}\n' > /work/tmp/rust-link-probe.rs
 rustc --target "$KURBIS_RUST_TARGET" -C strip=debuginfo /work/tmp/rust-link-probe.rs -o /work/out/rust-link-probe
 /work/out/rust-link-probe
+printf '#!/bin/sh\nprintf REMOTE_ARTIFACT_PROBE\n' > /work/out/artifact-probe
+chmod 0700 /work/out/artifact-probe
+[ "$(/work/out/artifact-probe)" = REMOTE_ARTIFACT_PROBE ]
+printf 'artifact_execution=true\n'
 wasm_libdir="$(rustc --print target-libdir --target wasm32-wasip2)"
 test -d "$wasm_libdir" || { echo "WASI target libraries unavailable: $wasm_libdir" >&2; exit 78; }
 test -x /work/.ci-source-preparer || { echo "trusted source preparer unavailable" >&2; exit 78; }
@@ -132,7 +137,7 @@ printf 'workspace_boundary=operator_tmpfs_explicit_size_and_inodes\n'
 
 
 def fail(message, status=1, stdout="", stderr=""):
-    result = {"ok": False, "status": status, "stdout": stdout[-MAX_LOG:], "stderr": (message + "\n" + stderr)[-MAX_LOG:], "artifacts": []}
+    result = {"ok": False, "status": status, "stdout": stdout[-MAX_LOG:], "stderr": (message + "\n" + stderr)[-MAX_LOG:], "artifacts": [], "capability": None}
     sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     raise SystemExit(0)
@@ -192,6 +197,70 @@ def validate_cache_size(value):
     return size
 
 
+def hash_path(path):
+    """Hash immutable files/directories with stable metadata and content."""
+    digest = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    if not path.is_dir():
+        raise ValueError(f"immutable input is not a regular file or directory: {path}")
+    entries = []
+    for entry in path.rglob("*"):
+        relative = entry.relative_to(path).as_posix()
+        info = entry.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            kind = b"l"
+            content = os.readlink(entry).encode()
+        elif stat.S_ISDIR(info.st_mode):
+            kind = b"d"
+            content = b""
+        elif stat.S_ISREG(info.st_mode):
+            kind = b"f"
+            file_digest = hashlib.sha256()
+            with entry.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    file_digest.update(chunk)
+            content = file_digest.digest()
+        else:
+            raise ValueError(f"immutable input contains unsupported entry: {entry}")
+        entries.append((relative, kind, info.st_size, info.st_mode & 0o7777, content))
+    for relative, kind, size, mode, content in sorted(entries):
+        digest.update(relative.encode())
+        digest.update(b"\\0")
+        digest.update(kind)
+        digest.update(size.to_bytes(8, "big"))
+        digest.update(mode.to_bytes(4, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def meminfo():
+    values = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, _, raw = line.partition(":")
+        parts = raw.strip().split()
+        if parts and parts[0].isdigit():
+            values[key] = int(parts[0]) * (1024 if len(parts) > 1 and parts[1] == "kB" else 1)
+    return values.get("MemTotal", 0), values.get("MemAvailable", 0)
+
+
+def cgroup_mode():
+    root = Path("/sys/fs/cgroup")
+    try:
+        controllers = set((root / "cgroup.controllers").read_text().split())
+        delegated = set((root / "cgroup.subtree_control").read_text().split())
+    except OSError:
+        return "unavailable"
+    required = {"cpu", "memory", "pids"}
+    if required <= controllers and required <= {value.lstrip("+") for value in delegated}:
+        return "delegated"
+    if required <= controllers:
+        return "available_not_delegated"
+    return "unavailable"
+
 def runner_command(header, workspace, script):
     bwrap = Path(header["bwrap"])
     rootfs = Path(header["rootfs"])
@@ -234,7 +303,7 @@ def main():
         fail("invalid job header")
     try:
         header = json.loads(line)
-        if header.get("version") != 1 or header.get("mode") not in ("preflight", "compile"):
+        if header.get("version") != REMOTE_PROTOCOL_VERSION or header.get("mode") not in ("preflight", "compile"):
             raise ValueError("unsupported job header")
         if any(not isinstance(header.get(key), str) or not header[key] for key in ("job_id", "target", "rustc", "patch_fingerprint", "workspace_root", "cache_root", "bwrap", "rootfs", "toolchain", "source_preparer")):
             raise ValueError("missing job field")
@@ -243,8 +312,12 @@ def main():
         source_len = int(header.get("source_len", 0))
         plugin_len = int(header.get("plugin_len", 0))
         validate_cache_size(header.get("cache_max_bytes", 0))
+        if int(header.get("profile_memory_bytes", 0)) <= 0 or int(header.get("profile_workspace_bytes", 0)) <= 0 or int(header.get("profile_workspace_inodes", 0)) <= 0 or int(header.get("profile_concurrency", 0)) <= 0:
+            raise ValueError("invalid resource profile")
         if source_len < 0 or source_len > MAX_SOURCE or plugin_len < 0 or plugin_len > MAX_PLUGIN:
             raise ValueError("framed input exceeds bounds")
+        if header["mode"] == "compile" and not isinstance(header.get("capability_fingerprint"), str):
+            raise ValueError("compile requires a registered capability fingerprint")
         if header["mode"] == "preflight" and (source_len or plugin_len):
             raise ValueError("preflight cannot carry input")
         workspace_root = private_workspace_root(header["workspace_root"])
@@ -268,6 +341,41 @@ def main():
         stdout = completed.stdout[-MAX_LOG:].decode("utf-8", "replace")
         stderr = completed.stderr[-MAX_LOG:].decode("utf-8", "replace")
         artifacts = []
+        capability = None
+        if completed.returncode == 0 and header["mode"] == "preflight":
+            workspace_stat = os.statvfs(workspace)
+            workspace_bytes = workspace_stat.f_frsize * workspace_stat.f_blocks
+            workspace_inodes = workspace_stat.f_files
+            if workspace_bytes != int(header["profile_workspace_bytes"]) or workspace_inodes != int(header["profile_workspace_inodes"]):
+                raise ValueError("measured workspace size or inode budget differs from profile")
+            probe = workspace / "out" / "artifact-probe"
+            transferred = probe.is_file() and probe.read_bytes() == b"#!/bin/sh\nprintf REMOTE_ARTIFACT_PROBE\n"
+            rustc_release = ""
+            for line in stdout.splitlines():
+                if line.startswith("rustc="):
+                    rustc_release = line.split("=", 1)[1].strip()
+                    break
+            total_memory, available_memory = meminfo()
+            capability = {
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "host_uid": os.getuid(),
+                "host_gid": os.getgid(),
+                "sandbox_uid": 0,
+                "sandbox_gid": 0,
+                "bwrap_hash": hash_path(Path(header["bwrap"])),
+                "rootfs_hash": hash_path(Path(header["rootfs"])),
+                "toolchain_hash": hash_path(Path(header["toolchain"])),
+                "source_preparer_hash": hash_path(Path(header["source_preparer"])),
+                "rustc_version": rustc_release,
+                "workspace_bytes": workspace_bytes,
+                "workspace_inodes": workspace_inodes,
+                "memory_total_bytes": total_memory,
+                "memory_available_bytes": available_memory,
+                "cgroup_mode": cgroup_mode(),
+                "smoke_build": completed.returncode == 0 and "BWRAP_NAMESPACE_AND_TOOLCHAIN_PROBE_PASSED" in stdout,
+                "artifact_transfer": transferred,
+                "artifact_execution": "artifact_execution=true" in stdout,
+            }
         if completed.returncode == 0 and header["mode"] == "compile":
             for filename in ("pumpkin", "kurbis-control.wasm"):
                 path = workspace / "out" / filename
@@ -276,7 +384,7 @@ def main():
                     raise ValueError(f"invalid output {filename}")
                 data = path.read_bytes()
                 artifacts.append({"name": filename, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "data": data})
-        result = {"ok": completed.returncode == 0, "status": completed.returncode, "stdout": stdout, "stderr": stderr, "artifacts": [{k: v for k, v in item.items() if k != "data"} for item in artifacts]}
+        result = {"ok": completed.returncode == 0, "status": completed.returncode, "stdout": stdout, "stderr": stderr, "artifacts": [{k: v for k, v in item.items() if k != "data"} for item in artifacts], "capability": capability}
         sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         for item in artifacts:

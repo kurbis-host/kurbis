@@ -79,6 +79,37 @@
   to { opacity: 1; }
 }
 
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes xp-orb {
+  0% { opacity: 0; transform: translate(var(--orb-x), var(--orb-y)); }
+  25% { opacity: 1; }
+  100% { opacity: 0; transform: translate(0, 0) scale(0.3); }
+}
+
+@keyframes portal-shimmer {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fall-fade {
+  0%, 100% { opacity: 0; }
+  35%, 60% { opacity: 1; }
+}
+
+/* Landing page: the 3D world sets these on <html> while something is hovered or the ore wall is in view. */
+.landing-hover .landing-canvas {
+  cursor: pointer;
+}
+
+.landing-pick .landing-canvas,
+.landing-pick #layer-ores {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 16 16' shape-rendering='crispEdges'%3E%3Cpath d='M2 13h1v-1h1v-1h1v-1h1V9h1V8h1V7h1V6h1v1h-1v1H9v1H8v1H7v1H6v1H5v1H4v1H2z' fill='%236b4a2c'/%3E%3Cpath d='M4 1h4v1h2v1h1v1h1v1h1v2h1v4h-2V8h-1V6h-1V5h-1V4H8V3H4z' fill='%23d9dee3'/%3E%3Cpath d='M4 1h4v1H4zM13 7h1v4h-1z' fill='%2378838c'/%3E%3C/svg%3E") 8 2, crosshair;
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;

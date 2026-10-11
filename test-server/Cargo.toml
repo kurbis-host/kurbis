@@ -1,3 +1,3 @@
 [workspace]
-members = ["controller", "protocol"]
+members = ["controller"]
 resolver = "2"

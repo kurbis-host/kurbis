@@ -76,6 +76,25 @@ Use a disposable local database. The schema is bootstrapped from the canonical
 empty-database definition; historical migration fixtures and upgrade
 compatibility are not supported.
 
+### Frontend-only preview
+
+To preview the marketing landing page locally without PostgreSQL, the control
+plane, workers, or OAuth credentials:
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+bun run dev # or pnpm run dev
+```
+
+Open `http://localhost:3000`. The landing page, its interactive wake/sleep demo,
+and `/login` render without backend requests. `/` always shows the marketing
+page, including for signed-in visitors; use `/app` to open the management panel.
+Actual sign-in, management routes, and API requests still require the control
+plane. Run the web command from `web/`, not the Rust repository root.
+
+### Full local stack
+
 Local panel development uses an isolated PostgreSQL database and the loopback OAuth fixture, so it does not need production OAuth credentials. The checked-out local settings live in the ignored `web/.env.local` file. Create the database once:
 
 ```bash
@@ -228,9 +247,10 @@ stack, then updates the separate systemd-managed host worker from the deployed
 application image. It verifies the worker binary, Pumpkin runtime, and renewing
 worker lease, and rolls the worker and app back together if verification fails.
 Set `TEST_DATABASE_URL` to a disposable PostgreSQL database for the required
-release regression. The first migration from the current unlabelled Respond5
-baseline additionally requires the reviewed manifest described in the rollout
-guide; do not enable Dokploy's direct auto-deploy path for production.
+release regression; the release path has one canonical source-provenance flow
+and no historical baseline/rollback mode. For stranded CI coordination rows, use
+the bounded, dry-run-first procedure in [`deployment/ci-cleanup.md`](deployment/ci-cleanup.md);
+never reset production data with broad SQL or Compose volume deletion.
 
 ## Configuration
 

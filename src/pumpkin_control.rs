@@ -53,6 +53,18 @@ pub struct PlayerStatus {
     pub activity_revision: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStats {
+    pub cpu_percent: Option<f64>,
+    pub cpu_limit_millis: Option<u64>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub disk_used_bytes: Option<u64>,
+    pub disk_limit_bytes: Option<u64>,
+    pub tps: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct OnlineAuthentication {
     java: bool,
@@ -66,6 +78,7 @@ struct Response {
     activity_revision: Option<u64>,
     online_authentication: Option<OnlineAuthentication>,
     waiting_players: Option<Vec<WaitingPlayer>>,
+    stats: Option<HostStats>,
     output: Option<Vec<String>>,
     error: Option<String>,
 }
@@ -90,6 +103,11 @@ impl PumpkinControl {
                 .activity_revision
                 .context("status response omitted activity_revision")?,
         })
+    }
+
+    pub async fn stats(&self, socket: &Path) -> Result<HostStats> {
+        let response = self.request(socket, json!({"action":"stats"})).await?;
+        response.stats.context("stats response omitted stats")
     }
 
     pub async fn online_authentication(&self, socket: &Path) -> Result<(bool, bool)> {
@@ -333,6 +351,23 @@ mod tests {
                 xuid: "2533274790395904".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn host_stats_response_preserves_unavailable_resource_fields() {
+        let stats: HostStats = serde_json::from_value(json!({
+            "cpu_percent": null,
+            "cpu_limit_millis": 1000,
+            "memory_used_bytes": 12,
+            "memory_limit_bytes": 2048,
+            "disk_used_bytes": null,
+            "disk_limit_bytes": null,
+            "tps": 20.0
+        }))
+        .unwrap();
+        assert_eq!(stats.cpu_percent, None);
+        assert_eq!(stats.cpu_limit_millis, Some(1000));
+        assert_eq!(stats.tps, Some(20.0));
     }
 
     #[test]

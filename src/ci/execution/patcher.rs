@@ -23,6 +23,7 @@ const PLUGIN_4: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/chat
 const PLUGIN_5: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/command.rs");
 const PLUGIN_6: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/lib.rs");
 const PLUGIN_7: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/menu.rs");
+const PLUGIN_8: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/stats.rs");
 
 /// The exact build integration compiled into this binary: pinned Pumpkin
 /// patches plus every trusted plugin source/lockfile input used in artifacts.
@@ -43,6 +44,7 @@ pub fn checked_in_patch_fingerprint() -> String {
         ("trusted-plugin/src/command.rs", PLUGIN_5),
         ("trusted-plugin/src/lib.rs", PLUGIN_6),
         ("trusted-plugin/src/menu.rs", PLUGIN_7),
+        ("trusted-plugin/src/stats.rs", PLUGIN_8),
     ] {
         hasher.update(&(name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());

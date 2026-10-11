@@ -244,6 +244,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kurbis-ai-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kurbis-ai-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "wasmparser",
+]
+
+[[package]]
+name = "kurbis-ai-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,31 +501,6 @@ dependencies = [
  "js-sys",
  "serde_core",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "vibe-controller"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
- "vibe-protocol",
- "wasmparser",
-]
-
-[[package]]
-name = "vibe-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "uuid",
 ]
 
 [[package]]

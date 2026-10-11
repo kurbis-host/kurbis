@@ -1,7 +1,5 @@
 /runtime/
 /target/
-/vibe-bridge/target/
 
-/plugin-support/target/
 /tests/__pycache__/
 /scripts/__pycache__/

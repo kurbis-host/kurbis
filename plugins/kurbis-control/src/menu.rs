@@ -337,11 +337,7 @@ fn render_home(inv: &Inventory, actions: &mut HashMap<i16, Action>) -> Result<()
     Ok(())
 }
 
-fn render_status(
-    inv: &Inventory,
-    actions: &mut HashMap<i16, Action>,
-    data: &Value,
-) -> Result<()> {
+fn render_status(inv: &Inventory, actions: &mut HashMap<i16, Action>, data: &Value) -> Result<()> {
     button(
         inv,
         actions,
@@ -446,15 +442,7 @@ fn render_logs(
     for (index, entry) in page_entries(entries, page).enumerate() {
         let line = value(entry, &["line"]);
         let slot = content_slot(index);
-        button(
-            inv,
-            actions,
-            slot,
-            "paper",
-            &clip(&line, 40),
-            &line,
-            None,
-        );
+        button(inv, actions, slot, "paper", &clip(&line, 40), &line, None);
     }
     page_controls(inv, actions, view, page, entries.len());
     Ok(())
@@ -580,6 +568,18 @@ fn render_settings(
                 direction: 1,
             }),
         },
+    );
+    button(
+        inv,
+        actions,
+        43,
+        "name_tag",
+        "Tab stats",
+        &format!(
+            "Current: {}\nClick to toggle",
+            value(settings, &["tab_stats"])
+        ),
+        Some(Action::ToggleSetting { key: "tab_stats" }),
     );
     button(
         inv,
@@ -964,9 +964,7 @@ fn render_restore_confirm(
         22,
         restore.material,
         restore.label,
-        &format!(
-            "Replace current world with generation {generation}. Click to confirm."
-        ),
+        &format!("Replace current world with generation {generation}. Click to confirm."),
         Some(Action::Restore { generation, page }),
     );
     button(
@@ -1169,7 +1167,7 @@ pub(crate) struct Click;
 impl EventHandler<InventoryClickEvent> for Click {
     fn handle(
         &self,
-        _server: Server,
+        server: Server,
         mut event: EventData<InventoryClickEvent>,
     ) -> EventData<InventoryClickEvent> {
         let key = player_key(&event.player);
@@ -1193,14 +1191,14 @@ impl EventHandler<InventoryClickEvent> for Click {
             return event;
         }
 
-        if let Err(error) = activate(&event.player, action) {
+        if let Err(error) = activate(&event.player, &server, action) {
             tell(&event.player, &format!("Kurbis: {error:#}"));
         }
         event
     }
 }
 
-fn activate(player: &Player, action: Action) -> Result<()> {
+fn activate(player: &Player, server: &Server, action: Action) -> Result<()> {
     match action {
         Action::Open(view) => open(player, view)?,
         Action::Login => {
@@ -1237,6 +1235,9 @@ fn activate(player: &Player, action: Action) -> Result<()> {
         }
         Action::ToggleSetting { key } => {
             api::adjust_setting(key, 1)?;
+            if key == "tab_stats" {
+                crate::stats::refresh_now(server);
+            }
             tell(
                 player,
                 if key == "whitelist" {
@@ -1365,30 +1366,26 @@ impl EventHandler<PlayerChatEvent> for ChatInput {
         }
 
         match target {
-            TextInputTarget::Motd => {
-                match api::update_setting("motd", Value::String(text)) {
-                    Ok(()) => {
-                        tell(&event.player, "Updated server setting motd.");
-                        let _ = open(&event.player, View::Settings);
-                    }
-                    Err(error) => {
-                        tell(&event.player, &format!("Kurbis: {error:#}"));
-                        let _ = open(&event.player, View::Settings);
-                    }
+            TextInputTarget::Motd => match api::update_setting("motd", Value::String(text)) {
+                Ok(()) => {
+                    tell(&event.player, "Updated server setting motd.");
+                    let _ = open(&event.player, View::Settings);
                 }
-            }
-            TextInputTarget::WhitelistAdd(page) => {
-                match api::add_whitelist_entry(&text) {
-                    Ok(()) => {
-                        tell(&event.player, &format!("Added {text} to the whitelist."));
-                        let _ = open(&event.player, View::Whitelist(page));
-                    }
-                    Err(error) => {
-                        tell(&event.player, &format!("Kurbis: {error:#}"));
-                        let _ = open(&event.player, View::Whitelist(page));
-                    }
+                Err(error) => {
+                    tell(&event.player, &format!("Kurbis: {error:#}"));
+                    let _ = open(&event.player, View::Settings);
                 }
-            }
+            },
+            TextInputTarget::WhitelistAdd(page) => match api::add_whitelist_entry(&text) {
+                Ok(()) => {
+                    tell(&event.player, &format!("Added {text} to the whitelist."));
+                    let _ = open(&event.player, View::Whitelist(page));
+                }
+                Err(error) => {
+                    tell(&event.player, &format!("Kurbis: {error:#}"));
+                    let _ = open(&event.player, View::Whitelist(page));
+                }
+            },
         }
         event
     }
@@ -1417,7 +1414,9 @@ impl EventHandler<BedrockFormResponseEvent> for BedrockForm {
             if !trimmed.is_empty() {
                 match target {
                     TextInputTarget::Motd => {
-                        if let Err(e) = api::update_setting("motd", Value::String(trimmed.to_owned())) {
+                        if let Err(e) =
+                            api::update_setting("motd", Value::String(trimmed.to_owned()))
+                        {
                             tell(&event.player, &format!("Kurbis: {e:#}"));
                         } else {
                             tell(&event.player, "Updated server setting motd.");
@@ -1498,7 +1497,10 @@ mod tests {
     fn content_slot_positions_are_within_valid_container_slots() {
         for index in 0..PAGE_SIZE {
             let slot = content_slot(index);
-            assert!(slot < 54, "slot {slot} should be within generic 9x6 container");
+            assert!(
+                slot < 54,
+                "slot {slot} should be within generic 9x6 container"
+            );
             assert!(
                 !matches!(slot, 0..=8 | 45..=53),
                 "slot {slot} should not overwrite header or footer row"
@@ -1572,7 +1574,10 @@ mod detailed_tests {
         ];
         for view in views {
             let title = view_title(&view);
-            assert!(title.starts_with("Kurbis • ") || title.starts_with("Select "), "title: {title}");
+            assert!(
+                title.starts_with("Kurbis • ") || title.starts_with("Select "),
+                "title: {title}"
+            );
         }
     }
 }

@@ -261,7 +261,7 @@ where
             Ok(values) => values,
             Err(error) => {
                 tracing::warn!(build_id = %build_id, ?error, "failed to load CI Check Run diagnostics");
-                (String::new(), Utc::now(), vec![])
+                (String::new(), None, vec![])
             }
         };
         let diagnostics = tail_utf8_bytes(&build_log, 6 * 1024);
@@ -283,7 +283,7 @@ where
             failure_message,
             build_log: diagnostics,
             preview_hostnames,
-            expires_at: Some(expires_at.to_rfc3339()),
+            expires_at: expires_at.map(|value| value.to_rfc3339()),
             details_url,
         };
         match client
@@ -314,7 +314,7 @@ where
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
         let (build, _) = self
             .repository
-            .ensure_build(&request.key)
+            .ensure_build_with_retention(&request.key, request.retention)
             .await
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
         // A source poll may materialize a queued PR identity without asking
@@ -325,7 +325,11 @@ where
             .mark_build_requested(build.id)
             .await
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
-        if build.stage == CiBuildStage::Ready && build.expires_at > Utc::now() {
+        if build.stage == CiBuildStage::Ready
+            && build
+                .expires_at
+                .is_none_or(|expires_at| expires_at > Utc::now())
+        {
             self.repository
                 .advance_stable_aliases_for_build(build.id, &self.root_domain)
                 .await
@@ -547,7 +551,7 @@ where
                     &digest,
                     &format!("ci/{}/{digest}.tar", request.key.commit_sha),
                     &artifact,
-                    Utc::now() + Duration::hours(72),
+                    request.retention.expires_at(Utc::now()),
                 )
                 .await
                 .map_err(artifact_cache_error)?;

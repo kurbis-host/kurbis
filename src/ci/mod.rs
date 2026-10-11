@@ -13,14 +13,15 @@ pub mod status;
 
 pub use domain::{
     BUILD_TTL_HOURS, BuildKey, CI_ROOT_DOMAIN, CI_TARGET_REPOSITORY, CiBuild, CiBuildFailureClass,
-    CiBuildStage, CiHostname, CiPreview, CiPreviewState, CiPublicPreviewStatus, CiRefKind,
-    InvalidCiValue, POLL_INTERVAL_SECONDS, normalize_root_domain, parse_pr_number, slugify_branch,
-    validate_commit_sha,
+    CiBuildQueueState, CiBuildRetention, CiBuildStage, CiHostname, CiPreview, CiPreviewState,
+    CiPublicPreviewStatus, CiRefKind, InvalidCiValue, POLL_INTERVAL_SECONDS, normalize_root_domain,
+    parse_pr_number, slugify_branch, validate_commit_sha,
 };
 pub use execution::{
     CheckedInPumpkinPatcher, DockerRootlessBuildRuntime, GitHubExactSource,
     MAX_COMPRESSED_SOURCE_BYTES, ROOTLESS_BUILD_LIMITS, RustPumpkinBuilder, bubblewrap_pipeline,
     checked_in_patch_fingerprint, docker_pipeline, remote_bubblewrap_pipeline,
+    remote_bubblewrap_pipeline_ready,
 };
 pub use rate_limit::{GitHubRateLimitConfig, GitHubRateLimitDiagnostics, GitHubRateLimitGuard};
 pub use source_control::{

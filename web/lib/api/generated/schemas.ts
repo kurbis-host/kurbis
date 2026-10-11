@@ -97,6 +97,7 @@ export interface components {
              *       "hardcore": false,
              *       "motd": "Hosted by Kurbis",
              *       "simulation_distance": 8,
+             *       "tab_stats": false,
              *       "view_distance": 12,
              *       "whitelist": false
              *     } */
@@ -223,6 +224,32 @@ export interface components {
         };
         /** @enum {string} */
         ResetMode: "world" | "full";
+        RuntimeStats: {
+            /** Format: uint64 */
+            cpu_limit_millis?: number | null;
+            /** Format: double */
+            cpu_percent?: number | null;
+            /** Format: uint64 */
+            disk_limit_bytes?: number | null;
+            /** Format: uint64 */
+            disk_used_bytes?: number | null;
+            /**
+             * Format: int64
+             * @description The placement generation that produced this sample.
+             */
+            generation: number;
+            /**
+             * Format: date-time
+             * @description Assigned by the control plane when the sample is persisted.
+             */
+            measured_at: string;
+            /** Format: uint64 */
+            memory_limit_bytes?: number | null;
+            /** Format: uint64 */
+            memory_used_bytes?: number | null;
+            /** Format: double */
+            tps?: number | null;
+        };
         Server: {
             bedrock_address: string;
             /** Format: date-time */
@@ -375,6 +402,8 @@ export interface components {
              * @default 8
              */
             simulation_distance: number;
+            /** @default false */
+            tab_stats: boolean;
             /**
              * Format: uint8
              * @default 12
@@ -397,6 +426,8 @@ export interface components {
              * @default null
              */
             simulation_distance: number | null;
+            /** @default null */
+            tab_stats: boolean | null;
             /**
              * Format: uint8
              * @default null

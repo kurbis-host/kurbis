@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::{
     actions, api, chat,
     menu::{self, View},
+    stats,
 };
 
 pub(crate) fn command() -> Command {
@@ -94,7 +95,7 @@ impl CommandHandler for Handler {
     fn handle(
         &self,
         sender: CommandSender,
-        _server: Server,
+        server: Server,
         args: ConsumedArgs,
     ) -> Result<i32, CommandError> {
         let run = || -> Result<()> {
@@ -146,7 +147,7 @@ impl CommandHandler for Handler {
                         ),
                     );
                 }
-                "set" => update_setting(&sender, &args)?,
+                "set" => update_setting(&sender, &server, &args)?,
                 "whitelist_add" => {
                     let name = arg(&args, "name")?;
                     api::add_whitelist_entry(&name)?;
@@ -205,7 +206,7 @@ fn page(sender: &CommandSender, view: View) -> Result<()> {
     Ok(())
 }
 
-fn update_setting(sender: &CommandSender, args: &ConsumedArgs) -> Result<()> {
+fn update_setting(sender: &CommandSender, server: &Server, args: &ConsumedArgs) -> Result<()> {
     let key = arg(args, "key")?;
     let raw = arg(args, "value")?;
     let value = match key.as_str() {
@@ -222,10 +223,13 @@ fn update_setting(sender: &CommandSender, args: &ConsumedArgs) -> Result<()> {
             Value::String(raw)
         }
         "view_distance" | "simulation_distance" => Value::Number(raw.parse::<u8>()?.into()),
-        "hardcore" | "whitelist" => Value::Bool(raw.parse::<bool>()?),
+        "hardcore" | "whitelist" | "tab_stats" => Value::Bool(raw.parse::<bool>()?),
         _ => bail!("invalid settings key or value"),
     };
     api::update_setting(&key, value)?;
+    if key == "tab_stats" {
+        stats::refresh_now(server);
+    }
     say(
         sender,
         &format!(

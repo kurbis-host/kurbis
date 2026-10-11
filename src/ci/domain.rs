@@ -10,6 +10,50 @@ pub const CI_ROOT_DOMAIN: &str = "pumpkin.kurbis.host";
 /// repositories remain separate source inputs and are validated independently.
 pub const CI_TARGET_REPOSITORY: &str = "Pumpkin-MC/Pumpkin";
 pub const BUILD_TTL_HOURS: i64 = 72;
+
+/// Retention policy for immutable Pumpkin builds and their content-addressed artifacts.
+/// Preview builds follow the sliding 72-hour cache lifetime; the default-branch build
+/// is permanent until its build key changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBuildRetention {
+    Preview,
+    Permanent,
+}
+
+impl CiBuildRetention {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Permanent => "permanent",
+        }
+    }
+
+    pub fn expires_at(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Preview => Some(now + chrono::Duration::hours(BUILD_TTL_HOURS)),
+            Self::Permanent => None,
+        }
+    }
+}
+
+impl fmt::Display for CiBuildRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CiBuildRetention {
+    type Err = InvalidCiValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "preview" => Ok(Self::Preview),
+            "permanent" => Ok(Self::Permanent),
+            _ => Err(InvalidCiValue::new("unknown CI build retention policy")),
+        }
+    }
+}
 pub const POLL_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -92,6 +136,62 @@ impl FromStr for CiBuildFailureClass {
             "transient" => Ok(Self::Transient),
             "permanent" => Ok(Self::Permanent),
             _ => Err(InvalidCiValue::new("unknown CI build failure class")),
+        }
+    }
+}
+
+/// Durable desired-build lifecycle. Queue state is intentionally separate from
+/// the immutable build pipeline stage: a newer PR head can supersede an older
+/// build without rewriting that build's diagnostics or artifact history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBuildQueueState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Superseded,
+    Cancelled,
+}
+
+impl CiBuildQueueState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Superseded | Self::Cancelled
+        )
+    }
+
+    pub const fn is_claimable(self) -> bool {
+        matches!(self, Self::Pending | Self::Failed)
+    }
+}
+
+impl fmt::Display for CiBuildQueueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl FromStr for CiBuildQueueState {
+    type Err = InvalidCiValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "superseded" => Ok(Self::Superseded),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(InvalidCiValue::new("unknown CI build queue state")),
         }
     }
 }
@@ -336,7 +436,9 @@ pub struct CiBuild {
     pub failure_message: Option<String>,
     pub build_log: String,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    /// Preview builds expire after the sliding TTL; permanent default-branch builds
+    /// intentionally have no expiration timestamp.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -500,5 +602,33 @@ mod tests {
         assert!(CiBuildStage::Packaging.can_transition_to(CiBuildStage::Ready));
         assert!(!CiBuildStage::Ready.can_transition_to(CiBuildStage::Compiling));
         assert!(!CiBuildStage::Failed.can_transition_to(CiBuildStage::Ready));
+    }
+
+    #[test]
+    fn build_queue_states_are_explicit_and_terminal() {
+        let states = [
+            (CiBuildQueueState::Pending, false, true),
+            (CiBuildQueueState::Running, false, false),
+            (CiBuildQueueState::Succeeded, true, false),
+            (CiBuildQueueState::Failed, true, true),
+            (CiBuildQueueState::Superseded, true, false),
+            (CiBuildQueueState::Cancelled, true, false),
+        ];
+        for (state, terminal, claimable) in states {
+            assert_eq!(state.is_terminal(), terminal, "{state}");
+            assert_eq!(state.is_claimable(), claimable, "{state}");
+            assert_eq!(
+                state.to_string().parse::<CiBuildQueueState>().unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_and_cancelled_queue_states_cannot_be_claimed() {
+        assert!(!CiBuildQueueState::Superseded.is_claimable());
+        assert!(!CiBuildQueueState::Cancelled.is_claimable());
+        assert!("running".parse::<CiBuildQueueState>().is_ok());
+        assert!("legacy".parse::<CiBuildQueueState>().is_err());
     }
 }
