@@ -592,7 +592,7 @@ impl CiPreviewRepository {
                     count(*) FILTER (WHERE queue.state = 'superseded'),
                     count(*) FILTER (WHERE queue.state = 'cancelled'),
                     count(*) FILTER (WHERE queue.state = 'running' AND queue.claim_expires_at <= now()),
-                    min(EXTRACT(EPOCH FROM (now() - queue.requested_at))) FILTER (WHERE queue.state = 'pending')
+                    min(EXTRACT(EPOCH FROM (now() - queue.requested_at))::float8) FILTER (WHERE queue.state = 'pending')
              FROM ci_build_queue queue
              JOIN ci_watched_repositories watched ON watched.id = queue.repository_id
              WHERE ($1::text IS NULL OR watched.repository = $1)",
