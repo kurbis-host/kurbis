@@ -24,10 +24,10 @@ index 9e936794..3f2106b6 100644
 +            toml::from_str("external_ip = \"203.0.113.7\"\nexternal_port = 19132").unwrap();
 @@ -110,0 +120 @@ mod tests {
 +        assert_eq!(config.external_port, Some(19132));
-diff --git a/crates/pumpkin/src/net/bedrock/nethernet/endpoint.rs b/crates/pumpkin/src/net/bedrock/nethernet/endpoint.rs
+diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
 index 43adfd8e..d914c798 100644
---- a/crates/pumpkin/src/net/bedrock/nethernet/endpoint.rs
-+++ b/crates/pumpkin/src/net/bedrock/nethernet/endpoint.rs
+--- a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
++++ b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
 @@ -1 +1,4 @@
 -use std::{net::SocketAddr, sync::Arc};
 +use std::{
@@ -154,18 +154,18 @@ index 43adfd8e..d914c798 100644
 +    }
 +}
 +
-diff --git a/crates/pumpkin/src/net/bedrock/nethernet/peer.rs b/crates/pumpkin/src/net/bedrock/nethernet/peer.rs
+diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
 index b555a71e..5b71f303 100644
---- a/crates/pumpkin/src/net/bedrock/nethernet/peer.rs
-+++ b/crates/pumpkin/src/net/bedrock/nethernet/peer.rs
+--- a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
++++ b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
 @@ -149 +149,3 @@ async fn negotiate_inner(
 -                state.ice_router.public_addr().port(),
 +                state
 +                    .external_port
 +                    .unwrap_or_else(|| state.ice_router.public_addr().port()),
-diff --git a/crates/pumpkin/src/net/bedrock/nethernet/state.rs b/crates/pumpkin/src/net/bedrock/nethernet/state.rs
+diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
 index 998cf006..ba972458 100644
---- a/crates/pumpkin/src/net/bedrock/nethernet/state.rs
-+++ b/crates/pumpkin/src/net/bedrock/nethernet/state.rs
+--- a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
++++ b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
 @@ -22,0 +23 @@ pub(super) struct NetherNetState {
 +    pub(super) external_port: Option<u16>,

@@ -555,7 +555,7 @@ async fn handle(
                 .await;
             };
             let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sender = CommandSender::Rcon(output.clone());
+            let sender = CommandSender::HostControl(output.clone());
             let source = sender.into_source(server);
             server
                 .command_dispatcher

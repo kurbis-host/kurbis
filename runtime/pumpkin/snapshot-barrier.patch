@@ -1,16 +1,16 @@
-diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
-index ec4d762..5a518e5 100644
---- a/crates/pumpkin/src/lib.rs
-+++ b/crates/pumpkin/src/lib.rs
-@@ -605,6 +605,7 @@ impl PumpkinServer {
+diff --git a/crates/pumpkin-core/src/lib.rs b/crates/pumpkin-core/src/lib.rs
+index d878e74a..0dee942c 100644
+--- a/crates/pumpkin-core/src/lib.rs
++++ b/crates/pumpkin-core/src/lib.rs
+@@ -609,6 +609,7 @@ impl PumpkinServer {
                                       world
                                           .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
                                           .await;
 +                                     server_clone.finish_player_admission();
-
+ 
                                       if let ClientPlatform::Java(client) = player.client.as_ref() {
                                           client.progress_player_packets(&player, &server_clone).await;
-@@ -613,6 +614,7 @@ impl PumpkinServer {
+@@ -617,6 +618,7 @@ impl PumpkinServer {
                                           client.close();
                                           client.await_tasks().await;
                                       }
@@ -18,7 +18,7 @@ index ec4d762..5a518e5 100644
                                       player.remove().await;
                                       server_clone.remove_player(&player);
                                      if let Err(e) = server_clone
-@@ -716,9 +718,11 @@ impl PumpkinServer {
+@@ -720,9 +722,11 @@ impl PumpkinServer {
                          Some(config),
                      ) {
                          client.set_player(player.clone());
@@ -30,10 +30,10 @@ index ec4d762..5a518e5 100644
                          player.remove().await;
                          server.remove_player(&player);
                          if let Err(error) = server.player_data_storage.handle_player_leave(&player)
-diff --git a/crates/pumpkin/src/net/bedrock/play/chat_command.rs b/crates/pumpkin/src/net/bedrock/play/chat_command.rs
-index d31683b..f594142 100644
---- a/crates/pumpkin/src/net/bedrock/play/chat_command.rs
-+++ b/crates/pumpkin/src/net/bedrock/play/chat_command.rs
+diff --git a/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs b/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
+index d31683b7..f5941420 100644
+--- a/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
++++ b/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
 @@ -8,6 +8,7 @@ impl BedrockClient {
          server: &Arc<Server>,
          packet: SCommandRequest<'_>,
@@ -42,10 +42,10 @@ index d31683b..f594142 100644
          player.update_last_action_time();
          if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
              return;
-diff --git a/crates/pumpkin/src/net/bedrock/play/chat_message.rs b/crates/pumpkin/src/net/bedrock/play/chat_message.rs
-index d32485e..13060f0 100644
---- a/crates/pumpkin/src/net/bedrock/play/chat_message.rs
-+++ b/crates/pumpkin/src/net/bedrock/play/chat_message.rs
+diff --git a/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs b/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
+index d32485e9..13060f0b 100644
+--- a/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
++++ b/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
 @@ -8,6 +8,7 @@ impl BedrockClient {
          player: &Arc<Player>,
          packet: SText<'_>,
@@ -54,11 +54,11 @@ index d32485e..13060f0 100644
          player.update_last_action_time();
          if player.check_chat_spam(server, crate::entity::player::SpamType::Chat) {
              return;
-diff --git a/crates/pumpkin/src/net/bedrock/play/player_action.rs b/crates/pumpkin/src/net/bedrock/play/player_action.rs
-index c7cf353..4c17fbb 100644
---- a/crates/pumpkin/src/net/bedrock/play/player_action.rs
-+++ b/crates/pumpkin/src/net/bedrock/play/player_action.rs
-@@ -240,7 +240,11 @@ impl BedrockClient {
+diff --git a/crates/pumpkin-core/src/net/bedrock/play/player_action.rs b/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
+index 8205626b..d8be5ad7 100644
+--- a/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
++++ b/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
+@@ -235,7 +235,11 @@ impl BedrockClient {
                      || player.living_entity.health.load() <= 0.0 =>
              {
                  let player_c = player.clone();
@@ -70,10 +70,10 @@ index c7cf353..4c17fbb 100644
                      player_c.world().respawn_player(&player_c, false).await;
                  });
              }
-diff --git a/crates/pumpkin/src/net/java/play/chat_command.rs b/crates/pumpkin/src/net/java/play/chat_command.rs
-index a274019..5cefc45 100644
---- a/crates/pumpkin/src/net/java/play/chat_command.rs
-+++ b/crates/pumpkin/src/net/java/play/chat_command.rs
+diff --git a/crates/pumpkin-core/src/net/java/play/chat_command.rs b/crates/pumpkin-core/src/net/java/play/chat_command.rs
+index a2740195..5cefc45f 100644
+--- a/crates/pumpkin-core/src/net/java/play/chat_command.rs
++++ b/crates/pumpkin-core/src/net/java/play/chat_command.rs
 @@ -8,6 +8,7 @@ impl JavaClient {
          server: &Arc<Server>,
          command: &SChatCommand<'_>,
@@ -82,22 +82,22 @@ index a274019..5cefc45 100644
          player.update_last_action_time();
          if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
              return;
-diff --git a/crates/pumpkin/src/net/java/play/chat_message.rs b/crates/pumpkin/src/net/java/play/chat_message.rs
-index 6536ce6..aa97976 100644
---- a/crates/pumpkin/src/net/java/play/chat_message.rs
-+++ b/crates/pumpkin/src/net/java/play/chat_message.rs
+diff --git a/crates/pumpkin-core/src/net/java/play/chat_message.rs b/crates/pumpkin-core/src/net/java/play/chat_message.rs
+index 6536ce65..aa979764 100644
+--- a/crates/pumpkin-core/src/net/java/play/chat_message.rs
++++ b/crates/pumpkin-core/src/net/java/play/chat_message.rs
 @@ -9,6 +9,7 @@ impl JavaClient {
          player: &Arc<Player>,
          chat_message: SChatMessage<'_>,
      ) {
 +        let _snapshot_activity = server.begin_snapshot_activity().await;
          player.update_last_action_time();
-
+ 
          if let Some(command) = chat_message.message.strip_prefix('/') {
-diff --git a/crates/pumpkin/src/net/java/play/client_command.rs b/crates/pumpkin/src/net/java/play/client_command.rs
-index afdb65c..28fde8c 100644
---- a/crates/pumpkin/src/net/java/play/client_command.rs
-+++ b/crates/pumpkin/src/net/java/play/client_command.rs
+diff --git a/crates/pumpkin-core/src/net/java/play/client_command.rs b/crates/pumpkin-core/src/net/java/play/client_command.rs
+index afdb65c1..28fde8c0 100644
+--- a/crates/pumpkin-core/src/net/java/play/client_command.rs
++++ b/crates/pumpkin-core/src/net/java/play/client_command.rs
 @@ -16,7 +16,9 @@ impl JavaClient {
                  let Some(server) = player.world().server.upgrade() else {
                      return;
@@ -108,11 +108,11 @@ index afdb65c..28fde8c 100644
                      player_c
                          .world()
                          .clone()
-diff --git a/crates/pumpkin/src/server/mod.rs b/crates/pumpkin/src/server/mod.rs
-index 8a12a10..3d48571 100644
---- a/crates/pumpkin/src/server/mod.rs
-+++ b/crates/pumpkin/src/server/mod.rs
-@@ -44,9 +44,10 @@ use rsa::RsaPublicKey;
+diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
+index c4b41498..ca3f0e28 100644
+--- a/crates/pumpkin-core/src/server/mod.rs
++++ b/crates/pumpkin-core/src/server/mod.rs
+@@ -45,9 +45,10 @@ use rsa::RsaPublicKey;
  use std::fs;
  use std::net::IpAddr;
  use std::sync::Arc;
@@ -124,11 +124,11 @@ index 8a12a10..3d48571 100644
 +use tokio::sync::{OnceCell, watch};
  use tokio::task::JoinHandle;
  use tokio_util::task::TaskTracker;
-
-@@ -67,6 +68,14 @@ use crate::data::advancement_data::AdvancementManager;
- use crate::server::scheduler::TaskScheduler;
-
- /// Represents a Minecraft server instance.
+ 
+@@ -66,6 +67,14 @@ pub use recipe::RecipeManager;
+ 
+ use crate::data::advancement_data::AdvancementManager;
+ 
 +pub struct SnapshotActivityGuard(Arc<AtomicUsize>);
 +
 +impl Drop for SnapshotActivityGuard {
@@ -137,9 +137,9 @@ index 8a12a10..3d48571 100644
 +    }
 +}
 +
+ /// Represents a Minecraft server instance.
  pub struct Server {
      pub basic_config: BasicConfiguration,
-     pub advanced_config: AdvancedConfiguration,
 @@ -103,6 +112,16 @@ pub struct Server {
      container_id: AtomicU32,
      /// Changes for every successful player join and leave, including brief sessions.
@@ -169,10 +169,10 @@ index 8a12a10..3d48571 100644
              recipe_manager: Arc::new(recipe::RecipeManager::new()),
              datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
              enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
-@@ -615,6 +639,78 @@ impl Server {
+@@ -619,6 +643,78 @@ impl Server {
          Ok(())
      }
-
+ 
 +    /// Stop simulation and admissions, drain in-flight work, then durably save
 +    /// all mutable world and player data before the worker archives the volume.
 +    pub async fn begin_snapshot_barrier(self: &Arc<Self>) -> Result<(), String> {
@@ -248,7 +248,7 @@ index 8a12a10..3d48571 100644
      /// Adds a new player to the server.
      ///
      /// This function takes an `Arc<Client>` representing the connected client and performs the following actions:
-@@ -646,6 +742,20 @@ impl Server {
+@@ -650,6 +746,20 @@ impl Server {
          profile: GameProfile,
          config: Option<PlayerConfig>,
      ) -> Option<(Arc<Player>, Arc<World>)> {
@@ -269,7 +269,7 @@ index 8a12a10..3d48571 100644
          let gamemode = self
              .defaultgamemode
              .lock()
-@@ -706,6 +816,7 @@ impl Server {
+@@ -710,6 +820,7 @@ impl Server {
              'after: {
                  player.screen_handler_sync_handler.store_player(player.clone());
                  world.add_player(&player).is_ok().then(|| {
@@ -277,7 +277,7 @@ index 8a12a10..3d48571 100644
                      self.player_activity_revision
                          .fetch_add(1, Ordering::Release);
                      {
-@@ -1109,6 +1220,13 @@ impl Server {
+@@ -1150,6 +1261,13 @@ impl Server {
      /// Main server tick method. This now handles both player/network ticking (which always runs)
      /// and world/game logic ticking (which is affected by freeze state).
      pub fn tick(self: &Arc<Self>) {
@@ -288,6 +288,6 @@ index 8a12a10..3d48571 100644
 +        if self.snapshot_barrier_active.load(Ordering::Acquire) {
 +            return;
 +        }
+         // Do not flush mid-tick; `Flush` is `flushChannel`.
+         let suspended = self.suspend_player_flushes();
          if self.tick_rate_manager.runs_normally() || self.tick_rate_manager.is_sprinting() {
-             self.tick_worlds();
-             // Always run player and network ticking, even when game is frozen

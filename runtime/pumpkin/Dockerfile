@@ -13,7 +13,7 @@ RUN git apply --check /tmp/host-control.patch \
     && git apply /tmp/snapshot-barrier.patch \
     && git apply --unidiff-zero --check /tmp/nethernet-gateway.patch \
     && git apply --unidiff-zero /tmp/nethernet-gateway.patch
-COPY runtime/pumpkin/host_control.rs crates/pumpkin/src/net/host_control.rs
+COPY runtime/pumpkin/host_control.rs crates/pumpkin-core/src/net/host_control.rs
 ENV CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=false RUSTUP_TOOLCHAIN=1.98.1
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \

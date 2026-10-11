@@ -195,7 +195,7 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
         .await?;
         Self::apply_patch(root, "nethernet-gateway.patch", NETHERNET_PATCH, true).await?;
 
-        let host_control = root.join("crates/pumpkin/src/net/host_control.rs");
+        let host_control = root.join("crates/pumpkin-core/src/net/host_control.rs");
         if let Some(parent) = host_control.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 BuildPipelineError::transient(

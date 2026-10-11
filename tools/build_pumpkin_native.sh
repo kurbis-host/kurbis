@@ -32,7 +32,7 @@ if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$fingerprint" ]; then
     git -C "$source_dir" apply "$root/runtime/pumpkin/snapshot-barrier.patch"
     git -C "$source_dir" apply --unidiff-zero --check "$root/runtime/pumpkin/nethernet-gateway.patch"
     git -C "$source_dir" apply --unidiff-zero "$root/runtime/pumpkin/nethernet-gateway.patch"
-    cp "$root/runtime/pumpkin/host_control.rs" "$source_dir/crates/pumpkin/src/net/host_control.rs"
+    cp "$root/runtime/pumpkin/host_control.rs" "$source_dir/crates/pumpkin-core/src/net/host_control.rs"
     printf '%s\n' "$fingerprint" > "$stamp"
 fi
 export CARGO_TARGET_DIR="$root/output/native-pumpkin/target"
