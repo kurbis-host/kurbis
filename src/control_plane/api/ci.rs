@@ -333,6 +333,24 @@ pub(super) async fn admit(
         .lookup_preview(&request.hostname)
         .await
         .map_err(ApiError::from)?;
+    if state.ci_main_only {
+        let supported_branch = state.ci_default_branch.as_deref().and_then(|branch| {
+            CiHostname::for_ref(CiRefKind::Branch, branch, crate::ci::CI_ROOT_DOMAIN)
+                .ok()
+                .map(|hostname| hostname.value)
+        });
+        let supported = existing.as_ref().is_some_and(|preview| {
+            preview.alias.kind == CiRefKind::Branch
+                && supported_branch.as_deref() == Some(preview.alias.value.as_str())
+        });
+        if !supported {
+            return Err(ApiError::with_code(
+                StatusCode::GONE,
+                "ci_pr_previews_disabled",
+                "pull-request and non-default-branch CI previews are disabled; only the latest default branch is supported",
+            ));
+        }
+    }
     let preview = match existing.clone() {
         Some(preview) if preview.alias.kind == CiRefKind::PullRequest => {
             Some(ensure_pull_request_preview_on_demand(&state, &repository, preview).await?)

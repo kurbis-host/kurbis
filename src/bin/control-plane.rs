@@ -93,6 +93,8 @@ async fn main() -> Result<()> {
     );
     let mut ci_build_coordinator: Option<Arc<dyn BuildCoordinator>> = None;
     let mut ci_build_identity: Option<CiBuildIdentity> = None;
+    let mut ci_main_only = false;
+    let mut ci_default_branch: Option<String> = None;
     if let Some(ci_config) = CiConfig::from_env()? {
         let ci_repository = CiPreviewRepository::new(pool.clone());
         let watched = ci_repository
@@ -210,6 +212,8 @@ async fn main() -> Result<()> {
                 }
             };
         ci_build_coordinator = Some(pipeline.clone());
+        ci_main_only = true;
+        ci_default_branch = Some(ci_config.default_branch.clone());
         ci_build_identity = Some(CiBuildIdentity {
             repository: ci_config.repository.clone(),
             patch_fingerprint: ci_config.patch_fingerprint.clone(),
@@ -226,6 +230,7 @@ async fn main() -> Result<()> {
             },
         );
         let ci_poller = CiPoller::new(ci_repository, std::sync::Arc::new(source))
+            .default_branch_only()
             .with_check_runs(check_runs)
             .with_config(CiPollerConfig {
                 root_domain: kurbis_hoster::ci::CI_ROOT_DOMAIN.into(),
@@ -274,6 +279,8 @@ async fn main() -> Result<()> {
         pool,
         ci_build_coordinator,
         ci_build_identity,
+        ci_main_only,
+        ci_default_branch,
         lifecycle,
         config,
         object_store,
