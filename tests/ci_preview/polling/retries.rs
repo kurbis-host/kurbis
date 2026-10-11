@@ -312,6 +312,16 @@ async fn transient_failed_pr_build_retries_after_backoff_with_immutable_dedupe_a
             .await
             .unwrap()
     );
+    let requested_at_is_set: bool =
+        sqlx::query_scalar("SELECT requested_at IS NOT NULL FROM ci_builds WHERE id = $1")
+            .bind(build.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        requested_at_is_set,
+        "claiming a build makes it eligible for durable retry recovery after a worker restart"
+    );
     assert!(
         repository
             .fail_claimed_build_with_class(
