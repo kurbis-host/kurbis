@@ -851,6 +851,7 @@ pub async fn ensure_rootless_volume_owner(path: &Path, uid: u32, gid: u32) -> Re
 
 #[cfg(target_os = "linux")]
 pub async fn rootless_docker_socket() -> Result<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let endpoint = docker_output([
         "context",
         "inspect",
