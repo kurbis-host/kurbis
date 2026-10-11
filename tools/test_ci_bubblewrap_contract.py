@@ -15,6 +15,28 @@ class CiBubblewrapContractTests(unittest.TestCase):
         self.assertIn("trusted source preparer fingerprint mismatch", runner)
         self.assertIn("--print-fingerprint", ROOT.joinpath("src/bin/ci-source-preparer.rs").read_text())
 
+    def test_only_the_code_free_fetch_phase_has_network(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("runner", ROOT / "tools/ci_bubblewrap_runner.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        # The fetch phase may only unpack archives and download locked
+        # dependencies; anything that compiles or runs fetched code must stay
+        # in the network-less build phase.
+        commands = [
+            line.split()[0]
+            for line in runner.FETCH_SCRIPT.splitlines()
+            if line and not line.startswith(("#", "export ", "set ", "umask "))
+        ]
+        self.assertEqual(set(commands), {"mkdir", "tar", "cargo", "printf"})
+        self.assertNotIn("cargo build", runner.FETCH_SCRIPT)
+        self.assertIn("--offline", runner.BUILD_SCRIPT)
+        source = (ROOT / "tools/ci_bubblewrap_runner.py").read_text(encoding="utf-8")
+        self.assertIn('command.append("--unshare-net")', source)
+        self.assertIn("runner_command(header, workspace, FETCH_SCRIPT, network=True)", source)
+        self.assertEqual(source.count("network=True"), 1)
+
     def test_remote_job_header_carries_host_fingerprint(self):
         source = (ROOT / "src/ci/execution/remote_bubblewrap.rs").read_text(encoding="utf-8")
         self.assertIn("patch_fingerprint: String", source)

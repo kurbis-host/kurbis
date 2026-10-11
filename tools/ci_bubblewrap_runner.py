@@ -5,23 +5,38 @@ The control plane sends one JSON header followed by two bounded tar archives. Th
 runner emits one JSON result followed by the two bounded output files. It never
 uses public /tmp or evaluates source-controlled shell input; only this checked-in
 build script runs inside the Bubblewrap namespace.
+
+A compile job has two phases. The fetch phase has network access but executes
+no source-controlled code: it unpacks the archives, lets Cargo download the
+locked dependencies into the persistent cache, and the runner itself downloads
+the Minecraft server jar that upstream's data build script needs. The build
+phase then compiles with no network at all.
 """
 import hashlib
 import json
 import os
-import secrets
+import re
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 MAX_SOURCE = 256 * 1024 * 1024
 MAX_PLUGIN = 64 * 1024 * 1024
 MAX_ARTIFACT = 1024 * 1024 * 1024
 MAX_LOG = 512 * 1024
-REMOTE_PROTOCOL_VERSION = 2
+REMOTE_PROTOCOL_VERSION = 3
+MAX_FETCH_SECONDS = 20 * 60
+MAX_SERVER_JAR = 256 * 1024 * 1024
+MAX_METADATA = 16 * 1024 * 1024
+MOJANG_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+MOJANG_HOSTS = ("piston-meta.mojang.com", "piston-data.mojang.com")
+HOST_RESOLV_CONF = "/etc/resolv.conf"
+HOST_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 PREFLIGHT_SCRIPT = r"""
 set -eu
@@ -74,14 +89,35 @@ printf 'rust_target=%s\n' "$KURBIS_RUST_TARGET"
 printf 'wasi_libdir=%s\n' "$wasm_libdir"
 """
 
+FETCH_SCRIPT = r"""
+set -eu
+umask 077
+mkdir -p /work/source /work/plugin /work/tmp /work/home /cache/cargo-home
+export HOME=/work/home
+export TMPDIR=/work/tmp
+export CARGO_HOME=/cache/cargo-home
+export CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+export CARGO_NET_RETRY=5
+tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
+tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
+# `cargo fetch` only resolves and downloads the locked dependency set; it never
+# runs build scripts or proc macros, so no fetched code executes with network.
+cargo fetch --locked --manifest-path /work/source/Cargo.toml --target "$KURBIS_RUST_TARGET"
+cargo fetch --locked --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2
+printf 'dependency_fetch=complete\n'
+"""
+
 BUILD_SCRIPT = r"""
 set -eu
 umask 077
 ulimit -n 4096 2>/dev/null || true
-mkdir -p /work/source /work/plugin /work/out /work/tmp /work/home
+mkdir -p /work/out /work/tmp /work/home
 export HOME=/work/home
 export TMPDIR=/work/tmp
-export CARGO_HOME=/toolchain/cargo
+export CARGO_HOME=/cache/cargo-home
+export CARGO_NET_OFFLINE=true
 export CARGO_BUILD_JOBS=1
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_LTO=false
@@ -117,8 +153,6 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 }
 build_elapsed_seconds=0
 SECONDS=0
-tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-permissions
-tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 cd /work/source
 cargo_build build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
@@ -261,7 +295,7 @@ def cgroup_mode():
         return "available_not_delegated"
     return "unavailable"
 
-def runner_command(header, workspace, script):
+def runner_command(header, workspace, script, network=False, extra_env=None):
     bwrap = Path(header["bwrap"])
     rootfs = Path(header["rootfs"])
     toolchain = Path(header["toolchain"])
@@ -279,9 +313,10 @@ def runner_command(header, workspace, script):
         "KURBIS_BWRAP_GUARANTEE": "bubblewrap_namespace_only",
         "KURBIS_CGROUP_DELEGATION": "remote_probe",
     }
+    env_values.update(extra_env or {})
     command = [
         str(bwrap), "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
-        "--unshare-ipc", "--unshare-uts", "--unshare-net", "--uid", "0", "--gid", "0",
+        "--unshare-ipc", "--unshare-uts", "--uid", "0", "--gid", "0",
         "--cap-drop", "ALL", "--ro-bind", str(rootfs), "/", "--ro-bind", str(toolchain), "/toolchain",
         "--bind", str(private_cache_root(header["cache_root"])), "/cache",
         "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev",
@@ -291,10 +326,82 @@ def runner_command(header, workspace, script):
         "--setenv", "HOME", "/work/home", "--setenv", "PATH", "/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
         "--ro-bind", str(preparer), "/work/.ci-source-preparer",
     ]
+    if network:
+        # The read-only rootfs carries empty mount points for the host's
+        # resolver configuration and CA bundle; nothing else of the host leaks in.
+        for host_path in (HOST_RESOLV_CONF, HOST_CA_BUNDLE):
+            if not (rootfs / host_path.lstrip("/")).is_file():
+                raise ValueError(f"rootfs lacks the fetch-phase mount point {host_path}")
+            command.extend(("--ro-bind", str(Path(host_path).resolve(strict=True)), host_path))
+    else:
+        command.append("--unshare-net")
     for key, value in env_values.items():
         command.extend(("--setenv", key, value))
     command.extend(("/bin/sh", "-ec", script))
     return command
+
+
+def fetch_bounded(url, limit):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in MOJANG_HOSTS:
+        raise ValueError(f"refusing Minecraft download outside Mojang hosts: {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": "kurbis-ci-runner"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"Minecraft download exceeds its size bound: {url}")
+    return data
+
+
+def minecraft_server_jar(workspace, cache_root):
+    """Provide the vanilla server jar that pumpkin-data's build script unpacks.
+
+    Upstream no longer vendors the vanilla datapack and downloads the jar at
+    build time, which the network-less build phase cannot do. Returns the
+    sandbox path of a verified cached jar, or None when the source does not
+    need one.
+    """
+    source = workspace / "source"
+    if (source / "assets/datapack/data/minecraft").is_dir():
+        return None
+    build_script = source / "crates/pumpkin-data/build.rs"
+    try:
+        info = build_script.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        return None
+    text = build_script.read_text(errors="replace")
+    version = re.search(r'const MC_VERSION: &str = "([0-9A-Za-z][0-9A-Za-z._-]{0,31})";', text)
+    if "PUMPKIN_MINECRAFT_SERVER_JAR" not in text or version is None:
+        return None
+    version = version.group(1)
+    directory = cache_root / "minecraft"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    jar = directory / f"server-{version}.jar"
+    if not jar.is_file():
+        manifest = json.loads(fetch_bounded(MOJANG_MANIFEST, MAX_METADATA))
+        entry = next((item for item in manifest["versions"] if item.get("id") == version), None)
+        if entry is None:
+            raise ValueError(f"Minecraft {version} is not in Mojang's version manifest")
+        download = json.loads(fetch_bounded(entry["url"], MAX_METADATA))["downloads"]["server"]
+        data = fetch_bounded(download["url"], MAX_SERVER_JAR)
+        if hashlib.sha1(data).hexdigest() != download["sha1"]:
+            raise ValueError(f"Minecraft {version} server jar failed its SHA-1 check")
+        temporary = directory / f".server-{version}.{os.getpid()}.tmp"
+        temporary.write_bytes(data)
+        temporary.chmod(0o600)
+        temporary.replace(jar)
+    return f"/cache/minecraft/{jar.name}"
+
+
+def run_phase(command, deadline, limit=None):
+    remaining = deadline - time.monotonic()
+    if limit is not None:
+        remaining = min(remaining, limit)
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(command, 0)
+    return subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=remaining, check=False)
 
 
 def main():
@@ -333,12 +440,20 @@ def main():
         if plugin_len:
             (workspace / "input/plugin.tar.gz").write_bytes(plugin)
             (workspace / "input/plugin.tar.gz").chmod(0o600)
+        deadline = time.monotonic() + int(header.get("timeout_seconds", 5400))
         if header["mode"] == "preflight":
-            command = runner_command(header, workspace, PREFLIGHT_SCRIPT)
+            completed = run_phase(runner_command(header, workspace, PREFLIGHT_SCRIPT), deadline)
+            fetch_log = b""
         else:
-            command = runner_command(header, workspace, BUILD_SCRIPT)
-        completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=int(header.get("timeout_seconds", 5400)), check=False)
-        stdout = completed.stdout[-MAX_LOG:].decode("utf-8", "replace")
+            completed = run_phase(runner_command(header, workspace, FETCH_SCRIPT, network=True), deadline, MAX_FETCH_SECONDS)
+            fetch_log = completed.stdout
+            if completed.returncode == 0:
+                build_env = {}
+                server_jar = minecraft_server_jar(workspace, private_cache_root(header["cache_root"]))
+                if server_jar:
+                    build_env["PUMPKIN_MINECRAFT_SERVER_JAR"] = server_jar
+                completed = run_phase(runner_command(header, workspace, BUILD_SCRIPT, extra_env=build_env), deadline)
+        stdout = (fetch_log + completed.stdout)[-MAX_LOG:].decode("utf-8", "replace")
         stderr = completed.stderr[-MAX_LOG:].decode("utf-8", "replace")
         artifacts = []
         capability = None

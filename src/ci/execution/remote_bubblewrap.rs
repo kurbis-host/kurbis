@@ -33,7 +33,7 @@ use crate::ci::{BuildPipelineError, SandboxLimits};
 const MAX_PLUGIN_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_LINE: usize = 256 * 1024;
 const CAPABILITY_LEASE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
-const REMOTE_PROTOCOL_VERSION: u8 = 2;
+const REMOTE_PROTOCOL_VERSION: u8 = 3;
 
 /// Evidence returned by the remote helper before CI is marked ready.
 ///
@@ -350,8 +350,10 @@ impl SshBubblewrapBuildRuntime {
 
     fn command(&self) -> Command {
         let mut command = self.ssh_command();
+        // The runner keeps the host network for its dependency-fetch phase and
+        // unshares it itself for every phase that executes fetched code.
         command
-            .args(["unshare", "-Urnm", "python3"])
+            .args(["unshare", "-Urm", "python3"])
             .arg(&self.runner);
         command
     }
