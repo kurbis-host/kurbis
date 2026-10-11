@@ -13,7 +13,7 @@ The build script accepts `debug` or `release` (default `debug`):
 ```sh
 tools/build_pumpkin_native.sh debug
 tools/build_pumpkin_native.sh release
-tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo --jobs 1 build --bins
+tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --jobs 1 --bins
 export DATABASE_URL=postgres://localhost/melon_hoster
 export KURBIS_ALLOW_UNSANDBOXED_NATIVE_DEV=true
 . examples/config/native-worker.env.example
@@ -86,7 +86,7 @@ private key owner-only. For remote clients, advertise the actual public UDP
 address instead of loopback and provide a certificate trusted for the same
 hostnames.
 
-In another terminal with those same variables, use the bounded wrapper if a gateway binary build is needed: `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo --jobs 1 run --bin gateway`.
+In another terminal with those same variables, use the bounded wrapper if a gateway binary build is needed: `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo run --jobs 1 --bin gateway`.
 Run the worker in a third terminal from the native worker example above.
 The default waiting ports are 25566/TCP and 19133/TCP+UDP; hosted backend ports
 come from the worker’s distinct assigned range. Set wildcard DNS or local

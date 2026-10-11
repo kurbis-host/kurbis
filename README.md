@@ -64,7 +64,7 @@ Run Rust tests through the same admission gate:
 ```bash
 TEST_DATABASE_URL=postgres://localhost/melon_hoster_test \
   tools/run_bounded_build.py --memory-bytes 10737418240 -- \
-  cargo --jobs 1 test --locked --all-targets -- --test-threads=1
+  cargo test --jobs 1 --locked --all-targets -- --test-threads=1
 ```
 
 Use `tools/docker_build_with_limits.sh` rather than raw `docker buildx build` or
