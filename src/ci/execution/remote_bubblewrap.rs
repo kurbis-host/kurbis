@@ -930,7 +930,13 @@ async fn probe_remote_identity(target: &str) -> Result<(u32, u32), BuildPipeline
     let output = timeout(
         Duration::from_secs(30),
         command
-            .args(["sh", "-c", "printf '%s\n%s\n' \"$(id -u)\" \"$(id -g)\""])
+            // OpenSSH concatenates remote command arguments before invoking the
+            // target shell. Passing `sh`, `-c`, and the script as separate SSH
+            // arguments makes `printf` become the `sh -c` command's `$0`, so
+            // dash receives the format string as an option/argument and exits
+            // before emitting the UID/GID. Pass the complete shell command as
+            // one SSH argument instead.
+            .arg("printf '%s\n%s\n' \"$(id -u)\" \"$(id -g)\"")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
