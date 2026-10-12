@@ -38,13 +38,7 @@ pub(super) async fn whitelist_state(pool: &PgPool, server_id: Uuid) -> Result<Wh
     .bind(server_id)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| {
-        ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "server_not_found",
-            "server not found",
-        )
-    })?;
+    .ok_or_else(ApiError::server_not_found)?;
     let revision = sqlx::query_as::<_, (i64, i64)>(
         "SELECT revision, applied_revision
          FROM server_whitelist_state WHERE server_id = $1",

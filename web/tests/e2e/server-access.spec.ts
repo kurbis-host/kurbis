@@ -388,7 +388,7 @@ test("server login link opens a scoped panel and keeps account routes private", 
   for (const width of [1440, 820, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
     await expect(navigation).toBeVisible();
-    await expect(navigation.getByRole("link")).toHaveCount(5);
+    await expect(navigation.getByRole("link")).toHaveCount(6);
     await expect(page.getByText("Server only • no Kurbis account")).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
     const navMetrics = await navigation.evaluate((element) => ({
@@ -423,6 +423,7 @@ test("server login link opens a scoped panel and keeps account routes private", 
     { label: "Console", suffix: "/console", heading: "Console" },
     { label: "Backups", suffix: "/backups", heading: "Backups" },
     { label: "Players", suffix: "/players", heading: "Players" },
+    { label: "AI", suffix: "/ai", heading: "AI assistant" },
     { label: "Settings", suffix: "/settings", heading: "World settings" },
   ]) {
     await navigation.getByRole("link", { name: route.label }).click();

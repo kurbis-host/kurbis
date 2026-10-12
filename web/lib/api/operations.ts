@@ -4,6 +4,7 @@ import { ApiError, apiRequest, apiVoid } from "./client";
 
 export function apiOperations(client: Client<paths>) {
   const serverParams = (serverId: string) => ({ params: { path: { server_id: serverId } } });
+  const aiJobParams = (serverId: string, jobId: string) => ({ params: { path: { server_id: serverId, job_id: jobId } } });
 
   return {
     getSession: () => apiRequest(client.GET("/api/v1/session")),
@@ -46,6 +47,11 @@ export function apiOperations(client: Client<paths>) {
         body: { request_id: requestId, command: commandText },
       }));
     },
+    getAiOverview: (serverId: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/ai", serverParams(serverId))),
+    updateAiSettings: (serverId: string, body: components["schemas"]["AiSettings"]) =>
+      apiRequest(client.PUT("/api/v1/servers/{server_id}/ai/settings", { ...serverParams(serverId), body })),
+    getAiJob: (serverId: string, jobId: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/ai/jobs/{job_id}", aiJobParams(serverId, jobId))),
+    cancelAiJob: (serverId: string, jobId: string) => apiRequest(client.POST("/api/v1/servers/{server_id}/ai/jobs/{job_id}/cancel", aiJobParams(serverId, jobId))),
     createWorldExport: (serverId: string) => apiRequest(client.POST("/api/v1/servers/{server_id}/exports", serverParams(serverId))),
     cancelWorldExport: (serverId: string, exportId: string) => apiRequest(client.DELETE("/api/v1/servers/{server_id}/exports/{export_id}", {
       params: { path: { server_id: serverId, export_id: exportId } },

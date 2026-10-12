@@ -33,7 +33,7 @@ use crate::ci::{BuildPipelineError, SandboxLimits};
 const MAX_PLUGIN_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_LINE: usize = 256 * 1024;
 const CAPABILITY_LEASE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
-const REMOTE_PROTOCOL_VERSION: u8 = 2;
+const REMOTE_PROTOCOL_VERSION: u8 = 3;
 
 /// Evidence returned by the remote helper before CI is marked ready.
 ///
@@ -142,6 +142,7 @@ pub struct SshBubblewrapBuildRuntime {
     toolchain: String,
     workspace_root: String,
     source_preparer: String,
+    patch_fingerprint: String,
     compiler_cache_root: String,
     compiler_cache_size: u64,
     rustc_version: String,
@@ -194,6 +195,10 @@ impl SshBubblewrapBuildRuntime {
         let toolchain = toolchain.into();
         let workspace_root = workspace_root.into();
         let source_preparer = source_preparer.into();
+        // The source preparer is an operator-mounted executable. Carry the
+        // host-compiled fingerprint into every remote preflight so a stale
+        // preparer cannot silently diverge from the patcher used for admission.
+        let patch_fingerprint = crate::ci::checked_in_patch_fingerprint();
         let compiler_cache_root = std::path::Path::new(&workspace_root)
             .parent()
             .ok_or_else(|| {
@@ -216,7 +221,7 @@ impl SshBubblewrapBuildRuntime {
                 .map_err(|error| BuildPipelineError::Sandbox(error.to_string()))?;
         }
         let full_identity = format!(
-            "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};rust={rustc_version}",
+            "bubblewrap_namespace_only;transport=ssh;target={target};runner={};bwrap={bwrap};rootfs={rootfs};toolchain={toolchain};workspace={workspace_root};source_preparer={source_preparer};patch={patch_fingerprint};rust={rustc_version}",
             runner.display()
         );
         let identity = super::bounded_build_identity(
@@ -246,6 +251,7 @@ impl SshBubblewrapBuildRuntime {
             toolchain,
             workspace_root,
             source_preparer,
+            patch_fingerprint,
             compiler_cache_root,
             compiler_cache_size,
             rustc_version,
@@ -344,8 +350,10 @@ impl SshBubblewrapBuildRuntime {
 
     fn command(&self) -> Command {
         let mut command = self.ssh_command();
+        // The runner keeps the host network for its dependency-fetch phase and
+        // unshares it itself for every phase that executes fetched code.
         command
-            .args(["unshare", "-Urnm", "python3"])
+            .args(["unshare", "-Urm", "python3"])
             .arg(&self.runner);
         command
     }
@@ -391,6 +399,7 @@ impl SshBubblewrapBuildRuntime {
             rootfs: self.rootfs.clone(),
             toolchain: self.toolchain.clone(),
             source_preparer: self.source_preparer.clone(),
+            patch_fingerprint: self.patch_fingerprint.clone(),
             cache_root: self.compiler_cache_root.clone(),
             cache_max_bytes: self.compiler_cache_size,
             source_len: source.len(),
@@ -709,6 +718,7 @@ struct JobHeader {
     rootfs: String,
     toolchain: String,
     source_preparer: String,
+    patch_fingerprint: String,
     cache_root: String,
     cache_max_bytes: u64,
     source_len: usize,
@@ -922,7 +932,13 @@ async fn probe_remote_identity(target: &str) -> Result<(u32, u32), BuildPipeline
     let output = timeout(
         Duration::from_secs(30),
         command
-            .args(["sh", "-c", "printf '%s\n%s\n' \"$(id -u)\" \"$(id -g)\""])
+            // OpenSSH concatenates remote command arguments before invoking the
+            // target shell. Passing `sh`, `-c`, and the script as separate SSH
+            // arguments makes `printf` become the `sh -c` command's `$0`, so
+            // dash receives the format string as an option/argument and exits
+            // before emitting the UID/GID. Pass the complete shell command as
+            // one SSH argument instead.
+            .arg("printf '%s\n%s\n' \"$(id -u)\" \"$(id -g)\"")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

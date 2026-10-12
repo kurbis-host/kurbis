@@ -13,7 +13,7 @@ cargo build --locked --manifest-path plugins/kurbis-control/Cargo.toml \
 ```
 
 Operators can open `/kurbis` for status, players, logs, activity, settings,
-whitelist, snapshots, and server controls. All navigation and setting updates
+whitelist, snapshots, server controls and the AI assistant. All navigation and setting updates
 occur in-place within the chest container without closing or reopening the screen,
 preventing mouse cursor resets. Logs and activity open in paged in-menu lists
 rather than written books or inventory items. Settings are editable directly from
@@ -31,6 +31,26 @@ the restore automatically; sleeping servers restore immediately. `/kurbis login`
 prints a one-use browser link for this server using the configured public URL scheme. The link expires after
 15 minutes; its redeemed browser grant does not sign in to a Kurbis account and
 remains active until revoked or the server is removed or suspended.
+
+Operators can also ask the Kurbis AI assistant to act on the server.
+`/ai ask <question>` sends the question to the AI gateway on the control
+plane; follow-ups within an hour continue the same conversation, and
+`/ai new <question>` starts a fresh one. `/ai cancel` stops the running
+request and `/ai status` shows the model and this month's spending against the
+server and account budgets. While a request runs, the plugin syncs with the
+gateway every half second: it runs the tools the model asks for (server
+status, players, worlds, entities and server commands, executed as the asking
+operator) and shows progress lines and the answer in that operator's chat. The
+gateway records the cost of every model call and refuses new requests once a
+budget is used up. `/ai` on its own opens the assistant's page in the chest
+menu: the latest requests of every operator with their state and cost, Ask and
+New conversation buttons that use the same chat prompt or Bedrock form as the
+MOTD control, and this month's spending. A request opens to its tool calls with
+their input and output, its whole answer or error (in chat on Java, in a form on
+Bedrock) and, while it runs, a cancel button. Model, effort, the server budget
+and the on/off switch are changed in the web panel; the menu's settings button
+prints a login link.
+CI preview servers do not offer `/ai`.
 
 Docker workers use the plugin baked into the hosted Pumpkin image. Native
 workers build it from this crate by default; `KURBIS_CONTROL_PLUGIN_WASM` can

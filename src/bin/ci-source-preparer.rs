@@ -11,9 +11,13 @@ use kurbis_hoster::ci::{CheckedInPumpkinPatcher, MAX_COMPRESSED_SOURCE_BYTES, Pa
 async fn main() -> anyhow::Result<()> {
     kurbis_hoster::init_tracing("kurbis_hoster=warn");
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.len() == 1 && arguments[0] == "--print-fingerprint" {
+        println!("{}", kurbis_hoster::ci::checked_in_patch_fingerprint());
+        return Ok(());
+    }
     ensure!(
         arguments.len() == 3,
-        "usage: ci-source-preparer SOURCE.tar.gz OUTPUT.tar.gz PATCH_FINGERPRINT"
+        "usage: ci-source-preparer SOURCE.tar.gz OUTPUT.tar.gz PATCH_FINGERPRINT (or --print-fingerprint)"
     );
     let input = Path::new(&arguments[0]);
     let output = Path::new(&arguments[1]);

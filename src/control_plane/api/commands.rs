@@ -260,11 +260,7 @@ pub(super) async fn dispatch_command(
     } else if actor.server_capability(server_id).is_some() {
         CommandAuthority::ServerCapability
     } else {
-        return Err(ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "server_not_found",
-            "server not found",
-        ));
+        return Err(ApiError::server_not_found());
     };
     let command = request.into_domain(authority)?;
     let lifecycle_actor = match authority {
@@ -306,11 +302,7 @@ pub(super) async fn dispatch_command(
                     token_hash: token_hash.to_vec(),
                 }
             } else {
-                return Err(ApiError::with_code(
-                    StatusCode::NOT_FOUND,
-                    "server_not_found",
-                    "server not found",
-                ));
+                return Err(ApiError::server_not_found());
             }
         }
     };

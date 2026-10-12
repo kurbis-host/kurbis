@@ -215,8 +215,15 @@ poller, Check Run client, artifact cache, and preview coordinator. It sends one
 framed JSON-plus-archive job over a pinned non-root SSH account to the checked-in
 `tools/ci_bubblewrap_runner.py` on lxhalle. The runner enters a private user and
 mount namespace, mounts the operator workspace as an exact 5 GiB/1,310,720-inode
-tmpfs below that account's HOME, and runs the pinned Bubblewrap build with no
-network and read-only root/toolchain inputs. It returns only bounded build logs
+tmpfs below that account's HOME, and runs the pinned Bubblewrap build with
+read-only root/toolchain inputs. A compile job has two phases. The fetch phase
+has network access but executes no fetched code: it unpacks the archives, runs
+`cargo fetch --locked` into `compiler-cache/cargo-home`, and the runner
+downloads the SHA-1-checked Minecraft server jar that upstream's
+`pumpkin-data` build script unpacks into `compiler-cache/minecraft`. The build
+phase then compiles `--offline` in a namespace with no network. The rootfs
+must carry empty `etc/resolv.conf` and `etc/ssl/certs/ca-certificates.crt`
+files as mount points for the fetch phase. It returns only bounded build logs
 and SHA-256-labelled artifacts; the respond5 coordinator verifies each stream
 before the normal BLAKE3 artifact-cache verification and runtime registration.
 

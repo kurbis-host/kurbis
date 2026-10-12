@@ -21,13 +21,22 @@ healthy stack and worker lease, then restores the configured `main` source
 branch. A failed rollout keeps the lock and transaction evidence until both app
 and worker recovery are verified.
 
-Respond5 builds the pinned Pumpkin runtime from the exact release source and
+The pinned Pumpkin runtime is compiled once per release on the remote CI
+builder, through the same `tools/ci_bubblewrap_runner.py` job the control plane
+uses for CI builds (`scripts/pumpkin_artifacts.py`, configured by the
+`CI_BUILDER_SSH_TARGET` and `CI_BUBBLEWRAP_*` values in Dokploy). The release
+uploads the two SHA-256-checked binaries to
+`/srv/kurbis/release-artifacts/<sha>` on Respond5, which only packages them
+into the `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`
+images; Compose never compiles or builds Pumpkin. Respond5 then
 checks the executable, WASM plugin, hosted entrypoint, OCI labels, embedded
 revision, worker configuration, and renewing lease. Recovery uses only the
 verified previous SHA and never removes PostgreSQL data, named volumes, worlds,
 or object-store data.
 
 Respond5 writes the accepted-release marker only after app and waiting-Pumpkin OCI labels and embedded revisions match the selected SHA, the waiting container's actual Pumpkin executable matches the independently built host-control image, and the worker binary/environment/lease transaction is verified. If post-deploy worker verification fails or its SSH response is lost, the wrapper idempotently restores the previous worker bundle and asks Dokploy to redeploy the prior app revision. For the one-time legacy path, rollback is constrained to the captured old image digests or images labeled with the attempted candidate SHA; it restores exact local image tags with `docker compose up --no-build --no-deps`, leaves Postgres and named volumes untouched, then restores the captured worker executable and protected legacy config. It verifies all exact service image digests, health, worker ID/executable/config and renewing lease before considering recovery verified. Legacy recovery remains explicitly marked `legacy-unproven`; only a later successful SHA-labeled release creates a source-proven marker. An unverified rollback retains protected transaction state; do not treat it as a successful release.
+
+The host-control Pumpkin compile uses BuildKit Cargo registry/Git caches shared under lock and a Cargo target cache keyed by the full `BUILD_REVISION` plus Rust 1.98.1. This allows a retry of the same immutable release to reuse compiled objects without reusing artifacts across source revisions. The application image intentionally does not mount a mutable Cargo target cache. Respond5 SSH operations use a 90-minute default command timeout with 30-second SSH keepalives; set `KURBIS_REMOTE_COMMAND_TIMEOUT_SECONDS` to a value from 1,800 through 86,400 when the builder requires a longer bounded window. The rollout acquires its local and remote locks before starting, does not retry an in-flight build, and rejects overlapping Dokploy deployments.
 
 The first-join regression requires `TEST_DATABASE_URL` to point to a disposable PostgreSQL database. If it is unset or the test fails, the release stops before production changes.
 

@@ -7,6 +7,7 @@ mod panel_state;
 pub mod persistence;
 pub mod runner;
 pub mod runtime;
+pub mod runtime_api_relay;
 pub mod sandbox;
 mod server_access;
 pub mod snapshot;

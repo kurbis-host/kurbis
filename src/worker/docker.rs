@@ -43,6 +43,7 @@ pub struct DockerRuntime {
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
     runtime_api_proxy_allow_insecure: bool,
+    runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
 }
 
 impl DockerRuntime {
@@ -60,6 +61,7 @@ impl DockerRuntime {
         runtime_api_proxy_upstream: String,
         runtime_api_proxy_egress_network: String,
         runtime_api_proxy_allow_insecure: bool,
+        runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
     ) -> Result<Self> {
         let ingress = GatewayIngressPolicy::new(gateway_address)?;
         crate::runtime_api_proxy::validate_upstream_url(
@@ -80,6 +82,7 @@ impl DockerRuntime {
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
+            runtime_api_relay,
         })
     }
 
@@ -155,6 +158,7 @@ impl ServerRuntime for DockerRuntime {
                     &network,
                     &self.runtime_api_proxy_egress_network,
                     self.runtime_api_proxy_allow_insecure,
+                    Some(self.runtime_api_relay.socket_path()),
                 )
                 .await?;
                 let ports = workload_ports(self.public_address, self.signal_address, placement)?;
@@ -204,10 +208,17 @@ impl ServerRuntime for DockerRuntime {
             ),
         )
         .await?;
-        let (runtime_uid, runtime_gid) = self.sandbox.rootless_daemon_identity().await?;
+        let (runtime_uid, runtime_gid) =
+            self.sandbox.rootless_container_identity(2613, 2613).await?;
         ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
         persist_runtime_generation(&self.root, server_id, placement.generation).await?;
         prepare_control_socket_alias(server_id, server_dir).await?;
+        // ServerAccess writes managed plugin files as the worker account after
+        // the initial volume preparation. Reconcile the full tree immediately
+        // before bind-mounting it into the non-root Pumpkin process.
+        let (runtime_uid, runtime_gid) =
+            self.sandbox.rootless_container_identity(2613, 2613).await?;
+        ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
 
         let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
         let volume = format!(
@@ -261,6 +272,7 @@ impl ServerRuntime for DockerRuntime {
             &network,
             &self.runtime_api_proxy_egress_network,
             self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
         )
         .await
         {
@@ -455,6 +467,19 @@ fn control_socket_alias_for_server(server_id: Uuid) -> PathBuf {
 
 impl DockerRuntime {
     pub async fn verify_sandbox(&self) -> Result<()> {
+        // The worker's rootless Docker daemon is separate from the Compose
+        // daemon that runs the control plane.  Verify both the egress network
+        // and the proxy image against the daemon this worker will actually
+        // use, before the worker acquires a lease and accepts placements.
+        runtime_api_proxy::verify_runtime_dependencies(
+            &self.runtime_api_proxy_image,
+            &self.runtime_api_proxy_egress_network,
+            &self.runtime_api_proxy_upstream,
+            self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
+        )
+        .await
+        .context("verify managed-plugin runtime API proxy dependencies")?;
         self.sandbox
             .verify_with_limits(
                 &self.image,

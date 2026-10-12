@@ -10,7 +10,8 @@ use uuid::Uuid;
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 const MIGRATION_MANIFEST_SHA256: &str =
-    "de4f66bbd5ee591e254c969f899e86f32e35604fbf629b6dbab5365a3c73e024";
+    "a3810200b3ba5615ca3270be897efbdabdf2a02978a5b83463d88ddd4b6e0dc0";
+const LATEST_MIGRATION: i64 = 19;
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -38,7 +39,7 @@ fn migration_manifest_is_canonical_and_append_only() {
         .iter()
         .map(|record| record["version"].as_i64().expect("migration version"))
         .collect();
-    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=LATEST_MIGRATION).collect::<Vec<_>>());
     let mut payload = value.as_object().expect("manifest object").clone();
     payload.remove("manifest_sha256");
     let canonical = format!(
@@ -136,7 +137,7 @@ async fn verify_fresh_database(options: PgConnectOptions) -> anyhow::Result<()> 
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=LATEST_MIGRATION).collect::<Vec<_>>());
 
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
@@ -187,7 +188,7 @@ async fn verify_applied_history_upgrade(options: PgConnectOptions) -> anyhow::Re
     let migrator =
         sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
             .await?;
-    for migration in migrator.iter().filter(|migration| migration.version < 16) {
+    for migration in migrator.iter().filter(|migration| migration.version < 17) {
         sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await?;
     }
     sqlx::query(
@@ -199,7 +200,7 @@ async fn verify_applied_history_upgrade(options: PgConnectOptions) -> anyhow::Re
     )
     .execute(&pool)
     .await?;
-    for migration in migrator.iter().filter(|migration| migration.version < 16) {
+    for migration in migrator.iter().filter(|migration| migration.version < 17) {
         sqlx::query(
             "INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time)
              VALUES ($1, $2, true, $3, 0)",
@@ -215,7 +216,7 @@ async fn verify_applied_history_upgrade(options: PgConnectOptions) -> anyhow::Re
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=LATEST_MIGRATION).collect::<Vec<_>>());
     assert_migration_one_checksum(&pool).await?;
     assert_schema_objects(&pool).await?;
     pool.close().await;
@@ -281,6 +282,29 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
         "stable build retention migration must be present"
     );
 
+    let requested_at_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'ci_builds'
+           AND column_name = 'requested_at')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        requested_at_column,
+        "CI queue demand marker must be migrated"
+    );
+
+    let build_queue_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'ci_build_queue')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        build_queue_table,
+        "fenced CI build queue migration must be present"
+    );
+
     let expected_tables = [
         "worker_snapshot_hints",
         "ci_github_rate_limits",
@@ -288,6 +312,13 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
         "server_known_players",
         "console_commands",
         "server_runtime_stats",
+        "ai_server_settings",
+        "ai_conversations",
+        "ai_messages",
+        "ai_jobs",
+        "ai_tool_calls",
+        "ai_job_events",
+        "ai_usage",
     ];
     for table in expected_tables {
         let present: bool = sqlx::query_scalar(

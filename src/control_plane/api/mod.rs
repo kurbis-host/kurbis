@@ -38,6 +38,7 @@ use super::{
 mod account;
 mod activity;
 mod actor;
+mod ai;
 mod ci;
 mod ci_runtime_public;
 mod commands;
@@ -98,12 +99,19 @@ pub struct AppState {
     pub pool: PgPool,
     pub ci_build_coordinator: Option<Arc<dyn crate::ci::BuildCoordinator>>,
     pub ci_build_identity: Option<crate::ci::CiBuildIdentity>,
+    /// Production CI deliberately builds only the latest configured default
+    /// branch. Tests and embedded callers can leave this disabled when they
+    /// need the legacy preview orchestration.
+    pub ci_main_only: bool,
+    pub ci_default_branch: Option<String>,
     pub lifecycle: Lifecycle,
     pub config: ControlPlaneConfig,
     pub http: Client,
     pub object_store: Arc<dyn ObjectStore>,
     /// Read-only lifecycle projection for supervised non-HTTP workers.
     pub supervision: SupervisorRegistry,
+    /// The AI gateway, present when a model provider is configured.
+    pub ai: Option<crate::control_plane::ai::AiGateway>,
 }
 
 #[derive(Debug)]
@@ -148,6 +156,14 @@ impl aide::operation::OperationOutput for ApiError {
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self::with_code(status, "request_failed", message)
+    }
+
+    pub(super) fn server_not_found() -> Self {
+        Self::with_code(
+            StatusCode::NOT_FOUND,
+            "server_not_found",
+            "server not found",
+        )
     }
 
     pub(super) fn with_code(
@@ -520,6 +536,40 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                     operation.response::<201, Json<Operators>>()
                 })
                 .delete(operators::remove_operator),
+        )
+        .api_route("/api/v1/servers/{server_id}/ai", api_get(ai::ai_overview))
+        .api_route(
+            "/api/v1/servers/{server_id}/ai/settings",
+            api_put_with(ai::update_ai_settings, |operation| {
+                operation
+                    .id("updateAiSettings")
+                    .description("Change the server's AI assistant settings and return the updated overview.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/ai/jobs",
+            api_post_with(ai::create_ai_job, |operation| {
+                operation
+                    .id("createAiJob")
+                    .description("Start an operator's AI request from the in-game plugin. Retrying with the same job id returns the existing job with 200.")
+                    .response::<201, Json<crate::contracts::ai::AiJob>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/ai/jobs/{job_id}",
+            api_get(ai::ai_job),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/ai/jobs/{job_id}/cancel",
+            api_post_with(ai::cancel_ai_job, |operation| operation.id("cancelAiJob")),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/ai/sync",
+            api_post_with(ai::sync_ai, |operation| {
+                operation
+                    .id("syncAi")
+                    .description("Plugin poll: return tool results, receive pending tool calls and chat lines for operators.")
+            }),
         )
         .api_route(
             "/api/v1/servers/{server_id}/whitelist",

@@ -73,6 +73,20 @@ fn normal_scope_allows_only_server_capability_routes() {
         ),
         (Method::POST, format!("/api/v1/servers/{expected}/commands")),
         (Method::POST, "/api/v1/server/login-links".to_owned()),
+        (Method::GET, format!("/api/v1/servers/{expected}/ai")),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai/jobs")),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai/sync")),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+        ),
     ] {
         assert!(
             route_allowed(Scope::Server, &method, &path, expected),
@@ -100,6 +114,46 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
         (
             Method::POST,
             format!("/api/v1/servers/{expected}/runtime-stats"),
+        ),
+        (
+            Method::PUT,
+            format!("/api/v1/servers/{expected}/ai/settings"),
+        ),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai")),
+        (Method::GET, format!("/api/v1/servers/{expected}/ai/sync")),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/ai/jobs/not-a-job/cancel"),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/not-a-job"),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::GET,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/retry",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{}/ai/jobs/{}/cancel",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ),
         ),
     ] {
         assert!(
@@ -198,6 +252,7 @@ async fn capability_proxy_forwards_allowed_request_and_blocks_scope_escape() {
         scope: Scope::Server,
         expected_id,
         expected_capability_hash: *blake3::hash(token.as_bytes()).as_bytes(),
+        relay_socket: None,
     };
     let proxy_listener = TcpListener::bind(config.listen).await.unwrap();
     let proxy_address = proxy_listener.local_addr().unwrap();
@@ -265,6 +320,7 @@ fn health_is_not_ready_until_the_pinned_upstream_health_check_succeeds() {
         scope: Scope::Server,
         expected_id,
         expected_capability_hash: [0; 32],
+        relay_socket: None,
     };
     let make_state = |healthy| ProxyState {
         config: config.clone(),
@@ -283,6 +339,19 @@ fn handle_health(state: ProxyState) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+#[test]
+fn proxy_dependency_preflight_fails_closed_for_external_http_and_accepts_valid_paths() {
+    // The production worker's rootless Docker daemon is separate from the
+    // Compose daemon. Local service-alias HTTP is therefore only acceptable
+    // on a worker-side internal bridge; a routed bridge must use HTTPS.
+    let local = Url::parse("http://control-plane:8080").unwrap();
+    assert!(validate_runtime_dependency_configuration(true, &local).is_ok());
+    assert!(validate_runtime_dependency_configuration(false, &local).is_err());
+
+    let remote = Url::parse("https://control.example").unwrap();
+    assert!(validate_runtime_dependency_configuration(false, &remote).is_ok());
 }
 
 #[test]
@@ -414,6 +483,7 @@ async fn upstream_redirect_is_not_followed_or_exposed_to_the_workload() {
             scope: Scope::Server,
             expected_id: id(),
             expected_capability_hash: *blake3::hash(token.as_bytes()).as_bytes(),
+            relay_socket: None,
         },
         client: build_pinned_client(&upstream_url, &[upstream_address.ip()]).unwrap(),
         upstream_healthy: Arc::new(AtomicBool::new(true)),

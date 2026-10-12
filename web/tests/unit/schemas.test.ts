@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { settingsFormSchema, setupSchema } from "../../lib/schemas";
+import { aiSettingsFormSchema, settingsFormSchema, setupSchema } from "../../lib/schemas";
 
 const valid = {
   subdomain: "friends-world",
@@ -38,5 +38,29 @@ describe("player mutation form", () => {
     expect(playerMutationSchema.safeParse({ name: "   " }).success).toBe(false);
     expect(playerMutationSchema.safeParse({ name: "x".repeat(65) }).success).toBe(false);
     expect(playerMutationSchema.safeParse({ name: "Bad\nName" }).success).toBe(false);
+  });
+});
+
+describe("AI settings form", () => {
+  const schema = aiSettingsFormSchema(20_000_000);
+  const values = { enabled: true, model: "", effort: "" as const, monthly_budget: "" };
+
+  it("accepts defaults and dollar budgets up to the account budget", () => {
+    for (const monthly_budget of ["", "0", "5", "12.50", " 20 ", "19.999999"]) {
+      expect(schema.safeParse({ ...values, monthly_budget }).success, monthly_budget).toBe(true);
+    }
+    expect(schema.parse({ ...values, monthly_budget: " 12.50 " }).monthly_budget).toBe("12.50");
+  });
+
+  it("rejects malformed budgets and budgets above the account budget", () => {
+    for (const monthly_budget of ["abc", "-1", "$5", "1.2345678"]) {
+      const result = schema.safeParse({ ...values, monthly_budget });
+      expect(result.success, monthly_budget).toBe(false);
+      expect(result.error?.issues[0]?.message).toBe("Enter an amount in US dollars, like 5 or 12.50.");
+    }
+    const above = schema.safeParse({ ...values, monthly_budget: "20.01" });
+    expect(above.error?.issues.map((issue) => issue.message)).toEqual([
+      "A server can't spend more than the account budget of $20.00.",
+    ]);
   });
 });

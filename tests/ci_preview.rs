@@ -157,6 +157,8 @@ impl SourceControlClient for PullRequestFixtureSource {
     }
 }
 
+#[path = "ci_preview/admission.rs"]
+mod admission;
 #[path = "ci_preview/basics.rs"]
 mod basics;
 #[path = "ci_preview/builders.rs"]

@@ -317,6 +317,14 @@ where
             .ensure_build_with_retention(&request.key, request.retention)
             .await
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
+        // A source poll may materialize a queued PR identity without asking
+        // for work. Mark only actual coordinator calls as recoverable demand;
+        // this keeps a large historical open-PR set from becoming a build
+        // backlog while preserving restart recovery for admitted jobs.
+        self.repository
+            .mark_build_requested(build.id)
+            .await
+            .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
         if build.stage == CiBuildStage::Ready
             && build
                 .expires_at

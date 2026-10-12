@@ -55,6 +55,9 @@ struct Request {
     host: Option<String>,
     port: Option<u16>,
     message: Option<String>,
+    /// Mirror status messages into Java chat in addition to the action bar.
+    /// Older gateways omit this field and retain overlay-only behavior.
+    chat: Option<bool>,
     enabled: Option<bool>,
     whitelist_entries: Option<Vec<WhitelistEntry>>,
     operators: Option<Vec<WhitelistEntry>>,
@@ -335,7 +338,13 @@ async fn handle(
                 )
                 .await;
             };
-            player.send_system_message_raw(&TextComponent::text(message), true);
+            let text = TextComponent::text(message);
+            player.send_system_message_raw(&text, true);
+            if request.chat.unwrap_or(false)
+                && matches!(player.client.as_ref(), ClientPlatform::Java(_))
+            {
+                player.send_system_message_raw(&text, false);
+            }
             write_response(&mut write_half, json!({"ok": true})).await
         }
         Action::Transfer => {
@@ -546,7 +555,7 @@ async fn handle(
                 .await;
             };
             let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sender = CommandSender::Rcon(output.clone());
+            let sender = CommandSender::HostControl(output.clone());
             let source = sender.into_source(server);
             server
                 .command_dispatcher

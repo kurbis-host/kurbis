@@ -57,6 +57,7 @@ pub struct CiPreviewWorker {
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
     runtime_api_proxy_allow_insecure: bool,
+    runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
 }
 
 impl CiPreviewWorker {
@@ -77,6 +78,7 @@ impl CiPreviewWorker {
         runtime_api_proxy_upstream: String,
         runtime_api_proxy_egress_network: String,
         runtime_api_proxy_allow_insecure: bool,
+        runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
     ) -> Self {
         let runtime_root = root.join("ci-preview-runtime");
         let storage = StorageManager::new(root.join("ci-preview-storage"), storage_mode);
@@ -97,6 +99,7 @@ impl CiPreviewWorker {
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
+            runtime_api_relay,
         }
     }
 
@@ -199,6 +202,7 @@ impl CiPreviewWorker {
                 &network,
                 &self.runtime_api_proxy_egress_network,
                 self.runtime_api_proxy_allow_insecure,
+                Some(self.runtime_api_relay.socket_path()),
             )
             .await?;
             let container = container_name(placement.preview_id);
@@ -250,7 +254,7 @@ impl CiPreviewWorker {
         validate_quota_volume(&world, CI_RUNTIME_DISK_BYTES as u64)
             .await
             .context("CI world must have a hard quota filesystem")?;
-        let (daemon_uid, daemon_gid) = self.sandbox.rootless_daemon_identity().await?;
+        let (daemon_uid, daemon_gid) = self.sandbox.rootless_container_identity(2613, 2613).await?;
         ensure_rootless_volume_owner(&world, daemon_uid, daemon_gid).await?;
         let runtime_dir = self.runtime_dir(placement.preview_id);
         remove_owned_runtime_dir(&self.runtime_root, placement.preview_id)?;
@@ -358,6 +362,7 @@ impl CiPreviewWorker {
             &network,
             &self.runtime_api_proxy_egress_network,
             self.runtime_api_proxy_allow_insecure,
+            Some(self.runtime_api_relay.socket_path()),
         )
         .await?;
         let published_ports = PublishedWorkloadPorts {
@@ -641,7 +646,8 @@ impl CiPreviewWorker {
             };
             let world = self.storage.path(placement.preview_id);
             self.storage.reset(placement.preview_id).await?;
-            let (daemon_uid, daemon_gid) = self.sandbox.rootless_daemon_identity().await?;
+            let (daemon_uid, daemon_gid) =
+                self.sandbox.rootless_container_identity(2613, 2613).await?;
             unpack_world_snapshot(
                 &snapshot_path,
                 &world,

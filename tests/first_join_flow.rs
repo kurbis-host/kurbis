@@ -44,6 +44,7 @@ static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 struct FakeHostControlState {
     player: Option<WaitingPlayer>,
     messages: Vec<String>,
+    chat_messages: Vec<String>,
     transfers: Vec<(Uuid, String, u16)>,
     kicks: Vec<(Uuid, String)>,
     status_requests: usize,
@@ -103,6 +104,9 @@ async fn spawn_host_control(
                         let mut state = state.lock().await;
                         if let Some(message) = request["message"].as_str() {
                             state.messages.push(message.to_owned());
+                            if request["chat"].as_bool() == Some(true) {
+                                state.chat_messages.push(message.to_owned());
+                            }
                         }
                         json!({"ok": true})
                     }
@@ -453,6 +457,10 @@ async fn first_verified_java_and_bedrock_join_wake_and_transfer_without_reconnec
                     "Waking your server…" | "Restoring your world…" | "Starting your server…"
                 )),
                 "the uninterrupted connection should remain held in the waiting runtime"
+            );
+            assert!(
+                !state.chat_messages.is_empty(),
+                "gateway lifecycle status should request a chat copy"
             );
         }
 

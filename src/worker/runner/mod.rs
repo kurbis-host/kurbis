@@ -34,6 +34,7 @@ use crate::{
             write_whitelist_file,
         },
         runtime::{ServerRuntime, native::NativeRuntime},
+        runtime_api_relay::WorkerRuntimeApiRelay,
         server_access::ServerAccess,
         snapshot::{SnapshotManager, WorkerObjectClient},
         snapshot_retry::SnapshotSchedule,
@@ -72,6 +73,20 @@ impl WorkerRunner {
         tokio::fs::create_dir_all(config.root.join("servers")).await?;
         let object_client = WorkerObjectClient::from_control_plane(control_plane.clone());
         let snapshots = SnapshotManager::new_worker(object_client);
+        let runtime_api_relay = match &config.runtime {
+            RuntimeConfig::Docker { .. } => {
+                let socket = crate::worker::sandbox::rootless_docker_socket().await?;
+                Some(std::sync::Arc::new(
+                    WorkerRuntimeApiRelay::start(
+                        &socket,
+                        &config.control_plane_url,
+                        config.allow_insecure_local_control_plane_http,
+                    )
+                    .await?,
+                ))
+            }
+            RuntimeConfig::Native { .. } => None,
+        };
         let runtime: Box<dyn ServerRuntime> = match &config.runtime {
             RuntimeConfig::Docker { image } => {
                 let runtime = DockerRuntime::new(
@@ -93,6 +108,7 @@ impl WorkerRunner {
                     config.runtime_api_proxy_upstream.clone(),
                     config.runtime_api_proxy_egress_network.clone(),
                     config.allow_insecure_local_control_plane_http,
+                    runtime_api_relay.clone().expect("Docker runtime relay"),
                 )?;
                 runtime.verify_sandbox().await?;
                 Box::new(runtime)
@@ -135,6 +151,7 @@ impl WorkerRunner {
                 config.runtime_api_proxy_upstream.clone(),
                 config.runtime_api_proxy_egress_network.clone(),
                 config.allow_insecure_local_control_plane_http,
+                runtime_api_relay.clone().expect("Docker CI runtime relay"),
             )),
             RuntimeConfig::Native { .. } => None,
         };

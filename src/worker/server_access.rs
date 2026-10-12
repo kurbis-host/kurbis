@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{RuntimeConfig, WorkerConfig};
-use crate::worker::control_plane::WorkerControl;
+use crate::{
+    worker::{
+        control_plane::WorkerControl,
+        sandbox::{ensure_rootless_volume_owner, rootless_container_identity},
+    },
+};
 
 const PLUGIN_NAME: &str = "kurbis-control";
 
@@ -74,6 +79,15 @@ impl ServerAccess {
                 capability: capability.clone(),
             },
         )?;
+        // prepare_plugin writes the managed WASM and JSON as the worker account.
+        // Rootless Docker maps Pumpkin's uid 2613 through the subordinate-id
+        // range, so reconcile ownership after these writes and before the
+        // runtime bind-mounts the tree. Otherwise hosted-entrypoint cannot
+        // replace the plugin file and exits with a misleading permission error.
+        if self.runtime_api_proxy {
+            let (uid, gid) = rootless_container_identity(2613, 2613).await?;
+            ensure_rootless_volume_owner(server_dir, uid, gid).await?;
+        }
         Ok(Some(capability))
     }
 

@@ -4688,6 +4688,885 @@
         ]
       }
     },
+    "/api/v1/servers/{server_id}/ai": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Everything the panel shows about the AI assistant of one server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/ai/settings": {
+      "put": {
+        "description": "Change the server's AI assistant settings and return the updated overview.",
+        "operationId": "updateAiSettings",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "description": "Per-server AI settings. `None` means \"use the gateway default\".",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Everything the panel shows about the AI assistant of one server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/ai/jobs": {
+      "post": {
+        "description": "Start an operator's AI request from the in-game plugin. Retrying with the same job id returns the existing job with 200.",
+        "operationId": "createAiJob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "description": "Start a request on behalf of an in-game operator.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/ai/jobs/{job_id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One request with every tool call it made.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiJobDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/ai/jobs/{job_id}/cancel": {
+      "post": {
+        "operationId": "cancelAiJob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/ai/sync": {
+      "post": {
+        "description": "Plugin poll: return tool results, receive pending tool calls and chat lines for operators.",
+        "operationId": "syncAi",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "description": "One plugin poll: return finished tool results, receive new calls and chat\n lines.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiSyncResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/servers/{server_id}/whitelist": {
       "get": {
         "parameters": [
@@ -5334,6 +6213,601 @@
           "type",
           "summary",
           "created_at"
+        ]
+      },
+      "AiActiveJob": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operator_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AiJobState"
+          }
+        },
+        "required": [
+          "job_id",
+          "operator_id",
+          "state"
+        ]
+      },
+      "AiBudget": {
+        "description": "Spending against one monthly cap.",
+        "type": "object",
+        "properties": {
+          "budget_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reserved_micros": {
+            "description": "Worst-case cost of model calls that are still in flight.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "spent_micros": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "spent_micros",
+          "reserved_micros",
+          "budget_micros"
+        ]
+      },
+      "AiDefaults": {
+        "description": "Gateway-wide defaults that apply when a server keeps a setting unset.",
+        "type": "object",
+        "properties": {
+          "account_monthly_budget_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "effort": {
+            "$ref": "#/components/schemas/AiEffort"
+          },
+          "model": {
+            "type": "string"
+          },
+          "server_monthly_budget_micros": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "model",
+          "effort",
+          "server_monthly_budget_micros",
+          "account_monthly_budget_micros"
+        ]
+      },
+      "AiEffort": {
+        "description": "How much the model thinks before answering.",
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "AiJob": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "model": {
+            "type": "string"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "operator_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operator_name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AiJobState"
+          },
+          "tool_calls": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "operator_id",
+          "operator_name",
+          "prompt",
+          "model",
+          "state",
+          "model_calls",
+          "tool_calls",
+          "cost_micros",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "AiJobDetail": {
+        "description": "One request with every tool call it made.",
+        "type": "object",
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/AiJob"
+          },
+          "tool_calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiToolCall"
+            }
+          }
+        },
+        "required": [
+          "job",
+          "tool_calls"
+        ]
+      },
+      "AiJobEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AiJobEventKind"
+          },
+          "message": {
+            "type": "string"
+          },
+          "operator_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id",
+          "job_id",
+          "operator_id",
+          "kind",
+          "message"
+        ]
+      },
+      "AiJobEventKind": {
+        "description": "Chat line delivered to the requesting operator.",
+        "type": "string",
+        "enum": [
+          "progress",
+          "answer",
+          "error"
+        ]
+      },
+      "AiJobRequest": {
+        "description": "Start a request on behalf of an in-game operator.",
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "description": "Client-chosen id; retrying with the same id returns the same job.",
+            "type": "string",
+            "format": "uuid"
+          },
+          "new_conversation": {
+            "description": "Start a fresh conversation instead of continuing the operator's last one.",
+            "type": "boolean",
+            "default": false
+          },
+          "operator_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operator_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "prompt": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "operator_id",
+          "operator_name",
+          "prompt"
+        ]
+      },
+      "AiJobState": {
+        "description": "Lifecycle of one operator request.",
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "awaiting_tools",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "AiModel": {
+        "description": "A model the server owner can choose, with its standard prices.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "input_micros_per_mtok": {
+            "description": "Micro-USD per million uncached input tokens.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "output_micros_per_mtok": {
+            "description": "Micro-USD per million output tokens.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "input_micros_per_mtok",
+          "output_micros_per_mtok"
+        ]
+      },
+      "AiOverview": {
+        "description": "Everything the panel shows about the AI assistant of one server.",
+        "type": "object",
+        "properties": {
+          "available": {
+            "description": "Whether the control plane has a model provider configured.",
+            "type": "boolean"
+          },
+          "defaults": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AiDefaults"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiJob"
+            }
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiModel"
+            }
+          },
+          "settings": {
+            "$ref": "#/components/schemas/AiSettings"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AiUsage"
+          }
+        },
+        "required": [
+          "available",
+          "settings",
+          "models",
+          "usage",
+          "jobs"
+        ]
+      },
+      "AiSettings": {
+        "description": "Per-server AI settings. `None` means \"use the gateway default\".",
+        "type": "object",
+        "properties": {
+          "effort": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AiEffort"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "monthly_budget_micros": {
+            "description": "Monthly spending cap for this server in micro-USD, at most the\n account's monthly budget.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ]
+      },
+      "AiSyncRequest": {
+        "description": "One plugin poll: return finished tool results, receive new calls and chat\n lines.",
+        "type": "object",
+        "properties": {
+          "after_event_id": {
+            "description": "Last event id the plugin has seen. Omit it on the first sync: the\n plugin then receives only the lines of requests still running.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "results": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AiToolResult"
+            },
+            "maxItems": 8
+          }
+        },
+        "additionalProperties": false
+      },
+      "AiSyncResponse": {
+        "type": "object",
+        "properties": {
+          "active_jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiActiveJob"
+            }
+          },
+          "calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiToolCallRequest"
+            }
+          },
+          "cursor": {
+            "description": "Pass back as `after_event_id` on the next sync.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AiJobEvent"
+            }
+          }
+        },
+        "required": [
+          "calls",
+          "events",
+          "cursor",
+          "active_jobs"
+        ]
+      },
+      "AiToolCall": {
+        "description": "One tool call as recorded for the owner's audit trail.",
+        "type": "object",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "input": true,
+          "is_error": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/AiToolCallState"
+          }
+        },
+        "required": [
+          "call_id",
+          "name",
+          "input",
+          "state",
+          "is_error",
+          "created_at"
+        ]
+      },
+      "AiToolCallRequest": {
+        "description": "A tool call the plugin must execute as the requesting operator.",
+        "type": "object",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "input": true,
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "operator_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "job_id",
+          "call_id",
+          "operator_id",
+          "name",
+          "input"
+        ]
+      },
+      "AiToolCallState": {
+        "description": "Execution state of one tool call requested by the model.",
+        "type": "string",
+        "enum": [
+          "pending",
+          "delivered",
+          "completed"
+        ]
+      },
+      "AiToolResult": {
+        "type": "object",
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "is_error": {
+            "type": "boolean",
+            "default": false
+          },
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "output": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "call_id",
+          "output"
+        ]
+      },
+      "AiUsage": {
+        "description": "This calendar month's (UTC) usage of one server and its owner's account.",
+        "type": "object",
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/AiBudget"
+          },
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "period_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "server": {
+            "$ref": "#/components/schemas/AiBudget"
+          }
+        },
+        "required": [
+          "period_start",
+          "server",
+          "account",
+          "model_calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_creation_input_tokens",
+          "cache_read_input_tokens"
         ]
       },
       "ApiErrorResponse": {
@@ -6129,6 +7603,23 @@
           "updated_at"
         ]
       },
+      "ServerAiJobPath": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "server_id",
+          "job_id"
+        ]
+      },
       "ServerCommandRequest": {
         "description": "Canonical lifecycle command wire format at\n `POST /api/v1/servers/{server_id}/commands`.",
         "oneOf": [
@@ -6428,6 +7919,22 @@
               "type",
               "data"
             ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "ai"
+              },
+              "data": {
+                "$ref": "#/components/schemas/AiOverview"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ]
           }
         ],
         "required": [
@@ -6443,7 +7950,8 @@
           "log",
           "players",
           "whitelist",
-          "operators"
+          "operators",
+          "ai"
         ]
       },
       "ServerExportPath": {

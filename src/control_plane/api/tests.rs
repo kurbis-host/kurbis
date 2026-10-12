@@ -286,6 +286,8 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
     Arc::new(AppState {
         ci_build_coordinator: None,
         ci_build_identity: None,
+        ci_main_only: false,
+        ci_default_branch: None,
         lifecycle: Lifecycle::new(pool.clone()),
         pool,
         config: ControlPlaneConfig {
@@ -318,6 +320,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
         http: reqwest::Client::new(),
         object_store: Arc::new(object_store::memory::InMemory::new()),
         supervision: crate::control_plane::supervision::SupervisorRegistry::new(),
+        ai: None,
     })
 }
 

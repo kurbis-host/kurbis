@@ -9,9 +9,9 @@ SQLx SHA-384 checksum for every migration and a SHA-256 over the ordered
 inventory. The release gate refuses to run with a missing, duplicated, renamed,
 or modified migration entry.
 
-The history currently ends at version 17. The stable CI-build retention change
-is version 16 because version 14 is already the deployed repository-poll lease
-migration; an earlier un-applied duplicate-number candidate was removed before
-this manifest was introduced. The runtime-stats migration is version 15. This
-keeps the applied production chain unambiguous while preserving every deployed
-checksum.
+The history currently ends at version 19. Version 16 is the deployed CI
+build-demand marker migration. Stable CI-build retention is version 17, the
+fenced pull-request build queue is version 18 and the AI gateway (settings,
+conversations, jobs, tool calls and the usage ledger) is version 19. The
+runtime-stats migration is version 15. This keeps the applied production chain
+append-only and unambiguous while preserving every deployed checksum.

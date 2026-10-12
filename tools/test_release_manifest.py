@@ -24,7 +24,8 @@ class ReleaseManifestTests(unittest.TestCase):
         digest = migration.validate_manifest(ROOT / "migrations", ROOT / "migrations/MANIFEST.json")
         self.assertEqual(len(digest), 64)
         records = migration.migration_records(ROOT / "migrations")
-        self.assertEqual([record["version"] for record in records], list(range(1, 18)))
+        # Versions are append-only and gapless; the count grows with each migration.
+        self.assertEqual([record["version"] for record in records], list(range(1, len(records) + 1)))
 
     def test_release_manifest_binds_revision_digests_and_environment_revision(self):
         revision = "a" * 40

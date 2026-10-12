@@ -45,6 +45,15 @@ x-control-plane-environment: &control-plane-environment
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
   S3_SECRET_KEY: ${S3_SECRET_KEY:-}
   S3_ALLOW_HTTP: ${S3_ALLOW_HTTP:-false}
+  # The in-game AI assistant is offered only when ANTHROPIC_API_KEY is set.
+  # Blank AI settings keep the control plane's defaults.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+  AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-}
+  AI_DEFAULT_EFFORT: ${AI_DEFAULT_EFFORT:-}
+  AI_SERVER_MONTHLY_BUDGET_USD: ${AI_SERVER_MONTHLY_BUDGET_USD:-}
+  AI_ACCOUNT_MONTHLY_BUDGET_USD: ${AI_ACCOUNT_MONTHLY_BUDGET_USD:-}
+  AI_MAX_CONCURRENT_CALLS: ${AI_MAX_CONCURRENT_CALLS:-}
 
 services:
   postgres:
@@ -70,8 +79,11 @@ services:
     build:
       context: .
       dockerfile: runtime/Dockerfile
+      # List form makes Compose read BUILD_REVISION from the --env-file even
+      # when Dokploy invokes Compose through env -i. Mapping interpolation
+      # otherwise falls back to development in that environment.
       args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+        - BUILD_REVISION
     entrypoint: [/usr/local/bin/control-plane]
     environment: *control-plane-environment
     volumes:
@@ -96,13 +108,10 @@ services:
     networks: [hoster, runtime-api-egress]
 
   waiting-pumpkin:
-    image: melon-pumpkin:waiting
-    build:
-      context: .
-      dockerfile: runtime/pumpkin/Dockerfile
-      target: waiting
-      args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+    # Compose never builds this image. A release packages the Pumpkin binaries
+    # compiled on the remote CI builder (`runtime/pumpkin/Dockerfile`, target
+    # `waiting`) under the exact release SHA; `start.sh` builds it locally.
+    image: melon-pumpkin:waiting-${BUILD_REVISION:-development}
     environment:
       PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
@@ -161,8 +170,11 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      # List form makes Compose read BUILD_REVISION from the --env-file even
+      # when Dokploy invokes Compose through env -i. Mapping interpolation
+      # otherwise falls back to development in that environment.
       args:
-        BUILD_REVISION: ${BUILD_REVISION:-development}
+        - BUILD_REVISION
     ports:
       - ${PANEL_BIND_ADDRESS:-127.0.0.1}:${PANEL_PORT}:3000
     environment:

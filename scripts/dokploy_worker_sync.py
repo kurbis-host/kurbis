@@ -21,6 +21,10 @@ from typing import Sequence
 
 ROOT = Path("/srv/kurbis")
 CHECKOUT = Path("/etc/dokploy/compose/kurbis-hoster-fbikvd/code")
+# Dokploy clones with a GitHub App token embedded in the `origin` URL, and that
+# token expires after an hour. Release tags are fetched through this plain URL
+# so the host's own Git credential helper authenticates instead.
+RELEASE_REMOTE = "https://github.com/kurbis-host/kurbis.git"
 ENV = CHECKOUT / ".env"
 WORKER = Path("/srv/kurbis-hoster/target/release/worker")
 WORKER_ENV = ROOT / "worker.env"
@@ -30,9 +34,13 @@ WORKER_SERVICE = "kurbis-worker.service"
 PROJECT = "kurbis-hoster-fbikvd"
 SERVICES = ("control-plane", "gateway", "panel", "waiting-pumpkin", "postgres")
 PUMPKIN_PREFIX = "melon-pumpkin:host-control-"
+WAITING_PREFIX = "melon-pumpkin:waiting-"
+PUMPKIN_ARTIFACTS = ("pumpkin", "kurbis-control.wasm")
 LOCK = Path("/run/lock/kurbis-production-deploy.lock")
 OPERATION_LOCK = Path("/run/lock/kurbis-production-deploy-operation.lock")
 CHECKOUT_BACKUP = ROOT / "deploy-checkout-overrides"
+# Pumpkin binaries compiled on the remote CI builder, uploaded per release SHA.
+RELEASE_ARTIFACTS = ROOT / "release-artifacts"
 WORKER_BACKUP = ROOT / "worker-rollbacks"
 ENV_BACKUP = ROOT / "worker-bundle-rollbacks"
 MARKER = ROOT / "deployed-release.json"
@@ -470,7 +478,7 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
         manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing"),"original_target":original_target})
     (backup/"manifest.json").write_text(json.dumps(manifest),encoding="utf-8"); os.chmod(backup/"manifest.json",0o600)
     tag=f"kurbis-release-{revision}"
-    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
+    run(["git","-C",str(CHECKOUT),"fetch",RELEASE_REMOTE,f"refs/tags/{tag}:refs/tags/{tag}"])
     if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"] ) != revision: raise Error("immutable release tag SHA mismatch")
     run(["git","-C",str(CHECKOUT),"reset","--hard",revision]); run(["git","-C",str(CHECKOUT),"clean","-fdx","-e",".env"])
     status = run_bytes(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
@@ -549,11 +557,27 @@ def verify_git_archive(archive: Path, expected: dict[str, str]) -> str:
     return digest(archive)
 
 
-def build_pumpkin(revision: str, expected: dict[str,str], token: str) -> dict[str,str]:
+def release_artifact_context(revision: str, artifacts: dict[str,str]) -> Path:
+    """Return the Docker build context holding this release's verified Pumpkin binaries."""
+    if set(artifacts)!=set(PUMPKIN_ARTIFACTS) or not all(re.fullmatch(r"[0-9a-f]{64}",str(value)) for value in artifacts.values()):
+        raise Error("Pumpkin artifact digest manifest is invalid")
+    context=RELEASE_ARTIFACTS/revision
+    directory=context/"artifacts"
+    for path in (RELEASE_ARTIFACTS,context,directory):
+        if path.is_symlink() or not path.is_dir() or path.stat().st_uid!=0 or stat.S_IMODE(path.stat().st_mode)!=0o700:
+            raise Error("release artifact directory ownership/mode invalid")
+    if {entry.name for entry in directory.iterdir()}!=set(PUMPKIN_ARTIFACTS): raise Error("release artifact directory holds unexpected files")
+    for name,expected_digest in artifacts.items():
+        path=directory/name
+        if path.is_symlink() or not path.is_file() or digest(path)!=expected_digest: raise Error(f"uploaded Pumpkin artifact differs from the remote build: {name}")
+    return context
+
+def build_pumpkin(revision: str, expected: dict[str,str], token: str, artifacts: dict[str,str]) -> dict[str,str]:
     require_lock(token); validate_expected_manifest(expected)
     if not valid_sha(revision): raise Error("invalid Pumpkin build revision")
+    context=release_artifact_context(revision,artifacts)
     tag_name=f"kurbis-release-{revision}"
-    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag_name}:refs/tags/{tag_name}"])
+    run(["git","-C",str(CHECKOUT),"fetch",RELEASE_REMOTE,f"refs/tags/{tag_name}:refs/tags/{tag_name}"])
     if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag_name}^{{commit}}"] )!=revision:
         raise Error("Pumpkin source tag does not resolve to requested release SHA")
     root=ROOT/"release-builds"
@@ -573,12 +597,17 @@ def build_pumpkin(revision: str, expected: dict[str,str], token: str) -> dict[st
             if result.returncode: raise Error("git archive failed")
             archive_sha=verify_git_archive(archive,expected)
         tag=f"{PUMPKIN_PREFIX}{revision}"
-        run(["docker","build","--target","host-control","--build-arg",f"BUILD_REVISION={revision}","-f","runtime/pumpkin/Dockerfile","-t",tag,"."],cwd=source)
+        # The named context replaces the Dockerfile's from-source `artifacts`
+        # stage, so respond5 only packages the binaries compiled on the builder.
+        for target,image in (("host-control",tag),("waiting",f"{WAITING_PREFIX}{revision}")):
+            run(["docker","build","--target",target,"--build-arg",f"BUILD_REVISION={revision}","--build-context",f"artifacts={context}",
+                 "-f","runtime/pumpkin/Dockerfile","-t",image,"."],cwd=source)
         image_id,label=run(["docker","image","inspect",tag,"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
         if label!=revision: raise Error("Pumpkin image revision label mismatch")
         upstream=run(["git","-C",str(source),"show",f"{revision}:runtime/pumpkin/REVISION"]).strip()
         pump_id,pump_sha=verify_pumpkin(tag,revision,upstream)
         if pump_id!=image_id: raise Error("Pumpkin immutable image ID changed during verification")
+        if pump_sha!=artifacts["pumpkin"]: raise Error("packaged Pumpkin executable differs from the remote build")
         return {"status":"built","pumpkin_image":tag,"pumpkin_image_id":image_id,"pumpkin_revision":revision,"pumpkin_sha256":pump_sha,"archive_sha256":archive_sha}
     finally: run(["git","-C",str(CHECKOUT),"worktree","remove","--force",str(source)])
 
@@ -888,16 +917,16 @@ def verify_build_context(checkout:Path,revision:str,expected:dict[str,str],relea
     verify_gateway_tls_configuration(services,values["BEDROCK_TLS_HOST_DIRECTORY"],values["BEDROCK_PORT"],error_cls=Error)
     verify_bedrock_tls_assets(values["BEDROCK_TLS_HOST_DIRECTORY"],values["ROOT_DOMAIN"],
                               error_cls=Error,run_command=run,project=PROJECT)
-    expected_contexts={"control-plane":checkout,"panel":checkout/"web","waiting-pumpkin":checkout}
+    expected_contexts={"control-plane":checkout,"panel":checkout/"web"}
     for service,expected_context in expected_contexts.items():
         build=services[service].get("build",{})
         args=build.get("args",{}) or {}
         if args.get("BUILD_REVISION")!=revision:raise Error(f"Compose build revision mismatch: {service}")
         if Path(str(build.get("context", ""))).resolve()!=expected_context.resolve():raise Error(f"Compose build context differs from tracked source: {service}")
         if build.get("additional_contexts"):raise Error(f"unexpected external Compose build context: {service}")
-    waiting=services["waiting-pumpkin"].get("build",{})
-    if waiting.get("dockerfile")!="runtime/pumpkin/Dockerfile" or waiting.get("target")!="waiting":
-        raise Error("waiting Pumpkin service does not use the revision-pinned waiting target")
+    waiting=services["waiting-pumpkin"]
+    if waiting.get("build") or waiting.get("image")!=f"{WAITING_PREFIX}{revision}":
+        raise Error("waiting Pumpkin service does not run the release-built revision-pinned image")
     panel_ports=services["panel"].get("ports",[])
     if not any((isinstance(port,dict) and port.get("host_ip")=="127.0.0.1") or str(port).startswith("127.0.0.1:") for port in panel_ports):raise Error("panel port is not bound to localhost")
 
@@ -1068,7 +1097,7 @@ def finalize_worker(token: str, revision: str, receipt: str) -> dict[str, str]:
     return {"status":"finalized"}
 
 def main() -> int:
-    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--upstream"); parser.add_argument("--receipt"); parser.add_argument("--release-environment"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--remote",required=True); parser.add_argument("--token"); parser.add_argument("--revision"); parser.add_argument("--expected"); parser.add_argument("--baseline"); parser.add_argument("--pumpkin"); parser.add_argument("--upstream"); parser.add_argument("--receipt"); parser.add_argument("--release-environment"); parser.add_argument("--artifacts"); args=parser.parse_args()
     try:
         expected=json.loads(args.expected) if args.expected else None
         if args.remote=="lock": result=lock(args.token,True)
@@ -1084,7 +1113,7 @@ def main() -> int:
             verify_build_context(CHECKOUT,args.revision,expected,release_environment=release_environment)
             result={"status":"build-context-verified","revision":args.revision}
         elif args.remote=="restore": result=restore(args.token)
-        elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected,args.token)
+        elif args.remote=="build-pumpkin": result=build_pumpkin(args.revision,expected,args.token,json.loads(args.artifacts))
         elif args.remote=="wait": result=wait_sync(args.revision,args.pumpkin,json.loads(args.baseline),expected,args.token)
         elif args.remote=="mark": result=mark(args.receipt,args.token)
         elif args.remote=="rollback-worker": result=rollback_worker(args.token)

@@ -80,9 +80,42 @@ class RolloutTests(unittest.TestCase):
         self.assertNotIn("legacy_baseline", source)
         self.assertNotIn("--legacy", source)
 
-    def test_no_mutable_cargo_target_cache_mounts(self):
-        for path in (ROOT / "runtime/Dockerfile", ROOT / "runtime/pumpkin/Dockerfile"):
-            self.assertNotIn("target=/source/target", path.read_text(encoding="utf-8"))
+    def test_cargo_target_cache_is_release_scoped_only_for_pumpkin(self):
+        application = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
+        pumpkin = (ROOT / "runtime/pumpkin/Dockerfile").read_text(encoding="utf-8")
+        self.assertNotIn("target=/source/target", application)
+        self.assertIn(
+            "id=kurbis-pumpkin-target-${BUILD_REVISION},target=/source/target,sharing=locked",
+            pumpkin,
+        )
+        self.assertIn(
+            "id=kurbis-pumpkin-plugin-target-${BUILD_REVISION},target=/source/plugins/kurbis-control/target,sharing=locked",
+            pumpkin,
+        )
+        self.assertEqual(pumpkin.count("target=/usr/local/cargo/registry,sharing=locked"), 2)
+        self.assertEqual(pumpkin.count("target=/usr/local/cargo/git,sharing=locked"), 2)
+
+    def test_release_revision_accepts_sha_scoped_pumpkin_target_cache(self):
+        with patch.object(deploy, "run", side_effect=["a" * 40, "", "a" * 40]):
+            self.assertEqual(deploy.release_revision(), "a" * 40)
+
+    def test_remote_timeout_defaults_to_90_minutes_and_supports_safe_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(deploy.remote_command_timeout_seconds(), 5400)
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "7200"}, clear=True):
+            self.assertEqual(deploy.remote_command_timeout_seconds(), 7200)
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "1799"}, clear=True):
+            with self.assertRaisesRegex(deploy.DeploymentError, "must be from"):
+                deploy.remote_command_timeout_seconds()
+
+    def test_remote_uses_keepalive_and_configured_timeout_without_retrying(self):
+        with patch.dict(os.environ, {deploy.REMOTE_COMMAND_TIMEOUT_ENV: "5400"}, clear=True), \
+             patch.object(deploy, "run", return_value="{}") as remote_run:
+            self.assertEqual(deploy.remote("respond5", "baseline"), {})
+        command = remote_run.call_args.args[0]
+        self.assertIn("ServerAliveInterval=30", command)
+        self.assertIn("ServerAliveCountMax=182", command)
+        self.assertEqual(remote_run.call_args.kwargs["timeout"], 5400)
 
     def test_runtime_image_propagates_build_revision_to_binaries_and_label(self):
         dockerfile = (ROOT / "runtime/Dockerfile").read_text(encoding="utf-8")
@@ -138,6 +171,7 @@ class RolloutTests(unittest.TestCase):
                 return original_stat(path, *args, **kwargs)
             token = "a" * 32
             with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "CHECKOUT_BACKUP", backup_root), \
+                 patch.object(sync, "RELEASE_REMOTE", str(bare)), \
                  patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "identity", return_value="worker-id"), \
                  patch.object(Path, "stat", stat_with_root_backup_owner):
                 result = sync.stage(revision, token, expected)
@@ -219,7 +253,7 @@ class RolloutTests(unittest.TestCase):
                     "ports": [{"published": "19132", "target": 19132, "protocol": protocol} for protocol in ("tcp", "udp")],
                     "volumes": [{"type": "bind", "source": "/srv/kurbis/certs", "target": "/run/kurbis-tls", "read_only": True}]},
                 "panel": {"build": {"context": str(checkout / "web"), "args": {"BUILD_REVISION": revision}}, "ports": [{"host_ip": "127.0.0.1"}]},
-                "waiting-pumpkin": {"build": {"context": str(checkout), "dockerfile": "runtime/pumpkin/Dockerfile", "target": "waiting", "args": {"BUILD_REVISION": revision}}},
+                "waiting-pumpkin": {"image": f"{sync.WAITING_PREFIX}{revision}"},
                 "postgres": {},
             }}
             def fake_run(args, **kwargs):
@@ -246,11 +280,44 @@ class RolloutTests(unittest.TestCase):
             with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"), patch.object(sync, "verify_bedrock_tls_assets"):
                 release_env={"BUILD_REVISION":revision,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1"}
                 sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
-                config["services"]["waiting-pumpkin"]["build"]["target"] = "host-control"
-                with self.assertRaises(sync.Error):
-                    sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                # Compose must run the image packaged from the remote build, never
+                # another revision's image or one it compiles itself.
+                for waiting in ({"image": f"{sync.WAITING_PREFIX}{'d' * 40}"},
+                                {"image": f"{sync.WAITING_PREFIX}{revision}", "build": {"context": str(checkout)}}):
+                    config["services"]["waiting-pumpkin"] = waiting
+                    with self.assertRaisesRegex(sync.Error, "release-built revision-pinned image"):
+                        sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                config["services"]["waiting-pumpkin"] = {"image": f"{sync.WAITING_PREFIX}{revision}"}
                 with self.assertRaisesRegex(sync.Error,"environment overrides differ"):
                     sync.verify_build_context(checkout,revision,expected,release_environment={**release_env,"PANEL_BIND_ADDRESS":"0.0.0.0"})
+
+    def test_release_artifacts_must_match_the_remote_build_digests(self):
+        revision = "c" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "release-artifacts"
+            artifacts = root / revision / "artifacts"
+            artifacts.mkdir(parents=True)
+            for path in (root, root / revision, artifacts):
+                path.chmod(0o700)
+            digests = {}
+            for name in sync.PUMPKIN_ARTIFACTS:
+                (artifacts / name).write_bytes(name.encode())
+                digests[name] = hashlib.sha256(name.encode()).hexdigest()
+            original_stat = Path.stat
+            def root_owned_stat(path, *args, **kwargs):
+                result = original_stat(path, *args, **kwargs)
+                if path in (root, root / revision, artifacts):
+                    result = type("RootOwnedStat", (), {"st_uid": 0, "st_mode": result.st_mode})()
+                return result
+            with patch.object(sync, "RELEASE_ARTIFACTS", root), patch.object(Path, "stat", root_owned_stat):
+                self.assertEqual(sync.release_artifact_context(revision, digests), root / revision)
+                with self.assertRaisesRegex(sync.Error, "differs from the remote build"):
+                    sync.release_artifact_context(revision, {**digests, "pumpkin": "0" * 64})
+                with self.assertRaisesRegex(sync.Error, "digest manifest is invalid"):
+                    sync.release_artifact_context(revision, {"pumpkin": digests["pumpkin"]})
+                (artifacts / "extra").write_bytes(b"unexpected")
+                with self.assertRaisesRegex(sync.Error, "unexpected files"):
+                    sync.release_artifact_context(revision, digests)
 
     def test_pending_worker_rollback_blocks_another_release(self):
         with tempfile.TemporaryDirectory() as directory:

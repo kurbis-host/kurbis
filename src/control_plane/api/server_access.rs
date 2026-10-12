@@ -550,7 +550,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn invalid_capability() -> ApiError {
+pub(super) fn invalid_capability() -> ApiError {
     ApiError::with_code(
         StatusCode::UNAUTHORIZED,
         "invalid_server_capability",

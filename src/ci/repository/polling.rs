@@ -11,13 +11,27 @@ use uuid::Uuid;
 
 use super::super::{
     domain::CiRefKind,
-    source_control::{PollCheckpoint, SourceRefKind},
+    source_control::{PollCheckpoint, SourceRef, SourceRefKind},
 };
 use super::rows::WatchedRepositoryRow;
 use super::{CiPreviewRepository, WatchedRepository};
 
 const POLL_LEASE_DURATION: Duration = Duration::from_secs(120);
 const POLL_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_INITIAL_EAGER_PR_BUILDS: usize = 32;
+
+fn bound_initial_eager_refs(mut refs: Vec<SourceRef>, initial_poll: bool) -> Vec<SourceRef> {
+    if initial_poll && refs.len() > MAX_INITIAL_EAGER_PR_BUILDS {
+        refs.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        refs.truncate(MAX_INITIAL_EAGER_PR_BUILDS);
+    }
+    refs
+}
 
 /// Fences one provider poll without retaining a PostgreSQL transaction during
 /// network I/O. Cancellation starts a best-effort asynchronous lease release;
@@ -272,7 +286,7 @@ impl CiPreviewRepository {
         .into_iter()
         .map(|(name, sha, closed, deleted)| (name, (sha, closed, deleted)))
         .collect();
-        poll.eager_refs = poll
+        let eager_refs: Vec<_> = poll
             .refs
             .iter()
             .filter(|source_ref| {
@@ -287,6 +301,10 @@ impl CiPreviewRepository {
             })
             .cloned()
             .collect();
+        // A first poll can observe thousands of historical open PRs. Build a
+        // bounded recent subset, not the entire historical set; joins and
+        // webhook deliveries still admit any omitted head on demand.
+        poll.eager_refs = bound_initial_eager_refs(eager_refs, row.last_successful_poll.is_none());
         let updated = sqlx::query(
             "UPDATE ci_watched_repositories SET etag = $3, branch_etag = $4,
                     pull_request_page = $5, branch_cursor = $6, last_successful_poll = $7,
@@ -370,5 +388,51 @@ impl CiPreviewRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_poll_caps_eager_heads_to_recent_work() {
+        let now = Utc::now();
+        let refs = (0..64)
+            .map(|age| SourceRef {
+                kind: SourceRefKind::PullRequest,
+                name: format!("pr-{}", age + 1),
+                number: Some((age + 1) as u64),
+                commit_sha: format!("{:040x}", age + 1),
+                source_repository: Some("fork/Pumpkin".into()),
+                closed: false,
+                deleted: false,
+                updated_at: Some(now - chrono::Duration::minutes(age as i64)),
+            })
+            .collect();
+        let selected = bound_initial_eager_refs(refs, true);
+        assert_eq!(selected.len(), MAX_INITIAL_EAGER_PR_BUILDS);
+        assert!(selected.iter().any(|item| item.name == "pr-1"));
+        assert!(!selected.iter().any(|item| item.name == "pr-64"));
+    }
+
+    #[test]
+    fn non_initial_poll_does_not_drop_eager_heads() {
+        let refs = (0..(MAX_INITIAL_EAGER_PR_BUILDS + 1))
+            .map(|number| SourceRef {
+                kind: SourceRefKind::PullRequest,
+                name: format!("pr-{number}"),
+                number: Some(number as u64),
+                commit_sha: format!("{:040x}", number + 1),
+                source_repository: Some("fork/Pumpkin".into()),
+                closed: false,
+                deleted: false,
+                updated_at: None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bound_initial_eager_refs(refs.clone(), false).len(),
+            refs.len()
+        );
     }
 }

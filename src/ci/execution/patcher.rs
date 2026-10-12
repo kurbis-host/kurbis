@@ -1,5 +1,6 @@
-use std::path::Path;
+use std::{path::Path, process::Command as HostCommand};
 
+use include_dir::{Dir, include_dir};
 use tokio::process::Command;
 
 use super::archive::{
@@ -12,38 +13,28 @@ const HOST_CONTROL_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/host-
 const SNAPSHOT_BARRIER_PATCH: &[u8] =
     include_bytes!("../../../runtime/pumpkin/snapshot-barrier.patch");
 const NETHERNET_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/nethernet-gateway.patch");
+const HOST_PATCHER_CAPABILITY: &[u8] = b"git-runtime-v1";
 const HOST_CONTROL_RS: &[u8] = include_bytes!("../../../runtime/pumpkin/host_control.rs");
 const PUMPKIN_REVISION: &[u8] = include_bytes!("../../../runtime/pumpkin/REVISION");
-const PLUGIN_0: &[u8] = include_bytes!("../../../plugins/kurbis-control/Cargo.toml");
-const PLUGIN_1: &[u8] = include_bytes!("../../../plugins/kurbis-control/Cargo.lock");
-const PLUGIN_2: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/actions.rs");
-const PLUGIN_3: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/api.rs");
-const PLUGIN_4: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/chat.rs");
-const PLUGIN_5: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/command.rs");
-const PLUGIN_6: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/lib.rs");
-const PLUGIN_7: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/menu.rs");
-const PLUGIN_8: &[u8] = include_bytes!("../../../plugins/kurbis-control/src/stats.rs");
+const PLUGIN_MANIFEST: &[u8] = include_bytes!("../../../plugins/kurbis-control/Cargo.toml");
+const PLUGIN_LOCKFILE: &[u8] = include_bytes!("../../../plugins/kurbis-control/Cargo.lock");
+/// The whole source tree, so a new plugin module can never be left out.
+static PLUGIN_SOURCE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/plugins/kurbis-control/src");
 
 /// The exact build integration compiled into this binary: pinned Pumpkin
 /// patches plus every trusted plugin source/lockfile input used in artifacts.
 pub fn checked_in_patch_fingerprint() -> String {
     let mut hasher = blake3::Hasher::new();
-    for (name, bytes) in [
+    let pinned = [
+        ("host-patcher-capability", HOST_PATCHER_CAPABILITY),
         ("pumpkin-revision", PUMPKIN_REVISION),
         ("host-control.patch", HOST_CONTROL_PATCH),
         ("snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH),
         ("nethernet-gateway.patch", NETHERNET_PATCH),
         ("host_control.rs", HOST_CONTROL_RS),
-        ("trusted-plugin/Cargo.toml", PLUGIN_0),
-        ("trusted-plugin/Cargo.lock", PLUGIN_1),
-        ("trusted-plugin/src/actions.rs", PLUGIN_2),
-        ("trusted-plugin/src/api.rs", PLUGIN_3),
-        ("trusted-plugin/src/chat.rs", PLUGIN_4),
-        ("trusted-plugin/src/command.rs", PLUGIN_5),
-        ("trusted-plugin/src/lib.rs", PLUGIN_6),
-        ("trusted-plugin/src/menu.rs", PLUGIN_7),
-        ("trusted-plugin/src/stats.rs", PLUGIN_8),
-    ] {
+    ]
+    .map(|(name, bytes)| (name.to_owned(), bytes));
+    for (name, bytes) in pinned.into_iter().chain(trusted_plugin_inputs()) {
         hasher.update(&(name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());
         hasher.update(&(bytes.len() as u64).to_be_bytes());
@@ -52,10 +43,57 @@ pub fn checked_in_patch_fingerprint() -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// The plugin manifest, lockfile and every source file, sources by name.
+fn trusted_plugin_inputs() -> Vec<(String, &'static [u8])> {
+    fn collect(dir: &'static Dir<'static>, sources: &mut Vec<(String, &'static [u8])>) {
+        sources.extend(dir.files().map(|file| {
+            (
+                format!("trusted-plugin/src/{}", file.path().display()),
+                file.contents(),
+            )
+        }));
+        for child in dir.dirs() {
+            collect(child, sources);
+        }
+    }
+    let mut sources = Vec::new();
+    collect(&PLUGIN_SOURCE, &mut sources);
+    sources.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut inputs = vec![
+        ("trusted-plugin/Cargo.toml".to_owned(), PLUGIN_MANIFEST),
+        ("trusted-plugin/Cargo.lock".to_owned(), PLUGIN_LOCKFILE),
+    ];
+    inputs.extend(sources);
+    inputs
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckedInPumpkinPatcher;
 
 impl CheckedInPumpkinPatcher {
+    /// Verify the host dependency used by the patcher before exposing CI.
+    ///
+    /// Remote Bubblewrap compilation still performs source patching in the
+    /// control-plane process, so a runtime image without Git cannot be
+    /// considered CI-capable even when the remote builder is healthy.
+    pub fn verify_runtime_dependencies() -> Result<(), BuildPipelineError> {
+        let output = HostCommand::new("git")
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                BuildPipelineError::Sandbox(format!(
+                    "CI patcher requires git in the control-plane runtime: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(BuildPipelineError::Sandbox(format!(
+                "CI patcher git preflight failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     async fn apply_patch(
         root: &Path,
         filename: &str,
@@ -170,7 +208,7 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
         .await?;
         Self::apply_patch(root, "nethernet-gateway.patch", NETHERNET_PATCH, true).await?;
 
-        let host_control = root.join("crates/pumpkin/src/net/host_control.rs");
+        let host_control = root.join("crates/pumpkin-core/src/net/host_control.rs");
         if let Some(parent) = host_control.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 BuildPipelineError::transient(
@@ -239,10 +277,41 @@ mod tests {
     use crate::ci::PatchApplier;
 
     #[test]
+    fn patcher_runtime_dependency_preflight_succeeds_when_git_is_available() {
+        CheckedInPumpkinPatcher::verify_runtime_dependencies().unwrap();
+    }
+
+    #[test]
     fn patch_fingerprint_is_derived_from_every_checked_in_input() {
         let fingerprint = checked_in_patch_fingerprint();
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn patch_fingerprint_covers_every_trusted_plugin_source() {
+        let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/kurbis-control");
+        let mut on_disk = vec![
+            "trusted-plugin/Cargo.toml".to_owned(),
+            "trusted-plugin/Cargo.lock".to_owned(),
+        ];
+        let mut sources = walkdir::WalkDir::new(plugin.join("src"))
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let relative = entry.path().strip_prefix(&plugin).unwrap();
+                format!("trusted-plugin/{}", relative.display())
+            })
+            .collect::<Vec<_>>();
+        sources.sort();
+        on_disk.extend(sources);
+        let fingerprinted = trusted_plugin_inputs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprinted, on_disk);
+        assert!(fingerprinted.contains(&"trusted-plugin/src/ai/mod.rs".to_owned()));
     }
 
     #[test]

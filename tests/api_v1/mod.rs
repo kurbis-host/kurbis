@@ -1,6 +1,7 @@
 mod access;
 mod account;
 mod admission;
+mod ai;
 mod events;
 mod exports;
 mod resources;

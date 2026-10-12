@@ -359,7 +359,7 @@ start_native() {
   fi
   python3 "$ROOT/tools/run_bounded_build.py" \
     --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
-    -- bash -lc "cd '$ROOT' && cargo --jobs 1 ${cargo_args[*]}"
+    -- bash -lc "cd '$ROOT' && cargo ${cargo_args[*]}"
 
   mkdir -p "$ROOT/data/native-waiting"
   printf 'native\n' > "$MODE_FILE"
@@ -396,8 +396,9 @@ start_docker() {
     "$ROOT"
   printf 'Building the Docker waiting runtime...\n'
   "$ROOT/tools/docker_build_with_limits.sh" \
-    -f "$ROOT/deployment/waiting.Dockerfile" \
-    --tag melon-pumpkin:waiting \
+    -f "$ROOT/runtime/pumpkin/Dockerfile" \
+    --target waiting \
+    --tag "melon-pumpkin:waiting-${BUILD_REVISION:-development}" \
     "$ROOT"
   printf 'Building Compose services with per-step cgroup caps...\n'
   KURBIS_BUILD_MEMORY_BYTES="${KURBIS_DOCKER_BUILD_MEMORY_BYTES:-10737418240}" \
@@ -413,7 +414,7 @@ start_docker() {
   printf 'Building the host worker for Docker mode...\n'
   python3 "$ROOT/tools/run_bounded_build.py" \
     --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
-    -- bash -lc "cd '$ROOT' && cargo --jobs 1 build --release --bin worker"
+    -- bash -lc "cd '$ROOT' && cargo build --release --bin worker"
   mkdir -p "$ROOT/data"
   printf 'docker\n' > "$MODE_FILE"
   printf 'Starting Compose services...\n'

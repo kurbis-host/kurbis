@@ -7,7 +7,7 @@ import { browserApi } from "../lib/api/operations";
 import { lifecycle } from "../lib/lifecycle";
 import { formatBytes } from "../lib/format";
 import { queryKeys } from "../lib/query";
-import { PageHeader, Surface } from "./ui";
+import { PageHeader, StatusLabel, Surface } from "./ui";
 import { RevokeServerAccess } from "./revoke-server-access";
 
 type Server = components["schemas"]["Server"];
@@ -57,7 +57,7 @@ export function ServerList({
                   </div>
                   <p className="mt-1.5 mb-0 text-[13px] text-ink-soft">{server.java_address}</p>
                   <div className="mt-2 flex flex-wrap items-center gap-4 text-[13px] text-ink-soft">
-                    <span className="inline-flex items-center gap-2 font-[740] text-ink"><i className={`size-2 rounded-full ${toneClass(state.tone)}`} />{state.label}</span>
+                    <StatusLabel tone={state.tone}>{state.label}</StatusLabel>
                     <span>{formatBytes(server.storage_bytes)} stored</span>
                   </div>
                 </Link>
@@ -75,11 +75,4 @@ export function ServerList({
       )}
     </>
   );
-}
-
-function toneClass(tone: string) {
-  if (tone === "good") return "bg-[#91bd67]";
-  if (tone === "quiet") return "bg-[#94a4a5]";
-  if (tone === "danger") return "bg-[#df7468]";
-  return "bg-[#df9d58]";
 }

@@ -482,27 +482,28 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
     );
     assert_eq!(build.stage, CiBuildStage::Queued);
     // Poll recovery admits the open PR head into the durable queue even when
-    // the build row predates queue admission. Repeating explicit demand is
-    // idempotent and leaves exactly one queued request.
+    // the build row predates queue admission. The queue is authoritative for
+    // pending work; the legacy build-row recovery query intentionally excludes
+    // identities that have not yet been explicitly requested.
+    let queue_metrics = repository
+        .pull_request_build_queue_metrics(Some(REPOSITORY))
+        .await
+        .unwrap();
     assert_eq!(
-        repository
-            .queued_pull_request_builds(REPOSITORY)
-            .await
-            .unwrap()
-            .len(),
-        1
+        queue_metrics.pending, 1,
+        "poll recovery must leave exactly one pending durable queue request"
     );
     repository
         .enqueue_pull_request_build(REPOSITORY, 5005, &key, Some("contributor/Pumpkin"))
         .await
         .unwrap();
+    let queue_metrics = repository
+        .pull_request_build_queue_metrics(Some(REPOSITORY))
+        .await
+        .unwrap();
     assert_eq!(
-        repository
-            .queued_pull_request_builds(REPOSITORY)
-            .await
-            .unwrap()
-            .len(),
-        1
+        queue_metrics.pending, 1,
+        "repeating explicit queue demand must remain idempotent"
     );
     let pr_alias = CiHostname::for_ref(CiRefKind::PullRequest, "pr-5005", ROOT_DOMAIN).unwrap();
     let commit_alias = CiHostname::for_ref(CiRefKind::Commit, COMMIT_SHA, ROOT_DOMAIN).unwrap();

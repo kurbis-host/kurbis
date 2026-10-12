@@ -129,7 +129,7 @@ pub(super) async fn get_console_command(
     .bind(path.command_id)
     .fetch_optional(&state.pool)
     .await?
-    .ok_or_else(server_not_found)?;
+    .ok_or_else(ApiError::server_not_found)?;
     Ok(Json(ConsoleCommandResponse::from(row)))
 }
 
@@ -151,7 +151,7 @@ fn resolve_console_actor(
         }
         ActorContext::ServerSessions(sessions) => {
             let Some(scope) = sessions.iter().find(|scope| scope.server_id == server.id) else {
-                return Err(server_not_found());
+                return Err(ApiError::server_not_found());
             };
             Ok(ConsoleActorFence::ServerSession {
                 grant_id: scope.grant_id,
@@ -179,7 +179,7 @@ async fn authorize_console_actor(
             .fetch_optional(&mut **tx)
             .await?;
     let Some(owner_id) = owner_id else {
-        return Err(server_not_found());
+        return Err(ApiError::server_not_found());
     };
     let valid = match actor {
         ConsoleActorFence::Owner(user_id) if user_id == owner_id => {
@@ -202,7 +202,7 @@ async fn authorize_console_actor(
     if valid {
         Ok(())
     } else {
-        Err(server_not_found())
+        Err(ApiError::server_not_found())
     }
 }
 
@@ -352,14 +352,6 @@ fn validate_console_command(command: String) -> Result<String, ApiError> {
         ));
     }
     Ok(normalized.to_owned())
-}
-
-fn server_not_found() -> ApiError {
-    ApiError::with_code(
-        StatusCode::NOT_FOUND,
-        "server_not_found",
-        "server not found",
-    )
 }
 
 #[cfg(test)]
