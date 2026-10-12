@@ -21,6 +21,10 @@ from typing import Sequence
 
 ROOT = Path("/srv/kurbis")
 CHECKOUT = Path("/etc/dokploy/compose/kurbis-hoster-fbikvd/code")
+# Dokploy clones with a GitHub App token embedded in the `origin` URL, and that
+# token expires after an hour. Release tags are fetched through this plain URL
+# so the host's own Git credential helper authenticates instead.
+RELEASE_REMOTE = "https://github.com/kurbis-host/kurbis.git"
 ENV = CHECKOUT / ".env"
 WORKER = Path("/srv/kurbis-hoster/target/release/worker")
 WORKER_ENV = ROOT / "worker.env"
@@ -470,7 +474,7 @@ def stage(revision: str, token: str, expected: dict[str, str]) -> dict[str, str]
         manifest.append({"path":relative,"content":base64.b64encode(content).decode(),"mode":stat.S_IMODE(m.st_mode),"uid":m.st_uid,"gid":m.st_gid,"target":expected.get(relative,"missing"),"original_target":original_target})
     (backup/"manifest.json").write_text(json.dumps(manifest),encoding="utf-8"); os.chmod(backup/"manifest.json",0o600)
     tag=f"kurbis-release-{revision}"
-    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag}:refs/tags/{tag}"])
+    run(["git","-C",str(CHECKOUT),"fetch",RELEASE_REMOTE,f"refs/tags/{tag}:refs/tags/{tag}"])
     if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag}^{{commit}}"] ) != revision: raise Error("immutable release tag SHA mismatch")
     run(["git","-C",str(CHECKOUT),"reset","--hard",revision]); run(["git","-C",str(CHECKOUT),"clean","-fdx","-e",".env"])
     status = run_bytes(["git","-C",str(CHECKOUT),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
@@ -553,7 +557,7 @@ def build_pumpkin(revision: str, expected: dict[str,str], token: str) -> dict[st
     require_lock(token); validate_expected_manifest(expected)
     if not valid_sha(revision): raise Error("invalid Pumpkin build revision")
     tag_name=f"kurbis-release-{revision}"
-    run(["git","-C",str(CHECKOUT),"fetch","origin",f"refs/tags/{tag_name}:refs/tags/{tag_name}"])
+    run(["git","-C",str(CHECKOUT),"fetch",RELEASE_REMOTE,f"refs/tags/{tag_name}:refs/tags/{tag_name}"])
     if run(["git","-C",str(CHECKOUT),"rev-parse",f"refs/tags/{tag_name}^{{commit}}"] )!=revision:
         raise Error("Pumpkin source tag does not resolve to requested release SHA")
     root=ROOT/"release-builds"
