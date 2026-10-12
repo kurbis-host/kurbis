@@ -30,9 +30,11 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
 4. **Verify.** Every Compose service must be running, healthy, and labelled
    with the release SHA, and Dokploy must have deployed that commit.
 5. **Worker.** The native `kurbis-worker` service gets the worker binary from
-   the deployed app image and the new Pumpkin image. It has to stay active and
-   send heartbeats for 40 seconds; otherwise the previous binary and settings
-   are put back and the release fails.
+   the deployed app image and the new Pumpkin image. One worker process has to
+   stay up for 40 seconds and send heartbeats within four minutes; otherwise
+   the previous binary and settings are put back and the release fails. The
+   first starts normally exit with `worker_already_active` until the previous
+   worker's lease lapses.
 
 The result is recorded in `/srv/kurbis/deployed-release.json` on the host.
 

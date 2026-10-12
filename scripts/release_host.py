@@ -32,8 +32,9 @@ WORKER = Path("/srv/kurbis-hoster/target/release/worker")
 WORKER_ENV = Path("/srv/kurbis/worker.env")
 WORKER_SERVICE = "kurbis-worker.service"
 PUMPKIN_ARTIFACTS = ("pumpkin", "kurbis-control.wasm")
-# Long enough for the worker to register and renew its lease at least once.
+# One worker process must stay up this long, heartbeating, to count as started.
 WORKER_SETTLE_SECONDS = 40
+WORKER_START_SECONDS = 240
 
 
 class Failure(RuntimeError):
@@ -168,20 +169,32 @@ def start_worker(binary: bytes, environment: bytes, database: str) -> str | None
         staged.chmod(mode)
         staged.replace(path)
     run(["systemctl", "restart", WORKER_SERVICE])
-    deadline = time.monotonic() + WORKER_SETTLE_SECONDS
+    # The control plane refuses a new worker process until the previous one's
+    # lease lapses, so the first starts exit with "worker_already_active" and
+    # systemd retries. Healthy means one process that stays up and heartbeats.
+    expected, stable_pid, stable_since = hashlib.sha256(binary).hexdigest(), "", 0.0
+    deadline = time.monotonic() + WORKER_START_SECONDS
     while time.monotonic() < deadline:
         time.sleep(5)
-        # A worker that cannot start exits and is restarted by systemd, so one
-        # active sample proves nothing; it has to stay up for the whole window.
-        if subprocess.run(["systemctl", "is-active", "--quiet", WORKER_SERVICE], check=False).returncode:
-            log = subprocess.run(["journalctl", "-u", WORKER_SERVICE, "--since", "-1min", "--no-pager", "-o", "cat"],
-                                 text=True, stdout=subprocess.PIPE, check=False).stdout
-            errors = [line for line in log.splitlines() if "Error" in line]
-            return errors[-1][-500:] if errors else "the worker service did not stay active"
-    pid = run(["systemctl", "show", "--property=MainPID", "--value", WORKER_SERVICE])
-    if sha256(Path(f"/proc/{pid}/exe")) != hashlib.sha256(binary).hexdigest():
-        return "the running worker is not the installed binary"
-    return None if worker_heartbeat_is_fresh(database) else "the worker is not sending heartbeats"
+        pid = run(["systemctl", "show", "--property=MainPID", "--value", WORKER_SERVICE])
+        if pid == "0" or subprocess.run(["systemctl", "is-active", "--quiet", WORKER_SERVICE], check=False).returncode:
+            stable_pid = ""
+            continue
+        if pid != stable_pid:
+            stable_pid, stable_since = pid, time.monotonic()
+        try:
+            running = sha256(Path(f"/proc/{pid}/exe"))
+        except OSError:
+            stable_pid = ""
+            continue
+        if running != expected:
+            return "the running worker is not the installed binary"
+        if time.monotonic() - stable_since >= WORKER_SETTLE_SECONDS and worker_heartbeat_is_fresh(database):
+            return None
+    log = subprocess.run(["journalctl", "-u", WORKER_SERVICE, "--since", "-2min", "--no-pager", "-o", "cat"],
+                         text=True, stdout=subprocess.PIPE, check=False).stdout
+    errors = [line for line in log.splitlines() if "Error" in line]
+    return errors[-1][-500:] if errors else "the worker did not stay up and send heartbeats"
 
 
 def worker(arguments: dict) -> dict:
