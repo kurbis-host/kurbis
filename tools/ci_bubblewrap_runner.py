@@ -118,7 +118,10 @@ export HOME=/work/home
 export TMPDIR=/work/tmp
 export CARGO_HOME=/cache/cargo-home
 export CARGO_NET_OFFLINE=true
-export CARGO_BUILD_JOBS=1
+# Eight jobs measured 6.5 minutes against 31 with one on the shared builder;
+# beyond eight the build is a serial chain of a few large crates. Codegen
+# units stay at one so the binary is identical to a single-job build.
+export CARGO_BUILD_JOBS=8
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
@@ -154,10 +157,10 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 build_elapsed_seconds=0
 SECONDS=0
 cd /work/source
-cargo_build build --locked --offline --release --jobs 1 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo_build build --locked --offline --release --jobs 8 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo_build build --locked --offline --release --jobs 1 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo_build build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
 build_elapsed_seconds=$SECONDS
