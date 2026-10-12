@@ -96,6 +96,10 @@ impl CommandHandler for Handler {
         args: ConsumedArgs,
     ) -> Result<i32, CommandError> {
         let run = || -> Result<()> {
+            if let Some(player) = sender.as_player() {
+                // Any command ends a pending chat prompt from the menu.
+                menu::forget_text_input(&player);
+            }
             match self.0 {
                 "menu" => {
                     if let Some(player) = sender.as_player() {

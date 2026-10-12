@@ -77,6 +77,10 @@ fn normal_scope_allows_only_server_capability_routes() {
         (Method::POST, format!("/api/v1/servers/{expected}/ai/jobs")),
         (Method::POST, format!("/api/v1/servers/{expected}/ai/sync")),
         (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
             Method::POST,
             format!(
                 "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
@@ -120,6 +124,28 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
         (
             Method::POST,
             format!("/api/v1/servers/{expected}/ai/jobs/not-a-job/cancel"),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/not-a-job"),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::GET,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/retry",
+                Uuid::new_v4()
+            ),
         ),
         (
             Method::POST,

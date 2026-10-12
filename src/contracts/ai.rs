@@ -186,9 +186,11 @@ pub struct AiToolCall {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// One request with every tool call it made.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AiJobDetail {
-    #[serde(flatten)]
+    // Nested, not flattened: the request's `tool_calls` count would collide
+    // with this list.
     pub job: AiJob,
     pub tool_calls: Vec<AiToolCall>,
 }

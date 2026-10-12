@@ -67,7 +67,7 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
         queryKey: queryKeys.aiJobs(serverId),
         predicate: ({ state }) => {
           const detail = state.data as AiJobDetail | undefined;
-          return !detail || isActiveAiJob(detail.state);
+          return !detail || isActiveAiJob(detail.job.state);
         },
       });
       break;

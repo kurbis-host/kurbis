@@ -172,6 +172,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
+                /** @description One request with every tool call it made. */
                 200: {
                     headers: {
                         [name: string]: unknown;

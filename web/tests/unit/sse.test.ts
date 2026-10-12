@@ -122,7 +122,7 @@ describe("server event integration", () => {
 
   it("replaces the AI overview and refreshes only the request details still in progress", () => {
     const client = new QueryClient();
-    const detail = (job: typeof activeAiJob): AiJobDetail => ({ ...job, tool_calls: [] });
+    const detail = (job: typeof activeAiJob): AiJobDetail => ({ job, tool_calls: [] });
     client.setQueryData(queryKeys.aiJob(server.id, activeAiJob.id), detail(activeAiJob));
     client.setQueryData(queryKeys.aiJob(server.id, finishedAiJob.id), detail(finishedAiJob));
 

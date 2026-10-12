@@ -1194,8 +1194,12 @@ pub(crate) fn route_allowed(scope: Scope, method: &Method, path: &str, expected_
                     matches!(*method, Method::GET | Method::POST | Method::DELETE)
                 }
                 Some(["commands"] | ["ai", "jobs" | "sync"]) => *method == Method::POST,
-                Some(["ai", "jobs", job_id, "cancel"]) => {
-                    *method == Method::POST && Uuid::parse_str(job_id).is_ok()
+                Some(["ai", "jobs", job_id, rest @ ..]) if Uuid::parse_str(job_id).is_ok() => {
+                    match rest {
+                        [] => *method == Method::GET,
+                        ["cancel"] => *method == Method::POST,
+                        _ => false,
+                    }
                 }
                 _ => false,
             }

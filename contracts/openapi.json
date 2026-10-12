@@ -5148,7 +5148,7 @@
         ],
         "responses": {
           "200": {
-            "description": "",
+            "description": "One request with every tool call it made.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6378,87 +6378,21 @@
         ]
       },
       "AiJobDetail": {
+        "description": "One request with every tool call it made.",
         "type": "object",
         "properties": {
-          "answer": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "conversation_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "cost_micros": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "finished_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "model": {
-            "type": "string"
-          },
-          "model_calls": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "operator_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "operator_name": {
-            "type": "string"
-          },
-          "prompt": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/AiJobState"
+          "job": {
+            "$ref": "#/components/schemas/AiJob"
           },
           "tool_calls": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AiToolCall"
             }
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
           }
         },
         "required": [
-          "id",
-          "conversation_id",
-          "operator_id",
-          "operator_name",
-          "prompt",
-          "model",
-          "state",
-          "model_calls",
-          "tool_calls",
-          "cost_micros",
-          "created_at",
-          "updated_at",
+          "job",
           "tool_calls"
         ]
       },

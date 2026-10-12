@@ -290,7 +290,7 @@ describe("AI assistant page", () => {
 
   it("loads a request's tool calls once, when it is first expanded", async () => {
     const detail: AiJobDetail = {
-      ...finishedAiJob,
+      job: finishedAiJob,
       tool_calls: [
         {
           call_id: "call-1",

@@ -259,7 +259,7 @@ impl AiFixture {
             .owner(Method::GET, &format!("/jobs/{job_id}"), None)
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        body["state"].as_str().unwrap().to_owned()
+        body["job"]["state"].as_str().unwrap().to_owned()
     }
 
     async fn cleanup(self) {
@@ -476,13 +476,20 @@ async fn ai_job_runs_a_tool_round_through_the_plugin_and_meters_every_call() {
         .owner(Method::GET, &format!("/jobs/{job_id}"), None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(detail["state"], "succeeded");
-    assert_eq!(detail["answer"], "Steve and Alex are online.");
-    assert_eq!(detail["model_calls"], 2);
+    assert_eq!(detail["job"]["state"], "succeeded");
+    assert_eq!(detail["job"]["answer"], "Steve and Alex are online.");
+    assert_eq!(detail["job"]["model_calls"], 2);
+    assert_eq!(detail["job"]["tool_calls"], 2);
     assert_eq!(detail["tool_calls"].as_array().unwrap().len(), 2);
     assert_eq!(detail["tool_calls"][1]["state"], "completed");
     assert_eq!(detail["tool_calls"][1]["is_error"], true);
-    assert_eq!(detail["cost_micros"], first_cost + second_cost);
+    assert_eq!(detail["job"]["cost_micros"], first_cost + second_cost);
+    // The in-game menu reads the same detail with the server capability.
+    let (status, plugin_detail) = fixture
+        .plugin(Method::GET, &format!("/jobs/{job_id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plugin_detail, detail);
 
     let (status, overview) = fixture.owner(Method::GET, "", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -672,9 +679,9 @@ async fn ai_requests_are_limited_to_operators_settings_and_budgets() {
     let (_, detail) = fixture
         .owner(Method::GET, &format!("/jobs/{starved}"), None)
         .await;
-    assert_eq!(detail["state"], "failed");
+    assert_eq!(detail["job"]["state"], "failed");
     assert!(
-        detail["error"].as_str().unwrap().contains("budget"),
+        detail["job"]["error"].as_str().unwrap().contains("budget"),
         "{detail}"
     );
     assert!(fixture.fake.requests().is_empty());
@@ -818,7 +825,7 @@ async fn cancelled_and_undelivered_tool_rounds_end_cleanly() {
     let (_, detail) = fixture
         .owner(Method::GET, &format!("/jobs/{stalled}"), None)
         .await;
-    assert_eq!(detail["state"], "succeeded", "{detail}");
+    assert_eq!(detail["job"]["state"], "succeeded", "{detail}");
     assert_eq!(detail["tool_calls"][0]["is_error"], true);
     assert!(last_tool_result(2).contains("so it did not run"));
 

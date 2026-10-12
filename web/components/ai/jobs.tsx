@@ -24,7 +24,7 @@ function ToolCalls({ serverId, jobId }: { serverId: string; jobId: string }) {
     queryKey: queryKeys.aiJob(serverId, jobId),
     queryFn: () => browserApi.getAiJob(serverId, jobId),
     // A finished request never changes again; live "ai" events refresh one in progress.
-    staleTime: ({ state }) => (state.data && !isActiveAiJob(state.data.state) ? Infinity : 0),
+    staleTime: ({ state }) => (state.data && !isActiveAiJob(state.data.job.state) ? Infinity : 0),
   });
 
   if (isPending) return <p className="m-0 text-xs text-ink-soft" role="status">Loading tool calls…</p>;

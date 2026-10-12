@@ -110,30 +110,10 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /** @description One request with every tool call it made. */
         AiJobDetail: {
-            answer?: string | null;
-            /** Format: uuid */
-            conversation_id: string;
-            /** Format: int64 */
-            cost_micros: number;
-            /** Format: date-time */
-            created_at: string;
-            error?: string | null;
-            /** Format: date-time */
-            finished_at?: string | null;
-            /** Format: uuid */
-            id: string;
-            model: string;
-            /** Format: int32 */
-            model_calls: number;
-            /** Format: uuid */
-            operator_id: string;
-            operator_name: string;
-            prompt: string;
-            state: components["schemas"]["AiJobState"];
+            job: components["schemas"]["AiJob"];
             tool_calls: components["schemas"]["AiToolCall"][];
-            /** Format: date-time */
-            updated_at: string;
         };
         AiJobEvent: {
             /** Format: int64 */

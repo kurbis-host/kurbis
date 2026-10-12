@@ -3,8 +3,9 @@
 //! A request becomes a job on the control plane. While jobs are active the
 //! pump syncs with the gateway: it runs the tool calls the model asks for,
 //! returns their results and shows progress lines and answers to the operator
-//! who asked.
+//! who asked. `/ai` alone opens the assistant's page of the server menu.
 
+pub(crate) mod records;
 mod tools;
 
 use std::{
@@ -33,7 +34,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{api, command::arg};
+use crate::{
+    api,
+    command::arg,
+    menu::{self, View},
+};
+use records::Overview;
 
 /// Ticks between syncs while a request is active (20 ticks per second).
 const SYNC_TICKS: u64 = 10;
@@ -54,7 +60,6 @@ const RESULT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_BACKOFF_RUNS: u32 = 64;
 /// The gateway's prompt limit, checked here for a friendlier message.
 const MAX_PROMPT_CHARS: usize = 2000;
-const ACTIVE_STATES: [&str; 3] = ["queued", "running", "awaiting_tools"];
 
 static PUMP_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -117,7 +122,7 @@ struct ChatLine {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum LineKind {
+pub(crate) enum LineKind {
     Progress,
     Answer,
     Error,
@@ -134,7 +139,7 @@ pub(crate) fn command() -> Command {
         &["ai".into()],
         "Ask the Kurbis AI assistant to act on this server.",
     )
-    .execute(Handler::Help)
+    .execute(Handler::Menu)
     .then(CommandNode::literal("ask").then(prompt(Handler::Ask)))
     .then(CommandNode::literal("new").then(prompt(Handler::New)))
     .then(CommandNode::literal("cancel").execute(Handler::Cancel))
@@ -263,7 +268,7 @@ fn next_batch(results: &mut Vec<ToolResult>) -> Vec<ToolResult> {
 
 #[derive(Debug, Clone, Copy)]
 enum Handler {
-    Help,
+    Menu,
     Ask,
     New,
     Cancel,
@@ -281,8 +286,10 @@ impl CommandHandler for Handler {
             let player = sender
                 .as_player()
                 .context("Only players can use /ai: answers go to the operator who asked.")?;
+            // Any command ends a pending chat prompt from the menu.
+            menu::forget_text_input(&player);
             match self {
-                Self::Help => help(&player),
+                Self::Menu => menu::open(&player, View::Ai)?,
                 Self::Ask => ask(&player, &arg(&args, "prompt")?, false)?,
                 Self::New => ask(&player, &arg(&args, "prompt")?, true)?,
                 Self::Cancel => cancel(&player)?,
@@ -296,18 +303,7 @@ impl CommandHandler for Handler {
     }
 }
 
-fn help(player: &Player) {
-    for line in [
-        "/ai ask <question> - ask or give an instruction; follow-ups within an hour continue the conversation",
-        "/ai new <question> - start a fresh conversation",
-        "/ai cancel - stop your running request",
-        "/ai status - this month's AI budget and your current request",
-    ] {
-        player.send_system_message(TextComponent::text(line), false);
-    }
-}
-
-fn ask(player: &Player, prompt: &str, new_conversation: bool) -> Result<()> {
+pub(crate) fn ask(player: &Player, prompt: &str, new_conversation: bool) -> Result<()> {
     let prompt = prompt.trim();
     anyhow::ensure!(!prompt.is_empty(), "Ask a question after the command.");
     anyhow::ensure!(
@@ -342,83 +338,51 @@ fn cancel(player: &Player) -> Result<()> {
         .get(&operator_id)
         .copied()
         .context("You have no AI request running.")?;
+    cancel_job(job_id)
+}
+
+/// Cancel any request on this server. The operator who asked is told with
+/// the next sync.
+pub(crate) fn cancel_job(job_id: Uuid) -> Result<()> {
     api::post_empty(&api::server_path(&format!("/ai/jobs/{job_id}/cancel"))?)?;
-    // The gateway's confirmation arrives with the next sync.
     lock_state().dirty = true;
     Ok(())
 }
 
+fn overview() -> Result<Overview> {
+    serde_json::from_value(api::get(&api::server_path("/ai")?)?).context("invalid AI overview")
+}
+
 fn status(player: &Player) -> Result<()> {
-    let overview = api::get(&api::server_path("/ai")?)?;
-    let operator_id = player_id(player)?.to_string();
-    for line in status_lines(&overview, &operator_id) {
+    for line in status_lines(&overview()?, player_id(player)?) {
         player.send_system_message(TextComponent::text(&line), false);
     }
     Ok(())
 }
 
-fn status_lines(overview: &Value, operator_id: &str) -> Vec<String> {
-    if overview["available"] != true {
-        return vec!["The AI assistant is not set up on this Kurbis installation.".into()];
+fn status_lines(overview: &Overview, operator_id: Uuid) -> Vec<String> {
+    if let Some(reason) = overview.unavailable_reason() {
+        return vec![reason.to_owned()];
     }
-    if overview["settings"]["enabled"] != true {
-        return vec!["The AI assistant is turned off for this server.".into()];
-    }
-    let model_id = overview["settings"]["model"]
-        .as_str()
-        .or_else(|| overview["defaults"]["model"].as_str())
-        .unwrap_or_default();
-    let model = overview["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|model| model["id"] == model_id)
-        .and_then(|model| model["name"].as_str())
-        .unwrap_or(model_id);
-    let budget = |key: &str| {
-        let budget = &overview["usage"][key];
-        format!(
-            "{} of {}",
-            usd(budget["spent_micros"].as_i64().unwrap_or_default()
-                + budget["reserved_micros"].as_i64().unwrap_or_default()),
-            usd(budget["budget_micros"].as_i64().unwrap_or_default())
-        )
-    };
-    let mut lines = vec![
-        format!("AI assistant: {model}"),
+    let current = overview
+        .jobs
+        .iter()
+        .find(|job| job.operator_id == operator_id && job.state.is_active());
+    vec![
+        format!("AI assistant: {}", overview.model_name()),
         format!(
             "This month: {} for this server, {} for the owner's account.",
-            budget("server"),
-            budget("account")
+            overview.budget(&overview.usage.server),
+            overview.budget(&overview.usage.account)
         ),
-    ];
-    let current = overview["jobs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|job| {
-            job["operator_id"] == operator_id
-                && job["state"]
-                    .as_str()
-                    .is_some_and(|state| ACTIVE_STATES.contains(&state))
-        });
-    lines.push(match current {
-        Some(job) => format!(
-            "Your request \"{}\" is in progress.",
-            job["prompt"].as_str().unwrap_or_default()
-        ),
-        None => "You have no request running.".into(),
-    });
-    lines
+        match current {
+            Some(job) => format!("Your request \"{}\" is in progress.", job.prompt),
+            None => "You have no request running.".into(),
+        },
+    ]
 }
 
-/// Micro-USD as dollars and cents, rounded up so spending never reads low.
-fn usd(micros: i64) -> String {
-    let cents = (micros.max(0) as u64).div_ceil(10_000);
-    format!("${}.{:02}", cents / 100, cents % 100)
-}
-
-fn show(player: &Player, kind: LineKind, message: &str) {
+pub(crate) fn show(player: &Player, kind: LineKind, message: &str) {
     let (color, italic) = match kind {
         LineKind::Progress => (NamedColor::Gray, true),
         LineKind::Answer => (NamedColor::White, false),
@@ -447,31 +411,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dollars_round_up_to_the_cent() {
-        assert_eq!(usd(0), "$0.00");
-        assert_eq!(usd(1), "$0.01");
-        assert_eq!(usd(5_000_000), "$5.00");
-        assert_eq!(usd(1_234_567), "$1.24");
-        assert_eq!(usd(-5), "$0.00");
-    }
-
-    #[test]
     fn status_names_the_model_budgets_and_the_running_request() {
-        let operator = "00000000-0000-0000-0000-000000000001";
-        let overview = json!({
-            "available": true,
-            "settings": {"enabled": true, "model": null},
-            "defaults": {"model": "claude-opus-5-5"},
-            "models": [{"id": "claude-opus-5-5", "name": "Claude Opus 5.5"}],
-            "usage": {
-                "server": {"spent_micros": 1_000_000, "reserved_micros": 250_000, "budget_micros": 5_000_000},
-                "account": {"spent_micros": 2_000_000, "reserved_micros": 0, "budget_micros": 20_000_000},
-            },
-            "jobs": [
-                {"operator_id": "00000000-0000-0000-0000-000000000002", "state": "running", "prompt": "other"},
-                {"operator_id": operator, "state": "awaiting_tools", "prompt": "make it day"},
-            ],
-        });
+        let operator = Uuid::from_u128(1);
+        let mut overview = records::tests::overview();
         assert_eq!(
             status_lines(&overview, operator),
             vec![
@@ -481,7 +423,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            status_lines(&json!({"available": false}), operator),
+            status_lines(&overview, Uuid::from_u128(2))[2],
+            "You have no request running."
+        );
+        overview.available = false;
+        assert_eq!(
+            status_lines(&overview, operator),
             vec!["The AI assistant is not set up on this Kurbis installation."]
         );
     }
