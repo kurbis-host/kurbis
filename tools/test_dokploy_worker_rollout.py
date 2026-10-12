@@ -41,13 +41,15 @@ class RolloutTests(unittest.TestCase):
 
 
 
-    def test_strict_baseline_rejects_worker_pumpkin_from_another_app_revision(self):
+    def test_baseline_rejects_a_mixed_revision_app_stack(self):
         active = "f" * 40
-        other = "e" * 40
         state = {name: [{"id": name, "image": "sha256:app", "status": "running", "health": "healthy", "revision": active}]
                  for name in sync.SERVICES}
+        state["gateway"][0]["revision"] = "e" * 40
+        # The worker may lag the app after an interrupted release; only the
+        # Compose services have to agree before a new release starts.
         with patch.object(sync, "OperationLock", NoopOperationLock), patch.object(sync, "root_only"), patch.object(sync, "service_valid"), patch.object(sync, "identity", return_value="worker"), \
-             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "worker_image", return_value=f"{sync.PUMPKIN_PREFIX}{other}"), \
+             patch.object(sync, "pending_worker_transactions", return_value=[]), patch.object(sync, "worker_image", return_value=f"{sync.PUMPKIN_PREFIX}{'d' * 40}"), \
              patch.object(sync, "states", return_value=state), self.assertRaisesRegex(sync.Error, "revisions do not match"):
             sync.baseline()
 

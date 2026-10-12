@@ -103,7 +103,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      # Startup registers the remote CI builder before it serves HTTP, which
+      # has taken two minutes; a short window made a good deploy report failure
+      # and left the gateway and panel created but not started.
+      start_period: 300s
     restart: unless-stopped
     networks: [hoster, runtime-api-egress]
 

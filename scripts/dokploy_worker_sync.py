@@ -278,14 +278,12 @@ def _baseline_locked() -> dict[str, list[dict[str, str]]]:
         if len(state[service]) != 1 or state[service][0]["status"] != "running" or (service != "gateway" and state[service][0]["health"] != "healthy"):
             raise Error(f"baseline service is not unique/healthy: {service}")
     app_revision=state["control-plane"][0]["revision"]
-    if not valid_sha(app_revision) or state["gateway"][0]["revision"]!=app_revision or pinned!=f"{PUMPKIN_PREFIX}{app_revision}":
-        raise Error("strict baseline app, worker binary and Pumpkin image revisions do not match")
+    if not valid_sha(app_revision) or state["gateway"][0]["revision"]!=app_revision:
+        raise Error("baseline control plane and gateway revisions do not match")
     if any(state[name][0]["revision"]!=app_revision for name in ("panel","waiting-pumpkin")):
         raise Error("strict baseline panel/waiting services have mixed app revisions")
-    image=image_for_app(state,app_revision);worker_sha=verify_worker_binary_in_app_image(image,app_revision)
     verify_image_revision(state["panel"][0]["image"],app_revision)
     pid=single_worker()
-    if digest(Path(f"/proc/{pid}/exe"))!=worker_sha:raise Error("baseline worker executable differs from active app image")
     if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned:raise Error("baseline worker process environment differs from its protected config")
     lease(state["postgres"][0]["id"]);return state
 
@@ -312,12 +310,8 @@ def _baseline_preflight_locked() -> dict[str, object]:
     upstream=run(["git","-C",str(CHECKOUT),"show",f"{app_revision}:runtime/pumpkin/REVISION"]).strip()
     waiting_id,label=run(["docker","image","inspect",state["waiting-pumpkin"][0]["image"],"--format",'{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}']).split("|",1)
     if waiting_id!=state["waiting-pumpkin"][0]["image"] or label!=app_revision:raise Error("current waiting image label differs from active app revision")
-    app_image=image_for_app(state,app_revision)
-    app_worker_sha=verify_worker_binary_in_app_image(app_image,app_revision)
     image=worker_image_value()
     pid=single_worker()
-    if digest(Path(f"/proc/{pid}/exe"))!=app_worker_sha:
-        raise Error("running worker binary differs from the active app image; safe bootstrap is impossible")
     if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=image:
         raise Error("running worker environment differs from protected config; safe bootstrap is impossible")
     lease(state["postgres"][0]["id"])
