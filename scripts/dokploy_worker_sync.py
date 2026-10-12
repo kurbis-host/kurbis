@@ -177,6 +177,37 @@ def worker_image_value() -> str:
     return value
 
 
+def worker_setting(name: str) -> str | None:
+    """Return one optional `export NAME=value` setting from the worker environment."""
+    values = [line.split("=", 1)[1].strip().strip("\"'") for line in WORKER_ENV.read_text(encoding="utf-8").splitlines() if line.startswith(f"export {name}=")]
+    if len(values) > 1:
+        raise Error(f"worker env must not repeat {name}")
+    return values[0] if values else None
+
+
+def publish_image_to_worker(image: str) -> None:
+    """Copy a release image into the Docker daemon the worker starts runtimes on.
+
+    The worker uses its own rootless daemon, whose image store is separate
+    from the one release images are built in; without the copy the worker's
+    startup probe fails with "No such image".
+    """
+    host = worker_setting("DOCKER_HOST")
+    if not host:
+        return
+    if not re.fullmatch(r"unix:///[A-Za-z0-9_./-]+", host):
+        raise Error("worker DOCKER_HOST is not a local Unix socket")
+    image_id = run(["docker", "image", "inspect", image, "--format", "{{.Id}}"])
+    saved = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    loaded = subprocess.run(["docker", "--host", host, "load"], stdin=saved.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    saved.stdout.close()
+    save_error = saved.stderr.read().decode("utf-8", "replace").strip()
+    if saved.wait() or loaded.returncode:
+        raise Error(f"could not copy {image} to the worker Docker daemon: {save_error or loaded.stderr.decode('utf-8', 'replace').strip()}")
+    if run(["docker", "--host", host, "image", "inspect", image, "--format", "{{.Id}}"]) != image_id:
+        raise Error(f"worker Docker daemon holds a different image for {image}")
+
+
 def worker_image() -> str:
     image=worker_image_value()
     if not re.fullmatch(re.escape(PUMPKIN_PREFIX) + r"[0-9a-f]{40}", image):
@@ -601,6 +632,7 @@ def build_pumpkin(revision: str, expected: dict[str,str], token: str, artifacts:
         pump_id,pump_sha=verify_pumpkin(tag,revision,upstream)
         if pump_id!=image_id: raise Error("Pumpkin immutable image ID changed during verification")
         if pump_sha!=artifacts["pumpkin"]: raise Error("packaged Pumpkin executable differs from the remote build")
+        publish_image_to_worker(tag)
         return {"status":"built","pumpkin_image":tag,"pumpkin_image_id":image_id,"pumpkin_revision":revision,"pumpkin_sha256":pump_sha,"archive_sha256":archive_sha}
     finally: run(["git","-C",str(CHECKOUT),"worktree","remove","--force",str(source)])
 
@@ -947,6 +979,11 @@ def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,lis
     pumpkin_id,pumpkin_sha=verify_pumpkin(pumpkin_image,revision,upstream)
     verify_waiting(current["waiting-pumpkin"][0],revision,upstream,pumpkin_image)
     database_id=current["postgres"][0]["id"]
+    proxy_image=worker_setting("WORKER_RUNTIME_API_PROXY_IMAGE")
+    if proxy_image:
+        # The runtime API proxy runs next to each server from the app image.
+        if run(["docker","image","inspect",proxy_image,"--format","{{.Id}}"])!=image:raise Error("worker runtime API proxy image is not the deployed app image")
+        publish_image_to_worker(proxy_image)
     old_env=WORKER_ENV.read_bytes()
     old_image=worker_image_value()
     old_hash=digest(WORKER)

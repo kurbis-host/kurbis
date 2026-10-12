@@ -328,6 +328,32 @@ class RolloutTests(unittest.TestCase):
                 with self.assertRaisesRegex(sync.Error, "unexpected files"):
                     sync.release_artifact_context(revision, digests)
 
+    def test_release_images_are_copied_to_the_worker_docker_daemon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "worker.env"
+            calls = []
+            def fake_run(args, **kwargs):
+                calls.append(list(args))
+                return "sha256:image"
+            completed = type("Completed", (), {"returncode": 0, "stderr": b""})()
+            saved = type("Saved", (), {"stdout": type("Pipe", (), {"close": lambda self: None})(),
+                                       "stderr": type("Pipe", (), {"read": lambda self: b""})(), "wait": lambda self: 0})()
+            with patch.object(sync, "WORKER_ENV", env), patch.object(sync, "run", side_effect=fake_run), \
+                 patch.object(sync.subprocess, "Popen", return_value=saved) as popen, \
+                 patch.object(sync.subprocess, "run", return_value=completed) as load:
+                env.write_text("export PUMPKIN_IMAGE=x\n", encoding="utf-8")
+                sync.publish_image_to_worker("melon-pumpkin:host-control-" + "a" * 40)
+                popen.assert_not_called()
+                env.write_text("export DOCKER_HOST=unix:///run/user/1800/docker.sock\n", encoding="utf-8")
+                sync.publish_image_to_worker("melon-pumpkin:host-control-" + "a" * 40)
+                self.assertEqual(popen.call_args.args[0][:2], ["docker", "save"])
+                self.assertEqual(load.call_args.args[0], ["docker", "--host", "unix:///run/user/1800/docker.sock", "load"])
+                self.assertIn(["docker", "--host", "unix:///run/user/1800/docker.sock", "image", "inspect",
+                               "melon-pumpkin:host-control-" + "a" * 40, "--format", "{{.Id}}"], calls)
+                env.write_text("export DOCKER_HOST=tcp://example.invalid:2375\n", encoding="utf-8")
+                with self.assertRaisesRegex(sync.Error, "local Unix socket"):
+                    sync.publish_image_to_worker("melon-pumpkin:host-control-" + "a" * 40)
+
     def test_pending_worker_rollback_blocks_another_release(self):
         with tempfile.TemporaryDirectory() as directory:
             txdir = Path(directory)
