@@ -171,6 +171,7 @@ export class Film {
 
   /** The scroll position in screens, from the page. */
   setScroll(screens: number, instant = false) {
+    if (!Number.isFinite(screens)) return; // (a window with no height yet has no scroll position to give)
     this.target = Math.min(Math.max(screens, 0), this.end);
     if (instant) {
       this.s = this.target;

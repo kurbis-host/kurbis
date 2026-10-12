@@ -16,6 +16,7 @@ behaviour:
 Everything drawn from the texture pack lands in web/public/landing, which git ignores.
 """
 
+import gzip
 import json
 import shutil
 import struct
@@ -204,7 +205,10 @@ def write_records(path, cells, which, tile, shade, origin):
         uint8  daylight x4, glow x4, sun x4, key suns x4   per face, one per corner
 
     Faces are sorted by the CHUNK-sized cube they are in; the header lists each cube's
-    bounds and its run of faces."""
+    bounds and its run of faces.
+
+    The file is written packed with gzip (a tenth the size): a server compresses the
+    text it sends but not bytes like these, so the page unpacks them itself."""
     world = cells + np.asarray(origin, np.int32)
     cube = np.floor_divide(world, CHUNK)
     order = np.lexsort((tile, which, cube[:, 0], cube[:, 1], cube[:, 2]))
@@ -223,12 +227,9 @@ def write_records(path, cells, which, tile, shade, origin):
     header = json.dumps({"count": int(len(world)), "chunk": CHUNK, "chunks": chunks}, separators=(",", ":")).encode()
     header += b" " * (-len(header) % 4)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as out:
-        out.write(b"KVX1" + struct.pack("<I", len(header)) + header)
-        out.write(a.tobytes())
-        out.write(b.tobytes())
-        out.write(np.ascontiguousarray(shade, np.uint8).tobytes())
-    return {"file": path.name, "count": int(len(world)), "chunks": len(chunks), "bytes": path.stat().st_size}
+    data = b"KVX1" + struct.pack("<I", len(header)) + header + a.tobytes() + b.tobytes() + np.ascontiguousarray(shade, np.uint8).tobytes()
+    path.write_bytes(gzip.compress(data, compresslevel=9, mtime=0))
+    return {"file": path.name, "count": int(len(world)), "chunks": len(chunks), "bytes": path.stat().st_size, "unpacked": len(data)}
 
 
 # -- models --------------------------------------------------------------------------

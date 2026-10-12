@@ -21,6 +21,7 @@ ENV HOSTNAME=0.0.0.0
 ENV PORT=3000
 COPY --chown=node:node --from=dependencies /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/.next ./.next
+COPY --chown=node:node --from=build /app/public ./public
 COPY --chown=node:node --from=build /app/next.config.ts ./next.config.ts
 COPY --chown=node:node --from=build /app/server.mjs ./server.mjs
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./

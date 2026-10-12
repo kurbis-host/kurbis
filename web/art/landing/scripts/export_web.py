@@ -2,8 +2,9 @@
 
     Blender -b --factory-startup -P scripts/export_web.py
 
-Writes web/public/landing/ (git-ignored: it is made from the texture pack) and the
-parity fixtures under web/tests/unit/landing/fixtures/ (numbers only).
+Writes web/public/landing/ (made from the texture pack while the page is a proof of
+concept) and the parity fixtures under web/tests/unit/landing/fixtures/ (numbers and
+our own copy only).
 """
 
 import hashlib
@@ -81,7 +82,7 @@ def world_records(S, aspect, report):
             if shared and aspect != "wide":
                 continue  # written once, from the wide frame
             key = f"{part}.{name}" if shared else f"{part}"
-            report[key] = export.write_records(export.OUT / f"{key}.bin", cells[pick], which[pick], tile[pick], shade[pick], origin)
+            report[key] = export.write_records(export.OUT / f"{key}.bin.gz", cells[pick], which[pick], tile[pick], shade[pick], origin)
     return digest.hexdigest()
 
 
@@ -91,7 +92,7 @@ def nether_records(S, report):
     cells, which, tile = export.faces(grid.g, b, "opaque")
     shade = export.light(cells, which, day, lit, solid)
     origin = np.asarray(sets.NETHER["origin"], np.int32) + np.asarray(grid.lo, np.int32)
-    report["nether.terrain"] = export.write_records(export.OUT / "nether.terrain.bin", cells, which, tile, shade, origin)
+    report["nether.terrain"] = export.write_records(export.OUT / "nether.terrain.bin.gz", cells, which, tile, shade, origin)
 
 
 def layout(S, shots, aspect):

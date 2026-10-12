@@ -3,9 +3,9 @@ import { expect, test, type Page } from "@playwright/test";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
-// The film's bundle is exported from the art on the machine that has the art
-// (art/landing/scripts/export_web.py) and is not in the repository. Without it the page
-// is its own HTML, which is what the last test here checks on every machine.
+// The film's bundle is exported from the art (art/landing/scripts/export_web.py) into
+// public/landing. Without it, and without WebGL, the page is its own HTML, which is what
+// the last test here checks on every machine.
 const bundle = existsSync(path.join(__dirname, "../../public/landing/scene.json"));
 const END = 6.2;
 
@@ -33,8 +33,18 @@ function watch(page: Page): string[] {
 }
 
 test.describe("the landing film", () => {
-  test.skip(!bundle, "the film's bundle is not exported on this machine");
+  test.skip(!bundle, "the film's bundle is not here");
   test.setTimeout(120000);
+
+  test.beforeEach(async ({ page }) => {
+    // Drawn in software, a frame of the film takes seconds: that tests the machine, not the page.
+    const renderer = await page.evaluate(() => {
+      const gl = document.createElement("canvas").getContext("webgl2");
+      const info = gl?.getExtension("WEBGL_debug_renderer_info");
+      return gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : "none";
+    });
+    test.skip(/swiftshader|llvmpipe|software|none/i.test(renderer), `no GPU to draw the film with (${renderer})`);
+  });
 
   test("plays from the sky to the Nether, with nothing blocked and nothing broken", async ({ page }) => {
     const problems = watch(page);

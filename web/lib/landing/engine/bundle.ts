@@ -267,10 +267,22 @@ export async function loadJson<T>(path: string): Promise<T> {
   return (await fetchOk(path)).json() as Promise<T>;
 }
 
+/**
+ * The bytes of a record file. The art pipeline writes them packed with gzip, because a
+ * server compresses the text it sends but not bytes like these; plain ones are taken as
+ * they come (something on the way may have unpacked them already).
+ */
+async function unpacked(response: Response): Promise<ArrayBuffer> {
+  const buffer = await response.arrayBuffer();
+  const head = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 2));
+  if (head[0] !== 0x1f || head[1] !== 0x8b) return buffer;
+  return new Response(new Blob([buffer]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+}
+
 export async function loadRecords(name: string): Promise<Records> {
-  const buffer = await (await fetchOk(`${name}.bin`)).arrayBuffer();
+  const buffer = await unpacked(await fetchOk(`${name}.bin.gz`));
   const view = new DataView(buffer);
-  if (view.getUint32(0, false) !== 0x4b565831) throw new Error(`landing: ${name}.bin is not a record file`);
+  if (view.getUint32(0, false) !== 0x4b565831) throw new Error(`landing: ${name}.bin.gz is not a record file`);
   const headerBytes = view.getUint32(4, true);
   const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerBytes))) as { count: number; chunks: number[][] };
   let offset = 8 + headerBytes;

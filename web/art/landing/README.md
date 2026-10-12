@@ -17,7 +17,7 @@ The page is one continuous take from the sky to the Nether, about six screens of
 | `scripts/gate0.py` | The earlier look-dev stills (superseded). Uses `kurbis/world_stills.py`. |
 | `scripts/kurbis/` | The toolkit (see below). |
 | `ref/` | Reference material and the third-party texture pack. Git-ignored. |
-| `blend/`, `export/`, `renders/` | Generated. Git-ignored while the POC uses pack textures. |
+| `blend/`, `export/`, `renders/` | Generated. Git-ignored. |
 
 ## Toolkit (`scripts/kurbis`)
 
@@ -100,13 +100,13 @@ This stages the `visit` session in both frames (nothing is baked) and writes:
 
 | Where | What |
 | --- | --- |
-| `web/public/landing/*.bin` | Block faces of the valley, what lies under it, the dungeon (one per frame) and the Nether: 28 bytes a face, with daylight, block glow and two suns' shadows baked per corner. Sorted into 32-block cubes so the browser can cull them |
+| `web/public/landing/*.bin.gz` | Block faces of the valley, what lies under it, the dungeon (one per frame) and the Nether: 28 bytes a face, with daylight, block glow and two suns' shadows baked per corner. Sorted into 32-block cubes so the browser can cull them. Packed with gzip (a tenth the size), which the page undoes itself: the server compresses what it sends as text, not bytes like these |
 | `web/public/landing/models.<frame>.glb` | Everything small, with names and parents, without pictures: the page gives each material its texture by the material's name |
 | `web/public/landing/scene.json`, `layout.<frame>.json` | The sky, palettes, glyphs and the film's constants; and per frame the camera's shots, the type (as text and place: the page builds the letters), lamps, haze boxes and places the sets worked out |
 | `web/public/landing/tex/`, `hud/`, `atlas_*.png` | Pictures from the pack |
 | `web/tests/unit/landing/fixtures/reference.<frame>.json` | The camera and the pumpkin sampled every 0.02 screens, and what the type says. Numbers and our own copy only, so it is committed: `parity.test.ts` holds the page's timeline to it, `copy.test.ts` the page's text |
 
-`web/public/landing/` is git-ignored (it is made from the pack). Without it the page is its own HTML: the same copy in reading order, a real lever button and a real name field (`web/components/landing/mirror.tsx`). That is also what a browser without WebGL2 gets, and what screen readers and search engines read while the film plays.
+`web/public/landing/` is committed, so the page plays wherever it is deployed. It is made from the pack: see "Rules". Where the bundle is missing or cannot load, the page is its own HTML: the same copy in reading order, a real lever button and a real name field (`web/components/landing/mirror.tsx`). That is also what a browser without WebGL2 gets, and what screen readers and search engines read while the film plays.
 
 To look at the page beside the previs, with `pnpm dev` running in `web/`:
 
@@ -134,7 +134,7 @@ Where the browser differs from the previs on purpose: light is baked per block c
 
 ## Rules
 
-- **Textures and skins are a stand-in.** The POC reads the "Trailers Vision" pack from `ref/pack`, including its Steve and Alex skins. Nothing derived from it may be committed or shipped; our own textures and characters replace it once the look is approved.
+- **Textures and skins are a stand-in.** The POC reads the "Trailers Vision" pack from `ref/pack`, including its Steve and Alex skins. The pack itself stays out of the repository. The bundle exported from it (`web/public/landing/`) is committed and deployed as a proof of concept, by the owner's decision of 2026-10-12; our own textures and characters replace it once the look is approved.
 - **Copy is in-world.** Text is voxel type in the scene, not DOM. The page still needs a hidden text mirror for screen readers and search, and a real `<input>` behind the name claim.
 - **Tone mapping is Standard.** AgX washes the palette out. The three.js side should use no tone mapping or Neutral to match.
 - **Export contract.** Named nodes, rigid parts under pivots, one atlas material per group. What the page must know about a thing beyond its geometry is said with `core.note` and exported with it.

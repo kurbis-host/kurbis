@@ -18,6 +18,3 @@ __pycache__/
 
 /logs/
 /pumpkin.toml
-
-# Landing v2: the exported scene is built from third-party pack textures (POC only).
-/web/public/landing/

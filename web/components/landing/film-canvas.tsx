@@ -66,7 +66,8 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
         return;
       }
       const film = new Film(element, stage, overlay.current, context);
-      const screens = () => window.scrollY / window.innerHeight;
+      // (A window that is not laid out yet, a hidden one say, has no height: it is at the top.)
+      const screens = () => (window.innerHeight > 0 ? window.scrollY / window.innerHeight : 0);
       const onScroll = () => film.setScroll(screens());
       const onResize = () => film.resize();
       const onVisible = () => (document.hidden ? film.stop() : film.start());
