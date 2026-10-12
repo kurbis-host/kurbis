@@ -6,7 +6,7 @@
 import { Color, Group, Mesh, Object3D, PerspectiveCamera, Scene, Vector3, type Material, type ShaderMaterial, type Texture } from "three";
 import { Shot } from "../anim/shot";
 import { readModel } from "../world/grid";
-import { gunzipped, type Took } from "../world/load";
+import type { Took } from "../world/load";
 import { pieceGeometry } from "./blockmodel";
 import { loadPicture, loadTiles, readModels, type Aspect, type FogData, type LayoutData, type NodeData, type Pack, type Records, type SceneData } from "./bundle";
 import { take } from "./early";
@@ -154,7 +154,8 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
       disposables.push(picture);
     }),
   );
-  const [gltf, slab, world] = await Promise.all([models, gunzipped(pack.bytes("slab.grid.gz")).then(readModel), valley, loadNamed]);
+  const [gltf, world] = await Promise.all([models, valley, loadNamed]);
+  const slab = readModel(pack.bytes("slab.grid").slice().buffer);
   // One grid holds the valley, what lies under it and the dungeon: all of it is there at once.
   for (const [part, look] of [["valley.terrain", "terrain"], ["valley.leaves", "leaves"], ["valley.water", "water"], ["under.terrain", "terrain"], ["under.water", "water"]]) {
     addRecords(part, world.parts.get(part), look);

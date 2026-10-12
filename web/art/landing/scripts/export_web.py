@@ -97,17 +97,12 @@ def world_grids(S, aspect, report, reference, wide):
     w, b = S["w"], S["b"]
     closed = voxel.ALL_CLOSED_BUT_FRONT_AND_TOP
     front = _front(w.z0)
-    suns = {"sun": {"toward": film.SUN_LIGHT, "reach": 520, "floor": VALLEY_FLOOR - w.z0}, "key": {"toward": KEY_SUN, "reach": 160, "floor": VALLEY_FLOOR - w.z0}}
+    floor = VALLEY_FLOOR - w.z0
     parts = _parts()
-    if aspect == "wide":
-        wide["grid"] = w.grid.copy()
-        report["valley"] = export.write_grid(export.OUT / "valley.grid.gz", w.grid, b, w.origin, parts, closed=closed, sky=True, front=[front(z) for z in range(w.grid.shape[2])], **suns)
-        origin, slab = w.front
-        report["slab"] = export.write_model(export.OUT / "slab.grid.gz", slab, b, origin, "Voxel", S["slab"])
-    else:
+    if aspect != "wide":
         report["dungeon.tall"] = export.write_patch(export.OUT / "dungeon.tall.patch.gz", wide["grid"], w.grid, b, closed)
     day, lit, solid = export.levels(w.grid, b, sky=True, front=front)
-    mine, shared = {}, hashlib.sha1()
+    mine, shared, lit_faces = {}, hashlib.sha1(), []
     for group in ("opaque", "leaves", "water"):
         cells, which, tile = export.faces(w.grid, b, group, closed)
         world = cells + np.asarray(w.origin, np.int32)
@@ -120,9 +115,20 @@ def world_grids(S, aspect, report, reference, wide):
             cells, which, tile = cells[apart], which[apart], tile[apart]
         if not len(cells):
             continue
-        shade = export.light(cells, which, day, lit, solid, sun=film.SUN_LIGHT, key=KEY_SUN, sun_floor=VALLEY_FLOOR - w.z0)
+        shade = export.light(cells, which, day, lit, solid, sun=film.SUN_LIGHT, key=KEY_SUN, sun_floor=floor)
+        lit_faces.append((cells, which, shade))
         mine.update(_sorted(parts, cells, which, tile, shade, w.origin, group, only=None if aspect == "wide" else ("dungeon",)))
     reference[aspect] = {**reference.get("wide", {}), **mine}
+    if aspect == "wide":
+        wide["grid"] = w.grid.copy()
+        # The suns' shadows go with the blocks: the page builds everything else itself.
+        # (They are the same in the tall frame: its dungeon lies below anything a sun
+        # lights, and nothing else differs. See "same_world".)
+        suns = [{"column": 8, "toward": film.SUN_LIGHT, "floor": floor}, {"column": 12, "toward": KEY_SUN, "floor": floor}]
+        shadows = export.shadows(*(np.concatenate([faces[i] for faces in lit_faces]) for i in range(3)), suns)
+        report["valley"] = export.write_grid(export.OUT / "valley.grid.gz", w.grid, b, w.origin, parts, closed=closed, sky=True, front=[front(z) for z in range(w.grid.shape[2])], shadows=shadows)
+        origin, slab = w.front
+        report["slab"] = export.write_model(export.OUT / "slab.grid", slab, b, origin, "Voxel", S["slab"])
     return shared.hexdigest()
 
 
@@ -202,8 +208,8 @@ def export_all():
     if not scene["same_world"]:
         raise RuntimeError("the valley outside the dungeon differs between the frames: the page builds both from one grid")
     # Everything small the page reads whole (pictures, the slab's cells) goes out as one file.
-    small = [f for f in out.rglob("*") if f.is_file() and (f.suffix == ".png" or f.name == "slab.grid.gz")]
-    report["small"] = export.write_pack(out / "small.pack", out, small)
+    small = [f for f in out.rglob("*") if f.is_file() and (f.suffix == ".png" or f.name == "slab.grid")]
+    report["small"] = export.write_pack(out / "small.pack.gz", out, small)
     (out / "scene.json").write_text(json.dumps(scene, separators=(",", ":")))
     (FIXTURES / "world.json").write_text(json.dumps(reference, separators=(",", ":")))
     files = sorted(f for f in out.rglob("*") if f.is_file())

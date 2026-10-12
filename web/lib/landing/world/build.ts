@@ -3,8 +3,8 @@
  * light, sorted into cubes of the world. What the art pipeline used to send ready-made.
  */
 
-import { cornerLight, levels, solids, sunlight, type Levels } from "./light";
-import type { BakedSun, BlockTable, Grid, Part } from "./grid";
+import { cornerLight, layShadows, levels, solids, type Levels } from "./light";
+import type { BlockTable, Grid, Part } from "./grid";
 
 /** Faces are grouped into cubes this many blocks across, to cull by. */
 const CHUNK = 32;
@@ -189,13 +189,13 @@ function gather(grid: Grid, faces: Faces, light: Uint8Array, part: Part, group: 
 
 /**
  * How long each stage of a build took, in milliseconds (for the curious, and the tests).
- * With helpers the stages run side by side, so they add up to more than `all`.
+ * With a helper the stages run side by side, so they add up to more than `all`.
  */
 export interface Timing {
   levels: number;
   faces: number;
+  shadows: number;
   corners: number;
-  suns: number;
   gather: number;
   all: number;
 }
@@ -209,36 +209,16 @@ export interface FloodJob {
   front?: number[];
 }
 
-/** A share of the suns' rays: the faces to work out are every `every`-th one from `phase`. */
-export interface SunJob {
-  faces: { count: number; x: Int16Array; y: Int16Array; z: Int16Array; side: Uint8Array };
-  solid: Uint8Array;
-  shape: [number, number, number];
-  sun?: BakedSun;
-  key?: BakedSun;
-  every: number;
-  phase: number;
-}
-
 /**
- * Someone else to give work to: another worker (./worker.ts). What it is asked for, it
- * answers as `flood` and `sunShare` here would (and may say how long the flood `took` it).
+ * Someone else to give work to: another worker (./worker.ts). It floods a grid with
+ * light as `flood` here would (and may say how long that `took` it).
  */
 export interface Helper {
   flood(job: FloodJob): Promise<Levels & { took?: number }>;
-  suns(job: SunJob): Promise<Uint8Array>;
 }
 
 export function flood(job: FloodJob): Levels {
   return levels(job.cells, job.shape, job.blocks, job.sky, job.front);
-}
-
-/** The suns' bytes for a job's share of the faces: eight a face (the sun's four corners, then the key suns'). */
-export function sunShare(job: SunJob): Uint8Array {
-  const out = new Uint8Array(Math.ceil(Math.max(job.faces.count - job.phase, 0) / job.every) * 8);
-  if (job.sun) sunlight(job.faces, job.solid, job.shape, job.sun, out, 0, 8, job.every, job.phase);
-  if (job.key) sunlight(job.faces, job.solid, job.shape, job.key, out, 4, 8, job.every, job.phase);
-  return out;
 }
 
 const now = () => performance.now();
@@ -263,12 +243,11 @@ export function build(grid: Grid, only?: readonly string[], timing?: Timing): Ma
   took.faces = now() - t;
   t = now();
   const light = new Uint8Array(faces.count * 16);
+  if (grid.shadows) layShadows(faces, grid.shadows, grid.shadowBytes, light);
+  took.shadows = now() - t;
+  t = now();
   cornerLight(faces, fields, grid.shape, light);
   took.corners = now() - t;
-  t = now();
-  if (grid.sun) sunlight(faces, solid, grid.shape, grid.sun, light, 8);
-  if (grid.key) sunlight(faces, solid, grid.shape, grid.key, light, 12);
-  took.suns = now() - t;
   t = now();
   const out = gatherAll(grid, parts, groups, faces, light);
   took.gather = now() - t;
@@ -277,55 +256,30 @@ export function build(grid: Grid, only?: readonly string[], timing?: Timing): Ma
 }
 
 /**
- * The same, with helpers, in less time: the light in the cells and the faces do not wait
- * for each other, so one helper floods the grid while the faces are found here; and the
- * suns' rays, most of the work, are shared among everyone. Whoever worked what out, the
- * faces come out the same. A helper that lets it down has its work done here.
+ * The same with a helper, in less time: the light in the cells and the faces do not
+ * wait for each other, so the helper floods the grid while the faces are found here.
+ * The faces come out the same. A helper that lets it down has its work done here.
  */
-export async function buildWith(grid: Grid, helpers: readonly Helper[], timing?: Timing): Promise<Map<string, Records>> {
-  if (!helpers.length) return build(grid, undefined, timing);
+export async function buildWith(grid: Grid, helper: Helper | undefined, timing?: Timing): Promise<Map<string, Records>> {
+  if (!helper) return build(grid, undefined, timing);
   const took = timing ?? ({} as Timing);
   const started = now();
   const groups = [...new Set(grid.parts.map((part) => part.group))];
   const flooded: FloodJob = { cells: grid.cells, shape: grid.shape, blocks: grid.blocks, sky: grid.sky, front: grid.front };
-  const flooding = helpers[0].flood(flooded).catch((): Levels & { took?: number } => flood(flooded));
+  const flooding = helper.flood(flooded).catch((): Levels & { took?: number } => flood(flooded));
   let t = now();
   const faces = findFaces(grid, groups);
   took.faces = now() - t;
-  const { count } = faces;
-  const solid = solids(grid.cells, grid.blocks);
-  const light = new Uint8Array(count * 16);
-  // The rays need the faces and what stands in their way, no more: they need not wait for the flood.
   t = now();
-  const hands = helpers.length + 1;
-  let shares: Promise<Uint8Array[]> = Promise.resolve([]);
-  if (grid.sun || grid.key) {
-    // (Tight copies: what is sent to a helper is copied whole, slack and all.)
-    const job: SunJob = {
-      faces: { count, x: faces.x.slice(0, count), y: faces.y.slice(0, count), z: faces.z.slice(0, count), side: faces.side.slice(0, count) },
-      solid,
-      shape: grid.shape,
-      sun: grid.sun,
-      key: grid.key,
-      every: hands,
-      phase: 0,
-    };
-    const asked = helpers.map((helper, k) => helper.suns({ ...job, phase: k + 1 }).catch(() => sunShare({ ...job, phase: k + 1 })));
-    const own = sunShare(job);
-    shares = Promise.all(asked).then((others) => [own, ...others]);
-  }
+  const solid = solids(grid.cells, grid.blocks);
+  const light = new Uint8Array(faces.count * 16);
+  if (grid.shadows) layShadows(faces, grid.shadows, grid.shadowBytes, light);
+  took.shadows = now() - t;
   const { day, lit, took: floodTook } = await flooding;
   took.levels = floodTook ?? now() - started;
-  const c = now();
+  t = now();
   cornerLight(faces, { day, lit, solid }, grid.shape, light);
-  took.corners = now() - c;
-  (await shares).forEach((share, phase) => {
-    for (let i = phase, from = 0; i < count; i += hands, from += 8) {
-      const to = i * 16 + 8;
-      for (let b = 0; b < 8; b += 1) light[to + b] = share[from + b];
-    }
-  });
-  took.suns = now() - t;
+  took.corners = now() - t;
   t = now();
   const out = gatherAll(grid, grid.parts, groups, faces, light);
   took.gather = now() - t;

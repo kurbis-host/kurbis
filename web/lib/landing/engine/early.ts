@@ -4,6 +4,9 @@
  * of what there is to download) is still on its way.
  *
  * Nothing here needs the renderer, so the page can afford to carry it from the start.
+ *
+ * (The files named `.gz` are stored packed and sent as they are, with the server saying
+ * so: the browser unpacks them on the way in, and what is read here is plain.)
  */
 
 import { bundleUrl } from "./address";
@@ -39,16 +42,16 @@ export function begin(aspect: Aspect): Early {
   let early = begun.get(aspect);
   if (!early) {
     performance.mark("landing:asked"); // (these marks are for looking into how loading went)
-    // The valley is what the first frame shows: it is asked for first, and built with all hands.
-    const valley = loadWorld("valley.grid.gz", aspect === "tall" ? "dungeon.tall.patch.gz" : undefined, { helpers: spare() });
+    // The valley is what the first frame shows: it is asked for first, and built with a helper.
+    const valley = loadWorld("valley.grid.gz", aspect === "tall" ? "dungeon.tall.patch.gz" : undefined, { helped: spare() });
     early = {
       valley,
       // The Nether is the film's last stop: it waits for the valley, and takes nothing from the first frame.
       nether: loadWorld("nether.grid.gz", undefined, { after: valley }),
       scene: get("scene.json").then((response) => response.json() as Promise<SceneData>),
       layout: get(`layout.${aspect}.json`).then((response) => response.json() as Promise<LayoutData>),
-      pack: get("small.pack").then((response) => response.arrayBuffer()),
-      models: get(`models.${aspect}.glb`).then((response) => response.arrayBuffer()),
+      pack: get("small.pack.gz").then((response) => response.arrayBuffer()),
+      models: get(`models.${aspect}.glb.gz`).then((response) => response.arrayBuffer()),
     };
     for (const promise of Object.values(early)) (promise as Promise<unknown>).catch(() => {}); // (whoever takes them hears of it)
     begun.set(aspect, early);

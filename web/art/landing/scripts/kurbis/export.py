@@ -6,8 +6,10 @@ behaviour:
 
   grids     the world as its blocks, one byte a cell (see `write_grid`). The page finds
             the faces and bakes their light itself, as `faces` and `light` do here:
-            a hundredth of the bytes the faces would be. `digest` is what holds the
-            two to each other.
+            a tenth of the bytes the faces would be. Only the suns' shadows are
+            sent ready-made (`shadows`): marching their rays is most of the work,
+            and too much to ask of a weak device. `digest` is what holds the two
+            to each other.
   models    everything small as a glb, through Blender's own exporter, with names
             and hierarchy and without images. (The slab comes as blocks too.)
   layout    per frame shape: the camera's keys, where type and flakes stand, lights,
@@ -16,7 +18,10 @@ behaviour:
   reference camera and pumpkin sampled along the scroll, for the page's parity tests.
 
 Everything lands in web/public/landing, textures of the pack included (while the page
-is a proof of concept).
+is a proof of concept). What is not text is written through gzip, once and as hard as
+gzip packs (`_gzip`): the server sends those files as they are and says so
+(`Content-Encoding`, see web/next.config.ts), and the browser unpacks them on the way
+in. A server would not pack such bytes by itself, nor does the CDN in front of it.
 """
 
 import gzip
@@ -202,6 +207,40 @@ def _sun(cells, which, solid, sun, floor, reach=520):
     return out
 
 
+def shadows(cells, which, shade, suns):
+    """The suns' shadows as the page takes them, so that it need not march a ray.
+
+    `shade` is the light of every face of a world (see `light`); each of `suns` says
+    where its four bytes stand in it (`column`), the way to it (`toward`) and the lowest
+    layer it lights (`floor`). For each sun, the faces that can see it at all (they face
+    it, at or above its floor) are written in the order the page finds faces: by x, then
+    y, then z, then side. A corner's value is one of a few (whatever stands in a ray's
+    way dims it by a fixed share), so it is written as its place among those `levels`,
+    two corners a byte.
+
+    Returns what the grid's header says of them, and the bytes."""
+    order = np.lexsort((which, cells[:, 2], cells[:, 1], cells[:, 0]))
+    cells, which, shade = cells[order], which[order], shade[order]
+    dirs = np.asarray(voxel.DIRS, np.float32)
+    seen = []
+    for sun in suns:
+        toward, column = np.asarray(sun["toward"], np.float32), sun["column"]
+        sides = [k for k in range(6) if float(dirs[k] @ toward) > 0.02]
+        pick = np.isin(which, sides) & (cells[:, 2] >= sun["floor"])
+        if shade[~pick, column : column + 4].any():
+            raise RuntimeError("a face is lit by a sun it cannot see: the page would leave it dark")
+        seen.append((sun, sides, shade[pick, column : column + 4]))
+    levels = np.unique(np.concatenate([values.ravel() for _, _, values in seen]))
+    if len(levels) > 16:
+        raise RuntimeError(f"the suns' shadows take {len(levels)} levels: more than fit two corners a byte")
+    table, body = [], b""
+    for sun, sides, values in seen:
+        place = np.searchsorted(levels, values).astype(np.uint8)
+        body += ((place[:, 0::2] << 4) | place[:, 1::2]).astype(np.uint8).tobytes()
+        table.append({"column": int(sun["column"]), "sides": sides, "floor": int(sun["floor"]), "faces": int(len(values))})
+    return {"levels": [int(v) for v in levels], "suns": table}, body
+
+
 # -- grids ---------------------------------------------------------------------------
 def uniform(grid, blocks, closed=()):
     """The grid with every block nobody can ever see made the same kind.
@@ -227,15 +266,25 @@ def uniform(grid, blocks, closed=()):
     return out
 
 
-def _packed(path, header, cells):
-    """'KVG1', the header's length, the header (JSON), then one byte a cell; all of it
-    packed with gzip, which the page unpacks itself (a server does not compress bytes)."""
-    head = json.dumps(header, separators=(",", ":")).encode()
-    head += b" " * (-len(head) % 4)
-    data = b"KVG1" + struct.pack("<I", len(head)) + head + np.ascontiguousarray(cells, np.uint8).tobytes()
+def _gzip(path, data):
+    """Write bytes through gzip, as hard as it packs and the same every time."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(gzip.compress(data, compresslevel=9, mtime=0))
-    return {"file": path.name, "cells": int(cells.size), "bytes": path.stat().st_size, "unpacked": len(data)}
+    return {"file": path.name, "bytes": path.stat().st_size, "unpacked": len(data)}
+
+
+def _packed(path, header, cells, more=b""):
+    """'KVG1', the header's length, the header (JSON), then one byte a cell (and whatever
+    `more` the header tells of). Through gzip if the file is named for it; plain if it
+    is on its way into something that is."""
+    head = json.dumps(header, separators=(",", ":")).encode()
+    head += b" " * (-len(head) % 4)
+    data = b"KVG1" + struct.pack("<I", len(head)) + head + np.ascontiguousarray(cells, np.uint8).tobytes() + more
+    if path.suffix == ".gz":
+        return {**_gzip(path, data), "cells": int(cells.size)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return {"file": path.name, "cells": int(cells.size), "bytes": len(data), "unpacked": len(data)}
 
 
 def _table(blocks):
@@ -262,21 +311,15 @@ def write_model(path, grid, blocks, origin, material, pieces):
     return _packed(path, header, grid)
 
 
-def _exact(direction):
-    """A direction as the 32-bit floats the light is worked out in, written so that they read back the same."""
-    return [float(v) for v in np.asarray(direction, np.float32)]
-
-
-def write_grid(path, grid, blocks, origin, parts, closed=(), sky=True, front=None, sun=None, key=None):
+def write_grid(path, grid, blocks, origin, parts, closed=(), sky=True, front=None, shadows=None):
     """A world for the page to build: its blocks, and what building it takes.
 
     The page finds the visible faces and bakes their light itself (web/lib/landing/world),
     the same way `faces` and `light` do here, so this is all it needs: the cells (x
     outermost, z innermost), what each kind of block is, which sides of the box are
     `closed`, where daylight comes from (`sky`, and `front`: the level outside the -Y
-    side at each layer), the suns whose shadows are baked (the way to each, how many
-    half-block steps a ray is followed, and the lowest layer that is lit), and the
-    `parts` its faces are sorted into."""
+    side at each layer), and the `parts` its faces are sorted into. The suns' `shadows`
+    (see the function of that name) follow the cells, where there are suns."""
     header = {
         "shape": [int(n) for n in grid.shape],
         "origin": [int(v) for v in origin],
@@ -287,10 +330,10 @@ def write_grid(path, grid, blocks, origin, parts, closed=(), sky=True, front=Non
     }
     if front is not None:
         header["front"] = [int(v) for v in front]
-    for name, baked in (("sun", sun), ("key", key)):
-        if baked is not None:
-            header[name] = {"toward": _exact(baked["toward"]), "reach": int(baked["reach"]), "floor": int(baked["floor"])}
-    return _packed(path, header, uniform(grid, blocks, closed))
+    table, more = shadows if shadows is not None else (None, b"")
+    if table is not None:
+        header["shadows"] = table
+    return _packed(path, header, uniform(grid, blocks, closed), more)
 
 
 def write_patch(path, base, changed, blocks, closed=()):
@@ -330,7 +373,8 @@ def skipped(obj):
 
 def write_glb(path, objects):
     """Meshes and empties, with their names, parents and notes, and no images: the page
-    gives every material its texture by the material's name."""
+    gives every material its texture by the material's name. `path` is the glb's; what
+    is left there is that file through gzip, named for it."""
     for obj in bpy.context.view_layer.objects:
         obj.select_set(False)
     for obj in objects:
@@ -348,7 +392,9 @@ def write_glb(path, objects):
         export_materials="PLACEHOLDER", export_animations=False, export_extras=True, export_cameras=False, export_lights=False,
         export_texcoords=True, export_normals=True, export_attributes=True,
     )
-    return {"file": path.name, "objects": len(objects), "bytes": path.stat().st_size}
+    data = path.read_bytes()
+    path.unlink()
+    return {**_gzip(path.with_name(path.name + ".gz"), data), "objects": len(objects)}
 
 
 # -- describing things ---------------------------------------------------------------
@@ -442,7 +488,9 @@ def write_pack(path, root, files):
         'KPK1', the header's length (uint32), the header (JSON, padded to four bytes):
         {"files": {name: [offset, length]}}, then the files' bytes end to end.
 
-    The files are taken out of `root` (they are in the pack now)."""
+    The files are taken out of `root` (they are in the pack now), and the pack goes
+    through gzip: pictures this small are mostly their own headers, which pack well
+    once they stand side by side."""
     table, body = {}, b""
     for file in sorted(files):
         data = file.read_bytes()
@@ -454,8 +502,7 @@ def write_pack(path, root, files):
             folder.rmdir()
     head = json.dumps({"files": table}, separators=(",", ":")).encode()
     head += b" " * (-len(head) % 4)
-    path.write_bytes(b"KPK1" + struct.pack("<I", len(head)) + head + body)
-    return {"file": path.name, "files": len(table), "bytes": path.stat().st_size}
+    return {**_gzip(path, b"KPK1" + struct.pack("<I", len(head)) + head + body), "files": len(table)}
 
 
 # -- reference -----------------------------------------------------------------------

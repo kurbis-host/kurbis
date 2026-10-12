@@ -15,9 +15,9 @@ export interface Built {
 }
 
 interface Job {
-  /** What the worker was sent, kept in case it has to be done here after all. */
-  grid: ArrayBuffer;
-  patch?: ArrayBuffer;
+  /** The files the worker was sent, by name: to fetch again if the work has to be done here after all. */
+  grid: string;
+  patch?: string;
   resolve(built: Built): void;
   reject(error: Error): void;
 }
@@ -29,6 +29,13 @@ let owed = 0;
 const waiting = new Map<number, Job>();
 
 const hire = () => new Worker(new URL("../world/worker.ts", import.meta.url), { type: "module" });
+
+/** A file of the bundle. (The server sends it through gzip and says so: what arrives here is unpacked.) */
+async function file(name: string): Promise<ArrayBuffer> {
+  const response = await fetch(bundleUrl(name));
+  if (!response.ok) throw new Error(`landing: ${name} answered ${response.status}`);
+  return response.arrayBuffer();
+}
 
 async function here(grid: ArrayBuffer, patch?: ArrayBuffer): Promise<Built> {
   const { buildWorld } = await import("../world/load");
@@ -52,7 +59,9 @@ function start(): Worker | null {
       made.terminate();
       for (const [id, job] of waiting) {
         waiting.delete(id);
-        here(job.grid, job.patch).then(job.resolve, job.reject);
+        Promise.all([file(job.grid), job.patch ? file(job.patch) : undefined])
+          .then(([grid, patch]) => here(grid, patch))
+          .then(job.resolve, job.reject);
       }
     };
     return made;
@@ -61,42 +70,35 @@ function start(): Worker | null {
   }
 }
 
-/** How many workers the device can spare to help with a build, beside the one that builds and the page itself. */
-export function spare(): number {
-  return Math.max(0, Math.min(3, (navigator.hardwareConcurrency || 2) - 2));
-}
-
-async function file(name: string): Promise<ArrayBuffer> {
-  const response = await fetch(bundleUrl(name));
-  if (!response.ok) throw new Error(`landing: ${name} answered ${response.status}`);
-  return response.arrayBuffer();
+/** Whether the device can spare a worker to help with a build, beside the one that builds and the page itself. */
+export function spare(): boolean {
+  return (navigator.hardwareConcurrency || 2) > 2;
 }
 
 /**
  * Build the world in a grid file of the bundle (with a patch laid into it first, if one
- * is named). `helpers` more workers take some of the work off the one that builds. With
- * `after`, the file is not asked for until that has come to its end: for a world that is
- * not needed yet, and should take nothing from one that is.
+ * is named). With `helped`, one more worker takes some of the work off the one that
+ * builds. With `after`, the file is not asked for until that has come to its end: for a
+ * world that is not needed yet, and should take nothing from one that is.
  */
-export function loadWorld(grid: string, patch?: string, { helpers = 0, after }: { helpers?: number; after?: Promise<unknown> } = {}): Promise<Built> {
+export function loadWorld(grid: string, patch?: string, { helped = false, after }: { helped?: boolean; after?: Promise<unknown> } = {}): Promise<Built> {
   const id = (asked += 1);
   owed += 1;
   // The worker is started now, and the files are asked for here: they are on their way while it starts.
   if (worker === undefined) worker = start();
-  const lent: Worker[] = [];
-  const ports: MessagePort[] = [];
-  try {
-    for (let i = 0; worker && i < helpers; i += 1) {
-      const helper = hire();
+  let helper: Worker | undefined;
+  let port: MessagePort | undefined;
+  if (worker && helped) {
+    try {
+      helper = hire();
       const line = new MessageChannel();
       helper.postMessage({ help: line.port2 } satisfies HelpRequest, [line.port2]);
       // (One that did not load answers nothing: the builder is told, and does its work itself.)
-      helper.onerror = () => worker?.postMessage({ lost: id, helper: i } satisfies HelperLost);
-      lent.push(helper);
-      ports.push(line.port1);
+      helper.onerror = () => worker?.postMessage({ lost: id } satisfies HelperLost);
+      port = line.port1;
+    } catch {
+      // (No helper, then: the builder does it all.)
     }
-  } catch {
-    // (Fewer hands, then: the builder does what nobody else does.)
   }
   const build = async (): Promise<Built> => {
     if (after) await after.then(() => {}, () => {});
@@ -106,8 +108,9 @@ export function loadWorld(grid: string, patch?: string, { helpers = 0, after }: 
     const builder = worker;
     const built = builder
       ? await new Promise<Built>((resolve, reject) => {
-          waiting.set(id, { grid: gridFile, patch: patchFile, resolve, reject });
-          builder.postMessage({ id, grid: gridFile, patch: patchFile, ports } satisfies BuildRequest, ports);
+          waiting.set(id, { grid, patch, resolve, reject });
+          // The files are handed over, not copied.
+          builder.postMessage({ id, grid: gridFile, patch: patchFile, port } satisfies BuildRequest, [gridFile, ...(patchFile ? [patchFile] : []), ...(port ? [port] : [])]);
         })
       : await here(gridFile, patchFile);
     built.took.fetch = fetched;
@@ -115,7 +118,7 @@ export function loadWorld(grid: string, patch?: string, { helpers = 0, after }: 
     return built;
   };
   return build().finally(() => {
-    for (const helper of lent) helper.terminate();
+    helper?.terminate();
     owed -= 1;
     if (owed === 0 && worker) {
       // Nothing more is owed: let the worker, and the grids it holds, go.

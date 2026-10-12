@@ -1,7 +1,8 @@
 /**
  * The page builds the world's faces and their light itself, from the grids of blocks the
- * art pipeline sends. This holds that building to the art pipeline's own (kurbis/export.py),
- * to the byte: the fixture carries a digest of what each part comes to there.
+ * art pipeline sends (only the suns' shadows come with them, ready-made). This holds
+ * that building to the art pipeline's own (kurbis/export.py), to the byte: the fixture
+ * carries a digest of what each part comes to there.
  */
 
 import { createHash } from "node:crypto";
@@ -11,7 +12,7 @@ import { gunzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { readPack } from "../../../lib/landing/engine/pack";
 import { BUNDLE } from "../../../lib/landing/engine/version";
-import { build, buildWith, flood, sunShare, type Helper, type Records } from "../../../lib/landing/world/build";
+import { build, buildWith, flood, type Helper, type Records } from "../../../lib/landing/world/build";
 import { patched, readGrid, readModel, readPatch } from "../../../lib/landing/world/grid";
 
 type Digest = { count: number; sha256: string };
@@ -59,25 +60,30 @@ describe("the world, built in the page", () => {
     expect(reference.tall.dungeon).not.toEqual(reference.wide.dungeon);
   }, 120000);
 
-  it("comes to the same when helpers share the work, and when one lets it down", async () => {
-    // (In the page the helpers are workers of their own; what they are asked and answer is the same.)
-    const asked: (string | number)[] = [];
+  it("comes to the same with a helper, and when the helper lets it down", async () => {
+    // (In the page the helper is a worker of its own; what it is asked and answers is the same.)
+    let asked = 0;
     const helper: Helper = {
       flood: async (job) => {
-        asked.push("flood");
+        asked += 1;
         return flood(job);
       },
-      suns: async (job) => {
-        asked.push(job.phase);
-        return sunShare(job);
-      },
     };
-    const gone: Helper = { flood: () => Promise.reject(new Error("gone")), suns: () => Promise.reject(new Error("gone")) };
-    const shared = await buildWith(valley, [helper, gone, helper]);
-    expect(asked).toEqual(["flood", 1, 3]);
-    for (const [name, want] of Object.entries(reference.wide)) expect(digest(shared.get(name)), name).toEqual(want);
-    const alone = await buildWith(valley, [gone]);
+    const helped = await buildWith(valley, helper);
+    expect(asked).toBe(1);
+    for (const [name, want] of Object.entries(reference.wide)) expect(digest(helped.get(name)), name).toEqual(want);
+    const alone = await buildWith(valley, { flood: () => Promise.reject(new Error("gone")) });
     for (const [name, want] of Object.entries(reference.wide)) expect(digest(alone.get(name)), name).toEqual(want);
+  }, 120000);
+
+  it("takes the suns' shadows from the grid, and refuses ones that are not for its faces", () => {
+    const shadows = valley.shadows;
+    expect(shadows?.suns.map((sun) => sun.column)).toEqual([8, 12]);
+    expect(valley.shadowBytes.length).toBe((shadows?.suns ?? []).reduce((bytes, sun) => bytes + sun.faces * 2, 0));
+    // A face too few for the first sun, one too many for the second: the bytes are all there, on the wrong faces.
+    const [sun, key] = shadows?.suns ?? [];
+    const shifted = { ...valley, shadows: { levels: shadows?.levels ?? [], suns: [{ ...sun, faces: sun.faces - 1 }, { ...key, faces: key.faces + 1 }] } };
+    expect(() => build(shifted)).toThrow("shadows are not for these faces");
   }, 120000);
 
   it("builds the Nether as the art pipeline does, to the byte", () => {
@@ -101,10 +107,8 @@ describe("the world, built in the page", () => {
   }, 120000);
 
   it("has the slab's pieces as cells", () => {
-    const file = readFileSync(join(bundle, "small.pack"));
-    const pack = readPack(file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength) as ArrayBuffer);
-    const cells = gunzipSync(pack.bytes("slab.grid.gz"));
-    const slab = readModel(cells.buffer.slice(cells.byteOffset, cells.byteOffset + cells.byteLength) as ArrayBuffer);
+    const pack = readPack(unpacked("small.pack.gz"));
+    const slab = readModel(pack.bytes("slab.grid").slice().buffer);
     expect(pack.has("atlas_color.png")).toBe(true);
     expect(slab.pieces.length).toBeGreaterThan(40);
     for (const piece of slab.pieces) {

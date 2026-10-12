@@ -1,13 +1,14 @@
 /**
  * Light, baked into the world the way the art pipeline bakes it (kurbis/export.py), to
  * the byte: daylight and block glow flooding from cell to cell as the game counts them,
- * the smooth, corner-darkened light of every face, and which corners see a sun.
+ * and the smooth, corner-darkened light of every face. Which corners see a sun is not
+ * worked out here: that comes with the grid.
  *
  * The art works in 32-bit floats, so the arithmetic here is rounded to them at every
  * step (Math.fround): the same faces get the same bytes.
  */
 
-import type { BakedSun, BlockTable } from "./grid";
+import type { BlockTable, Shadows } from "./grid";
 
 const f = Math.fround;
 
@@ -188,7 +189,7 @@ const BYTE = (() => {
 
 /**
  * Smooth light for every corner of every face: sixteen bytes a face, four each of
- * daylight, glow, direct sun and the key suns (the last two are filled in by `sunlight`).
+ * daylight, glow, direct sun and the key suns (the last two are filled in by `layShadows`).
  * A corner takes the mean of the four cells that meet there in front of the face, and is
  * darkened by how many of them are solid, the way the game shades its corners.
  */
@@ -237,122 +238,30 @@ export function cornerLight(faces: { count: number; x: Int16Array; y: Int16Array
   }
 }
 
-/** The grid is looked at in columns COARSE cells across, to know where a ray has nothing to meet. */
-const COARSE = 8;
-
 /**
- * Over each column of the grid, COARSE cells across: the height above which nothing
- * stands (0 where nothing stands at all). A ray that is above it meets nothing there.
+ * The suns' shadows, laid into the light of the faces they fall on: for each sun, the
+ * next two bytes for each face that can see it, as the grid file has them (`Shadows`).
+ * (The art pipeline works them out, marching a ray from every corner toward the sun.)
+ * Written into four bytes a face of `out`, which has sixteen for each.
  */
-function roofs(solid: Uint8Array, shape: readonly [number, number, number]): { roof: Uint8Array; across: number } {
-  const [nx, ny, nz] = shape;
-  const across = Math.ceil(ny / COARSE);
-  const roof = new Uint8Array(Math.ceil(nx / COARSE) * across);
-  for (let x = 0; x < nx; x += 1) {
-    for (let y = 0; y < ny; y += 1) {
-      const column = ((x / COARSE) | 0) * across + ((y / COARSE) | 0);
-      const base = (x * ny + y) * nz;
-      let z = nz - 1;
-      while (z >= roof[column] && !solid[base + z]) z -= 1;
-      if (z + 1 > roof[column]) roof[column] = z + 1;
+export function layShadows(faces: { count: number; z: Int16Array; side: Uint8Array }, shadows: Shadows, bytes: Uint8Array, out: Uint8Array) {
+  const levels = new Uint8Array(16);
+  levels.set(shadows.levels);
+  let at = 0;
+  for (const sun of shadows.suns) {
+    const facing = [0, 1, 2, 3, 4, 5].map((side) => sun.sides.includes(side));
+    const end = at + sun.faces * 2;
+    for (let i = 0; i < faces.count; i += 1) {
+      if (!facing[faces.side[i]] || faces.z[i] < sun.floor) continue;
+      // (Shadows that are not for these faces would only look wrong: better that the film does not play.)
+      if (at >= end) throw new Error("landing: the grid's shadows are not for these faces");
+      const to = i * 16 + sun.column;
+      out[to] = levels[bytes[at] >> 4];
+      out[to + 1] = levels[bytes[at] & 15];
+      out[to + 2] = levels[bytes[at + 1] >> 4];
+      out[to + 3] = levels[bytes[at + 1] & 15];
+      at += 2;
     }
-  }
-  return { roof, across };
-}
-
-/**
- * Which corners see a sun: a ray from each, a little in from the corner and off the
- * face, marched through the grid half a block at a time. Whatever stands in the way
- * (leaves too) dims it. Written into four bytes a face, starting at `column`.
- *
- * (A sun is above the horizon, so a ray only rises. Once it is above everything that
- * stands in the stretch of the grid it is over, the samples it would take there are not
- * taken: they would all find air. Every sample that is taken is the one the art takes,
- * so the result is the same.)
- *
- * With `every` and `phase`, only every so-manieth face is worked out (those whose number
- * leaves `phase` when divided by `every`): the rays are most of the work of building a
- * world, and this is how several workers share them. `out` has `width` bytes for each
- * face that is worked out, in their order.
- */
-export function sunlight(
-  faces: { count: number; x: Int16Array; y: Int16Array; z: Int16Array; side: Uint8Array },
-  solid: Uint8Array,
-  shape: readonly [number, number, number],
-  sun: BakedSun,
-  out: Uint8Array,
-  column: number,
-  width = 16,
-  every = 1,
-  phase = 0,
-) {
-  const [nx, ny, nz] = shape;
-  const toward = [f(sun.toward[0]), f(sun.toward[1]), f(sun.toward[2])];
-  const [sx, sy, sz] = toward;
-  const rising = sz >= 0;
-  const { roof, across } = roofs(solid, shape);
-  // Samples a ray takes while it moves one block along x and along y (none, if it does not move along it).
-  const paceX = sx === 0 ? Infinity : 1 / (Math.abs(sx) * 0.5);
-  const paceY = sy === 0 ? Infinity : 1 / (Math.abs(sy) * 0.5);
-  // How far along each axis a ray has moved at each sample.
-  const dx = new Float32Array(sun.reach);
-  const dy = new Float32Array(sun.reach);
-  const dz = new Float32Array(sun.reach);
-  for (let step = 0; step < sun.reach; step += 1) {
-    dx[step] = sx * (0.5 * step);
-    dy[step] = sy * (0.5 * step);
-    dz[step] = sz * (0.5 * step);
-  }
-  const dim = f(0.45);
-  const least = f(0.02);
-  const inset = f(0.12);
-  const lift = f(0.05);
-  // Where each corner's ray starts, from its cell: a little toward the middle of the face, and off it.
-  const starts = QUADS.map((quad, side) => {
-    const middle = [0, 1, 2].map((c) => f(f(f(f(quad[0][c] + quad[1][c]) + quad[2][c]) + quad[3][c]) / 4));
-    return { quad, middle, off: DIRS[side].map((d) => f(d * lift)) };
-  });
-  const faced = DIRS.map((dir) => f(f(f(dir[0] * sx) + f(dir[1] * sy)) + f(dir[2] * sz)) > 0.02);
-  for (let i = phase, row = 0; i < faces.count; i += every, row += 1) {
-    const side = faces.side[i];
-    if (!faced[side] || faces.z[i] < sun.floor) continue;
-    const cx = faces.x[i];
-    const cy = faces.y[i];
-    const cz = faces.z[i];
-    const { quad, middle, off } = starts[side];
-    for (let j = 0; j < 4; j += 1) {
-      const corner = quad[j];
-      const ax = cx + corner[0];
-      const ay = cy + corner[1];
-      const az = cz + corner[2];
-      const x0 = f(f(ax + f(f(f(cx + middle[0]) - ax) * inset)) + off[0]);
-      const y0 = f(f(ay + f(f(f(cy + middle[1]) - ay) * inset)) + off[1]);
-      const z0 = f(f(az + f(f(f(cz + middle[2]) - az) * inset)) + off[2]);
-      let seen = 1;
-      for (let step = 1; step < sun.reach; step += 1) {
-        const px = f(x0 + dx[step]);
-        const py = f(y0 + dy[step]);
-        const pz = f(z0 + dz[step]);
-        const x = Math.floor(px);
-        const y = Math.floor(py);
-        const z = Math.floor(pz);
-        if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) break;
-        if (solid[(x * ny + y) * nz + z]) {
-          seen = f(seen * dim);
-          if (!(seen > least)) break;
-          continue;
-        }
-        if (!rising) continue;
-        const bx = (x / COARSE) | 0;
-        const by = (y / COARSE) | 0;
-        if (z < roof[bx * across + by]) continue;
-        // Above everything in this stretch: go on to the last sample that is still well inside it.
-        const tx = ((sx > 0 ? (bx + 1) * COARSE - px : px - bx * COARSE) - 1e-3) * paceX;
-        const ty = ((sy > 0 ? (by + 1) * COARSE - py : py - by * COARSE) - 1e-3) * paceY;
-        const skip = Math.ceil(Math.min(tx, ty)) - 1;
-        if (skip > 0) step += skip;
-      }
-      out[row * width + column + j] = Math.min(Math.max(f(seen * 255), 0), 255) | 0;
-    }
+    if (at !== end) throw new Error("landing: the grid's shadows are not for these faces");
   }
 }

@@ -8,6 +8,11 @@
 // browser kept. Times are the medians, in milliseconds from the start of the navigation,
 // by the page's own clock: a script that waits for a selector hears of it up to half a
 // second late. A page from this branch on also says how its loading went (`marks`).
+//
+// ONLY names the connections to try ("no limit|9 Mbit/s, 60 ms"). For a slow device, run
+// it all at background priority, which on a Mac means the efficiency cores at low speed:
+//
+//   taskpolicy -b env ONLY="no limit" node art/landing/scripts/measure_loading.mjs <origin>...
 
 import { chromium } from "@playwright/test";
 import http from "node:http";
@@ -16,7 +21,8 @@ const builds = process.argv.slice(2).map((arg, i) => (arg.includes("=") && !arg.
 if (!builds.length) builds.push(["page", "http://127.0.0.1:3000"]);
 const RUNS = Number(process.env.RUNS ?? 5);
 // Bytes a second, and the delay before each answer.
-const lines = { "no limit": [Infinity, 0], "9 Mbit/s, 60 ms": [1125000, 60], "1.6 Mbit/s, 150 ms": [200000, 150] };
+const every = { "no limit": [Infinity, 0], "9 Mbit/s, 60 ms": [1125000, 60], "1.6 Mbit/s, 150 ms": [200000, 150] };
+const lines = Object.fromEntries(Object.entries(every).filter(([name]) => !process.env.ONLY || process.env.ONLY.split("|").includes(name)));
 
 /** The page behind a line of so many bytes a second, shared by everything being sent on it. */
 function proxy(target, bytesPerSecond, delayMs) {

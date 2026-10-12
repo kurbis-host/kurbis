@@ -1,7 +1,9 @@
 /**
- * The world as the art builds it: a box of block ids. The page gets this (a few tens of
- * kilobytes) instead of the faces it draws (megabytes), and works the faces and their
- * light out itself (./build.ts), exactly as the art pipeline would.
+ * The world as the art builds it: a box of block ids. The page gets this (a tenth of a
+ * megabyte or two) instead of the faces it draws (megabytes), and works the faces and
+ * their light out itself (./build.ts), exactly as the art pipeline would. Only the
+ * suns' shadows come ready-made, with the grid: marching their rays is most of what
+ * baking a world costs, and too much to ask of a weak device.
  *
  * Nothing here needs a window or a GPU: it runs in a worker, and in the tests.
  */
@@ -18,11 +20,23 @@ export interface BlockTable {
   bright: boolean[];
 }
 
-/** A sun whose shadow is baked: the way to it, how far a ray is followed, and the lowest layer that is lit at all. */
-export interface BakedSun {
-  toward: [number, number, number];
-  reach: number;
-  floor: number;
+/**
+ * The suns' shadows on a world's faces, as they are sent: for each sun, two bytes for
+ * every face that can see it at all, in the order the faces are found (./build.ts).
+ * The two bytes are the face's four corners, each a place among `levels`.
+ */
+export interface Shadows {
+  /** The light a corner gets, by its place: a sun is seen whole, or dimmed by what stands in the way. */
+  levels: number[];
+  suns: {
+    /** Where this sun's four bytes stand among the sixteen of a face's light. */
+    column: number;
+    /** Which faces can see it: those of these sides (+X, -X, +Y, -Y, +Z, -Z), at or above this layer. */
+    sides: number[];
+    floor: number;
+    /** How many such faces there are. */
+    faces: number;
+  }[];
 }
 
 /** One piece of the world's faces: those of one group inside (or outside) some boxes. */
@@ -48,13 +62,14 @@ export interface GridHeader {
   sky: boolean;
   /** Daylight standing outside the -Y side at each layer (the cut face), if any does. */
   front?: number[];
-  sun?: BakedSun;
-  key?: BakedSun;
+  shadows?: Shadows;
   parts: Part[];
 }
 
 export interface Grid extends GridHeader {
   cells: Uint8Array;
+  /** The shadows' bytes (see `Shadows`), sun after sun: none where there are no suns. */
+  shadowBytes: Uint8Array;
 }
 
 /** A change to a grid: a box of other cells (the dungeon, which differs by frame shape). */
@@ -87,13 +102,15 @@ function headed(buffer: ArrayBuffer): { header: unknown; cells: Uint8Array } {
   return { header, cells: new Uint8Array(buffer, 8 + bytes) };
 }
 
-/** Read a grid file: 'KVG1', the header's length, the header (JSON), then one byte a cell. */
+/** Read a grid file: 'KVG1', the header's length, the header (JSON), one byte a cell, then the suns' shadows. */
 export function readGrid(buffer: ArrayBuffer): Grid {
   const { header, cells } = headed(buffer);
   const grid = header as GridHeader;
   const [nx, ny, nz] = grid.shape;
-  if (cells.length < nx * ny * nz) throw new Error("landing: the grid file is short of cells");
-  return { ...grid, cells: cells.subarray(0, nx * ny * nz) };
+  const count = nx * ny * nz;
+  const shadowed = (grid.shadows?.suns ?? []).reduce((bytes, sun) => bytes + sun.faces * 2, 0);
+  if (cells.length < count + shadowed) throw new Error("landing: the grid file is short");
+  return { ...grid, cells: cells.subarray(0, count), shadowBytes: cells.subarray(count, count + shadowed) };
 }
 
 export function readModel(buffer: ArrayBuffer): BlockModel {
