@@ -3,12 +3,12 @@
  * a name, and whether it is free.
  */
 
-import { subdomainSchema } from "../schemas";
+import { SUBDOMAIN, isSubdomain } from "../subdomain";
 
 /** Whether the page asks a server if a name is free, or makes the answer up. There is no endpoint yet. */
 export const MOCK = true;
 
-export const LONGEST = 32;
+export const LONGEST = SUBDOMAIN.longest;
 
 /** What is wrong with a name, if anything: nothing typed, too short, a dash where none may be. */
 export type Flaw = "empty" | "short" | "dash" | null;
@@ -20,8 +20,8 @@ export function typed(raw: string): string {
 
 export function flawOf(name: string): Flaw {
   if (!name) return "empty";
-  if (subdomainSchema.safeParse(name).success) return null;
-  return name.length < 3 ? "short" : "dash";
+  if (isSubdomain(name)) return null;
+  return name.length < SUBDOMAIN.shortest ? "short" : "dash";
 }
 
 const TAKEN = new Set(["steve", "lena", "bigfarm", "alex", "creeper", "admin", "minecraft", "kurbis", "play", "survival", "www", "api"]);

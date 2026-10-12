@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { Aspect } from "../../lib/landing/engine/bundle";
 import { aspectNow } from "../../lib/landing/engine/early";
-import type { Film } from "../../lib/landing/film/film";
+import { loadStage } from "../../lib/landing/engine/stage";
+import { workAt } from "../../lib/landing/engine/world";
+import { Film } from "../../lib/landing/film/film";
 
 /** A pickaxe for the pointer, from the film's own picture of one: a data URL, or null without it. */
 async function pickaxe(source: Blob | null): Promise<string | null> {
@@ -24,7 +26,7 @@ async function pickaxe(source: Blob | null): Promise<string | null> {
 }
 
 /** The canvas the film plays in. It fills its box; the page's scroll drives it. */
-export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loading" | "playing" | "failed") => void; onFilm?: (film: Film | null) => void }) {
+export default function FilmCanvas({ worker, onState, onFilm }: { worker: string; onState?: (state: "loading" | "playing" | "failed") => void; onFilm?: (film: Film | null) => void }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const overlay = useRef<HTMLCanvasElement>(null);
   const [aspect, setAspect] = useState<Aspect | null>(null);
@@ -53,9 +55,9 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
       return;
     }
     const context = gl;
+    workAt(worker);
     onState?.("loading");
     (async () => {
-      const [{ loadStage }, { Film }] = await Promise.all([import("../../lib/landing/engine/stage"), import("../../lib/landing/film/film")]);
       performance.mark("landing:renderer");
       const stage = await loadStage(aspect);
       performance.mark("landing:staged");
@@ -135,7 +137,7 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
       cancelled = true;
       cleanup();
     };
-  }, [aspect, onState, onFilm]);
+  }, [aspect, worker, onState, onFilm]);
 
   return (
     <>

@@ -15,7 +15,8 @@
     "test:e2e:production": "node scripts/test-e2e-production.mjs",
     "api:generate": "node scripts/generate-api-types.mjs",
     "api:types": "node scripts/generate-api-types.mjs --from-openapi",
-    "api:check": "node scripts/generate-api-types.mjs --check"
+    "api:check": "node scripts/generate-api-types.mjs --check",
+    "build:worker": "node scripts/build-world-worker.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "5.9.1",
@@ -48,6 +49,7 @@
     "jsdom": "30.0.1",
     "openapi-typescript": "7.8.0",
     "pg": "8.23.0",
+    "rolldown": "1.2.11",
     "tailwindcss": "4.3.3",
     "typescript": "^5.9.0",
     "vitest": "5.0.1"

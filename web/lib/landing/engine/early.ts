@@ -1,9 +1,9 @@
 /**
- * Everything the film needs, asked for as early as the page can ask: the moment the page
- * is up. The world's faces are being built while the film's own code (the renderer, most
- * of what there is to download) is still on its way.
- *
- * Nothing here needs the renderer, so the page can afford to carry it from the start.
+ * Everything the film needs, gathered in one place for the stage to take. Most of it is
+ * on its way before this code is: the page's HTML asks for it (../boot.ts), and the
+ * world's faces are being built while the page's code is still arriving. What the HTML
+ * did not begin (after a change of frame, or coming here from another page) is begun
+ * here.
  *
  * (The files named `.gz` are stored packed and sent as they are, with the server saying
  * so: the browser unpacks them on the way in, and what is read here is plain.)
@@ -32,7 +32,11 @@ export function aspectNow(): Aspect {
 }
 
 async function get(path: string): Promise<Response> {
-  const response = await fetch(bundleUrl(path));
+  // (The page's HTML has usually asked already: ../boot.ts. What it asked for is taken once.)
+  const booted = window.__kurbis?.fetched;
+  const asked = booted?.[path];
+  if (booted) booted[path] = undefined;
+  const response = await (asked ?? fetch(bundleUrl(path)));
   if (!response.ok) throw new Error(`landing: ${path} answered ${response.status}`);
   return response;
 }
@@ -55,9 +59,6 @@ export function begin(aspect: Aspect): Early {
     };
     for (const promise of Object.values(early)) (promise as Promise<unknown>).catch(() => {}); // (whoever takes them hears of it)
     begun.set(aspect, early);
-    // The film's own code as well: it is asked for now, not when the canvas that plays it has come and asks.
-    void import("./stage").catch(() => {});
-    void import("../film/film").catch(() => {});
   }
   return early;
 }
