@@ -11,7 +11,8 @@ use axum::{
 use chrono::{Duration as ChronoDuration, Utc};
 use kurbis_hoster::ci::{
     CheckRunClient, CheckRunDetails, CheckRunId, CiBuildStage, GitHubCheckRunClient,
-    GitHubSourceControl, PollCheckpoint, SourceControlClient, SourceRefKind,
+    GitHubRateLimitConfig, GitHubRateLimitGuard, GitHubSourceControl, PollCheckpoint,
+    SourceControlClient, SourceRefKind,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -167,6 +168,14 @@ async fn github_check_run_fixture(
         .unwrap()
 }
 
+/// Local fixtures need no request pacing; the guard has its own tests.
+fn unpaced() -> Arc<GitHubRateLimitGuard> {
+    Arc::new(GitHubRateLimitGuard::new(GitHubRateLimitConfig {
+        minimum_interval: std::time::Duration::ZERO,
+        ..GitHubRateLimitConfig::default()
+    }))
+}
+
 async fn start_poll_server(fixture: Arc<PollFixture>) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -213,6 +222,7 @@ async fn pumpkin_mc_poll_uses_live_repository_path_etags_pages_and_pr_only_eager
     let client = GitHubSourceControl::new(Client::new(), "fixture-token")
         .unwrap()
         .with_api_base_url(api_base)
+        .with_rate_limit_guard(unpaced())
         .with_page_limits(1, 4);
     let prior_poll = PollCheckpoint {
         last_successful_poll: Some(now - ChronoDuration::hours(1)),
@@ -303,6 +313,7 @@ async fn pumpkin_check_run_get_then_write_uses_public_commit_url_and_exact_targe
     let client = GitHubCheckRunClient::new(Client::new(), "fixture-token")
         .unwrap()
         .with_api_base_url(api_base)
+        .with_rate_limit_guard(unpaced())
         .with_details_base_url("https://panel.example.test/ci/previews")
         .unwrap();
     let commit_hostname = format!("commit-{PR_SHA}.pumpkin.kurbis.host");
