@@ -6,7 +6,6 @@
 
 import { clamp01, easeIn, easeOut } from "../anim/easing";
 import type { Frame, Trigger } from "../anim/timeline";
-import { BASE } from "../engine/bundle";
 import { Draw, GREY, Hud, LINE, TOAST, WHITE, YELLOW, loadIcon, type Card, type Rgb } from "../engine/hud";
 import type { Ctx } from "./context";
 
@@ -68,7 +67,7 @@ export async function setInterface(ctx: Ctx, canvas: HTMLCanvasElement): Promise
   const { tl, C, stage, tall } = ctx;
   const hud = new Hud(canvas);
   const draw = new Draw(stage.data.glyphs.pixel);
-  const icon = async (key: string) => (stage.data.hud?.[key] ? loadIcon(`${BASE}/${stage.data.hud[key]}`) : null);
+  const icon = async (key: string) => (stage.data.hud?.[key] && stage.pack.has(stage.data.hud[key]) ? loadIcon(stage.pack.picture(stage.data.hud[key])) : null);
   const [back, pearl, ...icons] = await Promise.all([icon("toast"), icon("pearl"), icon("grass"), icon("dirt"), icon("cave"), icon("deeper")]);
 
   // -- chat ---------------------------------------------------------------------------

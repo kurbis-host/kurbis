@@ -28,7 +28,28 @@ const nextConfig: NextConfig = {
 	poweredByHeader: false,
 	reactStrictMode: true,
 	async headers() {
-		return [{ source: "/:path*", headers: securityHeaders }];
+		return [
+			{ source: "/:path*", headers: securityHeaders },
+			// The landing film's bundle. The page asks for each of its files by the bundle's
+			// version (lib/landing/engine/address.ts), so what an address names never changes
+			// and a browser may keep it for good. Without a version it is revalidated as ever.
+			{
+				source: "/landing/:path*",
+				has: [{ type: "query", key: "v" }],
+				headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+			},
+			// What is not text in the bundle is stored through gzip (once, as hard as gzip
+			// packs) and sent as it is: this is what tells the browser, which then unpacks
+			// it on the way in. Neither the server nor the CDN would pack such bytes itself.
+			// (The type is said as well: named gzip there too, some browsers leave a file packed.)
+			{
+				source: "/landing/:file(.*\\.gz)",
+				headers: [
+					{ key: "Content-Encoding", value: "gzip" },
+					{ key: "Content-Type", value: "application/octet-stream" },
+				],
+			},
+		];
 	},
 	allowedDevOrigins: ["127.0.0.1", "localhost"],
 };

@@ -121,6 +121,29 @@ test.describe("the landing film", () => {
   });
 });
 
+test("the film's bundle may be kept for good, where it is asked for by its version", async ({ request }) => {
+  test.skip(!bundle, "the film's bundle is not here");
+  // (The page asks for every file by the bundle's version, so what an address names never changes.)
+  const versioned = await request.get("/landing/scene.json?v=0123456789abcdef");
+  expect(versioned.headers()["cache-control"]).toBe("public, max-age=31536000, immutable");
+  const plain = await request.get("/landing/scene.json");
+  expect(plain.headers()["cache-control"] ?? "").not.toContain("immutable");
+});
+
+test("the bundle's packed files are sent as they are, and said to be gzip", async ({ request }) => {
+  test.skip(!bundle, "the film's bundle is not here");
+  // The browser unpacks them on the way in: the page reads plain bytes and unpacks nothing itself.
+  for (const file of ["valley.grid.gz", "nether.grid.gz", "small.pack.gz", "models.wide.glb.gz"]) {
+    const response = await request.get(`/landing/${file}`);
+    expect(response.status(), file).toBe(200);
+    expect(response.headers()["content-encoding"], file).toBe("gzip");
+    // (Said to be gzip in its type as well, a file is left packed by some browsers.)
+    expect(response.headers()["content-type"], file).toBe("application/octet-stream");
+    const body = await response.body();
+    expect([body[0], body[1]], `${file} arrives unpacked`).not.toEqual([0x1f, 0x8b]);
+  }
+});
+
 test("without WebGL the landing page is its own HTML, and fetches nothing of the film", async ({ page }) => {
   const fetched: string[] = [];
   page.on("request", (request) => {

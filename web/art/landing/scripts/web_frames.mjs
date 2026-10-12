@@ -19,7 +19,7 @@ const page = await browser.newPage({ viewport: size, deviceScaleFactor: 2 });
 page.on("pageerror", (error) => console.error("page:", String(error)));
 await page.goto(origin, { waitUntil: "load" });
 await page.waitForSelector('main[data-film="playing"]', { timeout: 120000 });
-await page.waitForTimeout(3000); // the world below the valley streams in behind the hero
+await page.waitForTimeout(3000); // the Nether is built behind the first frame
 let last = -1;
 for (const s of positions) {
   // Scroll there as a visitor would (in steps), so what the scroll triggers on the way is triggered.

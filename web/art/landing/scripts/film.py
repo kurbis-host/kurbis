@@ -436,6 +436,7 @@ def set_valley():
             centre = lo + Vector((1.0, (j1 - j0) / 2, nz / 2))
             chunk = voxel.grid_object(f"Slab_{i0:02d}_{row}", sub, b, mats["voxel"], "World", origin=tuple(lo - centre))
             chunk.location = centre
+            S.setdefault("slab", []).append({"name": chunk.name, "at": (i0, j0, 0), "shape": sub.shape, "centre": tuple(centre)})  # the page builds each from the slab's cells
             delay = 0.04 + 0.03 * abs(centre.x + 1.0) + (0.0 if row == 1 else 0.16)
             tip_x, twist, drift = rng.uniform(0.7, 1.5), rng.uniform(-0.25, 0.25), rng.uniform(0.6, 1.6)
 

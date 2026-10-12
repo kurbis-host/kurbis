@@ -90,6 +90,7 @@ export class Film {
   /** How long frames take, smoothed (milliseconds from one to the next), and what the last one drew. */
   readonly pace = { frame: 16.7, calls: 0, triangles: 0 };
   private frame = 0;
+  private drawn = false;
   private last = 0;
   private dt = 0;
   private readonly state: CameraState = { eye: new Vector3(), quat: new Quaternion(), lens: 28 };
@@ -202,6 +203,10 @@ export class Film {
       this.keepPace(dt);
       this.advance(dt);
       this.draw();
+      if (!this.drawn) {
+        this.drawn = true;
+        performance.mark("landing:frame"); // (the first one, which is where the shaders are compiled)
+      }
     };
     this.frame = requestAnimationFrame(tick);
   }

@@ -5,10 +5,15 @@
 
 import { Color, Group, Mesh, Object3D, PerspectiveCamera, Scene, Vector3, type Material, type ShaderMaterial, type Texture } from "three";
 import { Shot } from "../anim/shot";
-import { loadJson, loadModels, loadPicture, loadRecords, loadTiles, type Aspect, type FogData, type LayoutData, type NodeData, type SceneData } from "./bundle";
+import { readModel } from "../world/grid";
+import type { Took } from "../world/load";
+import { pieceGeometry } from "./blockmodel";
+import { loadPicture, loadTiles, readModels, type Aspect, type FogData, type LayoutData, type NodeData, type Pack, type Records, type SceneData } from "./bundle";
+import { take } from "./early";
 import { flakesMesh } from "./flakes";
 import { Lamps } from "./lamps";
 import { modelMaterial, readsTint, type Moves, type Pictures } from "./models";
+import { readPack } from "./pack";
 import { linearColor, makeGlobals, type Globals } from "./shading";
 import { makeSky } from "./sky";
 import { rimGeometry, scrimMesh, textMask, typeGeometry, typeMaterial } from "./type";
@@ -34,6 +39,10 @@ export interface Stage {
   /** How bright the sky is: the film turns it down underground. */
   skyStrength: { value: number };
   pictures: Pictures;
+  /** The bundle's small files (the interface takes its pictures from here). */
+  pack: Pack;
+  /** How long each world took to fetch and build, in milliseconds by stage (for looking into it). */
+  took: Record<string, Took>;
   /**
    * Type set at run time (a name being typed, what the page answers): lines of the block
    * face as one mesh, its origin at the bottom centre of its front. The caller places it
@@ -83,7 +92,13 @@ function ownTint(this: Object3D, _renderer: unknown, _scene: unknown, _camera: u
 }
 
 export async function loadStage(aspect: Aspect): Promise<Stage> {
-  const [data, layout] = await Promise.all([loadJson<SceneData>("scene.json"), loadJson<LayoutData>(`layout.${aspect}.json`)]);
+  // Everything is on its way already (./early.ts): the page asked for it, and set the
+  // world's faces building off this thread, before the renderer was here to draw them.
+  const early = take(aspect);
+  const { valley, nether } = early;
+  const models = early.models.then(readModels);
+  models.catch(() => {});
+  const [data, layout, pack] = await Promise.all([early.scene, early.layout, early.pack.then(readPack)]);
   const globals = makeGlobals();
   const scene = new Scene();
   const nodes = new Map<string, Object3D>();
@@ -94,10 +109,10 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
   const fog = new Map<string, FogData>(layout.fog.map((item) => [item.name, item]));
 
   const [tiles, tilesEmit, atlas, atlasEmit] = await Promise.all([
-    loadTiles("atlas_color.png", data.atlas),
-    loadTiles("atlas_emit.png", data.atlas),
-    loadPicture("atlas_color.png"),
-    loadPicture("atlas_emit.png"),
+    loadTiles(pack.picture("atlas_color.png"), data.atlas),
+    loadTiles(pack.picture("atlas_emit.png"), data.atlas),
+    loadPicture(pack.picture("atlas_color.png")),
+    loadPicture(pack.picture("atlas_emit.png")),
   ]);
   globals.uTiles.value = tiles;
   globals.uTilesEmit.value = tilesEmit;
@@ -115,8 +130,8 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
     nether: { emit: 1.5, crawl: true },
   };
   const voxelMaterials = new Map<string, ShaderMaterial>();
-  const addRecords = async (file: string, look: string) => {
-    const records = await loadRecords(file);
+  const addRecords = (file: string, records: Records | undefined, look: string) => {
+    if (!records?.count) return;
     let material = voxelMaterials.get(look);
     if (!material) {
       material = voxelMaterial(globals, looks[look]);
@@ -134,15 +149,22 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
   const pictures: Pictures = { atlas, atlasEmit, named };
   const loadNamed = Promise.all(
     Object.entries(data.textures).map(async ([key, file]) => {
-      const picture = await loadPicture(`tex/${file}`);
+      const picture = await loadPicture(pack.picture(`tex/${file}`));
       named.set(key, picture);
       disposables.push(picture);
     }),
   );
-  const [models] = await Promise.all([loadModels(aspect), loadNamed, addRecords("valley.terrain", "terrain"), addRecords("valley.leaves", "leaves"), addRecords("valley.water", "water")]);
+  const [gltf, world] = await Promise.all([models, valley, loadNamed]);
+  const slab = readModel(pack.bytes("slab.grid").slice().buffer);
+  // One grid holds the valley, what lies under it and the dungeon: all of it is there at once.
+  for (const [part, look] of [["valley.terrain", "terrain"], ["valley.leaves", "leaves"], ["valley.water", "water"], ["under.terrain", "terrain"], ["under.water", "water"]]) {
+    addRecords(part, world.parts.get(part), look);
+  }
+  addRecords(`dungeon.${aspect}`, world.parts.get("dungeon"), "terrain");
+  const took: Record<string, Took> = { valley: world.took };
 
   const materials = new Map<string, Material>();
-  models.traverse((object) => {
+  gltf.traverse((object) => {
     nodes.set(object.name, object);
     const mesh = object as Mesh;
     if (!mesh.isMesh) return;
@@ -164,7 +186,27 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
       if (note?.kind === "fading" && mesh.userData.tint <= 0) mesh.visible = false; // nothing of it yet: the film brings it in
     }
   });
-  scene.add(models);
+  scene.add(gltf);
+
+  // The slab in front of the cut face comes as cells, and is built here: by far the
+  // largest thing the models would otherwise carry.
+  const slabNote = data.materials[slab.material];
+  if (slabNote) {
+    let material = materials.get(slab.material);
+    if (!material) {
+      material = modelMaterial(globals, slabNote, pictures);
+      material.name = slab.material;
+      materials.set(slab.material, material);
+      disposables.push(material);
+    }
+    for (const piece of slab.pieces) {
+      const mesh = new Mesh(pieceGeometry(slab, piece, data.atlas.across, data.atlas.tile), material);
+      mesh.name = piece.name;
+      mesh.position.set(piece.centre[0], piece.centre[1], piece.centre[2]);
+      gltf.add(mesh);
+      nodes.set(piece.name, mesh);
+    }
+  }
 
   // What is built here rather than loaded: type, its rims and scrims, and the flakes.
   const face = data.glyphs.block;
@@ -219,13 +261,15 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
   const shots = layout.shots.map((shot) => new Shot(shot));
   const lamps = new Lamps(layout.lights, nodes);
 
-  // The rest of the world follows without holding up the hero.
-  const rest = Promise.all([
-    addRecords("under.terrain", "terrain"),
-    addRecords("under.water", "water"),
-    addRecords(`dungeon.${aspect}`, "terrain"),
-    addRecords("nether.terrain", "nether"),
-  ]).then(() => undefined);
+  // The Nether follows without holding up the first frame.
+  let disposed = false;
+  const rest = nether.then(
+    (built) => {
+      took.nether = built.took;
+      if (!disposed) addRecords("nether.terrain", built.parts.get("nether.terrain"), "nether");
+    },
+    (error: unknown) => console.error("landing: the Nether could not be built", error),
+  );
 
   return {
     aspect,
@@ -242,11 +286,14 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
     lamps,
     skyStrength,
     pictures,
+    pack,
+    took,
     makeType(lines, { palette = "cream", cell, depth, material = "Type", day = 0, leading = 3 }) {
       return new Mesh(typeGeometry(textMask(face, lines, { leading }), data.palettes[palette], cell, depth), typeLook(material, day));
     },
     rest,
     dispose() {
+      disposed = true;
       for (const item of disposables) item.dispose();
       scene.traverse((object) => (object as Mesh).geometry?.dispose());
     },
