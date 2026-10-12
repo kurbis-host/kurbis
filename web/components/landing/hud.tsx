@@ -55,7 +55,7 @@ export function YMeter() {
           <KurbisLogo size={26} className="drop-shadow-[0_2px_0_rgba(0,0,0,0.6)]" />
         </span>
       </div>
-      <p className="m-0 rounded-[7px] bg-ink/85 px-2 py-1 font-mono text-[12px] leading-none font-bold text-paper">
+      <p className="m-0 rounded-[7px] bg-ink px-2 py-1 font-mono text-[12px] leading-none font-bold text-paper">
         <span className="sr-only">Depth: </span>Y <span ref={readout}>{LAYERS[0].y}</span>
         <span className="ml-1.5 text-pumpkin">{LAYER_NAMES[LAYERS[layer]?.key ?? "sky"]}</span>
       </p>

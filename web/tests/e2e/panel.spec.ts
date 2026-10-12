@@ -472,6 +472,9 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   expect(session).toMatchObject({ httpOnly: true, secure: true, sameSite: 'Lax' });
   const address = page.getByRole('textbox', { name: 'Address', exact: true });
   const motd = page.getByRole('textbox', { name: 'MOTD', exact: true });
+  // Typing into the server-rendered form before hydration races the form's
+  // own initial value.
+  await expect(page.getByText('Live updates connected')).toBeVisible();
   await expect(address).toBeEnabled();
   await address.fill('renamed-world');
   await motd.fill('Draft survives repeated polling');
@@ -549,7 +552,7 @@ test('OAuth, settings, capacity queue, restart, logs, final snapshot, deletion a
   await expect.poll(async () => (await pool.query("SELECT count(*) FROM servers WHERE subdomain = 'renamed-world'")).rows[0].count).toBe('0');
   await page.goto('/app/account');
   await page.getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByRole('link', { name: 'Choose a sign-in method' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
   expect((await browserApi(page, '/api/v1/session')).status).toBe(401);
 });
 
