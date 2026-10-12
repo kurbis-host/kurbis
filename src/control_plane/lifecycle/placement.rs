@@ -341,9 +341,16 @@ pub async fn mark_runtime_lost(
     }
     release_placement_resources(&mut tx, &placement).await?;
     let deleting = server.desired_state == DesiredState::Deleted;
+    // A server that already failed keeps the cause recorded with that
+    // failure; the worker's later cleanup report must not replace it.
     sqlx::query(
         "UPDATE servers
-         SET desired_state = $4, observed_state = $5, last_error = $2, updated_at = now()
+         SET desired_state = $4, observed_state = $5,
+             last_error = CASE
+                 WHEN observed_state = 'failed' AND last_error IS NOT NULL THEN last_error
+                 ELSE $2
+             END,
+             updated_at = now()
          WHERE id = $1 AND generation = $3",
     )
     .bind(server_id)

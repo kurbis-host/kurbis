@@ -36,6 +36,13 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
    first starts normally exit with `worker_already_active` until the previous
    worker's lease lapses.
 
+6. **Canary.** The server named by `RELEASE_CANARY_SERVER_ID` in Dokploy is
+   started with the same command the gateway sends when a player joins, and
+   has to reach `online` within six minutes. Healthy containers do not prove a
+   server can start; this does. On failure the release fails and prints the
+   start error. The canary sleeps again by itself when it has been empty for
+   the idle timeout. If the setting is missing the release only warns.
+
 The result is recorded in `/srv/kurbis/deployed-release.json` on the host.
 
 ## Things to know

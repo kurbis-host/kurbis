@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{RuntimeConfig, WorkerConfig};
-use crate::{
-    worker::{
-        control_plane::WorkerControl,
-        sandbox::{ensure_rootless_volume_owner, rootless_container_identity},
+use crate::worker::{
+    control_plane::WorkerControl,
+    sandbox::{
+        PUMPKIN_GID, PUMPKIN_UID, ensure_rootless_volume_owner, rootless_container_identity,
     },
 };
 
@@ -85,7 +85,7 @@ impl ServerAccess {
         // runtime bind-mounts the tree. Otherwise hosted-entrypoint cannot
         // replace the plugin file and exits with a misleading permission error.
         if self.runtime_api_proxy {
-            let (uid, gid) = rootless_container_identity(2613, 2613).await?;
+            let (uid, gid) = rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID).await?;
             ensure_rootless_volume_owner(server_dir, uid, gid).await?;
         }
         Ok(Some(capability))

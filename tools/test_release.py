@@ -85,6 +85,28 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(load.call_args.args[0], ["docker", "--host", "unix:///run/user/1800/docker.sock", "load"])
                 self.assertEqual(calls[-1][:3], ["docker", "--host", "unix:///run/user/1800/docker.sock"])
 
+    def test_canary_reports_why_a_server_did_not_come_online(self):
+        server = "3cdbfa7d-ca8f-4baf-abc0-410dc30d18ae"
+        state = {name: service(name=name) for name in host.SERVICES}
+        answers = iter(["restoring", "failed", "Pumpkin exited with status 1 during startup"])
+        commands = []
+        def run(command, **_):
+            commands.append(command)
+            return ""
+        with patch.object(host, "services", return_value=state), patch.object(host, "run", side_effect=run), \
+             patch.object(host, "query", side_effect=lambda *_: next(answers)), patch.object(host.time, "sleep"):
+            with self.assertRaisesRegex(host.Failure, r"state: failed\): Pumpkin exited with status 1"):
+                host.canary({"server": server})
+            with self.assertRaisesRegex(host.Failure, "server UUID"):
+                host.canary({"server": "x'; drop table servers"})
+        # The start is requested from inside the control plane as the gateway would.
+        self.assertEqual(commands[0][:3], ["docker", "exec", "control-plane"])
+        self.assertIn('"reason":"gateway_join"', commands[0][-1])
+        self.assertIn(f"/api/v1/servers/{server}/commands", commands[0][-1])
+        with patch.object(host, "services", return_value=state), patch.object(host, "run", return_value=""), \
+             patch.object(host, "query", return_value="online"), patch.object(host.time, "sleep"):
+            self.assertEqual(host.canary({"server": server})["server"], server)
+
     def test_a_worker_that_fails_to_start_is_replaced_by_the_previous_one(self):
         with tempfile.TemporaryDirectory() as directory:
             worker, environment = Path(directory) / "worker", Path(directory) / "worker.env"

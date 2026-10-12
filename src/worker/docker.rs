@@ -23,8 +23,9 @@ use crate::{
     pumpkin_control::PumpkinControl,
     runtime_api_proxy,
     worker::sandbox::{
-        DockerSandbox, WorkloadLimits, ensure_rootless_volume_owner,
-        scoped_runtime_environment_args, scoped_runtime_token, validate_quota_volume,
+        DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, WorkloadLimits,
+        ensure_rootless_volume_owner, scoped_runtime_environment_args, scoped_runtime_token,
+        validate_quota_volume,
     },
 };
 
@@ -109,6 +110,47 @@ impl DockerRuntime {
         .await
         .context("ensure generation-scoped Gateway-only workload ingress")
     }
+}
+
+async fn container_log_tail(name: &str) -> String {
+    Command::new("docker")
+        .args(["logs", "--tail", "80", name])
+        .output()
+        .await
+        .ok()
+        .map(|output| {
+            let mut bytes = output.stdout;
+            bytes.extend_from_slice(&output.stderr);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .unwrap_or_else(|| "unable to read container logs".into())
+}
+
+/// Why a just-started Pumpkin container is no longer running, if it is not.
+///
+/// A container that exits during startup also leaves its workload network, so
+/// the isolation and ingress checks that follow would report a network fault
+/// and hide the real cause.
+async fn exited_workload_detail(name: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{.State.ExitCode}}",
+            name,
+        ])
+        .output()
+        .await
+        .ok()?;
+    let state = String::from_utf8_lossy(&output.stdout);
+    let (running, exit_code) = state.trim().split_once(' ')?;
+    if running != "false" {
+        return None;
+    }
+    let logs = container_log_tail(name).await;
+    Some(format!(
+        "Pumpkin exited with status {exit_code} during startup; container logs:\n{logs}"
+    ))
 }
 
 #[async_trait]
@@ -208,16 +250,20 @@ impl ServerRuntime for DockerRuntime {
             ),
         )
         .await?;
-        let (runtime_uid, runtime_gid) =
-            self.sandbox.rootless_container_identity(2613, 2613).await?;
+        let (runtime_uid, runtime_gid) = self
+            .sandbox
+            .rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID)
+            .await?;
         ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
         persist_runtime_generation(&self.root, server_id, placement.generation).await?;
         prepare_control_socket_alias(server_id, server_dir).await?;
         // ServerAccess writes managed plugin files as the worker account after
         // the initial volume preparation. Reconcile the full tree immediately
         // before bind-mounting it into the non-root Pumpkin process.
-        let (runtime_uid, runtime_gid) =
-            self.sandbox.rootless_container_identity(2613, 2613).await?;
+        let (runtime_uid, runtime_gid) = self
+            .sandbox
+            .rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID)
+            .await?;
         ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
 
         let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
@@ -227,7 +273,6 @@ impl ServerRuntime for DockerRuntime {
         );
         let generation_label = format!("kurbis.generation={}", placement.generation);
         let server_label = format!("kurbis.server_id={server_id}");
-        let runtime_user = "0:0";
         let network =
             crate::worker::sandbox::workload_network_name(server_id, placement.generation);
         let mut args = vec![
@@ -242,7 +287,7 @@ impl ServerRuntime for DockerRuntime {
         ];
         args.extend(self.sandbox.run_security_args(
             WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            runtime_user,
+            PUMPKIN_USER,
             &network,
             true,
         )?);
@@ -335,33 +380,35 @@ impl ServerRuntime for DockerRuntime {
             .verify_isolated_network(&network, &[name.clone(), proxy_name.clone()])
             .await
         {
+            let exited = exited_workload_detail(&name).await;
             let _ = self.remove_runtime(server_id).await;
+            if let Some(detail) = exited {
+                bail!(detail);
+            }
             return Err(error).context("workload network isolation check failed");
         }
-        self.ensure_ingress_relay(
-            server_id,
-            placement.generation,
-            &network,
-            &name,
-            &[name.clone(), proxy_name.clone()],
-            published_ports,
-        )
-        .await?;
+        if let Err(error) = self
+            .ensure_ingress_relay(
+                server_id,
+                placement.generation,
+                &network,
+                &name,
+                &[name.clone(), proxy_name.clone()],
+                published_ports,
+            )
+            .await
+        {
+            if let Some(detail) = exited_workload_detail(&name).await {
+                let _ = self.remove_runtime(server_id).await;
+                bail!(detail);
+            }
+            return Err(error);
+        }
         if let Err(error) = self
             .wait_ready(server_id, server_dir, Duration::from_secs(120))
             .await
         {
-            let logs = Command::new("docker")
-                .args(["logs", "--tail", "80", &name])
-                .output()
-                .await
-                .ok()
-                .map(|output| {
-                    let mut bytes = output.stdout;
-                    bytes.extend_from_slice(&output.stderr);
-                    String::from_utf8_lossy(&bytes).into_owned()
-                })
-                .unwrap_or_else(|| "unable to read container logs".into());
+            let logs = container_log_tail(&name).await;
             let cleanup_error = self.remove_runtime(server_id).await.err();
             if let Some(cleanup_error) = cleanup_error {
                 bail!(

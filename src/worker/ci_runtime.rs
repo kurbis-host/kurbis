@@ -30,8 +30,8 @@ use crate::{
             ensure_runtime_ingress,
         },
         sandbox::{
-            DockerSandbox, ensure_rootless_volume_owner, scoped_ci_preview_capability,
-            scoped_runtime_token, validate_quota_volume,
+            DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, ensure_rootless_volume_owner,
+            scoped_ci_preview_capability, scoped_runtime_token, validate_quota_volume,
         },
         storage::StorageManager,
     },
@@ -254,7 +254,10 @@ impl CiPreviewWorker {
         validate_quota_volume(&world, CI_RUNTIME_DISK_BYTES as u64)
             .await
             .context("CI world must have a hard quota filesystem")?;
-        let (daemon_uid, daemon_gid) = self.sandbox.rootless_container_identity(2613, 2613).await?;
+        let (daemon_uid, daemon_gid) = self
+            .sandbox
+            .rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID)
+            .await?;
         ensure_rootless_volume_owner(&world, daemon_uid, daemon_gid).await?;
         let runtime_dir = self.runtime_dir(placement.preview_id);
         remove_owned_runtime_dir(&self.runtime_root, placement.preview_id)?;
@@ -394,7 +397,7 @@ impl CiPreviewWorker {
         let container = container_name(placement.preview_id);
         let security = self
             .sandbox
-            .run_security_args(ci_limits(), "0:0", &network, true)?;
+            .run_security_args(ci_limits(), PUMPKIN_USER, &network, true)?;
         let mut owned = [
             "run",
             "--detach",
@@ -646,8 +649,10 @@ impl CiPreviewWorker {
             };
             let world = self.storage.path(placement.preview_id);
             self.storage.reset(placement.preview_id).await?;
-            let (daemon_uid, daemon_gid) =
-                self.sandbox.rootless_container_identity(2613, 2613).await?;
+            let (daemon_uid, daemon_gid) = self
+                .sandbox
+                .rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID)
+                .await?;
             unpack_world_snapshot(
                 &snapshot_path,
                 &world,

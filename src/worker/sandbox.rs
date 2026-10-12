@@ -821,6 +821,16 @@ impl DockerSandbox {
     }
 }
 
+/// The unprivileged account Pumpkin runs as inside every workload container.
+///
+/// Workload storage is handed to this account's host-side mapping before it
+/// is bind-mounted, so the container user and the storage owner must come
+/// from the same constants: with all capabilities dropped, any other
+/// container user (including root) cannot write to that storage.
+pub const PUMPKIN_UID: u32 = 2613;
+pub const PUMPKIN_GID: u32 = 2613;
+pub const PUMPKIN_USER: &str = "2613:2613";
+
 pub async fn ensure_rootless_volume_owner(path: &Path, uid: u32, gid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 

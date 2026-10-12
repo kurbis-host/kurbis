@@ -5,6 +5,7 @@
   2. Compile Pumpkin on the remote CI builder and package it on the host.
   3. Deploy the Compose stack through Dokploy and wait for it to be healthy.
   4. Move the native worker onto the release, restoring it if it fails.
+  5. Start the canary server like a joining player would and wait for it.
 
 A failed deployment is reported, not rolled back: Compose leaves the previous
 containers of any service it could not replace, and redeploying an older
@@ -39,6 +40,8 @@ PROJECT = "kurbis-hoster-fbikvd"
 REMOTE_ARTIFACTS = "/srv/kurbis/release-artifacts"
 # Settings every release pins in Dokploy next to the revision it deploys.
 ENVIRONMENT = {"BEDROCK_TLS_HOST_DIRECTORY": "/srv/kurbis/certs", "PANEL_BIND_ADDRESS": "127.0.0.1"}
+# Dokploy setting naming the server every release starts to prove starts work.
+CANARY_SETTING = "RELEASE_CANARY_SERVER_ID"
 FINISHED = {"done", "error", "failed", "cancelled", "canceled"}
 HEALTHY_WAIT_SECONDS = 6 * 60
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"]
@@ -205,12 +208,20 @@ def main() -> int:
             say(f"releasing {commit}")
             gate()
             say("gate passed; compiling Pumpkin on the CI builder")
-            build_pumpkin(arguments.host, commit, parse_environment(str(compose()["env"])))
+            settings = parse_environment(str(compose()["env"]))
+            build_pumpkin(arguments.host, commit, settings)
             say("Pumpkin images packaged; deploying through Dokploy")
             deploy(commit, arguments.deploy_wait)
             wait_until_healthy(arguments.host, commit)
             say("stack healthy; updating the worker")
             record = host_step(arguments.host, "worker", {"revision": commit}, timeout=600)
+            canary = settings.get(CANARY_SETTING)
+            if canary:
+                say("worker updated; starting the canary server")
+                started = host_step(arguments.host, "canary", {"server": canary}, timeout=600)
+                say(f"canary server online after {started['seconds']}s")
+            else:
+                say(f"WARNING: {CANARY_SETTING} is not set in Dokploy, so no server start was tested")
         except (ReleaseError, subprocess.TimeoutExpired) as error:
             say(f"release failed: {error}")
             return 1

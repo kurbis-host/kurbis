@@ -7,6 +7,7 @@ name and a JSON argument object, and reads one JSON result line back.
   package  build the Pumpkin images from the uploaded binaries
   status   report the running Compose services
   worker   move the native worker onto the deployed release
+  canary   start one real server the way a player's join does
 """
 from __future__ import annotations
 
@@ -35,6 +36,8 @@ PUMPKIN_ARTIFACTS = ("pumpkin", "kurbis-control.wasm")
 # One worker process must stay up this long, heartbeating, to count as started.
 WORKER_SETTLE_SECONDS = 40
 WORKER_START_SECONDS = 240
+# A start restores the world, boots Pumpkin, and is retried by the worker.
+CANARY_SECONDS = 6 * 60
 
 
 class Failure(RuntimeError):
@@ -153,11 +156,15 @@ def status(arguments: dict) -> dict:
     return {"services": state, "problems": found}
 
 
+def query(database: str, sql: str, value: str) -> str:
+    """Run one read-only statement in the production database; `:'value'` is its only parameter."""
+    return run(["docker", "exec", "-i", "--env", f"KURBIS_QUERY_VALUE={value}", database, "sh", "-c",
+                'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -v value="$KURBIS_QUERY_VALUE" -f -'], input_text=sql)
+
+
 def worker_heartbeat_is_fresh(database: str) -> bool:
-    worker_id = worker_setting("WORKER_ID")
-    query = "SELECT count(*) FROM workers WHERE id::text = :'worker_id' AND heartbeat_at > now() - interval '30 seconds'"
-    count = run(["docker", "exec", "-i", "--env", f"KURBIS_WORKER_ID={worker_id}", database, "sh", "-c",
-                 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -v worker_id="$KURBIS_WORKER_ID" -f -'], input_text=query)
+    count = query(database, "SELECT count(*) FROM workers WHERE id::text = :'value' AND heartbeat_at > now() - interval '30 seconds'",
+                  worker_setting("WORKER_ID") or "")
     return count == "1"
 
 
@@ -235,7 +242,38 @@ def worker(arguments: dict) -> dict:
     return record
 
 
-STEPS = {"package": package, "status": status, "worker": worker}
+def canary(arguments: dict) -> dict:
+    """Start one real server exactly as a player's join does and wait until it is online.
+
+    Healthy containers and a heartbeating worker do not prove that a server
+    can start; only a start does. The server goes back to sleep by itself
+    once it has been empty for the idle timeout.
+    """
+    server = str(arguments.get("server", ""))
+    if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", server):
+        raise Failure("canary server must be a server UUID")
+    state = services()
+    database = state["postgres"]["name"]
+    # The gateway's wake request, sent from inside the control plane so its
+    # internal token never leaves the container.
+    wake = ('curl --fail --silent --show-error --max-time 20 -X POST -H "Authorization: Bearer $INTERNAL_TOKEN" '
+            '-H "Content-Type: application/json" --data \'{"command":"start","reason":"gateway_join"}\' '
+            f"http://127.0.0.1:8080/api/v1/servers/{server}/commands")
+    run(["docker", "exec", state["control-plane"]["name"], "sh", "-c", wake])
+    started, observed = time.monotonic(), ""
+    while time.monotonic() - started < CANARY_SECONDS:
+        time.sleep(5)
+        observed = query(database, "SELECT observed_state FROM servers WHERE id::text = :'value'", server)
+        if observed == "online":
+            return {"server": server, "seconds": round(time.monotonic() - started)}
+        if observed == "failed":
+            break
+    cause = query(database, "SELECT coalesce(last_error, '') FROM operations WHERE server_id::text = :'value' "
+                            "AND kind = 'start' ORDER BY updated_at DESC LIMIT 1", server)
+    raise Failure(f"the canary server did not come online (state: {observed or 'unknown'}): {cause[-1500:] or 'no error recorded'}")
+
+
+STEPS = {"package": package, "status": status, "worker": worker, "canary": canary}
 
 
 def main() -> int:

@@ -215,7 +215,7 @@ impl WorkerRunner {
                             .mark_runtime_lost(
                                 server_id,
                                 generation,
-                                "Failed-start runtime removal confirmed; retry from the panel",
+                                "Server failed to start; its runtime was removed",
                             )
                             .await?
                     }
