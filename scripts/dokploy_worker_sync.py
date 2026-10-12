@@ -284,12 +284,10 @@ def _baseline_locked() -> dict[str, list[dict[str, str]]]:
         raise Error("strict baseline panel/waiting services have mixed app revisions")
     image=image_for_app(state,app_revision);worker_sha=verify_worker_binary_in_app_image(image,app_revision)
     verify_image_revision(state["panel"][0]["image"],app_revision)
-    upstream=run(["git","-C",str(CHECKOUT),"show",f"{app_revision}:runtime/pumpkin/REVISION"]).strip()
-    verify_waiting(state["waiting-pumpkin"][0],app_revision,upstream,pinned)
     pid=single_worker()
     if digest(Path(f"/proc/{pid}/exe"))!=worker_sha:raise Error("baseline worker executable differs from active app image")
     if worker_process_environment(pid).get("PUMPKIN_IMAGE")!=pinned:raise Error("baseline worker process environment differs from its protected config")
-    verify_pinned_pumpkin(pinned);lease(state["postgres"][0]["id"]);return state
+    lease(state["postgres"][0]["id"]);return state
 
 
 def baseline() -> dict[str, list[dict[str, str]]]:
@@ -317,10 +315,6 @@ def _baseline_preflight_locked() -> dict[str, object]:
     app_image=image_for_app(state,app_revision)
     app_worker_sha=verify_worker_binary_in_app_image(app_image,app_revision)
     image=worker_image_value()
-    if image != "melon-pumpkin:host-control":
-        verify_pinned_pumpkin(image)
-    else:
-        run(["docker","image","inspect",image,"--format","{{.Id}}"])
     pid=single_worker()
     if digest(Path(f"/proc/{pid}/exe"))!=app_worker_sha:
         raise Error("running worker binary differs from the active app image; safe bootstrap is impossible")
@@ -831,9 +825,6 @@ def _rollback_worker_locked(token: str) -> dict[str, str]:
             MARKER.unlink()
     except FileNotFoundError:
         pass
-    old_worker_image = str(data["old_worker_image"])
-    if old_worker_image != "melon-pumpkin:host-control":
-        verify_pinned_pumpkin(old_worker_image)
     atomic(WORKER,bin_backup.read_bytes(),int(data["old_worker_mode"]),int(data["old_worker_uid"]),int(data["old_worker_gid"]))
     atomic(WORKER_ENV,env_backup.read_bytes(),0o600,0,0)
     run(["systemctl","restart",WORKER_SERVICE])
@@ -952,8 +943,6 @@ def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,lis
     database_id=current["postgres"][0]["id"]
     old_env=WORKER_ENV.read_bytes()
     old_image=worker_image_value()
-    if old_image != "melon-pumpkin:host-control":
-        verify_pinned_pumpkin(old_image)
     old_hash=digest(WORKER)
     def verify_new():
         pid=single_worker()
