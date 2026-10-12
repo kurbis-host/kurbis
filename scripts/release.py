@@ -40,6 +40,7 @@ REMOTE_ARTIFACTS = "/srv/kurbis/release-artifacts"
 # Settings every release pins in Dokploy next to the revision it deploys.
 ENVIRONMENT = {"BEDROCK_TLS_HOST_DIRECTORY": "/srv/kurbis/certs", "PANEL_BIND_ADDRESS": "127.0.0.1"}
 FINISHED = {"done", "error", "failed", "cancelled", "canceled"}
+HEALTHY_WAIT_SECONDS = 6 * 60
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"]
 
 
@@ -173,6 +174,19 @@ def deploy(commit: str, wait_seconds: int) -> None:
     raise ReleaseError("the Dokploy deployment did not finish in time; it may still be queued behind other deployments")
 
 
+def wait_until_healthy(host: str, commit: str) -> None:
+    # Compose returns once containers are started; the panel and control plane
+    # need up to a few minutes more before their health checks pass.
+    deadline = time.monotonic() + HEALTHY_WAIT_SECONDS
+    while True:
+        found = host_step(host, "status", {"revision": commit}, timeout=120)["problems"]
+        if not found:
+            return
+        if time.monotonic() >= deadline:
+            raise ReleaseError("deployed, but: " + "; ".join(found))
+        time.sleep(10)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="respond5", help="SSH name of the production host")
@@ -194,9 +208,7 @@ def main() -> int:
             build_pumpkin(arguments.host, commit, parse_environment(str(compose()["env"])))
             say("Pumpkin images packaged; deploying through Dokploy")
             deploy(commit, arguments.deploy_wait)
-            state = host_step(arguments.host, "status", {"revision": commit}, timeout=120)
-            if state["problems"]:
-                raise ReleaseError("deployed, but: " + "; ".join(state["problems"]))
+            wait_until_healthy(arguments.host, commit)
             say("stack healthy; updating the worker")
             record = host_step(arguments.host, "worker", {"revision": commit}, timeout=600)
         except (ReleaseError, subprocess.TimeoutExpired) as error:
