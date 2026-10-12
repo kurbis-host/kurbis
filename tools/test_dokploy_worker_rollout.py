@@ -171,6 +171,7 @@ class RolloutTests(unittest.TestCase):
                 return original_stat(path, *args, **kwargs)
             token = "a" * 32
             with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "CHECKOUT_BACKUP", backup_root), \
+                 patch.object(sync, "RELEASE_REMOTE", str(bare)), \
                  patch.object(sync, "root_only"), patch.object(sync, "require_lock"), patch.object(sync, "identity", return_value="worker-id"), \
                  patch.object(Path, "stat", stat_with_root_backup_owner):
                 result = sync.stage(revision, token, expected)
