@@ -4,19 +4,23 @@ The page draws the same world with its own renderer and plays its own, TypeScrip
 choreography. What it needs from here is everything that is a thing rather than a
 behaviour:
 
-  records   the big voxel meshes as one small record per block face, with light
-            baked in (see `light`). No decoder: the bytes are the buffers.
+  grids     the world as its blocks, one byte a cell (see `write_grid`). The page finds
+            the faces and bakes their light itself, as `faces` and `light` do here:
+            a hundredth of the bytes the faces would be. `digest` is what holds the
+            two to each other.
   models    everything small as a glb, through Blender's own exporter, with names
-            and hierarchy and without images.
+            and hierarchy and without images. (The slab comes as blocks too.)
   layout    per frame shape: the camera's keys, where type and flakes stand, lights,
             haze, and the notes the toolkit left on things (`core.note`).
   scene     what both shapes share: sky, palettes, glyphs, constants.
   reference camera and pumpkin sampled along the scroll, for the page's parity tests.
 
-Everything drawn from the texture pack lands in web/public/landing, which git ignores.
+Everything lands in web/public/landing, textures of the pack included (while the page
+is a proof of concept).
 """
 
 import gzip
+import hashlib
 import json
 import shutil
 import struct
@@ -29,8 +33,7 @@ from . import anim, core, font, voxel
 from . import blocks as blk
 
 OUT = core.ROOT.parents[1] / "public" / "landing"
-CHUNK = 32  # faces are grouped into cubes this many blocks across, to cull and to load by
-BIG = ("Terrain", "Leaves", "Water", "Nether")  # written as records, not into the glb
+BIG = ("Terrain", "Leaves", "Water", "Nether")  # the page builds these from the grids: they are not in the glb
 AO = np.array((0.5, 0.66, 0.82, 1.0), np.float32)  # how dark a corner is with 3, 2, 1, 0 neighbours standing in it
 
 
@@ -80,6 +83,14 @@ def _spread(level, passes, dims, steps=15):
     return level.astype(np.uint8)
 
 
+def shining(blocks):
+    """Which blocks are lamps (lava, glowstone, lanterns): those whose tiles shine."""
+    emit = blocks.atlas.emit[..., :3].max(axis=2)  # how much each tile shines
+    n = blocks.atlas.n
+    shine = emit.reshape(n, blk.TILE, n, blk.TILE).mean(axis=(1, 3)).ravel()
+    return shine[blocks.tile_lut].max(axis=1) > 0.2
+
+
 def levels(grid, blocks, sky=True, front=None):
     """Two fields of light over a grid, each 0..15 a cell, as the game counts it:
     daylight coming down from the open sky (and, with `front`, in through the cut
@@ -96,10 +107,7 @@ def levels(grid, blocks, sky=True, front=None):
             outside = np.asarray([front(z) for z in range(grid.shape[2])], np.uint8)
             day[:, 0, :] = np.maximum(day[:, 0, :], np.where(passes[:, 0, :], np.maximum(outside[None, :], 1) - 1, 0))
         day = _spread(day, passes, leafy)
-    emit = blocks.atlas.emit[..., :3].max(axis=2)  # how much each tile shines
-    n = blocks.atlas.n
-    shine = emit.reshape(n, blk.TILE, n, blk.TILE).mean(axis=(1, 3)).ravel()
-    bright = shine[blocks.tile_lut].max(axis=1) > 0.2  # the blocks that are lamps: lava, glowstone, lanterns
+    bright = shining(blocks)
     glow = np.where(bright[grid], 15, 0).astype(np.uint8)
     lit = _spread(glow, passes | bright[grid], leafy)
     lit[bright[grid]] = 15
@@ -194,49 +202,128 @@ def _sun(cells, which, solid, sun, floor, reach=520):
     return out
 
 
-# -- records -------------------------------------------------------------------------
-def write_records(path, cells, which, tile, shade, origin):
-    """One file of faces: a short JSON header, then three plain arrays the page hands
-    to the GPU as they are.
+# -- grids ---------------------------------------------------------------------------
+def uniform(grid, blocks, closed=()):
+    """The grid with every block nobody can ever see made the same kind.
 
-        'KVX1', header length (uint32), header (JSON, padded to four bytes)
-        int16  x, y, z, direction      per face (block coordinates in the world)
-        uint16 tile, 0                 per face
-        uint8  daylight x4, glow x4, sun x4, key suns x4   per face, one per corner
+    A block is out of sight for good when it is opaque and has, on every side, another
+    opaque block or a `closed` side of the world. No face of it is ever drawn and no
+    light is ever read in it, so which block it is does not matter; made all one kind
+    (the commonest of them), they pack to half the size. Blocks that shine are left as
+    they are, so the light comes out the same to the byte."""
+    opaque = blocks.opaque_lut[grid]
+    pad = np.pad(opaque, 1, constant_values=False)
+    for k in closed:
+        edge = [slice(None)] * 3
+        edge[k // 2] = -1 if k % 2 == 0 else 0
+        pad[tuple(edge)] = True
+    nx, ny, nz = grid.shape
+    out_of_sight = opaque & ~shining(blocks)[grid]
+    for dx, dy, dz in voxel.DIRS:
+        out_of_sight &= pad[1 + dx : 1 + dx + nx, 1 + dy : 1 + dy + ny, 1 + dz : 1 + dz + nz]
+    out = grid.copy()
+    if out_of_sight.any():
+        out[out_of_sight] = np.bincount(grid[out_of_sight]).argmax()
+    return out
 
-    Faces are sorted by the CHUNK-sized cube they are in; the header lists each cube's
-    bounds and its run of faces.
 
-    The file is written packed with gzip (a tenth the size): a server compresses the
-    text it sends but not bytes like these, so the page unpacks them itself."""
-    world = cells + np.asarray(origin, np.int32)
-    cube = np.floor_divide(world, CHUNK)
-    order = np.lexsort((tile, which, cube[:, 0], cube[:, 1], cube[:, 2]))
-    world, which, tile, shade, cube = world[order], which[order], tile[order], shade[order], cube[order]
-    change = np.flatnonzero(np.any(np.diff(cube, axis=0) != 0, axis=1)) + 1
-    starts = np.concatenate(([0], change, [len(world)]))
-    chunks = []
-    for first, last in zip(starts[:-1], starts[1:]):
-        if last > first:
-            lo, hi = world[first:last].min(axis=0), world[first:last].max(axis=0) + 1
-            chunks.append([*map(int, lo), *map(int, hi), int(first), int(last - first)])
-    a = np.zeros((len(world), 4), "<i2")
-    a[:, :3], a[:, 3] = world, which
-    b = np.zeros((len(world), 2), "<u2")
-    b[:, 0] = tile
-    header = json.dumps({"count": int(len(world)), "chunk": CHUNK, "chunks": chunks}, separators=(",", ":")).encode()
-    header += b" " * (-len(header) % 4)
+def _packed(path, header, cells):
+    """'KVG1', the header's length, the header (JSON), then one byte a cell; all of it
+    packed with gzip, which the page unpacks itself (a server does not compress bytes)."""
+    head = json.dumps(header, separators=(",", ":")).encode()
+    head += b" " * (-len(head) % 4)
+    data = b"KVG1" + struct.pack("<I", len(head)) + head + np.ascontiguousarray(cells, np.uint8).tobytes()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = b"KVX1" + struct.pack("<I", len(header)) + header + a.tobytes() + b.tobytes() + np.ascontiguousarray(shade, np.uint8).tobytes()
     path.write_bytes(gzip.compress(data, compresslevel=9, mtime=0))
-    return {"file": path.name, "count": int(len(world)), "chunks": len(chunks), "bytes": path.stat().st_size, "unpacked": len(data)}
+    return {"file": path.name, "cells": int(cells.size), "bytes": path.stat().st_size, "unpacked": len(data)}
+
+
+def _table(blocks):
+    """What the page must know about each kind of block, by its id."""
+    return {
+        "tiles": [[int(tile) for tile in row] for row in blocks.tiles],
+        "opaque": [bool(v) for v in blocks.opaque],
+        "group": list(blocks.groups),
+        "bright": [bool(v) for v in shining(blocks)],
+    }
+
+
+def write_model(path, grid, blocks, origin, material, pieces):
+    """A small thing made of blocks, for the page to mesh piece by piece as `voxel.quads`
+    would (each piece a closed solid of its own): its cells, the material's name, and
+    each piece's name, box of cells and the place of its mesh's origin."""
+    header = {
+        "shape": [int(n) for n in grid.shape],
+        "origin": [int(v) for v in origin],
+        "blocks": _table(blocks),
+        "material": material,
+        "pieces": [{"name": p["name"], "at": [int(v) for v in p["at"]], "shape": [int(v) for v in p["shape"]], "centre": [float(v) for v in p["centre"]]} for p in pieces],
+    }
+    return _packed(path, header, grid)
+
+
+def _exact(direction):
+    """A direction as the 32-bit floats the light is worked out in, written so that they read back the same."""
+    return [float(v) for v in np.asarray(direction, np.float32)]
+
+
+def write_grid(path, grid, blocks, origin, parts, closed=(), sky=True, front=None, sun=None, key=None):
+    """A world for the page to build: its blocks, and what building it takes.
+
+    The page finds the visible faces and bakes their light itself (web/lib/landing/world),
+    the same way `faces` and `light` do here, so this is all it needs: the cells (x
+    outermost, z innermost), what each kind of block is, which sides of the box are
+    `closed`, where daylight comes from (`sky`, and `front`: the level outside the -Y
+    side at each layer), the suns whose shadows are baked (the way to each, how many
+    half-block steps a ray is followed, and the lowest layer that is lit), and the
+    `parts` its faces are sorted into."""
+    header = {
+        "shape": [int(n) for n in grid.shape],
+        "origin": [int(v) for v in origin],
+        "blocks": _table(blocks),
+        "closed": [int(k) for k in closed],
+        "sky": bool(sky),
+        "parts": list(parts),
+    }
+    if front is not None:
+        header["front"] = [int(v) for v in front]
+    for name, baked in (("sun", sun), ("key", key)):
+        if baked is not None:
+            header[name] = {"toward": _exact(baked["toward"]), "reach": int(baked["reach"]), "floor": int(baked["floor"])}
+    return _packed(path, header, uniform(grid, blocks, closed))
+
+
+def write_patch(path, base, changed, blocks, closed=()):
+    """Where one grid differs from another, as the box of cells to lay over it (the
+    dungeon, which is another room in the tall frame)."""
+    a, b = uniform(base, blocks, closed), uniform(changed, blocks, closed)
+    differs = np.argwhere(a != b)
+    lo, hi = differs.min(axis=0), differs.max(axis=0) + 1
+    cells = b[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]]
+    return _packed(path, {"at": [int(v) for v in lo], "shape": [int(n) for n in cells.shape]}, cells)
+
+
+def digest(cells, which, tile, shade, origin):
+    """What a part's faces come to, whatever order they were found in: for holding the
+    page's own building of them to this one. The faces are put in order of place and
+    side and hashed as the page keeps them (see web/lib/landing/world/build.ts)."""
+    world = cells + np.asarray(origin, np.int32)
+    order = np.lexsort((which, world[:, 2], world[:, 1], world[:, 0]))
+    a = np.zeros((len(world), 4), "<i2")
+    a[:, :3], a[:, 3] = world[order], which[order]
+    b = np.zeros((len(world), 2), "<u2")
+    b[:, 0] = tile[order]
+    sha = hashlib.sha256()
+    for part in (a, b, np.ascontiguousarray(shade[order], np.uint8)):
+        sha.update(part.tobytes())
+    return {"count": int(len(world)), "sha256": sha.hexdigest()}
 
 
 # -- models --------------------------------------------------------------------------
 def skipped(obj):
-    """Things the glb leaves out: the big meshes (records), what the page builds itself
-    (type, flakes, haze), and the previs's own interface and covers."""
-    if obj.name in BIG or obj.name.startswith(("Hud", "Cover_", "Probe_")):
+    """Things the glb leaves out: what the page builds from blocks (the world and the
+    slab) or by itself (type, flakes, haze), and the previs's own interface and covers."""
+    if obj.name in BIG or obj.name.startswith(("Hud", "Cover_", "Probe_", "Slab_")):
         return True
     return core.noted(obj).get("kind") in ("type", "rim", "scrim", "flakes", "fog")
 
@@ -347,6 +434,28 @@ def copy_textures(used):
             names["@" + said["made"]] = said["made"] + ".png"
             shutil.copyfile(core.EXPORT / (said["made"] + ".png"), out / (said["made"] + ".png"))
     return names
+
+
+def write_pack(path, root, files):
+    """Many small files as one, so the page asks once instead of fifty times:
+
+        'KPK1', the header's length (uint32), the header (JSON, padded to four bytes):
+        {"files": {name: [offset, length]}}, then the files' bytes end to end.
+
+    The files are taken out of `root` (they are in the pack now)."""
+    table, body = {}, b""
+    for file in sorted(files):
+        data = file.read_bytes()
+        table[file.relative_to(root).as_posix()] = [len(body), len(data)]
+        body += data
+        file.unlink()
+    for folder in sorted({file.parent for file in files}, reverse=True):
+        if folder != root and not any(folder.iterdir()):
+            folder.rmdir()
+    head = json.dumps({"files": table}, separators=(",", ":")).encode()
+    head += b" " * (-len(head) % 4)
+    path.write_bytes(b"KPK1" + struct.pack("<I", len(head)) + head + body)
+    return {"file": path.name, "files": len(table), "bytes": path.stat().st_size}
 
 
 # -- reference -----------------------------------------------------------------------

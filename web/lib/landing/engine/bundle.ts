@@ -1,15 +1,18 @@
 /**
  * The scene as the art pipeline writes it (web/art/landing/scripts/export_web.py):
- * JSON for what things are and where, plain binary records for the big voxel meshes,
- * a glb for everything small. Nothing here needs a decoder.
+ * JSON for what things are and where, a glb for everything small, and the world as
+ * grids of blocks, which the page builds its faces from (./world.ts).
  */
 
 import { DataArrayTexture, NearestFilter, NearestMipmapLinearFilter, SRGBColorSpace, Texture, type Group } from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import type { ShotData } from "../anim/shot";
 import type { TrackData } from "../anim/track";
+import type { Records } from "../world/build";
+import { BASE, bundleUrl } from "./address";
+import type { Pack } from "./pack";
 
-export const BASE = "/landing";
+export { BASE, bundleUrl };
 
 export type Aspect = "wide" | "tall";
 export type Rgb = [number, number, number];
@@ -244,58 +247,10 @@ export interface LayoutData {
   bands: [string[], string[], number, [number, number]][];
 }
 
-/** One file of block faces. `chunks` are runs of faces that share a cube of the world. */
-export interface Records {
-  count: number;
-  /** [x0, y0, z0, x1, y1, z1, first, count] */
-  chunks: number[][];
-  /** x, y, z, direction per face */
-  cells: Int16Array;
-  /** tile, 0 per face */
-  tiles: Uint16Array;
-  /** daylight x4, glow x4, sun x4, key suns x4 per face: one of each per corner */
-  light: Uint8Array;
-}
+export type { Pack, Records };
 
-async function fetchOk(path: string): Promise<Response> {
-  const response = await fetch(`${BASE}/${path}`);
-  if (!response.ok) throw new Error(`landing: ${path} answered ${response.status}`);
-  return response;
-}
-
-export async function loadJson<T>(path: string): Promise<T> {
-  return (await fetchOk(path)).json() as Promise<T>;
-}
-
-/**
- * The bytes of a record file. The art pipeline writes them packed with gzip, because a
- * server compresses the text it sends but not bytes like these; plain ones are taken as
- * they come (something on the way may have unpacked them already).
- */
-async function unpacked(response: Response): Promise<ArrayBuffer> {
-  const buffer = await response.arrayBuffer();
-  const head = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 2));
-  if (head[0] !== 0x1f || head[1] !== 0x8b) return buffer;
-  return new Response(new Blob([buffer]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
-}
-
-export async function loadRecords(name: string): Promise<Records> {
-  const buffer = await unpacked(await fetchOk(`${name}.bin.gz`));
-  const view = new DataView(buffer);
-  if (view.getUint32(0, false) !== 0x4b565831) throw new Error(`landing: ${name}.bin.gz is not a record file`);
-  const headerBytes = view.getUint32(4, true);
-  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerBytes))) as { count: number; chunks: number[][] };
-  let offset = 8 + headerBytes;
-  const cells = new Int16Array(buffer, offset, header.count * 4);
-  offset += header.count * 8;
-  const tiles = new Uint16Array(buffer, offset, header.count * 2);
-  offset += header.count * 4;
-  const light = new Uint8Array(buffer, offset, header.count * 16);
-  return { count: header.count, chunks: header.chunks, cells, tiles, light };
-}
-
-async function pixelsOf(path: string): Promise<ImageData> {
-  const bitmap = await createImageBitmap(await (await fetchOk(path)).blob(), { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+async function pixelsOf(picture: Blob): Promise<ImageData> {
+  const bitmap = await createImageBitmap(picture, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
   const canvas = document.createElement("canvas");
   canvas.width = bitmap.width;
   canvas.height = bitmap.height;
@@ -310,8 +265,8 @@ async function pixelsOf(path: string): Promise<ImageData> {
  * The block atlas as an array texture, one layer a tile. Mipmaps then never bleed from
  * one tile into its neighbour, which they do in an atlas.
  */
-export async function loadTiles(path: string, atlas: SceneData["atlas"]): Promise<DataArrayTexture> {
-  const image = await pixelsOf(path);
+export async function loadTiles(picture: Blob, atlas: SceneData["atlas"]): Promise<DataArrayTexture> {
+  const image = await pixelsOf(picture);
   const { tiles, across, tile } = atlas;
   const data = new Uint8Array(tiles * tile * tile * 4);
   for (let index = 0; index < tiles; index += 1) {
@@ -332,8 +287,8 @@ export async function loadTiles(path: string, atlas: SceneData["atlas"]): Promis
 }
 
 /** A pixel-art picture: nearest filtering, no mipmaps. */
-export async function loadPicture(path: string): Promise<Texture> {
-  const bitmap = await createImageBitmap(await (await fetchOk(path)).blob(), { premultiplyAlpha: "none", colorSpaceConversion: "none", imageOrientation: "flipY" });
+export async function loadPicture(picture: Blob): Promise<Texture> {
+  const bitmap = await createImageBitmap(picture, { premultiplyAlpha: "none", colorSpaceConversion: "none", imageOrientation: "flipY" });
   const texture = new Texture(bitmap);
   texture.colorSpace = SRGBColorSpace;
   texture.magFilter = NearestFilter;
@@ -344,7 +299,8 @@ export async function loadPicture(path: string): Promise<Texture> {
   return texture;
 }
 
-export async function loadModels(aspect: Aspect): Promise<Group> {
-  const gltf = await new GLTFLoader().loadAsync(`${BASE}/models.${aspect}.glb`);
+/** The small models, out of the glb's bytes. */
+export async function readModels(glb: ArrayBuffer): Promise<Group> {
+  const gltf = await new GLTFLoader().parseAsync(glb, "");
   return gltf.scene;
 }

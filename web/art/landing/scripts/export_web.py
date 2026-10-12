@@ -3,8 +3,8 @@
     Blender -b --factory-startup -P scripts/export_web.py
 
 Writes web/public/landing/ (made from the texture pack while the page is a proof of
-concept) and the parity fixtures under web/tests/unit/landing/fixtures/ (numbers and
-our own copy only).
+concept), the parity fixtures under web/tests/unit/landing/fixtures/ (numbers and
+our own copy only), and the bundle's version, web/lib/landing/engine/version.ts.
 """
 
 import hashlib
@@ -29,7 +29,8 @@ from kurbis import core, export, sets, voxel  # noqa: E402
 from kurbis import world as wld  # noqa: E402
 
 FIXTURES = core.ROOT.parents[1] / "tests" / "unit" / "landing" / "fixtures"
-VALLEY_FLOOR = -12  # faces at or above this height load with the hero; the rest follow
+VERSION = core.ROOT.parents[1] / "lib" / "landing" / "engine" / "version.ts"
+VALLEY_FLOOR = -12  # faces at or above this height are the valley proper (the suns light nothing below it); the rest lies under it
 KEY_SUN = tuple(np.array((-0.47, -0.57, 0.67)) / np.linalg.norm((-0.47, -0.57, 0.67)))  # toward the key suns of the open-air stops, near enough
 # Constants of the film the page reads rather than repeats.
 CONSTANTS = (
@@ -56,43 +57,82 @@ def _front(z0):
     return lambda zi: int(np.clip(15 + (zi + z0 + 8) * 0.92, 4, 15))
 
 
-def world_records(S, aspect, report):
-    """The valley's faces, split into what the hero needs, what lies under it, and the
-    dungeon (which differs by frame). Returns a digest of the shared part."""
-    w, b = S["w"], S["b"]
-    origin = np.asarray(w.origin, np.int32)
-    day, lit, solid = export.levels(w.grid, b, sky=True, front=_front(w.z0))
+def _parts():
+    """What the valley's faces are sorted into: what the first frame needs (the valley
+    proper), what lies under it, and the dungeon (which differs by frame)."""
     lo, hi = _dungeon_box()
-    digest = hashlib.sha1()
+    dungeon = [*map(int, lo), *map(int, hi)]
+    above = [-32768, -32768, VALLEY_FLOOR, 32767, 32767, 32767]
+    return [
+        {"name": "valley.terrain", "group": "opaque", "inside": [above], "outside": [dungeon]},
+        {"name": "valley.leaves", "group": "leaves", "inside": [above], "outside": [dungeon]},
+        {"name": "valley.water", "group": "water", "inside": [above], "outside": [dungeon]},
+        {"name": "under.terrain", "group": "opaque", "outside": [above, dungeon]},
+        {"name": "under.water", "group": "water", "outside": [above, dungeon]},
+        {"name": "dungeon", "group": "opaque", "inside": [dungeon]},
+    ]
+
+
+def _sorted(parts, cells, which, tile, shade, origin, group, only=None):
+    """The digest of each part of `group` among these faces (see `_parts`)."""
+    world = cells + np.asarray(origin, np.int32)
+    within = lambda boxes: np.any([np.all((world >= box[:3]) & (world < box[3:]), axis=1) for box in np.asarray(boxes)], axis=0)  # noqa: E731
+    out = {}
+    for part in parts:
+        if part["group"] != group or (only is not None and part["name"] not in only):
+            continue
+        pick = np.ones(len(world), bool)
+        if "inside" in part:
+            pick &= within(part["inside"])
+        if "outside" in part:
+            pick &= ~within(part["outside"])
+        out[part["name"]] = export.digest(cells[pick], which[pick], tile[pick], shade[pick], origin)
+    return out
+
+
+def world_grids(S, aspect, report, reference, wide):
+    """The valley as its blocks, for the page to build (once, from the wide frame; the
+    tall frame's dungeon is a patch laid over it), and what building it comes to here:
+    the digests the page's own building is held to (tests/unit/landing/world.test.ts)."""
+    w, b = S["w"], S["b"]
+    closed = voxel.ALL_CLOSED_BUT_FRONT_AND_TOP
+    front = _front(w.z0)
+    suns = {"sun": {"toward": film.SUN_LIGHT, "reach": 520, "floor": VALLEY_FLOOR - w.z0}, "key": {"toward": KEY_SUN, "reach": 160, "floor": VALLEY_FLOOR - w.z0}}
+    parts = _parts()
+    if aspect == "wide":
+        wide["grid"] = w.grid.copy()
+        report["valley"] = export.write_grid(export.OUT / "valley.grid.gz", w.grid, b, w.origin, parts, closed=closed, sky=True, front=[front(z) for z in range(w.grid.shape[2])], **suns)
+        origin, slab = w.front
+        report["slab"] = export.write_model(export.OUT / "slab.grid.gz", slab, b, origin, "Voxel", S["slab"])
+    else:
+        report["dungeon.tall"] = export.write_patch(export.OUT / "dungeon.tall.patch.gz", wide["grid"], w.grid, b, closed)
+    day, lit, solid = export.levels(w.grid, b, sky=True, front=front)
+    mine, shared = {}, hashlib.sha1()
     for group in ("opaque", "leaves", "water"):
-        cells, which, tile = export.faces(w.grid, b, group, voxel.ALL_CLOSED_BUT_FRONT_AND_TOP)
+        cells, which, tile = export.faces(w.grid, b, group, closed)
+        world = cells + np.asarray(w.origin, np.int32)
+        lo, hi = _dungeon_box()
+        apart = np.all((world >= lo) & (world < hi), axis=1)
+        shared.update(np.ascontiguousarray(world[~apart]).tobytes() + which[~apart].tobytes() + tile[~apart].tobytes())
+        if aspect != "wide":
+            # Outside the dungeon the world is the same in both frames (see "same_world"):
+            # only the dungeon is worked out again.
+            cells, which, tile = cells[apart], which[apart], tile[apart]
         if not len(cells):
             continue
         shade = export.light(cells, which, day, lit, solid, sun=film.SUN_LIGHT, key=KEY_SUN, sun_floor=VALLEY_FLOOR - w.z0)
-        world = cells + origin
-        inside = np.all((world >= lo) & (world < hi), axis=1)
-        high = world[:, 2] >= VALLEY_FLOOR
-        name = {"opaque": "terrain", "leaves": "leaves", "water": "water"}[group]
-        for part, pick in (("valley", high & ~inside), ("under", ~high & ~inside), (f"dungeon.{aspect}", inside)):
-            if not pick.any():
-                continue
-            shared = not part.startswith("dungeon")
-            if shared:
-                digest.update(np.ascontiguousarray(world[pick]).tobytes() + which[pick].tobytes() + tile[pick].tobytes())
-            if shared and aspect != "wide":
-                continue  # written once, from the wide frame
-            key = f"{part}.{name}" if shared else f"{part}"
-            report[key] = export.write_records(export.OUT / f"{key}.bin.gz", cells[pick], which[pick], tile[pick], shade[pick], origin)
-    return digest.hexdigest()
+        mine.update(_sorted(parts, cells, which, tile, shade, w.origin, group, only=None if aspect == "wide" else ("dungeon",)))
+    reference[aspect] = {**reference.get("wide", {}), **mine}
+    return shared.hexdigest()
 
 
-def nether_records(S, report):
+def nether_grid(S, report, reference):
     grid, b = S["nether_grid"], S["b"]
+    origin = np.asarray(sets.NETHER["origin"], np.int32) + np.asarray(grid.lo, np.int32)
+    report["nether"] = export.write_grid(export.OUT / "nether.grid.gz", grid.g, b, origin, [{"name": "nether.terrain", "group": "opaque"}], sky=False)
     day, lit, solid = export.levels(grid.g, b, sky=False)
     cells, which, tile = export.faces(grid.g, b, "opaque")
-    shade = export.light(cells, which, day, lit, solid)
-    origin = np.asarray(sets.NETHER["origin"], np.int32) + np.asarray(grid.lo, np.int32)
-    report["nether.terrain"] = export.write_records(export.OUT / "nether.terrain.bin.gz", cells, which, tile, shade, origin)
+    reference["nether"] = {"nether.terrain": export.digest(cells, which, tile, export.light(cells, which, day, lit, solid), origin)}
 
 
 def layout(S, shots, aspect):
@@ -120,13 +160,13 @@ def export_all():
         shutil.rmtree(out)
     out.mkdir(parents=True)
     FIXTURES.mkdir(parents=True, exist_ok=True)
-    report, digests, used = {}, {}, {}
+    report, digests, used, reference, wide = {}, {}, {}, {}, {}
     for aspect in ("wide", "tall"):
         shots = film.stage("visit", aspect)
         S = film.S
-        digests[aspect] = world_records(S, aspect, report)
+        digests[aspect] = world_grids(S, aspect, report, reference, wide)
         if aspect == "wide":
-            nether_records(S, report)
+            nether_grid(S, report, reference)
         objects = [obj for obj in S["scene"].objects if obj.type in ("MESH", "EMPTY") and not export.skipped(obj)]
         report[f"models.{aspect}"] = export.write_glb(out / f"models.{aspect}.glb", objects)
         laid = layout(S, shots, aspect)
@@ -157,11 +197,27 @@ def export_all():
     for key, rel in HUD.items():
         shutil.copyfile(core.TEX / rel, out / "hud" / f"{key}.png")
     scene["hud"] = {key: f"hud/{key}.png" for key in HUD}
-    scene["records"] = report
+    scene["files"] = report
     scene["same_world"] = digests["wide"] == digests["tall"]
+    if not scene["same_world"]:
+        raise RuntimeError("the valley outside the dungeon differs between the frames: the page builds both from one grid")
+    # Everything small the page reads whole (pictures, the slab's cells) goes out as one file.
+    small = [f for f in out.rglob("*") if f.is_file() and (f.suffix == ".png" or f.name == "slab.grid.gz")]
+    report["small"] = export.write_pack(out / "small.pack", out, small)
     (out / "scene.json").write_text(json.dumps(scene, separators=(",", ":")))
-    total = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
-    return {"seconds": round(time.time() - t0, 1), "megabytes": round(total / 1e6, 2), "same_world": scene["same_world"], "files": {k: (v.get("count", v.get("objects")), v["bytes"]) for k, v in report.items()}}
+    (FIXTURES / "world.json").write_text(json.dumps(reference, separators=(",", ":")))
+    files = sorted(f for f in out.rglob("*") if f.is_file())
+    # The bundle's version: the page asks for every file by it, so a browser may keep them for good.
+    version = hashlib.sha256()
+    for f in files:
+        version.update(f.relative_to(out).as_posix().encode() + b"\0" + f.read_bytes())
+    VERSION.write_text(
+        "// Written by art/landing/scripts/export_web.py with the bundle: do not edit.\n"
+        "// A digest of every file under public/landing, which the page asks for them by.\n"
+        f'export const BUNDLE = "{version.hexdigest()[:16]}";\n'
+    )
+    total = sum(f.stat().st_size for f in files)
+    return {"seconds": round(time.time() - t0, 1), "megabytes": round(total / 1e6, 2), "version": version.hexdigest()[:16], "files": {k: (v.get("cells", v.get("objects", v.get("files"))), v["bytes"]) for k, v in report.items()}}
 
 
 if __name__ == "__main__":

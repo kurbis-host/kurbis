@@ -33,7 +33,7 @@ The page is one continuous take from the sky to the Nether, about six screens of
 - `boxmodel.py`: box-UV models: players (rigid parts with elbow and knee pivots), held items, torch, lantern, chest, cart, lever, sign, rails, fish, plant sprites.
 - `scenery.py`: clouds, drifting leaves, rain, ripple rings, the snapshot block, the scrim behind type.
 - `look.py`: sky, lights, haze, camera, full-frame covers, compositor (bloom, vignette, lens wobble), render settings.
-- `export.py`: what the browser gets: block faces as compact records with baked light, small models as a glb, and what the toolkit noted about each thing (`core.note`).
+- `export.py`: what the browser gets: the worlds as grids of blocks, small models as a glb, and what the toolkit noted about each thing (`core.note`). It also holds the meshing and light baking the page repeats (`faces`, `levels`, `light`): the reference the page's own is tested against.
 
 ## Two clocks
 
@@ -93,20 +93,45 @@ The page plays this film in the browser. From here on the page's own code is the
 
 ```bash
 B=/Applications/Blender.app/Contents/MacOS/Blender
-$B -b --factory-startup -P scripts/export_web.py    # about half a minute
+$B -b --factory-startup -P scripts/export_web.py    # about 20 seconds
 ```
 
 This stages the `visit` session in both frames (nothing is baked) and writes:
 
 | Where | What |
 | --- | --- |
-| `web/public/landing/*.bin.gz` | Block faces of the valley, what lies under it, the dungeon (one per frame) and the Nether: 28 bytes a face, with daylight, block glow and two suns' shadows baked per corner. Sorted into 32-block cubes so the browser can cull them. Packed with gzip (a tenth the size), which the page undoes itself: the server compresses what it sends as text, not bytes like these |
-| `web/public/landing/models.<frame>.glb` | Everything small, with names and parents, without pictures: the page gives each material its texture by the material's name |
+| `web/public/landing/valley.grid.gz`, `nether.grid.gz` | The worlds as grids of blocks, one byte a cell: the valley with what lies under it and the dungeon (6.7 million cells in 97 KB), and the Nether (1.1 million in 39 KB). See "What the page builds itself" |
+| `web/public/landing/dungeon.tall.patch.gz` | The tall frame's dungeon, as the box of cells in which its world differs from the wide frame's: laid into the valley's grid before it is built |
+| `web/public/landing/small.pack` | Every small file as one: the pictures from the pack (`tex/`, `hud/`, the two atlases) and the slab's blocks (`slab.grid.gz`; the page meshes its pieces itself) |
+| `web/public/landing/models.<frame>.glb` | Everything else small, with names and parents, without pictures: the page gives each material its texture by the material's name |
 | `web/public/landing/scene.json`, `layout.<frame>.json` | The sky, palettes, glyphs and the film's constants; and per frame the camera's shots, the type (as text and place: the page builds the letters), lamps, haze boxes and places the sets worked out |
-| `web/public/landing/tex/`, `hud/`, `atlas_*.png` | Pictures from the pack |
+| `web/lib/landing/engine/version.ts` | The bundle's version: a hash over all of its files. The page asks for every file by it (`?v=...`), and `next.config.ts` lets a browser keep what is asked for that way for good |
 | `web/tests/unit/landing/fixtures/reference.<frame>.json` | The camera and the pumpkin sampled every 0.02 screens, and what the type says. Numbers and our own copy only, so it is committed: `parity.test.ts` holds the page's timeline to it, `copy.test.ts` the page's text |
+| `web/tests/unit/landing/fixtures/world.json` | A digest of every part of the world as built here: its faces and every byte of their light. `world.test.ts` holds the page's building to it |
 
 `web/public/landing/` is committed, so the page plays wherever it is deployed. It is made from the pack: see "Rules". Where the bundle is missing or cannot load, the page is its own HTML: the same copy in reading order, a real lever button and a real name field (`web/components/landing/mirror.tsx`). That is also what a browser without WebGL2 gets, and what screen readers and search engines read while the film plays.
+
+### What the page builds itself
+
+The page draws the world as block faces: 28 bytes each (where, which side, which tile, and for each corner daylight, block glow and two suns' shadows), sorted into 32-block cubes to cull by. There are 270,000 of them in the valley's grid alone. They used to be exported ready-made, 1.5 MB packed; now the page gets the blocks and works the faces out, which is 0.14 MB. With the small files as one pack, the film's data went from 1.85 MB in 58 requests to 0.31 MB in 6.
+
+`web/lib/landing/world/` does there what `faces`, `levels` and `light` in `kurbis/export.py` do here, and comes to the same bytes (the arithmetic is rounded to 32-bit floats at every step, as numpy's is). Change one and the other must follow: `world.test.ts` says when they have parted. Blocks nobody can ever see are written as one kind (`export.uniform`), which halves the packed grid and changes no face.
+
+Building the valley is about 0.6 s of work on a fast laptop, two thirds of it the suns' rays. It is done in workers (`world/worker.ts`): one builds, and up to three more flood the grid with light and share the rays, which brings it to a quarter of a second. Everything is asked for the moment the page is up (`engine/early.ts`), so the world is being built while the renderer's code is still on its way.
+
+Measured on production builds, old bundle against new: from the navigation to the film's first frame, on a first visit and on a repeat visit.
+
+| Connection | Faces sent | Blocks sent |
+| --- | --- | --- |
+| This machine, no limit | 0.56 s, then 0.48 s | 0.49 s, then 0.44 s |
+| 9 Mbit/s, 60 ms | 2.7 s, then 1.2 s | 1.1 s, then 0.47 s |
+| 1.6 Mbit/s, 150 ms | 11.7 s, then 2.3 s | 4.4 s, then 0.55 s |
+
+`node art/landing/scripts/measure_loading.mjs <origin>...` measures this, and the page marks how its own loading went (`performance.getEntriesByType("mark")`, the names beginning `landing:`).
+
+The price is the work, which a slow device pays in full: the same build took 2.3 s on this machine's efficiency cores at background priority. If that is too much for the phones the page meets, the suns' shadows are the part to send ready-made again: 0.12 MB more to fetch, two thirds less to work out.
+
+The grids are gzip files that the page unpacks itself (`DecompressionStream`), because a server compresses what it sends as text and not bytes like these. A browser without that gets the page as its HTML.
 
 To look at the page beside the previs, with `pnpm dev` running in `web/`:
 

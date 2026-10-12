@@ -2,18 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Aspect } from "../../lib/landing/engine/bundle";
+import { aspectNow } from "../../lib/landing/engine/early";
 import type { Film } from "../../lib/landing/film/film";
 
-function aspectOf(): Aspect {
-  return window.innerWidth < window.innerHeight ? "tall" : "wide";
-}
-
 /** A pickaxe for the pointer, from the film's own picture of one: a data URL, or null without it. */
-async function pickaxe(): Promise<string | null> {
+async function pickaxe(source: Blob | null): Promise<string | null> {
   try {
-    const response = await fetch("/landing/tex/item_iron_pickaxe.png");
-    if (!response.ok) return null;
-    const picture = await createImageBitmap(await response.blob());
+    if (!source) return null;
+    const picture = await createImageBitmap(source);
     const canvas = document.createElement("canvas");
     canvas.width = 32;
     canvas.height = 32;
@@ -34,7 +30,7 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
   const [aspect, setAspect] = useState<Aspect | null>(null);
 
   useEffect(() => {
-    const pick = () => setAspect(aspectOf());
+    const pick = () => setAspect(aspectNow());
     pick();
     window.addEventListener("resize", pick);
     return () => window.removeEventListener("resize", pick);
@@ -60,7 +56,9 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
     onState?.("loading");
     (async () => {
       const [{ loadStage }, { Film }] = await Promise.all([import("../../lib/landing/engine/stage"), import("../../lib/landing/film/film")]);
+      performance.mark("landing:renderer");
       const stage = await loadStage(aspect);
+      performance.mark("landing:staged");
       if (cancelled) {
         stage.dispose();
         return;
@@ -82,7 +80,7 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
         film.setScroll(to, true);
       };
       // The pointer: a hand over what can be touched, a pickaxe over what can be dug up.
-      const pick = await pickaxe();
+      const pick = await pickaxe(stage.pack.has("tex/item_iron_pickaxe.png") ? stage.pack.picture("tex/item_iron_pickaxe.png") : null);
       film.onCursor = (cursor) => {
         document.documentElement.style.cursor = cursor === "pick" && pick ? `url(${pick}) 25 6, pointer` : cursor === "" ? "" : "pointer";
       };
@@ -112,6 +110,7 @@ export default function FilmCanvas({ onState, onFilm }: { onState?: (state: "loa
       window.addEventListener("resize", onResize);
       document.addEventListener("visibilitychange", onVisible);
       film.start();
+      performance.mark("landing:playing");
       onState?.("playing");
       onFilm?.(film);
       if (process.env.NODE_ENV !== "production") (window as unknown as { kurbisFilm?: unknown }).kurbisFilm = film;

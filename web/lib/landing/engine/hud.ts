@@ -225,12 +225,10 @@ export class Hud {
   }
 }
 
-/** A picture for the interface, as it comes (pixel art: never smoothed). */
-export async function loadIcon(path: string): Promise<ImageBitmap | null> {
+/** A picture for the interface, as it comes (pixel art: never smoothed). The interface does without one that will not decode. */
+export async function loadIcon(picture: Blob): Promise<ImageBitmap | null> {
   try {
-    const response = await fetch(path);
-    if (!response.ok) return null;
-    return await createImageBitmap(await response.blob());
+    return await createImageBitmap(picture);
   } catch {
     return null;
   }

@@ -28,7 +28,17 @@ const nextConfig: NextConfig = {
 	poweredByHeader: false,
 	reactStrictMode: true,
 	async headers() {
-		return [{ source: "/:path*", headers: securityHeaders }];
+		return [
+			{ source: "/:path*", headers: securityHeaders },
+			// The landing film's bundle. The page asks for each of its files by the bundle's
+			// version (lib/landing/engine/address.ts), so what an address names never changes
+			// and a browser may keep it for good. Without a version it is revalidated as ever.
+			{
+				source: "/landing/:path*",
+				has: [{ type: "query", key: "v" }],
+				headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+			},
+		];
 	},
 	allowedDevOrigins: ["127.0.0.1", "localhost"],
 };

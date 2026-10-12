@@ -1,8 +1,8 @@
 /**
- * The big voxel meshes. A file of records is drawn as it comes: one instanced quad per
- * block face, the vertex shader placing its four corners from the face's cell and
- * direction. Faces are grouped by cube of the world, one mesh a cube, so the frustum
- * culls them.
+ * The big voxel meshes. The records the page builds from a grid of blocks (../world)
+ * are drawn as they come: one instanced quad per block face, the vertex shader placing
+ * its four corners from the face's cell and direction. Faces are grouped by cube of the
+ * world, one mesh a cube, so the frustum culls them.
  */
 
 import {
