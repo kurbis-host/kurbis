@@ -1,4 +1,7 @@
-"""Gate 0: look-dev stills for the landing v2 short.
+"""Gate 0: look-dev stills for the landing v2 short (superseded by film.py).
+
+Uses the stills world (`kurbis/world_stills.py`), where the rooms are stacked in
+one column. The film uses `kurbis/world.py`, laid out for the camera.
 
 Run inside Blender (Blender MCP, or `blender -b -P gate0.py`). `build()` makes
 the whole scene from scratch; `render(shot)` writes a still to ../renders.
@@ -21,7 +24,7 @@ from mathutils import Matrix, Vector  # noqa: E402
 
 from kurbis import blocks as blk  # noqa: E402
 from kurbis import boxmodel, core, font, look, mascot, scenery, voxel  # noqa: E402
-from kurbis import world as wld  # noqa: E402
+from kurbis import world_stills as wld  # noqa: E402
 
 # The sun sits on the horizon straight down the valley. The lamp is a little
 # higher than the disc so the forest keeps some direct light (a standard cheat).

@@ -7,6 +7,7 @@ defensively and anything unavailable is reported instead of raising.
 import math
 
 import bpy
+import numpy as np
 from mathutils import Vector
 
 from . import core
@@ -131,6 +132,7 @@ def sky(scene, sun_dir, stops, glow, glow_power=10.0, glow_gain=1.0, disc=6.0, d
     nt.links.new(color, bg.inputs["Color"])
     nt.links.new(bg.outputs[0], out.inputs["Surface"])
     scene.world = world
+    core.note(world, kind="sky", sun=list(Vector(sun_dir).normalized()), stops=[[e, list(c)] for e, c in stops], glow=list(glow), glow_power=glow_power, glow_gain=glow_gain, disc=disc, disc_power=disc_power, stars=stars, strength=strength)
     return world
 
 
@@ -213,6 +215,7 @@ def fog(name, lo, hi, density, color=(1.0, 0.86, 0.72), anisotropy=0.55, fade=No
     nt.links.new(scatter.outputs[0], out.inputs["Volume"])
     obj.data.materials.append(mat)
     obj.display_type = "WIRE"
+    core.note(obj, kind="fog", lo=list(lo), hi=list(hi), density=density, color=list(color), anisotropy=anisotropy, fade=list(fade) if fade is not None else None)
     return obj
 
 
@@ -230,8 +233,53 @@ def camera(name, location, target, lens=35.0, fstop=None, focus=None, col="Camer
     return obj
 
 
-def compositor(scene, bloom=0.5, threshold=1.0, size=0.55, vignette=0.0, saturation=1.0, contrast=0.0):
-    """Bloom, grade and vignette (Blender 5.x: node group on the scene, menu sockets)."""
+def overlay(name, cam, rgb=(1.0, 1.0, 1.0), image_rel=None, tiles=(4, 3), strength=1.0, dist=0.15, col="FX"):
+    """A full-frame card fixed in front of the camera, for covers that fill the
+    frame (cloud white-out, portal swirl). Its opacity is the object's colour alpha,
+    so it animates as a plain object property."""
+    half_w, half_h = dist * 2.4, dist * 1.5
+    tx, ty = tiles
+    quads, uvs = [], []
+    for i in range(tx):
+        for k in range(ty):
+            x0, x1 = -half_w + 2 * half_w * i / tx, -half_w + 2 * half_w * (i + 1) / tx
+            y0, y1 = -half_h + 2 * half_h * k / ty, -half_h + 2 * half_h * (k + 1) / ty
+            quads.append([(x0, y0, 0), (x1, y0, 0), (x1, y1, 0), (x0, y1, 0)])
+            uvs.append([(0, 31 / 32), (1, 31 / 32), (1, 1), (0, 1)] if image_rel else [(0, 0)] * 4)
+    obj = bpy.data.objects.new(name, core.mesh_from_quads(name, np.asarray(quads, np.float32), np.asarray(uvs, np.float32)))
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Color"].default_value = (*rgb, 1.0)
+    emit.inputs["Strength"].default_value = strength
+    if image_rel:
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = bpy.data.images.load(str(core.TEX / image_rel), check_existing=True)
+        tex.interpolation = "Closest"
+        nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
+    clear = nt.nodes.new("ShaderNodeBsdfTransparent")
+    info = nt.nodes.new("ShaderNodeObjectInfo")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    nt.links.new(info.outputs["Alpha"], mix.inputs[0])
+    nt.links.new(clear.outputs[0], mix.inputs[1])
+    nt.links.new(emit.outputs[0], mix.inputs[2])
+    nt.links.new(mix.outputs[0], out.inputs["Surface"])
+    mat.surface_render_method = "BLENDED"
+    obj.data.materials.append(mat)
+    core.link(obj, col)
+    obj.parent = cam
+    obj.location = (0, 0, -dist)
+    obj.color = (1.0, 1.0, 1.0, 0.0)
+    obj.visible_shadow = False
+    return obj
+
+
+def compositor(scene, bloom=0.5, threshold=1.0, size=0.55, vignette=0.0, saturation=1.0, contrast=0.0, wobble=False):
+    """Bloom, grade and vignette (Blender 5.x: node group on the scene, menu sockets).
+    `wobble` adds a lens-distortion node named "Wobble" whose inputs can be animated."""
     done = []
     try:
         ng = bpy.data.node_groups.new("KurbisComposite", "CompositorNodeTree")
@@ -249,6 +297,18 @@ def compositor(scene, bloom=0.5, threshold=1.0, size=0.55, vignette=0.0, saturat
         done.append("bloom")
     except Exception as exc:
         return f"compositor unavailable ({type(exc).__name__}: {exc})"
+    try:
+        if wobble:
+            lens = ng.nodes.new("CompositorNodeLensdist")
+            lens.name = "Wobble"
+            lens.inputs["Distortion"].default_value = 0.0
+            lens.inputs["Dispersion"].default_value = 0.0
+            lens.inputs["Fit"].default_value = True  # no black corners while it bends
+            ng.links.new(image, lens.inputs["Image"])
+            image = lens.outputs["Image"]
+            done.append("wobble")
+    except Exception as exc:
+        done.append(f"wobble failed ({exc})")
     try:
         if saturation != 1.0:
             hsv = ng.nodes.new("CompositorNodeHueSat")

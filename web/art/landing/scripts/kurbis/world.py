@@ -1,27 +1,53 @@
-"""The landing world: a hilly autumn surface cut open at y = 0 to show what is below.
+"""The film world: an autumn valley cut open at y = 0, laid out for the camera.
 
-Grid axes are (x, y, z) with z up and y running away from the viewer, so the
-cross-section the page scrolls down is the y = 0 face. Deterministic.
+Grid axes are (x, y, z) with z up and y running away from the viewer. The cut
+face (y = 0) carries the short tunnel the pumpkin digs: down, a jog, and down
+through the roof of a cave that the cut face opens too. From the back of the
+cave a cart track runs through the rock into a closed dungeon. A slab of ground
+in front of the cut face hides the cut until it breaks away.
+The Nether is a separate set (see sets.py). Deterministic.
 """
 
 import numpy as np
 
 SPOTS = {
-    "landing": (-2.0, 1.0, 1.0),  # where the pumpkin lands, top of the shaft
-    "shaft": {"x": (-3, -2), "y": (0, 1), "bottom": -17},  # two wide, so the one-block pumpkin can tumble
-    "cave": {"center": (3.0, 0.0, -21.5), "radius": (13.0, 12.0, 6.0), "floor": -25},
+    "landing": (-0.9, 2.2),  # where the pumpkin lands
     # Cut open by the y = 0 face, so the cross-section shows water over a sand basin.
     "pond": {"center": (-8.5, 0.8), "radius": (3.6, 3.3)},
-    "blossom": (6, 7),  # the flowering tree, on its one-block mound
-    "chest": (3, -8),  # a niche in the cut face with a buried chest
-    # Two more rooms on the way down, each reached by the shaft continuing.
-    "vault": {"x": (-9, 10), "y": (0, 8), "floor": -44, "top": -39, "shaft": (1, 2)},
-    "nether": {"x": (-8, 9), "y": (0, 9), "floor": -60, "top": -50, "shaft": (0, 1), "portal": (3, 5)},
+    "blossom": (6, 7),  # the flowering tree
     "blossom_trunk": 4,
+    "chest": (11, -9),  # a niche in the cut face with a buried chest
+    "fossil": ((7, -7), (8, -7), (9, -7), (9, -6), (7, -8)),  # bone showing in the cut face: (x, z)
+    # Corners of the dig on the cut face, as (x, z) of the pumpkin's bottom centre: down, a
+    # jog, and down through the roof of the cave. Two blocks wide and two high, so the
+    # one-block pumpkin can tumble.
+    "tunnel": ((-1, 1), (-1, -5), (-5, -5), (-5, -24)),
+    # Cut open by the y = 0 face as well: the camera looks in from the front.
+    "cave": {"center": (3.0, 0.0, -21.5), "radius": (13.0, 12.0, 6.0), "floor": -25},
+    # The cart track from the cave to the dungeon: corners of the rail's centre line. It
+    # runs north out of the cave, turns east, drops five blocks and runs in through the door.
+    "rail": ((0.5, 6.5, -25.0), (0.5, 17.5, -25.0), (4.0, 17.5, -25.0), (9.0, 17.5, -30.0), (16.5, 17.5, -30.0)),
+    # The dungeon's interior cells and its floor. Everything to look at is on the east
+    # wall, in two chambers: the ores to the south, where the track comes in, and the
+    # portal frame to the north. A wall parts them, open at its west end.
+    "dungeon": {"x": (12, 22), "y": (11, 34), "floor": -30, "height": 7, "ores": (24, 21, 18, 15, 12), "parting": (27, 17), "portal": (29, 30)},
+    # Ground in front of the cut face. It makes the meadow whole until the slice.
+    "front": {"x": (-30, 30), "depth": 14, "bottom": -11},
 }
 
 
-DETAIL_DEPTH = 30
+DETAIL_DEPTH = 40
+
+
+def tunnel_steps():
+    """Unit steps of the pumpkin's bottom centre along the cut face: [(x, z), ...]."""
+    corners = SPOTS["tunnel"]
+    steps = [corners[0]]
+    for (x0, z0), (x1, z1) in zip(corners, corners[1:]):
+        n = abs(x1 - x0) + abs(z1 - z0)
+        sx, sz = (x1 > x0) - (x1 < x0), (z1 > z0) - (z1 < z0)
+        steps += [(x0 + sx * i, z0 + sz * i) for i in range(1, n + 1)]
+    return steps
 
 
 def _hash(ix, iy, iz, seed):
@@ -60,14 +86,20 @@ def fbm2(x, y, scale, seed):
 
 
 class World:
-    def __init__(self, blocks, x0=-128, x1=128, depth=224, z0=-68, z1=72):
+    def __init__(self, blocks, x0=-128, x1=128, depth=224, z0=-44, z1=72, flat=(), dungeon=None):
+        """`flat` lists (x0, x1, z0, z1) rectangles of the cut face kept free of relief,
+        so type embossed there has a flat wall behind it. `dungeon` replaces entries of
+        SPOTS["dungeon"]: a frame of another shape wants its ore wall laid out otherwise."""
         self.b = blocks
+        self.flat = tuple(flat)
+        self.dungeon = {**SPOTS["dungeon"], **(dungeon or {})}
         self.x0, self.x1, self.depth, self.z0, self.z1 = x0, x1, depth, z0, z1
         self.shape = (x1 - x0, depth, z1 - z0)
         self.grid = np.zeros(self.shape, np.uint8)
         self.height = np.zeros(self.shape[:2], int)
         self.sprites = {"grass": [], "vines": [], "cane": [], "lily": [], "petals": [], "flowers": []}
-        self.plugs = {}  # shaft name -> (origin, blocks it will dig out): shown until that dig happens
+        self.tunnel = []  # per dig step: where the pumpkin is, and the blocks that step removes
+        self.front = None  # (origin, grid) of the slab in front of the cut face
         self.rng = np.random.default_rng(7)
 
     @property
@@ -100,25 +132,6 @@ class World:
 
     def top(self, x, y):
         return int(self.height[x - self.x0, y])
-
-    def restore_front(self, xs, zs):
-        """Undo the cut-face relief in a rectangle, so type has a flat wall behind it.
-        Only refills air, so the shaft, caves, niches and the pond stay as they are."""
-        x0, x1 = int(np.floor(xs[0])) - self.x0, int(np.ceil(xs[1])) - self.x0
-        z0, z1 = int(np.floor(zs[0])) - self.z0, int(np.ceil(zs[1])) - self.z0
-        now, before = self.grid[x0:x1, :2, z0:z1], self.front_before[x0:x1, :, z0:z1]
-        keep = np.zeros(now.shape, bool)
-        (sx0, sx1), (sy0, sy1) = SPOTS["shaft"]["x"], SPOTS["shaft"]["y"]
-        cx, cz = SPOTS["chest"]
-        keeps = [((sx0, sx1), (self.z0, self.z1)), ((cx, cx + 1), (cz, cz))]
-        keeps += [(SPOTS[k]["shaft"], (self.z0, self.z1)) for k in ("vault", "nether")]
-        for (ax0, ax1), (az0, az1) in keeps:
-            a0, a1 = max(ax0 - self.x0, x0) - x0, min(ax1 - self.x0 + 1, x1) - x0
-            b0, b1 = max(az0 - self.z0, z0) - z0, min(az1 - self.z0 + 1, z1) - z0
-            if a0 < a1 and b0 < b1:
-                keep[a0:a1, :, b0:b1] = True
-        fill = (now == 0) & (before != 0) & ~keep
-        now[fill] = before[fill]
 
     # -- generation --------------------------------------------------------
     def generate(self):
@@ -204,20 +217,27 @@ class World:
         gs[solid_s & (Z <= self.z0 + 1 + (noise2(Xn, Yn, 2, 8)[:, :, None] > 0.5))] = b["bedrock"]
 
         self._carve_cave(X3[:, :n], Ys, Z)
+        self._dungeon()
+        self._rail()
 
         # Relief on the cut face: knock out patches of the front one or two
         # layers so a raking light finds edges instead of a flat wall.
-        self._vault()
-        self._nether()
         self.front_before = g[:, :2, :].copy()
         XZ, ZX = X, Z[0]
         relief = noise2(XZ, ZX, 6, 71) * 0.7 + noise2(XZ, ZX, 2.5, 72) * 0.3
         under = ZX < h[:, :1]
-        g[:, 0, :][(relief > 0.61) & under] = 0
-        g[:, 1, :][(relief > 0.76) & under] = 0
+        keep = np.zeros(relief.shape, bool)
+        for xa, xb, za, zb in self.flat:
+            keep[int(np.floor(xa)) - self.x0 : int(np.ceil(xb)) - self.x0, int(np.floor(za)) - self.z0 : int(np.ceil(zb)) - self.z0] = True
+        g[:, 0, :][(relief > 0.61) & under & ~keep] = 0
+        g[:, 1, :][(relief > 0.76) & under & ~keep] = 0
         cx, cz = SPOTS["chest"]
         self.box((cx, cx + 1), (0, 0), (cz, cz), 0)
+        for x, z in SPOTS["fossil"]:
+            self.set(x, 0, z, "bone")
+        self._tunnel()
         self._pond()
+        self._front_slab()
         self._trees()
         self._blossom()
         self._pumpkins()
@@ -225,23 +245,20 @@ class World:
         return self
 
     def _carve_cave(self, X3, Y3, Z):
+        """A full cavern well behind the cut face, so the camera can fly inside it."""
         b, g = self.b, self.grid[:, : Y3.shape[1]]
         (cx, cy, cz), (rx, ry, rz) = SPOTS["cave"]["center"], SPOTS["cave"]["radius"]
+        cy = int(cy)
         floor = SPOTS["cave"]["floor"]
         wobble = (noise3(X3, Y3, Z, 4, 9) - 0.5) * 0.5
         e = ((X3 - cx) / rx) ** 2 + ((Y3 - cy) / ry) ** 2 + ((Z - cz) / rz) ** 2
         cave = (e < 1 + wobble) & (Z >= floor)
         g[cave] = 0
 
-        # The shaft the pumpkin digs: open on the cut face so the fall is visible.
-        shaft = SPOTS["shaft"]
-        (sx0, sx1), (sy0, sy1) = shaft["x"], shaft["y"]
-        self._dig("shaft", (sx0, sx1), (sy0, sy1), (shaft["bottom"], 2))
-
         # Lush corner on the right: moss on the floor and ceiling, a pool, vines.
         mossy = noise2(X3[:, :, 0], Y3[:, :, 0], 5, 41) > 0.42
         for x in range(int(cx - rx) - 1, int(cx + rx) + 2):
-            for y in range(0, int(ry) + 2):
+            for y in range(int(cy - ry) - 1, int(cy + ry) + 2):
                 if not self.inside(x, y, floor):
                     continue
                 lush = x > 4 and mossy[x - self.x0, y]
@@ -252,93 +269,130 @@ class World:
                     if self.get(x, y, z) and self.get(x, y, z - 1) == 0:
                         if lush:
                             self.set(x, y, z, "moss")
-                            if _hash(np.int64(x), np.int64(y), np.int64(0), 43) < 0.2 and y > 0 and x > 8:
+                            if _hash(np.int64(x), np.int64(y), np.int64(0), 43) < 0.2 and x > 8:
                                 self.sprites["vines"].append((x, y, z - 1, 1 + int(_hash(np.int64(x), np.int64(y), np.int64(1), 44) * 3)))
                         break
         for x in range(9, 14):
-            for y in range(2, 7):
-                if self.get(x, y, floor) == 0 and (x - 11) ** 2 / 6.5 + (y - 4) ** 2 / 6.5 < 1:
+            for y in range(cy + 2, cy + 7):
+                if self.get(x, y, floor) == 0 and (x - 11) ** 2 / 6.5 + (y - cy - 4) ** 2 / 6.5 < 1:
                     self.set(x, y, floor - 1, "water")
 
-        self._ore_patch((-8, 3, floor + 1), 2.4, "diamond_ore")
-        self._ore_patch((-9, 1, -20), 2.2, "redstone_ore")
-        self._ore_patch((2, 11, -19), 2.6, "gold_ore")
-        self._ore_patch((15, 3, -21), 2.2, "lapis_ore")
-        self._ore_patch((-5, 9, -17), 2.0, "iron_ore")
+        self._ore_patch((-8, cy + 3, floor + 1), 2.4, "diamond_ore")
+        self._ore_patch((-9, cy + 1, -20), 2.2, "redstone_ore")
+        self._ore_patch((2, cy + 11, -19), 2.6, "gold_ore")
+        self._ore_patch((15, cy + 3, -21), 2.2, "lapis_ore")
+        self._ore_patch((-5, cy + 9, -17), 2.0, "iron_ore")
+        self._ore_patch((6, cy - 9, -20), 2.4, "gold_ore")
+        self._ore_patch((-6, cy - 8, -22), 2.2, "redstone_ore")
 
-        # A low outcrop of diamond ore near the front: something to mine, and a stack of
+        # A low outcrop of diamond ore near the cast: something to mine, and a stack of
         # single blocks right beside a two-block player.
         for x, y, tall in ((-5, 4, 3), (-4, 4, 2), (-5, 5, 2), (-4, 5, 1), (-5, 6, 1), (-6, 5, 2)):
-            self.box((x, x), (y, y), (floor, floor + tall - 1), "stone")
+            self.box((x, x), (cy + y, cy + y), (floor, floor + tall - 1), "stone")
         for x, y, dz in ((-4, 4, 1), (-5, 4, 2), (-4, 5, 0), (-5, 5, 1), (-4, 4, 0)):
-            self.set(x, y, floor + dz, "diamond_ore")
+            self.set(x, cy + y, floor + dz, "diamond_ore")
 
         # A small base camp against the back wall: somebody lives here.
-        # The crafting table and barrel near the front are one-block scale cues beside the cast.
-        camp = ((-3, 8, 0, "furnace"), (-2, 8, 0, "crafting_table"), (1, 9, 0, "bookshelf"), (1, 9, 1, "bookshelf"), (2, 9, 0, "barrel"), (5, 4, 0, "crafting_table"), (6, 4, 0, "furnace"), (-7, 4, 0, "barrel"))
+        # The crafting table and barrel near the cast are one-block scale cues.
+        # The middle of the back wall stays free: that is where the cart track leaves.
+        camp = ((-4, 8, 0, "furnace"), (-3, 8, 0, "crafting_table"), (3, 9, 0, "bookshelf"), (3, 9, 1, "bookshelf"), (4, 9, 0, "barrel"), (6, 5, 0, "crafting_table"), (7, 5, 0, "furnace"), (-7, 4, 0, "barrel"))
         for x, y, dz, name in camp:
             z = floor
-            while self.get(x, y, z) and z < floor + 4:
+            while self.get(x, cy + y, z) and z < floor + 4:
                 z += 1
-            if self.get(x, y, z) == 0:  # only where the cave really is: never climb out to the surface
-                self.set(x, y, z + dz, name)
+            if self.get(x, cy + y, z) == 0:  # only where the cave really is
+                self.set(x, cy + y, z + dz, name)
 
-    def _dig(self, name, xs, ys, zs):
-        """Carve a shaft, keeping what was there as a plug for the scenes before the dig."""
-        view = self.grid[xs[0] - self.x0 : xs[1] - self.x0 + 1, ys[0] : ys[1] + 1, zs[0] - self.z0 : zs[1] - self.z0 + 1]
-        self.plugs[name] = ((xs[0], ys[0], zs[0]), view.copy())
-        view[...] = 0
+    def _tunnel(self):
+        """Carve the pumpkin's tunnel step by step, remembering what each step removes
+        so those blocks can be shown until the pumpkin digs them."""
 
-    def _room(self, name, spec, wall, carve_to):
-        """A walled room open to the cut face, plus the shaft down into it."""
-        (x0, x1), (y0, y1), floor, top = spec["x"], spec["y"], spec["floor"], spec["top"]
-        for x in range(x0 - 1, x1 + 2):
-            for y in range(0, y1 + 2):
-                for z in range(floor - 1, top + 2):
-                    inside = x0 <= x <= x1 and y <= y1 and floor <= z <= top
-                    self.set(x, y, z, 0 if inside else wall(x, y, z))
-        self._dig(name, spec["shaft"], (0, 1), (top + 1, carve_to))
+        def carve(cells, at):
+            got = []
+            for x, y, z in cells:
+                block = self.get(x, y, z)
+                if block:
+                    got.append((x, y, z, block))
+                    self.set(x, y, z, 0)
+            self.tunnel.append({"at": at, "cells": got})
 
-    def _vault(self):
-        """The treasure room: a mossy cobblestone dungeon, as in the reference cross-section."""
-        v = SPOTS["vault"]
+        for x, z in tunnel_steps():
+            carve([(cx, y, cz) for cx in (x - 1, x) for y in (0, 1) for cz in (z, z + 1)], (float(x), 1.0, float(z)))
 
-        def wall(x, y, z):
-            return "mossy_cobblestone" if _hash(np.int64(x), np.int64(y), np.int64(z), 301) < 0.42 else "cobblestone"
+    def _dungeon(self):
+        """A cobblestone room, part moss, closed all round but for the door the track
+        comes in by. Five kinds of ore stand out from the east wall, an obsidian frame
+        is set in it further north, and a patch of bedrock shows through the floor.
+        Each ore is two blocks square: `ores` gives its south edge and, if it does not
+        stand in the usual row, how far above the floor (y, up). `ledge` is a shelf of
+        planks the same width, for a chest to stand on among them."""
+        d = self.dungeon
+        (x0, x1), (y0, y1), floor, height = d["x"], d["y"], d["floor"], d["height"]
+        top = floor + height - 1
+        lo, hi = (x0 - 1, y0 - 1, floor - 2), (x1 + 3, y1 + 2, top + 2)  # thin toward the cave, so it never shows there
+        self.box((lo[0], hi[0]), (lo[1], hi[1]), (lo[2], hi[2]), "cobblestone")
+        self.box((x0, x1), (y0, y1), (floor, top), 0)
+        row, end = d["parting"]
+        self.box((end, x1), (row, row), (floor, top), "cobblestone")
+        self.box((x0, x1), (row, row), (top, top), "cobblestone")  # and a beam over the opening
+        shell = self.grid[lo[0] - self.x0 : hi[0] + 1 - self.x0, lo[1] : hi[1] + 1, lo[2] - self.z0 : hi[2] + 1 - self.z0]
+        X, Y, Z = np.meshgrid(*(np.arange(n, dtype=np.float64) for n in shell.shape), indexing="ij")
+        patchy = noise3(X, Y, Z, 3.5, 602)
+        shell[(shell == self.b["cobblestone"]) & (_hash(X, Y, Z, 601) < 0.16 + 0.6 * (patchy > 0.56))] = self.b["mossy_cobblestone"]
+        ores = ("redstone_ore", "coal_ore", "gold_ore", "lapis_ore", "copper_ore")  # read left to right, facing east
+        for at, ore in zip(d["ores"], ores):
+            y, up = at if isinstance(at, tuple) else (at, 3)
+            self.box((x1, x1), (y, y + 1), (floor + up, floor + up + 1), ore)
+        if d.get("ledge"):
+            y, up = d["ledge"]
+            self.box((x1, x1), (y, y + 1), (floor + up, floor + up), "planks")
+        p0, p1 = d["portal"]
+        self.box((x1 + 1, x1 + 1), (p0 - 1, p1 + 1), (floor - 1, floor + 3), "obsidian")
+        self.box((x1 + 1, x1 + 1), (p0, p1), (floor, floor + 2), 0)  # the wall shows through it until it lights
+        self.set(x1 + 1, p0 - 1, floor + 3, "crying_obsidian")
+        self.set(x1 + 1, p1 + 1, floor + 1, "crying_obsidian")
+        self.box((x0 + 1, x0 + 2), (y0 + 1, y0 + 2), (floor - 1, floor - 1), "bedrock")
 
-        self._room("vault", v, wall, SPOTS["cave"]["floor"] - 1)
-        (x0, x1), (y0, y1), top = v["x"], v["y"], v["top"]
-        for x in range(x0 + 2, x1, 5):  # warm lamps set into the ceiling
-            for y in (2, 6):
-                self.set(x, y, top + 1, "froglight")
+    def _rail(self):
+        """The cart tunnel: three wide and three high along the track, a block taller on
+        the slope, with pit props set into the walls."""
+        (rx, ry, rz), (_, turn_y, _), (slope_x, _, _), (foot_x, _, low), _ = SPOTS["rail"]
+        cx, cy, floor, low = int(np.floor(rx)), int(np.floor(turn_y)), int(rz), int(low)
+        slope_x, foot_x = int(slope_x), int(foot_x)
+        door = SPOTS["dungeon"]["x"][0] - 1
+        self.box((cx - 1, cx + 1), (int(np.floor(ry)), cy + 1), (floor, floor + 2), 0)  # north out of the cave
+        self.box((cx - 1, slope_x - 1), (cy - 1, cy + 1), (floor, floor + 2), 0)  # the turn east
+        self.box((cx + 2, cx + 2), (cy - 2, cy - 2), (floor, floor + 2), 0)  # the inside of the turn, cut back for the camera
+        for x in range(slope_x, foot_x):  # the slope: one block down per block
+            z = floor - 1 - (x - slope_x)
+            self.box((x, x), (cy - 1, cy + 1), (z, z + 3), 0)
+        self.box((foot_x, door), (cy - 1, cy + 1), (low, low + 2), 0)  # the run in, through the dungeon wall
+        # Pit props: posts in the walls and a beam in the roof.
+        for y in (10, 14):
+            for x in (cx - 2, cx + 2):
+                self.box((x, x), (y, y), (floor, floor + 2), "log")
+            self.box((cx - 2, cx + 2), (y, y), (floor + 3, floor + 3), "planks")
+        for x in (slope_x + 2, foot_x + 1):
+            z = floor - 1 - (x - slope_x) if x < foot_x else low
+            for y in (cy - 2, cy + 2):
+                self.box((x, x), (y, y), (z, z + 3), "log")
+            self.box((x, x), (cy - 2, cy + 2), (z + 4 if x < foot_x else z + 3, z + 4 if x < foot_x else z + 3), "planks")
 
-    def _nether(self):
-        """The portal chamber: blackstone, veins of netherrack, lava either side."""
-        n = SPOTS["nether"]
-
-        def wall(x, y, z):
-            # Netherrack in veins, not a checkerboard: follow a smooth noise field.
-            vein = float(noise3(np.float64(x), np.float64(y), np.float64(z), 4.5, 313))
-            if vein > 0.6:
-                return "netherrack"
-            return "gilded_blackstone" if _hash(np.int64(x), np.int64(y), np.int64(z), 311) < 0.05 else "blackstone"
-
-        self._room("nether", n, wall, SPOTS["vault"]["floor"] - 1)
-        (x0, x1), (y0, y1), floor = n["x"], n["y"], n["floor"]
-        for x in range(x0, x1 + 1):  # lava channels along both side walls, magma at the rim
-            for y in range(0, y1 + 1):
-                edge = min(x - x0, x1 - x)
-                wob = _hash(np.int64(x), np.int64(y), np.int64(0), 312)
-                if edge < 2 + (wob > 0.6):
-                    self.set(x, y, floor - 1, "lava")
-                elif edge < 3 + (wob > 0.5):
-                    self.set(x, y, floor - 1, "magma")
-        px, py = n["portal"]  # obsidian frame, 4 wide and 5 tall, on a low obsidian step
-        self.box((px - 1, px + 4), (py - 1, py + 1), (floor, floor), "obsidian")
-        self.box((px, px + 3), (py, py), (floor + 1, floor + 5), "obsidian")
-        self.box((px + 1, px + 2), (py, py), (floor + 2, floor + 4), 0)
-        self.set(px, py, floor + 3, "crying_obsidian")
-        self.set(px + 3, py, floor + 1, "crying_obsidian")
+    def _front_slab(self):
+        """Ground in front of the cut face: each column repeats the column behind it."""
+        f = SPOTS["front"]
+        (xa, xb), depth, bottom = f["x"], f["depth"], f["bottom"]
+        top = int(max(self.top(x, 0) for x in range(xa, xb)))
+        grid = np.zeros((xb - xa, depth, top - bottom + 1), np.uint8)
+        water, sand, air = self.b["water"], self.b["sand"], 0
+        for i, x in enumerate(range(xa, xb)):
+            h = self.top(x, 0)
+            column = self.front_before[x - self.x0, 0, bottom - self.z0 : h - self.z0 + 1].copy()
+            now = self.grid[x - self.x0, 0, bottom - self.z0 : h - self.z0 + 1]
+            column[now == water] = sand  # the pond's near bank
+            column[now == sand] = sand
+            grid[i, :, : len(column)] = column[None, :]
+        self.front = ((xa, -depth, bottom), grid)
 
     def _ore_patch(self, center, radius, ore):
         """Turn exposed stone near `center` into ore so the cave walls sparkle."""
@@ -350,7 +404,7 @@ class World:
                 for z in range(cz - r, cz + r + 1):
                     if (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2 > radius**2 or self.get(x, y, z) not in plain:
                         continue
-                    exposed = any(self.get(x + dx, y + dy, z + dz) == 0 for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)) if y + dy >= 0)
+                    exposed = any(self.get(x + dx, y + dy, z + dz) == 0 for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)))
                     if exposed and _hash(np.int64(x), np.int64(y), np.int64(z), 51) < 0.62:
                         self.set(x, y, z, ore)
 
@@ -368,7 +422,8 @@ class World:
                 elif top == 0 and e < 1.42 + _hash(np.int64(x), np.int64(y), np.int64(0), 83) * 0.25:
                     self.box((x, x), (y, y), (top - 1, top), "sand")  # beach only at water level
         # Clumps on the left bank as in the reference, and a few on the far bank where the shot sees them.
-        for x, y, tall in ((-14, 0, 2), (-13, 0, 4), (-13, 1, 3), (-14, 2, 2), (-13, 3, 3), (-12, 4, 2), (-11, 5, 3), (-10, 5, 3), (-9, 5, 2), (-8, 5, 3), (-7, 5, 2), (-6, 4, 3)):
+        # A gap is left on the far bank for the friend who fishes from there.
+        for x, y, tall in ((-14, 0, 2), (-13, 0, 4), (-13, 1, 3), (-14, 2, 2), (-13, 3, 3), (-12, 4, 2), (-11, 5, 3), (-10, 5, 3), (-12, 6, 2), (-10, 6, 2), (-11, 6, 3)):
             base = self.top(x, y) + 1
             self.sprites["cane"] += [(x, y, base + k) for k in range(tall)]
         self.sprites["lily"] += [(-8, 2, 1.02), (-10, 1, 1.02), (-7, 3, 1.02)]

@@ -28,7 +28,7 @@ _Inferred from `web/PLAN.md`._ One server per OAuth account; one region; Java + 
 
 ## Brand Commitments
 
-_Inferred from `web/PLAN.md`._ Preserve the Kurbis name. The visual identity is original and Minecraft-adjacent through voxel geometry, material cues, pixel-aware details, and custom Kurbis iconography without copying Minecraft UI or textures.
+_Inferred from `web/PLAN.md`._ Preserve the Kurbis name. The visual identity is original and Minecraft-adjacent through voxel geometry, material cues, pixel-aware details, and custom Kurbis iconography, inspired by Minecraft UI/textures.
 
 ## Evidence on Hand
 

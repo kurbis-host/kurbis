@@ -21,3 +21,6 @@ __pycache__/
 
 /target/kurbis-ai-plugin/
 /target/kurbis-ai-plugin-e2e/
+
+# Landing v2: the exported scene is built from third-party pack textures (POC only).
+/web/public/landing/
