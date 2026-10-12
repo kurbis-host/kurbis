@@ -5,6 +5,7 @@ import * as Switch from "@radix-ui/react-switch";
 import { AlertCircle, Box, Info, TriangleAlert } from "lucide-react";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { useState } from "react";
+import type { LifecyclePresentation } from "../lib/lifecycle";
 
 const buttonBase =
   "inline-flex min-h-11 cursor-pointer items-center justify-center gap-[9px] rounded-sm border-0 px-4 font-[760] transition-[transform,box-shadow,background-color] duration-150 ease-out active:enabled:translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-45";
@@ -128,6 +129,68 @@ export function Notice({
     >
       <Icon size={18} />
       <div>{children}</div>
+    </div>
+  );
+}
+
+const statusDotTones: Record<LifecyclePresentation["tone"], string> = {
+  good: "bg-[#91bd67]",
+  quiet: "bg-[#94a4a5]",
+  danger: "bg-[#df7468]",
+  progress: "bg-[#df9d58]",
+  warning: "bg-[#df9d58]",
+};
+
+/** A short state label; the dot only reinforces what the text says. */
+export function StatusLabel({
+  tone,
+  children,
+}: {
+  tone: LifecyclePresentation["tone"];
+  children: ReactNode;
+}) {
+  return (
+    <span className="inline-flex items-center gap-2 font-[740] text-ink">
+      <i className={`size-2 shrink-0 rounded-full ${statusDotTones[tone]}`} />
+      {children}
+    </span>
+  );
+}
+
+/**
+ * A horizontal gauge. Segments stack in order, so a later segment starts
+ * where the previous one ends; the bar stops at `max`.
+ */
+export function Meter({
+  label,
+  max,
+  segments,
+}: {
+  label: string;
+  max: number;
+  segments: { value: number; className: string }[];
+}) {
+  const percent = (value: number) => (max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0);
+  let end = 0;
+  const layers = segments.map((segment) => ({ className: segment.className, end: (end += segment.value) }));
+
+  return (
+    <div
+      className="relative h-2.5 overflow-hidden rounded-[4px] bg-[#dfd7c8]"
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(percent(end))}
+      aria-label={label}
+    >
+      {/* Each layer reaches from the start to its segment's end; earlier segments paint over later ones. */}
+      {[...layers].reverse().map((layer, index) => (
+        <span
+          key={index}
+          className={`absolute inset-y-0 left-0 rounded-[inherit] ${layer.className}`}
+          style={{ width: `${percent(layer.end)}%` }}
+        />
+      ))}
     </div>
   );
 }

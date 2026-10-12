@@ -775,14 +775,6 @@ fn operation_not_found() -> ApiError {
     )
 }
 
-fn server_not_found() -> ApiError {
-    ApiError::with_code(
-        StatusCode::NOT_FOUND,
-        "server_not_found",
-        "server not found",
-    )
-}
-
 fn invalid_progress() -> ApiError {
     ApiError::with_code(
         StatusCode::UNPROCESSABLE_ENTITY,

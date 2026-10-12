@@ -8,7 +8,7 @@ import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { serverEventStreamPath } from "../lib/api/paths";
 import { queryKeys, selectedServerId } from "../lib/query";
-import { applyServerEvent, parseServerEvent } from "../lib/sse";
+import { applyServerEvent, parseServerEvent, serverEventKinds } from "../lib/sse";
 
 type Server = components["schemas"]["Server"];
 type ServerScopedSession = components["schemas"]["ServerScopedSession"];
@@ -49,7 +49,7 @@ function EventsBridge({ scopedServerId }: { scopedServerId?: string }) {
     };
     source.onopen = () => queryClient.setQueryData(eventStatusKey, "live");
     source.onerror = () => queryClient.setQueryData(eventStatusKey, "reconnecting");
-    for (const name of ["server", "operation", "snapshot", "players", "whitelist", "operators", "log"] as const) {
+    for (const name of serverEventKinds) {
       source.addEventListener(name, (event) => consume(event as MessageEvent<string>));
     }
     return () => source.close();

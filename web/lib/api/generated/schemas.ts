@@ -51,6 +51,219 @@ export interface components {
             status?: string | null;
             summary: string;
         };
+        AiActiveJob: {
+            /** Format: uuid */
+            job_id: string;
+            /** Format: uuid */
+            operator_id: string;
+            state: components["schemas"]["AiJobState"];
+        };
+        /** @description Spending against one monthly cap. */
+        AiBudget: {
+            /** Format: int64 */
+            budget_micros: number;
+            /**
+             * Format: int64
+             * @description Worst-case cost of model calls that are still in flight.
+             */
+            reserved_micros: number;
+            /** Format: int64 */
+            spent_micros: number;
+        };
+        /** @description Gateway-wide defaults that apply when a server keeps a setting unset. */
+        AiDefaults: {
+            /** Format: int64 */
+            account_monthly_budget_micros: number;
+            effort: components["schemas"]["AiEffort"];
+            model: string;
+            /** Format: int64 */
+            server_monthly_budget_micros: number;
+        };
+        /**
+         * @description How much the model thinks before answering.
+         * @enum {string}
+         */
+        AiEffort: "low" | "medium" | "high";
+        AiJob: {
+            answer?: string | null;
+            /** Format: uuid */
+            conversation_id: string;
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: date-time */
+            created_at: string;
+            error?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            model: string;
+            /** Format: int32 */
+            model_calls: number;
+            /** Format: uuid */
+            operator_id: string;
+            operator_name: string;
+            prompt: string;
+            state: components["schemas"]["AiJobState"];
+            /** Format: int32 */
+            tool_calls: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** @description One request with every tool call it made. */
+        AiJobDetail: {
+            job: components["schemas"]["AiJob"];
+            tool_calls: components["schemas"]["AiToolCall"][];
+        };
+        AiJobEvent: {
+            /** Format: int64 */
+            id: number;
+            /** Format: uuid */
+            job_id: string;
+            kind: components["schemas"]["AiJobEventKind"];
+            message: string;
+            /** Format: uuid */
+            operator_id: string;
+        };
+        /**
+         * @description Chat line delivered to the requesting operator.
+         * @enum {string}
+         */
+        AiJobEventKind: "progress" | "answer" | "error";
+        /** @description Start a request on behalf of an in-game operator. */
+        AiJobRequest: {
+            /**
+             * Format: uuid
+             * @description Client-chosen id; retrying with the same id returns the same job.
+             */
+            job_id: string;
+            /**
+             * @description Start a fresh conversation instead of continuing the operator's last one.
+             * @default false
+             */
+            new_conversation: boolean;
+            /** Format: uuid */
+            operator_id: string;
+            operator_name: string;
+            prompt: string;
+        };
+        /**
+         * @description Lifecycle of one operator request.
+         * @enum {string}
+         */
+        AiJobState: "queued" | "running" | "awaiting_tools" | "succeeded" | "failed" | "cancelled";
+        /** @description A model the server owner can choose, with its standard prices. */
+        AiModel: {
+            id: string;
+            /**
+             * Format: int64
+             * @description Micro-USD per million uncached input tokens.
+             */
+            input_micros_per_mtok: number;
+            name: string;
+            /**
+             * Format: int64
+             * @description Micro-USD per million output tokens.
+             */
+            output_micros_per_mtok: number;
+        };
+        /** @description Everything the panel shows about the AI assistant of one server. */
+        AiOverview: {
+            /** @description Whether the control plane has a model provider configured. */
+            available: boolean;
+            defaults?: components["schemas"]["AiDefaults"] | null;
+            jobs: components["schemas"]["AiJob"][];
+            models: components["schemas"]["AiModel"][];
+            settings: components["schemas"]["AiSettings"];
+            usage: components["schemas"]["AiUsage"];
+        };
+        /** @description Per-server AI settings. `None` means "use the gateway default". */
+        AiSettings: {
+            effort?: components["schemas"]["AiEffort"] | null;
+            enabled: boolean;
+            model?: string | null;
+            /**
+             * Format: int64
+             * @description Monthly spending cap for this server in micro-USD, at most the
+             *      account's monthly budget.
+             */
+            monthly_budget_micros?: number | null;
+        };
+        /** @description One plugin poll: return finished tool results, receive new calls and chat
+         *      lines. */
+        AiSyncRequest: {
+            /**
+             * Format: int64
+             * @description Last event id the plugin has seen. Omit it on the first sync: the
+             *      plugin then receives only the lines of requests still running.
+             */
+            after_event_id?: number | null;
+            /** @default [] */
+            results: components["schemas"]["AiToolResult"][];
+        };
+        AiSyncResponse: {
+            active_jobs: components["schemas"]["AiActiveJob"][];
+            calls: components["schemas"]["AiToolCallRequest"][];
+            /**
+             * Format: int64
+             * @description Pass back as `after_event_id` on the next sync.
+             */
+            cursor: number;
+            events: components["schemas"]["AiJobEvent"][];
+        };
+        /** @description One tool call as recorded for the owner's audit trail. */
+        AiToolCall: {
+            call_id: string;
+            /** Format: date-time */
+            completed_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            input: unknown;
+            is_error: boolean;
+            name: string;
+            output?: string | null;
+            state: components["schemas"]["AiToolCallState"];
+        };
+        /** @description A tool call the plugin must execute as the requesting operator. */
+        AiToolCallRequest: {
+            call_id: string;
+            input: unknown;
+            /** Format: uuid */
+            job_id: string;
+            name: string;
+            /** Format: uuid */
+            operator_id: string;
+        };
+        /**
+         * @description Execution state of one tool call requested by the model.
+         * @enum {string}
+         */
+        AiToolCallState: "pending" | "delivered" | "completed";
+        AiToolResult: {
+            call_id: string;
+            /** @default false */
+            is_error: boolean;
+            /** Format: uuid */
+            job_id: string;
+            output: string;
+        };
+        /** @description This calendar month's (UTC) usage of one server and its owner's account. */
+        AiUsage: {
+            account: components["schemas"]["AiBudget"];
+            /** Format: int64 */
+            cache_creation_input_tokens: number;
+            /** Format: int64 */
+            cache_read_input_tokens: number;
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            model_calls: number;
+            /** Format: int64 */
+            output_tokens: number;
+            /** Format: date-time */
+            period_start: string;
+            server: components["schemas"]["AiBudget"];
+        };
         ApiErrorResponse: {
             code: string;
             message: string;
@@ -281,6 +494,12 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        ServerAiJobPath: {
+            /** Format: uuid */
+            job_id: string;
+            /** Format: uuid */
+            server_id: string;
+        };
         /** @description Canonical lifecycle command wire format at
          *      `POST /api/v1/servers/{server_id}/commands`. */
         ServerCommandRequest: {
@@ -352,9 +571,13 @@ export interface components {
             /** @constant */
             type: "operators";
             data: components["schemas"]["Operators"];
+        } | {
+            /** @constant */
+            type: "ai";
+            data: components["schemas"]["AiOverview"];
         });
         /** @enum {string} */
-        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist" | "operators";
+        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist" | "operators" | "ai";
         ServerExportPath: {
             /** Format: uuid */
             export_id: string;

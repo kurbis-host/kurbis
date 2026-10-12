@@ -37,3 +37,4 @@ export const getLogs = (serverId: string) => withServerApi((api) => api.getLogs(
 export const getSnapshots = (serverId: string) => withServerApi((api) => api.getSnapshots(serverId));
 export const getPlayers = (serverId: string) => withServerApi((api) => api.getPlayers(serverId));
 export const getWhitelist = (serverId: string) => withServerApi((api) => api.getWhitelist(serverId));
+export const getAiOverview = (serverId: string) => withServerApi((api) => api.getAiOverview(serverId));

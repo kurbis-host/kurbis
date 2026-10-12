@@ -18,6 +18,3 @@ __pycache__/
 
 /logs/
 /pumpkin.toml
-
-/target/kurbis-ai-plugin/
-/target/kurbis-ai-plugin-e2e/

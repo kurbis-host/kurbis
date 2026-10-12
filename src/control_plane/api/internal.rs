@@ -458,6 +458,22 @@ pub(super) async fn require_browser_server_access(
     require_server_access_inner(state, headers, server_id, false).await
 }
 
+/// Restrict plugin protocol endpoints to the server's own runtime capability.
+pub(super) async fn require_server_capability(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+) -> Result<ServerRecord, ApiError> {
+    if super::server_access::instance_capability_server_id(&state.pool, headers).await?
+        != Some(server_id)
+    {
+        return Err(super::server_access::invalid_capability());
+    }
+    server_by_id(&state.pool, server_id)
+        .await?
+        .ok_or_else(ApiError::server_not_found)
+}
+
 async fn require_server_access_inner(
     state: &AppState,
     headers: &HeaderMap,
@@ -472,11 +488,7 @@ async fn require_server_access_inner(
             {
                 return Ok(server);
             }
-            ApiError::with_code(
-                StatusCode::NOT_FOUND,
-                "server_not_found",
-                "server not found",
-            )
+            ApiError::server_not_found()
         }
         Err(error) => error,
     };
@@ -484,33 +496,21 @@ async fn require_server_access_inner(
     let server_session_ids =
         super::server_access::server_session_server_ids(&state.pool, headers).await?;
     if server_session_ids.contains(&server_id) {
-        return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
-            ApiError::with_code(
-                StatusCode::NOT_FOUND,
-                "server_not_found",
-                "server not found",
-            )
-        });
+        return server_by_id(&state.pool, server_id)
+            .await?
+            .ok_or_else(ApiError::server_not_found);
     }
 
     let capability_server_id =
         super::server_access::instance_capability_server_id(&state.pool, headers).await?;
     if allow_instance_capability && capability_server_id == Some(server_id) {
-        return server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
-            ApiError::with_code(
-                StatusCode::NOT_FOUND,
-                "server_not_found",
-                "server not found",
-            )
-        });
+        return server_by_id(&state.pool, server_id)
+            .await?
+            .ok_or_else(ApiError::server_not_found);
     }
 
     if !server_session_ids.is_empty() || capability_server_id.is_some() {
-        return Err(ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "server_not_found",
-            "server not found",
-        ));
+        return Err(ApiError::server_not_found());
     }
 
     Err(owner_error)

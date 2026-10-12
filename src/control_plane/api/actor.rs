@@ -427,13 +427,7 @@ impl FromRequestParts<Arc<AppState>> for ServerContext {
             })?;
         let record = internal::server_by_id(&state.pool, path.server_id)
             .await?
-            .ok_or_else(|| {
-                ApiError::with_code(
-                    axum::http::StatusCode::NOT_FOUND,
-                    "server_not_found",
-                    "server not found",
-                )
-            })?;
+            .ok_or_else(ApiError::server_not_found)?;
         Ok(Self {
             id: path.server_id,
             record,

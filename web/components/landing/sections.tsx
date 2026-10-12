@@ -321,7 +321,7 @@ function SpawnerSection() {
           </li>
         ))}
       </ul>
-      <p className={body}>Operators only. We cover the AI. No sign-in, no keys.</p>
+      <p className={body}>Operators only, with their own permissions. We cover the AI. No sign-in, no keys.</p>
     </Layer>
   );
 }
@@ -402,7 +402,7 @@ function NetherSection({ onFall }: { onFall: () => void }) {
         <a
           href="/login"
           onClick={stepThrough}
-          className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-[9px] bg-[#a45cff] px-4 text-[15px] font-[800] text-white no-underline shadow-[0_5px_0_#5b2ca3]"
+          className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-[9px] bg-[#9642ff] px-4 text-[15px] font-[800] text-white no-underline shadow-[0_5px_0_#5b2ca3]"
         >
           <DoorOpen size={17} aria-hidden="true" /> Open dashboard
         </a>

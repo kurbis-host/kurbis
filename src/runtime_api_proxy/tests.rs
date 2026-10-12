@@ -73,6 +73,20 @@ fn normal_scope_allows_only_server_capability_routes() {
         ),
         (Method::POST, format!("/api/v1/servers/{expected}/commands")),
         (Method::POST, "/api/v1/server/login-links".to_owned()),
+        (Method::GET, format!("/api/v1/servers/{expected}/ai")),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai/jobs")),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai/sync")),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+        ),
     ] {
         assert!(
             route_allowed(Scope::Server, &method, &path, expected),
@@ -100,6 +114,46 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
         (
             Method::POST,
             format!("/api/v1/servers/{expected}/runtime-stats"),
+        ),
+        (
+            Method::PUT,
+            format!("/api/v1/servers/{expected}/ai/settings"),
+        ),
+        (Method::POST, format!("/api/v1/servers/{expected}/ai")),
+        (Method::GET, format!("/api/v1/servers/{expected}/ai/sync")),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/ai/jobs/not-a-job/cancel"),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/ai/jobs/not-a-job"),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/servers/{expected}/ai/jobs/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::GET,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/ai/jobs/{}/retry",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{}/ai/jobs/{}/cancel",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ),
         ),
     ] {
         assert!(

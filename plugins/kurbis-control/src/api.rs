@@ -15,7 +15,7 @@ use wasi::{
     },
 };
 
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CONNECT_TIMEOUT_NANOS: u64 = 3_000_000_000;
 const FIRST_BYTE_TIMEOUT_NANOS: u64 = 8_000_000_000;

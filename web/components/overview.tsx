@@ -4,14 +4,15 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, ExternalLink, Play, RotateCcw, Square } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { errorMessage } from "../lib/api/client";
 import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { formatBytes, formatDateTime, formatRelative } from "../lib/format";
 import { lifecycle, lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
-import { Button, EmptyState, Notice, PageHeader, Surface } from "./ui";
+import { useNow } from "../lib/use-now";
+import { Button, EmptyState, Meter, Notice, PageHeader, Surface } from "./ui";
 
 type ActivityItem = components["schemas"]["ActivityEntry"];
 type Server = components["schemas"]["Server"];
@@ -86,12 +87,7 @@ export function Overview({
     initialData: initialActivity,
   });
   const [requestError, setRequestError] = useState<string | null>(null);
-  const [relativeNow, setRelativeNow] = useState(renderedAt);
-  useEffect(() => {
-    setRelativeNow(Date.now());
-    const timer = window.setInterval(() => setRelativeNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
+  const relativeNow = useNow(renderedAt);
   const action = useMutation({
     mutationFn: async (name: "start" | "stop" | "restart") =>
       browserApi.command(serverId, { command: name }),
@@ -133,11 +129,6 @@ export function Overview({
 
   const view = lifecycle[server.observed_state];
   const allowed = lifecycleActions(server);
-  const storagePercent = Math.min(
-    100,
-    (server.storage_bytes / server.storage_limit_bytes) * 100,
-  );
-  const storagePercentValue = Math.round(storagePercent);
 
   return (
     <>
@@ -231,19 +222,11 @@ export function Overview({
                   </strong>
                   <span>{formatBytes(server.storage_limit_bytes)} storage</span>
                 </div>
-                <div
-                  className="h-2.5 overflow-hidden rounded-[4px] bg-[#dfd7c8]"
-                  role="progressbar"
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={storagePercentValue}
-                  aria-label={`${storagePercentValue}% storage used`}
-                >
-                  <span
-                    className="block h-full rounded-[inherit] bg-grass"
-                    style={{ width: `${storagePercent}%` }}
-                  />
-                </div>
+                <Meter
+                  label="Storage used"
+                  max={server.storage_limit_bytes}
+                  segments={[{ value: server.storage_bytes, className: "bg-grass" }]}
+                />
               </div>
               <div className="grid grid-cols-2 gap-2.5 max-[560px]:grid-cols-1">
                 <div className="rounded-[9px] bg-[#eee7d8] p-3.5">

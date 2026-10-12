@@ -259,13 +259,7 @@ pub(super) async fn update_server(
     .bind(server_id)
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or_else(|| {
-        ApiError::with_code(
-            StatusCode::NOT_FOUND,
-            "server_not_found",
-            "server not found",
-        )
-    })?;
+    .ok_or_else(ApiError::server_not_found)?;
     if input.subdomain.is_some() && current.observed_state != ObservedState::Sleeping {
         return Err(ApiError::with_code(
             StatusCode::CONFLICT,

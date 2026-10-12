@@ -1,4 +1,5 @@
 mod actions;
+mod ai;
 mod api;
 mod chat;
 mod command;
@@ -134,6 +135,8 @@ impl Plugin for KurbisControl {
                 true,
             )?;
             stats::start(&context);
+            context.register_command(ai::command(), PERMISSION);
+            ai::start(&context);
         }
         Ok(())
     }

@@ -3,8 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { components } from "../../lib/api/generated";
 import { applyServerEvent, parseServerEvent } from "../../lib/sse";
 import { queryKeys } from "../../lib/query";
-import { server } from "./fixtures";
+import { activeAiJob, aiOverview, finishedAiJob, server } from "./fixtures";
 
+type AiJobDetail = components["schemas"]["AiJobDetail"];
 type ServerEvent = components["schemas"]["ServerEvent"];
 
 describe("server event integration", () => {
@@ -109,6 +110,7 @@ describe("server event integration", () => {
       { id: 5, type: "whitelist", data: { enabled: false, revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
       { id: 6, type: "operators", data: { revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
       { id: 7, type: "log" },
+      { id: 8, type: "ai", data: aiOverview },
     ];
 
     for (const event of events) {
@@ -116,5 +118,25 @@ describe("server event integration", () => {
       applyServerEvent(client, server.id, event);
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.activity(server.id) });
     }
+  });
+
+  it("replaces the AI overview and refreshes only the request details still in progress", () => {
+    const client = new QueryClient();
+    const detail = (job: typeof activeAiJob): AiJobDetail => ({ job, tool_calls: [] });
+    client.setQueryData(queryKeys.aiJob(server.id, activeAiJob.id), detail(activeAiJob));
+    client.setQueryData(queryKeys.aiJob(server.id, finishedAiJob.id), detail(finishedAiJob));
+
+    const parsed = parseServerEvent(JSON.stringify({ id: 30, type: "ai", data: aiOverview }));
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    applyServerEvent(client, server.id, parsed.data);
+
+    expect(client.getQueryData(queryKeys.ai(server.id))).toEqual(aiOverview);
+    expect(client.getQueryState(queryKeys.aiJob(server.id, activeAiJob.id))?.isInvalidated).toBe(true);
+    expect(client.getQueryState(queryKeys.aiJob(server.id, finishedAiJob.id))?.isInvalidated).toBe(false);
+  });
+
+  it("rejects events of unknown kinds", () => {
+    expect(parseServerEvent(JSON.stringify({ id: 31, type: "weather", data: {} })).success).toBe(false);
   });
 });

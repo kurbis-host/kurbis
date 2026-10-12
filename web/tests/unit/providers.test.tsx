@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppProviders } from "../../components/providers";
 import type { components } from "../../lib/api/generated";
 import { queryKeys } from "../../lib/query";
-import { server, session } from "./fixtures";
+import { aiOverview, server, session } from "./fixtures";
 
 type Server = components["schemas"]["Server"];
 
@@ -142,6 +142,34 @@ describe("event reconnect state", () => {
       }),
     ));
     await waitFor(() => expect(screen.getByText("1 operators")).toBeVisible());
+  });
+
+  it("subscribes to AI events and replaces the overview cache", async () => {
+    vi.stubGlobal("EventSource", EventSourceStub);
+    function AiSpend() {
+      const { data } = useQuery({
+        queryKey: queryKeys.ai(server.id),
+        queryFn: async () => aiOverview,
+        staleTime: Infinity,
+      });
+      return <span>{data?.usage.server.spent_micros} spent</span>;
+    }
+    render(
+      <AppProviders session={session} servers={[server]}>
+        <AiSpend />
+      </AppProviders>,
+    );
+    await waitFor(() => expect(screen.getByText("1250000 spent")).toBeVisible());
+
+    const updated = { ...aiOverview, usage: { ...aiOverview.usage, server: { ...aiOverview.usage.server, spent_micros: 1_300_000 } } };
+    act(() => EventSourceStub.instance?.emit(
+      "ai",
+      new MessageEvent("ai", {
+        data: JSON.stringify({ id: 23, type: "ai", data: updated }),
+        lastEventId: "23",
+      }),
+    ));
+    await waitFor(() => expect(screen.getByText("1300000 spent")).toBeVisible());
   });
 
   it("applies a named server event's complete envelope to the shared cache", async () => {

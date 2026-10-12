@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { formatUsd, parseUsdInput } from "./format";
 
 export const subdomainSchema = z
   .string()
@@ -37,3 +38,22 @@ export type PlayerMutationValues = z.infer<typeof playerMutationSchema>;
 
 export const whitelistFormSchema = playerMutationSchema;
 export type WhitelistFormValues = PlayerMutationValues;
+
+/** Empty choices keep the installation defaults. The server budget may not
+ * exceed the account budget, which all of the owner's servers share. */
+export function aiSettingsFormSchema(accountBudgetMicros: number) {
+  return z.object({
+    enabled: z.boolean(),
+    model: z.string(),
+    effort: z.enum(["", "low", "medium", "high"]),
+    monthly_budget: z
+      .string()
+      .trim()
+      .refine((value) => value === "" || parseUsdInput(value) !== null, "Enter an amount in US dollars, like 5 or 12.50.")
+      .refine(
+        (value) => (parseUsdInput(value) ?? 0) <= accountBudgetMicros,
+        `A server can't spend more than the account budget of ${formatUsd(accountBudgetMicros)}.`,
+      ),
+  });
+}
+export type AiSettingsFormValues = z.infer<ReturnType<typeof aiSettingsFormSchema>>;
