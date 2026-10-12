@@ -27,7 +27,7 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 const MIN_OUTPUT_TOKENS: u32 = 2048;
 const MAX_MODEL_CALLS: i32 = 24;
 const MAX_TOOL_CALLS: i32 = 64;
-/// Lease expiries a job survives before it is failed.
+/// The lease expiry that fails a job; earlier expiries requeue it.
 const MAX_STALLS: i32 = 2;
 const TOOL_RESULT_TIMEOUT_SECONDS: f64 = 30.0;
 /// Transcript JSON averages well above two bytes per token, so dividing by two
