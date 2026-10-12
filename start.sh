@@ -359,7 +359,7 @@ start_native() {
   fi
   python3 "$ROOT/tools/run_bounded_build.py" \
     --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
-    -- bash -lc "cd '$ROOT' && cargo ${cargo_args[*]} --jobs 1"
+    -- bash -lc "cd '$ROOT' && cargo ${cargo_args[*]}"
 
   mkdir -p "$ROOT/data/native-waiting"
   printf 'native\n' > "$MODE_FILE"
@@ -413,7 +413,7 @@ start_docker() {
   printf 'Building the host worker for Docker mode...\n'
   python3 "$ROOT/tools/run_bounded_build.py" \
     --memory-bytes "${KURBIS_NATIVE_BUILD_MEMORY_BYTES:-10737418240}" \
-    -- bash -lc "cd '$ROOT' && cargo build --release --bin worker --jobs 1"
+    -- bash -lc "cd '$ROOT' && cargo build --release --bin worker"
   mkdir -p "$ROOT/data"
   printf 'docker\n' > "$MODE_FILE"
   printf 'Starting Compose services...\n'

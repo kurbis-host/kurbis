@@ -53,10 +53,10 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 Local development runs directly on macOS or Linux. See [native setup](runtime/pumpkin/NATIVE.md) for workers and the waiting gateway runtime. On macOS, workers default to the native backend.
 
 Build the Rust project through host-wide memory admission (10 GiB build cap,
-4 GiB reserved for the OS/services, one Cargo job):
+4 GiB reserved for the OS/services):
 
 ```bash
-tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --jobs 1
+tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build
 ```
 
 Run Rust tests through the same admission gate:
@@ -64,7 +64,7 @@ Run Rust tests through the same admission gate:
 ```bash
 TEST_DATABASE_URL=postgres://localhost/melon_hoster_test \
   tools/run_bounded_build.py --memory-bytes 10737418240 -- \
-  cargo test --jobs 1 --locked --all-targets -- --test-threads=1
+  cargo test --locked --all-targets -- --test-threads=1
 ```
 
 Use `tools/docker_build_with_limits.sh` rather than raw `docker buildx build` or
@@ -313,7 +313,7 @@ See [`PROGRESS.md`](PROGRESS.md) for the current implementation state and [`PLAN
 
 Browser lifecycle and OAuth verification uses a disposable database and real panel/API/Postgres, with controlled external provider and worker boundaries. Run it using [the E2E instructions](web/tests/e2e/README.md).
 
-Build local hoster binaries with `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --jobs 1 --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Use `tools/docker_build_with_limits.sh --file runtime/Dockerfile --tag melon-hoster:local .` rather than an unbounded Compose/Docker build; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
+Build local hoster binaries with `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Use `tools/docker_build_with_limits.sh --file runtime/Dockerfile --tag melon-hoster:local .` rather than an unbounded Compose/Docker build; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
 
 To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks Java 26.3 login, save/shutdown, and player activity. The native lifecycle harness also exercises Java waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
 
