@@ -241,15 +241,13 @@ by an arrow key to select a process pane; `Ctrl-b z` zooms the selected pane,
 and `Ctrl-b d` detaches. Persistent PostgreSQL data is kept when stopping
 Compose. Stop hosted worlds from the panel before shutting down their worker.
 
-For Dokploy production releases, use [`deployment/production-rollout.md`](deployment/production-rollout.md)
-and run `python3 scripts/deploy_dokploy.py` from a clean checkout exactly matching
-`origin/main`. That release command waits for Dokploy's build and healthy Compose
-stack, then updates the separate systemd-managed host worker from the deployed
-application image. It verifies the worker binary, Pumpkin runtime, and renewing
-worker lease, and rolls the worker and app back together if verification fails.
-Set `TEST_DATABASE_URL` to a disposable PostgreSQL database for the required
-release regression; the release path has one canonical source-provenance flow
-and no historical baseline/rollback mode. For stranded CI coordination rows, use
+For production releases, run `python3 scripts/release.py` from a clean checkout
+exactly matching `origin/main`; [`deployment/production-rollout.md`](deployment/production-rollout.md)
+describes what it does. It compiles Pumpkin on the remote CI builder, deploys
+the Compose stack through Dokploy, and then moves the separate systemd-managed
+host worker onto the release, restoring the previous worker if the new one
+does not come up. Set `TEST_DATABASE_URL` to a disposable PostgreSQL database
+for the release gate. For stranded CI coordination rows, use
 the bounded, dry-run-first procedure in [`deployment/ci-cleanup.md`](deployment/ci-cleanup.md);
 never reset production data with broad SQL or Compose volume deletion.
 

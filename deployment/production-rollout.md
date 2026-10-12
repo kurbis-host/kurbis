@@ -1,66 +1,58 @@
-# Production rollout policy
+# Production releases
 
-Use `scripts/deploy_dokploy.py` for every Kurbis production release. There is one
-canonical release path: a clean checkout exactly matching `origin/main`, a
-verified Dokploy Compose configuration, an immutable
-`kurbis-release-<full-sha>` tag, and a coordinated Respond5 worker update.
-Historical baseline manifests and one-time migration/rollback aliases are not
-supported and are intentionally absent from this repository.
+Release with one command from a clean checkout that is exactly `origin/main`:
 
-The release gate runs the rollout behavior suite and the database-backed
-`first_join_flow` regression before mutating Dokploy or Respond5. Set
-`TEST_DATABASE_URL` to a disposable PostgreSQL database; if it is unset or the
-regression fails, the release stops before production changes.
+```sh
+TEST_DATABASE_URL=postgres://... python3 scripts/release.py
+```
 
-Dokploy must use `docker-compose` mode with no custom command. The runner
-verifies Dokploy's generated build-enabled command, rejects enabled patches for
-`compose.yaml`, and keeps `autoDeploy` disabled. Git is the sole source of
-truth for Compose, build arguments, CI configuration, TLS mounts, and worker
-settings. The release temporarily selects the immutable tag, validates the
-healthy stack and worker lease, then restores the configured `main` source
-branch. A failed rollout keeps the lock and transaction evidence until both app
-and worker recovery are verified.
+`TEST_DATABASE_URL` must point to a disposable PostgreSQL database; the gate
+runs the script tests and the `first_join_flow` regression against it. The
+Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
+`ssh respond5` must work as root.
 
-The pinned Pumpkin runtime is compiled once per release on the remote CI
-builder, through the same `tools/ci_bubblewrap_runner.py` job the control plane
-uses for CI builds (`scripts/pumpkin_artifacts.py`, configured by the
-`CI_BUILDER_SSH_TARGET` and `CI_BUBBLEWRAP_*` values in Dokploy). The release
-uploads the two SHA-256-checked binaries to
-`/srv/kurbis/release-artifacts/<sha>` on Respond5, which only packages them
-into the `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`
-images; Compose never compiles or builds Pumpkin. Respond5 then
-checks the executable, WASM plugin, hosted entrypoint, OCI labels, embedded
-revision, worker configuration, and renewing lease. Recovery uses only the
-verified previous SHA and never removes PostgreSQL data, named volumes, worlds,
-or object-store data.
+## What a release does
 
-Respond5 writes the accepted-release marker only after app and waiting-Pumpkin OCI labels and embedded revisions match the selected SHA, the waiting container's actual Pumpkin executable matches the independently built host-control image, and the worker binary/environment/lease transaction is verified. If post-deploy worker verification fails or its SSH response is lost, the wrapper idempotently restores the previous worker bundle and asks Dokploy to redeploy the prior app revision. For the one-time legacy path, rollback is constrained to the captured old image digests or images labeled with the attempted candidate SHA; it restores exact local image tags with `docker compose up --no-build --no-deps`, leaves Postgres and named volumes untouched, then restores the captured worker executable and protected legacy config. It verifies all exact service image digests, health, worker ID/executable/config and renewing lease before considering recovery verified. Legacy recovery remains explicitly marked `legacy-unproven`; only a later successful SHA-labeled release creates a source-proven marker. An unverified rollback retains protected transaction state; do not treat it as a successful release.
+1. **Gate.** Refuses a dirty checkout or any commit other than `origin/main`,
+   validates `migrations/MANIFEST.json`, and runs the tests.
+2. **Pumpkin.** Compiles the pinned Pumpkin integration once on the remote CI
+   builder, through the same `tools/ci_bubblewrap_runner.py` job the control
+   plane uses for CI builds (`scripts/pumpkin_artifacts.py`, configured by the
+   `CI_BUILDER_SSH_TARGET` and `CI_BUBBLEWRAP_*` values in Dokploy). The two
+   SHA-256-checked binaries are uploaded to
+   `/srv/kurbis/release-artifacts/<sha>` and packaged into
+   `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`.
+   Compose never compiles or builds Pumpkin.
+3. **Deploy.** Sets `BUILD_REVISION` in Dokploy, keeps auto-deploy off, queues
+   one Dokploy deployment of `main` and waits for it. Dokploy builds one
+   deployment at a time across all projects, so the wait (`--deploy-wait`,
+   four hours by default) includes its queue.
+4. **Verify.** Every Compose service must be running, healthy, and labelled
+   with the release SHA, and Dokploy must have deployed that commit.
+5. **Worker.** The native `kurbis-worker` service gets the worker binary from
+   the deployed app image and the new Pumpkin image. It has to stay active and
+   send heartbeats for 40 seconds; otherwise the previous binary and settings
+   are put back and the release fails.
 
-The host-control Pumpkin compile uses BuildKit Cargo registry/Git caches shared under lock and a Cargo target cache keyed by the full `BUILD_REVISION` plus Rust 1.98.1. This allows a retry of the same immutable release to reuse compiled objects without reusing artifacts across source revisions. The application image intentionally does not mount a mutable Cargo target cache. Respond5 SSH operations use a 90-minute default command timeout with 30-second SSH keepalives; set `KURBIS_REMOTE_COMMAND_TIMEOUT_SECONDS` to a value from 1,800 through 86,400 when the builder requires a longer bounded window. The rollout acquires its local and remote locks before starting, does not retry an in-flight build, and rejects overlapping Dokploy deployments.
+The result is recorded in `/srv/kurbis/deployed-release.json` on the host.
 
-The first-join regression requires `TEST_DATABASE_URL` to point to a disposable PostgreSQL database. If it is unset or the test fails, the release stops before production changes.
+## Things to know
 
-## Immutable provenance contract
+- **The worker has its own Docker daemon.** It starts servers on the rootless
+  daemon named by `DOCKER_HOST` in `/srv/kurbis/worker.env`. Images built by a
+  release live in the host's main daemon, so the release copies the Pumpkin
+  image and the runtime API proxy image across. A worker that reports
+  "No such image" is missing that copy.
+- **Dokploy auto-deploy stays off.** A plain Dokploy deploy has no Pumpkin
+  images for its commit and no matching worker, and fails when Compose tries
+  to pull `melon-pumpkin:waiting-<sha>`.
+- **Nothing is rolled back automatically.** If the deployment fails, Compose
+  keeps the previous containers of any service it could not replace. To go
+  back, release the older commit: reset `main` to it and run the script again.
+- **Migrations are append-only.** An applied migration file is never edited or
+  renumbered; a schema change is a new version in `migrations/MANIFEST.json`.
+- **The control plane is slow to become healthy.** It registers the remote CI
+  builder before serving HTTP, which has taken two minutes; its Compose health
+  check allows five.
 
-The checked-in `migrations/MANIFEST.json` is the canonical inventory of SQLx
-migrations. It records each migration filename, version, and SQLx-compatible
-SHA-384 checksum, plus a SHA-256 over the ordered manifest. Migration versions
-are append-only: an applied file is never edited or reused, duplicate version
-numbers are rejected, and a schema change must use a new version. The release
-gate validates this manifest before touching Dokploy and the schema tests cover
-both a fresh database and a database with the production migration history
-already applied.
-
-The Respond5 verifier receives one `kurbis.release-manifest.v1` for each
-accepted release. It binds the full Git SHA to the application and panel/waiting
-image IDs, compiled control-plane/gateway/worker digests, the independently
-built Pumpkin image and source archive digests, the worker environment digest,
-the migration-manifest hash, and a deterministic production environment
-revision. `status=verified` is only written after every Compose service is
-unique, running, and healthy (with the gateway's documented running-only
-health contract), every service image and OCI revision matches the manifest,
-and the worker executable, protected environment, identity, and database lease
-still match. The manifest itself is content-addressed and tamper-checked before
-`deployed-release.json` is written.
-
-For stranded CI coordination rows, use the bounded, dry-run-first procedure in [`ci-cleanup.md`](ci-cleanup.md). It releases only expired coordination markers and requires an exact confirmation phrase, an immutable candidate audit file, and a verified PostgreSQL backup reference before applying changes.
+For stranded CI coordination rows, see [`ci-cleanup.md`](ci-cleanup.md).

@@ -17,8 +17,7 @@ if [[ "${M5_LIVE_LINUX:-0}" == "1" ]]; then
   [[ -n "${DOKPLOY_URL:-}" && -n "${DOKPLOY_API_KEY:-}" ]] || {
     echo "M5 live mode requires DOKPLOY_URL and DOKPLOY_API_KEY" >&2; exit 2;
   }
-  python3 -m unittest discover -s "$root/tools" -p 'test_dokploy_worker_rollout.py'
-  python3 -m unittest discover -s "$root/tools" -p 'test_dokploy_legacy_baseline.py'
+  python3 -m unittest discover -s "$root/tools" -p 'test_release.py'
 fi
 
 cd "$root"
