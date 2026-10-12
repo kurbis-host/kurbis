@@ -290,6 +290,13 @@ class RolloutTests(unittest.TestCase):
                     with self.assertRaisesRegex(sync.Error, "release-built revision-pinned image"):
                         sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
                 config["services"]["waiting-pumpkin"] = {"image": f"{sync.WAITING_PREFIX}{revision}"}
+                # Dokploy re-serializes compose.yaml during a deployment; only
+                # the post-deployment check may accept that rewrite.
+                rewritten = b" M compose.yaml\0!! .env\0"
+                with patch.object(sync, "run_bytes", return_value=rewritten):
+                    with self.assertRaisesRegex(sync.Error, "unexpected Dokploy checkout change"):
+                        sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                    sync.verify_build_context(checkout, revision, {**expected, "compose.yaml": "0" * 40},release_environment=release_env,deployed=True)
                 with self.assertRaisesRegex(sync.Error,"environment overrides differ"):
                     sync.verify_build_context(checkout,revision,expected,release_environment={**release_env,"PANEL_BIND_ADDRESS":"0.0.0.0"})
 

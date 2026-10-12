@@ -419,8 +419,13 @@ def require_lock(token: str) -> None:
         raise Error("rollout lock ownership mismatch")
 
 
+# Files Dokploy and the panel build rewrite in place during a deployment:
+# Dokploy re-serializes compose.yaml (dropping comments and renaming anchors)
+# and the Next.js build normalizes web/tsconfig.json.
+DEPLOYMENT_REWRITTEN = frozenset({"compose.yaml", "web/tsconfig.json"})
+
 def validate_checkout_status(status: bytes, *, allow_overrides: bool) -> None:
-    allowed = {"compose.yaml", "web/tsconfig.json"} if allow_overrides else set()
+    allowed = DEPLOYMENT_REWRITTEN if allow_overrides else set()
     for record in (part for part in status.split(b"\0") if part):
         if len(record) < 4 or record[2:3] != b" ":
             raise Error(f"malformed Dokploy checkout status record: {record!r}")
@@ -859,14 +864,21 @@ if __file__ != "<stdin>":
     exec(compile(_tls_module.read_text(encoding="utf-8"),str(_tls_module),"exec"),globals())
 # __TLS_HELPERS__
 
-def verify_build_context(checkout:Path,revision:str,expected:dict[str,str],release_environment:dict[str,str]|None=None)->None:
+def verify_build_context(checkout:Path,revision:str,expected:dict[str,str],release_environment:dict[str,str]|None=None,*,deployed:bool=False)->None:
+    """Check the Dokploy checkout against the release manifest.
+
+    After a deployment (`deployed`), the files Dokploy rewrites in place are
+    exempt from the byte comparison; the rendered Compose configuration below
+    is still checked in full.
+    """
     if run(["git","-C",str(checkout),"rev-parse","HEAD"])!=revision:raise Error("Dokploy checkout HEAD differs from release SHA")
     validate_expected_manifest(expected)
     status=run_bytes(["git","-C",str(checkout),"status","--porcelain=v1","-z","--untracked-files=all","--ignored"])
-    validate_checkout_status(status, allow_overrides=False)
+    validate_checkout_status(status, allow_overrides=deployed)
     tracked=set(run(["git","-C",str(checkout),"ls-tree","-r","--name-only",revision]).splitlines())
     if tracked!=set(expected):raise Error("expected manifest does not cover all tracked build inputs")
     for path,blob in expected.items():
+        if deployed and path in DEPLOYMENT_REWRITTEN:continue
         if run(["git","-C",str(checkout),"hash-object","--",path])!=blob:raise Error(f"Dokploy build input mismatch: {path}")
     for ignore in (checkout/".dockerignore",checkout/"web/.dockerignore"):
         if not ignore.is_file() or ".env*" not in ignore.read_text().splitlines():raise Error("Docker context does not exclude .env secrets")
@@ -918,7 +930,7 @@ def verify_build_context(checkout:Path,revision:str,expected:dict[str,str],relea
 def _wait_sync_locked(revision:str,pumpkin_image:str,baseline_state:dict[str,list[dict[str,str]]],expected:dict[str,str],token:str,timeout:int=900)->dict[str,str]:
     require_lock(token)
     if not valid_sha(revision):raise Error("invalid release SHA")
-    verify_build_context(CHECKOUT,revision,expected)
+    verify_build_context(CHECKOUT,revision,expected,deployed=True)
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
         current=states();cp=current["control-plane"];gw=current["gateway"]
