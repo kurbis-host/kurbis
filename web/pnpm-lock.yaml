@@ -93,6 +93,9 @@ importers:
       pg:
         specifier: 8.23.0
         version: 8.23.0
+      rolldown:
+        specifier: 1.2.11
+        version: 1.2.11
       tailwindcss:
         specifier: 4.3.3
         version: 4.3.3

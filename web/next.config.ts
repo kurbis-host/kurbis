@@ -38,6 +38,12 @@ const nextConfig: NextConfig = {
 				has: [{ type: "query", key: "v" }],
 				headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
 			},
+			// The worker that builds the film's world, asked for by its own version (lib/landing/boot.ts).
+			{
+				source: "/world.worker.js",
+				has: [{ type: "query", key: "v" }],
+				headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+			},
 			// What is not text in the bundle is stored through gzip (once, as hard as gzip
 			// packs) and sent as it is: this is what tells the browser, which then unpacks
 			// it on the way in. Neither the server nor the CDN would pack such bytes itself.

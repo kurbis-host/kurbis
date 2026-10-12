@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { formatUsd, parseUsdInput } from "./format";
+import { SUBDOMAIN } from "./subdomain";
 
 export const subdomainSchema = z
   .string()
-  .min(3, "Use at least 3 characters.")
-  .max(32, "Use at most 32 characters.")
-  .regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/, "Use lowercase letters, numbers, or dashes; do not start or end with a dash.");
+  .min(SUBDOMAIN.shortest, `Use at least ${SUBDOMAIN.shortest} characters.`)
+  .max(SUBDOMAIN.longest, `Use at most ${SUBDOMAIN.longest} characters.`)
+  .regex(SUBDOMAIN.pattern, "Use lowercase letters, numbers, or dashes; do not start or end with a dash.");
 
 export const setupSchema = z.object({
   subdomain: subdomainSchema,

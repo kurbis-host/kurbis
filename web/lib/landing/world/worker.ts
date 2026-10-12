@@ -1,7 +1,11 @@
 /**
  * The world is built off the page's own thread: a fifth of a second of work on a fast
- * machine, more than a second on a slow one, that would otherwise hold up everything
+ * machine, most of a second on a slow one, that would otherwise hold up everything
  * else the page is doing while it loads.
+ *
+ * This file is bundled by itself into public/world.worker.js (scripts/build-world-worker.mjs),
+ * so that the page's HTML can start it before any of the page's own code is here
+ * (lib/landing/boot.ts). It fetches its grids itself.
  *
  * A worker is one of two things. A builder takes requests one at a time, in the order
  * they come. A helper is handed a line to a builder and floods grids with light for it
@@ -14,9 +18,9 @@ import { buildWorld, type Took } from "./load";
 
 export interface BuildRequest {
   id: number;
-  /** The grid's file, and that of a patch to lay into it first. */
-  grid: ArrayBuffer;
-  patch?: ArrayBuffer;
+  /** Where the grid's file is, and that of a patch to lay into it first. */
+  grid: string;
+  patch?: string;
   /** A line to a helper, if the page has one to spare. */
   port?: MessagePort;
 }

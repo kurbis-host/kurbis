@@ -121,7 +121,9 @@ The page draws the world as block faces: 28 bytes each (where, which side, which
 
 The suns' shadows are the one part of the light the page does not work out. Marching a ray from every corner toward each sun is two thirds of the work of baking the valley, so `export.shadows` sends the result with the grid: two bytes for each face a sun can reach, in the order the page finds faces, 124 KB packed. The page lays them in (`layShadows`), and refuses shadows that are not for the faces it found.
 
-What is left is about 0.2 s of work on a fast laptop. It is done in a worker (`world/worker.ts`), with a second one flooding the grid with light while the first finds the faces, which brings it to 0.14 s. Everything is asked for the moment the page is up (`engine/early.ts`), so the world is being built while the renderer's code is still on its way.
+What is left is about 0.2 s of work on a fast laptop. It is done in a worker (`world/worker.ts`), with a second one flooding the grid with light while the first finds the faces, which brings it to 0.14 s.
+
+None of this waits for the page's code. A few lines of script at the top of the HTML (`lib/landing/boot.ts`) start the worker and ask for every other file the first frame needs, as the browser reads the page's first bytes; the page's code, when it has arrived and run, takes over what is under way (`engine/world.ts`, `engine/early.ts`). For that the worker is a file of its own, `public/world.worker.js`, bundled from `lib/landing/world/` with `pnpm run build:worker` and committed (`world.test.ts` says when it is out of date). The film's code is part of the page's first scripts, so it downloads alongside. Against starting everything from the page's code, the first frame comes at 0.34 s instead of 0.46 s on this machine, 1.06 s instead of 1.19 s at 9 Mbit/s, 4.65 s instead of 4.94 s at 1.6 Mbit/s, and on slow cores 1.5 s instead of 1.8 s. (The table below was measured before this.)
 
 Measured on production builds: from the navigation to the film's first frame, on a first visit and on a repeat visit.
 

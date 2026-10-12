@@ -119,6 +119,14 @@ describe("the world, built in the page", () => {
   });
 });
 
+describe("the worker", () => {
+  it("is the one the page's HTML starts: public/world.worker.js is built from what is here", async () => {
+    // (Changed something under lib/landing/world? Run: pnpm run build:worker)
+    const { worldWorker } = (await import("../../../scripts/build-world-worker.mjs")) as { worldWorker(): Promise<string> };
+    expect(readFileSync(join(__dirname, "../../../public/world.worker.js"), "utf8")).toBe(await worldWorker());
+  }, 60000);
+});
+
 describe("the bundle", () => {
   it("goes by the version the page asks for it by", () => {
     // The page may keep these files for good, so they must not change under a version.
