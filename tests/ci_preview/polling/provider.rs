@@ -5,7 +5,8 @@ async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded
     let _test_guard = CI_TEST_LOCK.lock().await;
     use kurbis_hoster::ci::execution::SshBubblewrapBuildRuntime;
     use kurbis_hoster::ci::{
-        CiPoller, CiPollerConfig, ControlledBuildPipeline, GitHubSourceControl, SandboxLimits,
+        CiPoller, CiPollerConfig, ControlledBuildPipeline, GitHubRateLimitConfig,
+        GitHubRateLimitGuard, GitHubSourceControl, SandboxLimits,
     };
     use kurbis_hoster::routing::RouteRepository;
     use reqwest::Client;
@@ -37,7 +38,14 @@ async fn github_pr_3865_poll_persists_build_alias_and_gateway_route_with_bounded
     let source = std::sync::Arc::new(
         GitHubSourceControl::new(Client::new(), "fixture-token")
             .unwrap()
-            .with_api_base_url(api_base),
+            .with_api_base_url(api_base)
+            // The local fixture needs no request pacing.
+            .with_rate_limit_guard(std::sync::Arc::new(GitHubRateLimitGuard::new(
+                GitHubRateLimitConfig {
+                    minimum_interval: std::time::Duration::ZERO,
+                    ..GitHubRateLimitConfig::default()
+                },
+            ))),
     );
 
     // The old remote Bubblewrap identity embedded all operator paths and could

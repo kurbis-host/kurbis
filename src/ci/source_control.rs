@@ -723,6 +723,14 @@ mod http_tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
+    /// Local fixtures need no request pacing; the guard has its own tests.
+    fn unpaced() -> Arc<GitHubRateLimitGuard> {
+        Arc::new(GitHubRateLimitGuard::new(GitHubRateLimitConfig {
+            minimum_interval: Duration::ZERO,
+            ..GitHubRateLimitConfig::default()
+        }))
+    }
+
     async fn github_fixture(request: Request<Body>) -> axum::response::Response {
         let path = request
             .uri()
@@ -860,6 +868,7 @@ mod http_tests {
         let client = GitHubSourceControl::new(Client::new(), "fixture-token")
             .unwrap()
             .with_api_base_url(format!("http://{address}"))
+            .with_rate_limit_guard(unpaced())
             .with_page_limits(1, 4);
         assert_eq!(
             client
@@ -894,7 +903,8 @@ mod http_tests {
         });
         let client = GitHubSourceControl::new(Client::new(), "fixture-token")
             .unwrap()
-            .with_api_base_url(format!("http://{address}"));
+            .with_api_base_url(format!("http://{address}"))
+            .with_rate_limit_guard(unpaced());
         let first = client
             .poll("Pumpkin-MC/Pumpkin", &PollCheckpoint::default())
             .await
@@ -932,6 +942,7 @@ mod http_tests {
         let client = GitHubSourceControl::new(Client::new(), "test-token")
             .unwrap()
             .with_api_base_url(format!("http://{address}"))
+            .with_rate_limit_guard(unpaced())
             .with_page_limits(1, 4);
         let result = client
             .poll("Pumpkin-MC/Pumpkin", &PollCheckpoint::default())
