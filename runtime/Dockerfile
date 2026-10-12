@@ -3,7 +3,6 @@ FROM docker:28-cli AS docker-cli
 FROM rust:1.98-bookworm AS builder
 ARG BUILD_REVISION=development
 ENV KURBIS_BUILD_REVISION=${BUILD_REVISION}
-ENV CARGO_BUILD_JOBS=2
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -11,7 +10,7 @@ COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
 COPY plugins/kurbis-control /opt/kurbis/plugins/kurbis-control
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --jobs 1 --locked --release --bins && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --jobs 2 --locked --release --bin control-plane --bin gateway --bin worker --bin worker-bundle --bin runtime-api-proxy && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
 
 FROM debian:bookworm-slim
 ARG BUILD_REVISION=development

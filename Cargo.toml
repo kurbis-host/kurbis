@@ -49,6 +49,7 @@ walkdir = "2.5"
 [dev-dependencies]
 
 [profile.release]
-lto = "thin"
+# No cross-crate LTO: with it every binary re-optimises the whole dependency
+# graph at link time, about a third of a release build, for no smaller output.
 codegen-units = 1
 strip = true
