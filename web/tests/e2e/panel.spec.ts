@@ -266,7 +266,16 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
   test.setTimeout(120000);
   const axeResults: Record<string, unknown> = {};
   await page.emulateMedia({ reducedMotion: 'reduce' });
+  // The landing page is a WebGL film where it can be (landing.spec.ts). Here it is audited
+  // and compared as the page it is without one: its own HTML, the same on every machine.
+  await page.addInitScript(() => {
+    const original = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement, kind: string, ...rest: unknown[]) {
+      return kind === 'webgl2' ? null : (original as (...args: unknown[]) => unknown).call(this, kind, ...rest);
+    } as typeof original;
+  });
   await page.goto('/');
+  await expect(page.getByRole('main')).toHaveAttribute('data-film', 'failed');
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   const publicAudit = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   if (publicAudit.violations.length) axeResults['/'] = publicAudit.violations;

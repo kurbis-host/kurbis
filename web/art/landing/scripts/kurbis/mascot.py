@@ -42,6 +42,42 @@ FACES = {
         "................",
         "................",
     ],
+    "blink": [
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "..####....####..",
+        "................",
+        "................",
+        ".##..........##.",
+        ".####..##..####.",
+        "..############..",
+        "....########....",
+        "................",
+        "................",
+    ],
+    "peek": [
+        "................",
+        "................",
+        "................",
+        "................",
+        "...........##...",
+        "..........####..",
+        "..#..#....####..",
+        "...##.....####..",
+        "................",
+        "................",
+        "................",
+        ".......###......",
+        ".......###......",
+        "................",
+        "................",
+        "................",
+    ],
     "asleep": [
         "................",
         "................",
@@ -86,6 +122,8 @@ def register(blocks):
     side, top = blocks.tex("pumpkin_side"), blocks.tex("pumpkin_top")
     blocks.cube("kurbis_awake", side=side, front=_face(blocks, "awake", 1.0), top=top, bottom=top, group="mascot")
     blocks.cube("kurbis_whee", side=side, front=_face(blocks, "whee", 1.0), top=top, bottom=top, group="mascot")
+    blocks.cube("kurbis_blink", side=side, front=_face(blocks, "blink", 1.0), top=top, bottom=top, group="mascot")
+    blocks.cube("kurbis_peek", side=side, front=_face(blocks, "peek", 1.0), top=top, bottom=top, group="mascot")
     blocks.cube("kurbis_asleep", side=side, front=_face(blocks, "asleep", 0.3), top=top, bottom=top, group="mascot")
     blocks.cube("kurbis_stem", all=blocks.flat((0.33, 0.40, 0.13)), group="mascot")
 
@@ -104,3 +142,24 @@ def build(name, blocks, material, state="awake", col="Characters", size=1.0):
     tip.parent = root
     root.scale = (size,) * 3
     return root
+
+
+def build_actor(name, blocks, material, col="Characters", faces=("asleep", "peek", "awake", "blink", "whee")):
+    """The pumpkin for animation. `root` sits at the bottom centre (move, turn, squash);
+    `spin` sits at the body's centre (tumble). Every face exists as its own body, and
+    the animation shows one at a time. Returns (root, spin, {face: body}, stem)."""
+    root = core.empty(name, col)
+    spin = core.empty(f"{name}_spin", col, location=(0, 0, 0.5), parent=root)
+    bodies = {}
+    for face in faces:
+        grid = np.full((1, 1, 1), blocks[f"kurbis_{face}"], np.uint8)
+        body = voxel.grid_object(f"{name}_{face}", grid, blocks, material, col, group="mascot", origin=(-0.5, -0.5, -0.5))
+        body.parent = spin
+        bodies[face] = body
+    stem = np.zeros((3, 2, 3), np.uint8)
+    stem[0:2, :, 0:2] = blocks["kurbis_stem"]
+    stem[1:3, :, 2] = blocks["kurbis_stem"]
+    s = 0.105
+    tip = voxel.grid_object(f"{name}_stem", stem, blocks, material, col, group="mascot", scale=s, origin=(-s, -s, 0.5))
+    tip.parent = spin
+    return root, spin, bodies, tip

@@ -1,56 +1,100 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import LandingPage from "../../app/(marketing)/page";
 import LoginPage from "../../app/(marketing)/login/page";
-import { landing } from "../../lib/landing/store";
+import { session } from "./fixtures";
+
+const push = vi.fn();
+vi.mock("next/headers", () => ({
+  cookies: async () => ({ getAll: () => [] }),
+}));
+vi.mock("next/navigation", () => ({
+  redirect: vi.fn(() => {
+    throw new Error("Public pages must not redirect based on a session");
+  }),
+  useRouter: () => ({ push }),
+}));
 
 beforeEach(() => {
-  // jsdom has no WebGL, so the landing world falls back to its flat picture.
+  // A browser without WebGL (jsdom has no canvas at all): the film cannot play, and the page must not need it.
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
 });
 
 afterEach(() => {
   cleanup();
-  landing.reset();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  push.mockReset();
 });
 
 describe("standalone marketing pages", () => {
-  it("renders the landing page without contacting the backend", () => {
-    const fetch = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
+  it.each([
+    ["offline", () => Promise.reject(new TypeError("fetch failed"))],
+    ["unresponsive", () => new Promise<Response>(() => {})],
+    ["unavailable", () => Promise.resolve(new Response("unavailable", { status: 503 }))],
+    ["signed out", () => Promise.resolve(new Response("unauthorized", { status: 401 }))],
+    ["signed in", () => Promise.resolve(Response.json(session))],
+  ] as const)("renders the landing page without consulting the backend (%s)", async (_state, respond) => {
+    const fetch = vi.fn(respond);
     vi.stubGlobal("fetch", fetch);
 
     render(<LandingPage />);
 
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Your world is waiting below.");
+    // Everything the film says is on the page as text, in reading order, whether or not the film plays.
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Your world is waiting below");
+    expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      "You choose the name.",
+      "Cost: nothing.",
+      "Sleeps when you leave. Wakes when you join.",
+      "Your server. Your rules.",
+      "Ask the spawner anything.",
+      "Pick a name.",
+    ]);
+    expect(screen.getByText("No card. No ads.")).toBeInTheDocument();
+    expect(screen.getByText("2 GB RAM. 5 GB world. One server each.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Jump to portal" })).toHaveAttribute("href", "#name");
     expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
-    expect(screen.getByRole("link", { name: /Open dashboard/ })).toHaveAttribute("href", "/login");
+    expect(screen.getByRole("textbox", { name: /Pick a name for your server/ })).toBeInTheDocument();
+    // Where there is no WebGL (as here), nothing of the film is fetched either.
+    await waitFor(() => expect(screen.getByRole("main")).toHaveAttribute("data-film", "failed"));
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("advertises only the AI requests the in-game assistant really takes", () => {
-    render(<LandingPage />);
-
-    const spawner = screen.getByRole("region", { name: "Ask the spawner anything." });
-    const commands = within(spawner).getAllByText(/^\/ai /).map((command) => command.textContent);
-    expect(commands.length).toBeGreaterThan(0);
-    for (const command of commands) expect(command).toMatch(/^\/ai (?:(?:ask|new) .+|status|cancel)$/);
-  });
-
-  it("runs the wake/sleep demo locally without API requests", async () => {
+  it("runs the sleep/wake demo locally without API requests", async () => {
     const fetch = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
     vi.stubGlobal("fetch", fetch);
     const user = userEvent.setup();
     render(<LandingPage />);
 
-    const cave = screen.getByRole("region", { name: "It only glows when someone's home." });
-    expect(within(cave).getByText(/^Asleep\./)).toBeVisible();
-    await user.click(within(cave).getByRole("button", { name: "A player joins" }));
-    expect(within(cave).getByText("Awake. Someone's home.")).toBeVisible();
-    await user.click(within(cave).getByRole("button", { name: "Everyone leaves" }));
-    expect(within(cave).getByText(/^Everyone left\. Lights out in/)).toBeVisible();
+    const state = screen.getAllByRole("status")[0];
+    expect(state).toHaveTextContent("The server is awake.");
+    await user.click(screen.getByRole("button", { name: "Pull it: everyone leaves, and the server sleeps." }));
+    expect(state).toHaveTextContent("Nobody home. It sleeps. Every block saved.");
+    expect(state).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Pull it: someone joins, and the server wakes." }));
+    expect(state).toHaveTextContent("The server is awake.");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("checks a typed name and goes on to sign in, without API requests", async () => {
+    const fetch = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
+    vi.stubGlobal("fetch", fetch);
+    const user = userEvent.setup();
+    render(<LandingPage />);
+
+    const field = screen.getByRole("textbox", { name: /Pick a name for your server/ });
+    await user.type(field, "Steve");
+    expect(field).toHaveValue("steve");
+    expect(await screen.findByText("steve.kurbis.host is taken. Try another name.", {}, { timeout: 3000 })).toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(push).not.toHaveBeenCalled();
+
+    await user.clear(field);
+    await user.type(field, "pumpkin-patch");
+    expect(await screen.findByText("pumpkin-patch.kurbis.host is free. Press Enter to step through.", {}, { timeout: 3000 })).toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(push).toHaveBeenCalledWith("/login");
     expect(fetch).not.toHaveBeenCalled();
   });
 

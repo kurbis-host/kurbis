@@ -12,6 +12,8 @@ import numpy as np
 
 from . import core
 from .blocks import NX, NY, NZ, PX, PY, PZ
+from mathutils import Matrix, Vector
+
 from .voxel import QUADS
 
 PX_M = 1.0 / 16.0
@@ -50,6 +52,7 @@ def tex_material(name, rel, clip=True, tint=None, emit=0.0, emit_rel=None, rough
             src = glow.outputs["Color"]
         nt.links.new(src, bsdf.inputs["Emission Color"])
         bsdf.inputs["Emission Strength"].default_value = emit
+    core.note(mat, kind="tex", image=rel, clip=clip, tint=list(tint) if tint is not None else None, emit=emit, emit_image=emit_rel)
     return mat
 
 
@@ -99,6 +102,17 @@ class BoxMesh:
         lo = np.asarray(lo, np.float32) - inflate
         size = np.asarray(size, np.float32) + inflate * 2
         return self.faces(lo, size, regions, flip_v=flipped)
+
+    def turned(self, quarters=1):
+        """Turn everything so far by quarter turns about the vertical axis."""
+        for _ in range(quarters % 4):
+            self.verts = [np.stack([-v[:, 1], v[:, 0], v[:, 2]], axis=1) for v in self.verts]
+        return self
+
+    def add(self, other):
+        self.verts += other.verts
+        self.uvs += other.uvs
+        return self
 
     def object(self, name, material, col, pivot=(0, 0, 0), parent=None, parent_pivot=(0, 0, 0)):
         pivot = np.asarray(pivot, np.float32)
@@ -216,16 +230,25 @@ def chest(name, col="Props", open_deg=0.0):
 def cross_sprites(name, rel, positions, col="Props", tint=None, emit=0.0, emit_rel=None, size=1.0, rows=1):
     """Crossed quads (grass, wheat, vines). `rows` stacks the sprite downward for hanging plants."""
     mat = tex_material(f"{name}_mat", rel, clip=True, tint=tint, emit=emit, emit_rel=emit_rel)
-    verts, uvs = [], []
+    verts, uvs, sway = [], [], []
     a, b = 0.5 - 0.5 * size * 0.92, 0.5 + 0.5 * size * 0.92
     uv = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    # A plant stacked over several blocks (cane) is rooted where its lowest block stands;
+    # one that hangs (vines) is rooted at the top of its highest.
+    roots = {}
+    for x, y, z in positions:
+        roots[(x, y)] = max(roots.get((x, y), z + size), z + size) if rows > 1 else min(roots.get((x, y), z), z)
     for x, y, z in positions:
         for r in range(rows):
             zb = z - r * size
             for (x0, y0), (x1, y1) in (((a, a), (b, b)), ((a, b), (b, a))):
                 verts.append([(x + x0, y + y0, zb), (x + x1, y + y1, zb), (x + x1, y + y1, zb + size), (x + x0, y + y0, zb + size)])
                 uvs.append(uv)
-    obj = bpy.data.objects.new(name, core.mesh_from_quads(name, np.asarray(verts, np.float32), np.asarray(uvs, np.float32)))
+                far = [abs(h - roots[(x, y)]) ** 0.7 for h in (zb, zb, zb + size, zb + size)]
+                sway.append(far)
+    mesh = core.mesh_from_quads(name, np.asarray(verts, np.float32), np.asarray(uvs, np.float32))
+    core.point_attribute(mesh, "sway", np.asarray(sway, np.float32).ravel())  # for life.wind
+    obj = bpy.data.objects.new(name, mesh)
     obj.data.materials.append(mat)
     return core.link(obj, col)
 
@@ -262,3 +285,126 @@ def cage(name, rel="block/spawner.png", col="Props"):
     full = (0, 0, 16, 16)
     mesh = BoxMesh(16, 16).faces((-8, -8, 0), (16, 16, 16), {k: full for k in range(6)})
     return mesh.object(name, mat, col)
+
+
+def minecart(name, col="Props"):
+    """An open cart, its long axis along Y, the origin under its middle at rail height."""
+    mat = bpy.data.materials.get("Minecart") or tex_material("Minecart", "entity/minecart/minecart.png", clip=False)
+    # Laid out along X, as the texture is drawn, then turned to run along Y.
+    mesh = BoxMesh(64, 32)
+    mesh.faces((-10, -8, 0), (20, 16, 2), {PZ: (2, 12, 20, 16), NZ: (24, 12, 20, 16), NY: (2, 10, 20, 2), PY: (22, 10, 20, 2), PX: (0, 12, 2, 16), NX: (22, 12, 2, 16)})
+    inside, outside, rim, edge = (2, 2, 16, 8), (20, 2, 16, 8), (2, 0, 16, 2), (0, 2, 2, 8)
+
+    def wall(part, y, near):
+        """One wall along X; `near` says whether it is the one on the -Y side."""
+        part.faces((-8, y, 2), (16, 2, 8), {NY: outside if near else inside, PY: inside if near else outside, PZ: rim, PX: edge, NX: edge})
+
+    wall(mesh, -8, True)
+    wall(mesh, 6, False)
+    ends = BoxMesh(64, 32)
+    wall(ends, -10, True)
+    wall(ends, 8, False)
+    mesh.add(ends.turned())
+    return mesh.turned().object(name, mat, col)
+
+
+def lever(name, col="Props", on=True):
+    """A lever on its stone base, to stand on top of a block. Returns (base, handle);
+    the handle leans 40 degrees to one side or the other about its foot."""
+    stone = bpy.data.materials.get("LeverBase") or tex_material("LeverBase", "block/cobblestone.png", clip=False)
+    stick = bpy.data.materials.get("Lever") or tex_material("Lever", "block/lever.png", clip=False)
+    side, end = (5, 6, 8, 3), (5, 6, 6, 3)
+    base = BoxMesh(16, 16).faces((-4, -3, 0), (8, 6, 3), {PZ: (4, 5, 8, 6), NY: side, PY: side, PX: end, NX: end}).object(f"{name}_base", stone, col)
+    shaft = (7, 6, 2, 10)
+    handle = BoxMesh(16, 16).faces((-1, -1, 1), (2, 2, 10), {PX: shaft, NX: shaft, PY: shaft, NY: shaft, PZ: (7, 6, 2, 2)}).object(f"{name}_handle", stick, col, pivot=(0, 0, 2), parent=base)
+    handle.rotation_euler = (0, math.radians(40 if on else -40), 0)
+    return base, handle
+
+
+def sign(name, col="Props", post=True):
+    """A sign: a board 24 by 12 pixels on a post, the origin at the foot. Faces -Y.
+    The board glows a little, so what is written on it reads in a dim room."""
+    mat = bpy.data.materials.get("Sign") or tex_material("Sign", "entity/signs/oak.png", clip=False, emit=0.3)
+    mesh = BoxMesh(64, 32).box((-12, -1, 14 if post else 0), (24, 2, 12), (0, 0))
+    if post:
+        mesh.box((-1, -1, 0), (2, 2, 14), (0, 14))
+    return mesh.object(name, mat, col)
+
+
+def tiles(name, rel, quads, uvs=None, col="Props", **material):
+    """Flat textured tiles from explicit corners (rails and the like)."""
+    mat = bpy.data.materials.get(f"{name}_mat") or tex_material(f"{name}_mat", rel, **material)
+    quads = np.asarray(quads, np.float32)
+    if uvs is None:
+        uvs = [[(0, 0), (1, 0), (1, 1), (0, 1)]] * len(quads)
+    obj = bpy.data.objects.new(name, core.mesh_from_quads(name, quads, np.asarray(uvs, np.float32)))
+    obj.data.materials.append(mat)
+    return core.link(obj, col)
+
+
+def fish(name, kind="salmon", col="Props"):
+    """A fish about a block long, nose toward -Y, the origin at its middle."""
+    mat = bpy.data.materials.get(f"Fish_{kind}") or tex_material(f"Fish_{kind}", f"entity/fish/{kind}.png", clip=False)
+    mesh = BoxMesh(32, 32)
+    mesh.box((-1.5, -8, -2.5), (3, 8, 5), (0, 0))
+    mesh.box((-1.5, 0, -2.5), (3, 8, 5), (0, 13))
+    mesh.box((-1, -11, -2), (2, 3, 4), (22, 0))
+    return mesh.object(name, mat, col)
+
+
+def hold(rig, thing, grip=(-6, -6), scale=1.0, hand="hand_r"):
+    """Put an item (see `item`) in a hand, held by the pixel `grip` of its sprite, standing
+    up out of the fist. Returns the point of the sprite's far corner in the item's own
+    space, which for a rod or a tool is its tip."""
+    thing.parent = rig.parts[hand]
+    turn = Matrix.Rotation(math.pi, 3, "X") @ Matrix.Rotation(math.pi / 2, 3, "Z")
+    thing.rotation_euler = turn.to_euler()
+    thing.scale = (scale,) * 3
+    thing.location = Vector((0.0, -0.1, -0.34)) - turn @ (Vector((grip[0] / 16, 0, grip[1] / 16)) * scale)
+    return Vector((7.5 / 16, 0, 7.5 / 16))
+
+
+def image_tiles(name, image, quads, uvs=None, col="Props", emit=0.0):
+    """Flat tiles showing an image made in code (see core.image_from_pixels), cut out
+    where it is clear."""
+    mat = bpy.data.materials.new(f"{name}_mat")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
+    bsdf.inputs["Roughness"].default_value = 0.9
+    bsdf.inputs["Specular IOR Level"].default_value = 0.1
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = image
+    tex.interpolation = "Closest"
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    cut = nt.nodes.new("ShaderNodeMath")
+    cut.operation = "GREATER_THAN"
+    cut.inputs[1].default_value = 0.5
+    nt.links.new(tex.outputs["Alpha"], cut.inputs[0])
+    nt.links.new(cut.outputs[0], bsdf.inputs["Alpha"])
+    if emit:
+        nt.links.new(tex.outputs["Color"], bsdf.inputs["Emission Color"])
+        bsdf.inputs["Emission Strength"].default_value = emit
+    core.note(mat, kind="tex", made=image.name, clip=True, emit=emit)  # (an image made in code, saved under export/)
+    quads = np.asarray(quads, np.float32)
+    if uvs is None:
+        uvs = [[(0, 0), (1, 0), (1, 1), (0, 1)]] * len(quads)
+    obj = bpy.data.objects.new(name, core.mesh_from_quads(name, quads, np.asarray(uvs, np.float32)))
+    obj.data.materials.append(mat)
+    return core.link(obj, col)
+
+
+def strider(name, col="Characters"):
+    """A strider: a body on two long legs, about two blocks tall, facing -Y. Returns a Rig
+    with parts body, leg_r and leg_l (the legs swing from the hip)."""
+    mat = bpy.data.materials.get("Strider") or tex_material("Strider", "entity/strider/strider.png", clip=False)
+    root = core.empty(name, col)
+    rig = Rig(root)
+    for key, lo, size, uv, pivot in (
+        ("body", (-8, -8, 16), (16, 16, 14), (0, 0), (0, 0, 16)),
+        ("leg_r", (-6, -2, 0), (4, 4, 16), (0, 32), (-4, 0, 16)),
+        ("leg_l", (2, -2, 0), (4, 4, 16), (0, 55), (4, 0, 16)),
+    ):
+        rig.parts[key] = BoxMesh(64, 128).box(lo, size, uv).object(f"{name}_{key}", mat, col, pivot, root)
+        rig.pivots[key] = pivot
+    return rig

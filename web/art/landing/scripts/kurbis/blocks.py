@@ -176,6 +176,7 @@ def voxel_material(name, atlas, emit_strength=4.0, self_illum=0.0, roughness=0.9
     nt.links.new(add.outputs["Vector"], bsdf.inputs["Emission Color"])
     bsdf.inputs["Emission Strength"].default_value = 1.0
     nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
+    core.note(mat, kind="voxel", emit=emit_strength, glow=self_illum)
     return mat
 
 
@@ -190,6 +191,7 @@ def flat_material(name, rgb, alpha=1.0, emit=0.0, roughness=0.6, emit_rgb=None, 
     bsdf.inputs["Emission Strength"].default_value = emit
     if alpha < 1.0:
         mat.surface_render_method = "DITHERED" if dither else "BLENDED"
+    core.note(mat, kind="flat", rgb=list(rgb), alpha=alpha, emit=emit, emit_rgb=list(emit_rgb or rgb), dither=dither)
     return mat
 
 
@@ -208,6 +210,8 @@ TYPE_PALETTES = {
     "cream": {"front": (1.0, 0.96, 0.86), "top": (0.98, 0.84, 0.66), "side": (0.78, 0.55, 0.38), "bottom": (0.45, 0.27, 0.20)},
     "plum": {"front": (0.33, 0.13, 0.25), "top": (0.46, 0.19, 0.30), "side": (0.22, 0.08, 0.18), "bottom": (0.13, 0.05, 0.12)},
     "ember": {"front": (1.0, 0.52, 0.16), "top": (0.95, 0.38, 0.10), "side": (0.70, 0.22, 0.06), "bottom": (0.38, 0.10, 0.04)},
+    "ink": {"front": (0.15, 0.08, 0.06), "top": (0.22, 0.13, 0.09), "side": (0.09, 0.05, 0.04), "bottom": (0.05, 0.03, 0.03)},  # writing on signs
+    "lime": {"front": (0.50, 1.0, 0.36), "top": (0.36, 0.86, 0.26), "side": (0.20, 0.58, 0.16), "bottom": (0.10, 0.34, 0.10)},  # good news
 }
 
 
@@ -253,6 +257,8 @@ def build_registry():
     b.cube("magma", all=t("magma", emit=0.7, emit_mask=saturated))
     b.cube("gold_block", all=t("gold_block"))
     b.cube("lamp", all=t("redstone_lamp_on", emit=1.0))
+    b.cube("lamp_off", all=t("redstone_lamp"))
+    b.cube("basalt", side=t("basalt_side"), top=t("basalt_top"), bottom=t("basalt_top"))
     b.cube("froglight", side=t("ochre_froglight_side", emit=1.0), top=t("ochre_froglight_top", emit=1.0), bottom=t("ochre_froglight_top", emit=1.0))
     b.cube("command_block", side=t("command_block_side"), front=t("command_block_front", emit=0.35, emit_mask=saturated), top=t("command_block_back"), bottom=t("command_block_back"))
     b.cube("smithing_table", side=t("smithing_table_side"), front=t("smithing_table_front"), top=t("smithing_table_top"), bottom=t("smithing_table_bottom"))
@@ -270,10 +276,12 @@ def build_registry():
     b.cube("deepslate_diamond_ore", all=t("deepslate_diamond_ore", emit=0.3, emit_mask=saturated))
     b.cube("deepslate_gold_ore", all=t("deepslate_gold_ore", emit=0.22, emit_mask=saturated))
     b.cube("deepslate_redstone_ore", all=t("deepslate_redstone_ore", emit=0.3, emit_mask=saturated))
+    # Leaves are their own mesh, so the wind can move them. They do not hide what they
+    # touch: when a canopy sways, the trunk and the ground under it must still be there.
     for name, tint in LEAF_TINTS.items():
-        b.cube(name, all=t("oak_leaves", tint=tint))
-    b.cube("leaves_blossom", all=t("flowering_azalea_leaves"))
-    b.cube("leaves_cherry", all=t("cherry_leaves"))
+        b.cube(name, all=t("oak_leaves", tint=tint), opaque=False, group="leaves")
+    b.cube("leaves_blossom", all=t("flowering_azalea_leaves"), opaque=False, group="leaves")
+    b.cube("leaves_cherry", all=t("cherry_leaves"), opaque=False, group="leaves")
     b.cube("cherry_log", side=t("cherry_log"), top=t("cherry_log_top"), bottom=t("cherry_log_top"))
     b.cube("water", all=b.flat((0.16, 0.42, 0.86)), opaque=False, group="water")
     b.cube("cloud", all=b.flat((1.0, 0.93, 0.90)), opaque=False, group="cloud")

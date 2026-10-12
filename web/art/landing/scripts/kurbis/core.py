@@ -1,9 +1,11 @@
 """Paths, scene reset and small Blender helpers shared by the toolkit."""
 
+import json
 from pathlib import Path
 
 import bpy
 import numpy as np
+from mathutils import Euler, Matrix
 
 ROOT = Path(__file__).resolve().parents[2]
 # POC only: third-party trailer-style pack. Replaced by our own textures before shipping.
@@ -28,6 +30,7 @@ def reset_scene(name="KurbisLanding"):
         bpy.data.cameras,
         bpy.data.worlds,
         bpy.data.node_groups,
+        bpy.data.actions,
     ):
         for item in list(coll):
             coll.remove(item)
@@ -79,6 +82,19 @@ def image_from_pixels(name, buf, path=None):
     return img
 
 
+def note(block, **what):
+    """Write down on a datablock what it is. The web exporter reads these notes rather
+    than take node trees and modifiers apart. Notes add up."""
+    said = json.loads(block.get("kurbis", "{}"))
+    said.update(what)
+    block["kurbis"] = json.dumps(said)
+    return block
+
+
+def noted(block):
+    return json.loads(block.get("kurbis", "{}"))
+
+
 def mesh_from_quads(name, verts, uvs):
     """verts: (n, 4, 3), uvs: (n, 4, 2). Unshared corners, so shading stays flat."""
     n = len(verts)
@@ -94,3 +110,24 @@ def mesh_from_quads(name, verts, uvs):
     me.update(calc_edges=True)
     me.validate()
     return me
+
+
+def point_attribute(mesh, name, values):
+    """Store one value per vertex (floats, or vectors if `values` has three columns)."""
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    vector = values.ndim == 2
+    attribute = mesh.attributes.new(name, "FLOAT_VECTOR" if vector else "FLOAT", "POINT")
+    attribute.data.foreach_set("vector" if vector else "value", values.ravel())
+    return attribute
+
+
+def world_matrix(obj, turns=None):
+    """Where an object is, worked out from its own placement and its parents' (no scene
+    update needed, so it is cheap to ask on every frame). `turns` maps objects to
+    rotations (radians) to use instead of the ones they have."""
+    basis = obj.matrix_basis
+    if turns and obj in turns:
+        basis = Matrix.LocRotScale(obj.location, Euler(turns[obj]), obj.scale)
+    if obj.parent is None:
+        return basis.copy()
+    return world_matrix(obj.parent, turns) @ obj.matrix_parent_inverse @ basis

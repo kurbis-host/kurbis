@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { LandingPage } from "../../components/landing/landing-page";
+import { Landing } from "../../components/landing/landing";
+import { Mirror } from "../../components/landing/mirror";
 
 export const metadata: Metadata = {
   title: { absolute: "kurbis — free Minecraft servers. Dig down." },
@@ -7,5 +8,9 @@ export const metadata: Metadata = {
 };
 
 export default function MarketingPage() {
-  return <LandingPage />;
+  return (
+    <Landing>
+      <Mirror />
+    </Landing>
+  );
 }

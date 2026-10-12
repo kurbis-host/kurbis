@@ -5,3 +5,5 @@ node_modules
 *.tsbuildinfo
 test-results
 playwright-report
+# The landing page's art workspace: sources and gigabytes of renders, none of it needed to build.
+art
