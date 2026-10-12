@@ -19,6 +19,7 @@ pub enum ServerEventKind {
     Players,
     Whitelist,
     Operators,
+    Ai,
 }
 
 impl TryFrom<&str> for ServerEventKind {
@@ -33,6 +34,7 @@ impl TryFrom<&str> for ServerEventKind {
             "players" => Ok(Self::Players),
             "whitelist" => Ok(Self::Whitelist),
             "operators" => Ok(Self::Operators),
+            "ai" => Ok(Self::Ai),
             _ => Err(ApiError::with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid_server_event",
@@ -52,6 +54,7 @@ impl ServerEventKind {
             Self::Players => "players",
             Self::Whitelist => "whitelist",
             Self::Operators => "operators",
+            Self::Ai => "ai",
         }
     }
 }
@@ -110,6 +113,7 @@ pub(super) async fn activity(
                 ServerEventKind::Players => "Player presence changed",
                 ServerEventKind::Whitelist => "Whitelist changed",
                 ServerEventKind::Operators => "Operator roster changed",
+                ServerEventKind::Ai => "AI assistant activity",
             }
             .to_owned();
             Ok(ActivityEntry {

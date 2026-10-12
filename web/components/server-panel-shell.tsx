@@ -7,6 +7,7 @@ import {
   Gauge,
   ScrollText,
   Settings2,
+  Sparkles,
   UserRoundCheck,
   WandSparkles,
 } from "lucide-react";
@@ -29,6 +30,7 @@ const serverNav = [
   { suffix: "/console", label: "Console", Icon: ScrollText },
   { suffix: "/backups", label: "Backups", Icon: ArchiveRestore },
   { suffix: "/players", label: "Players", Icon: UserRoundCheck },
+  { suffix: "/ai", label: "AI", Icon: Sparkles },
   { suffix: "/settings", label: "Settings", Icon: Settings2 },
 ] as const;
 

@@ -8,9 +8,10 @@ use kurbis_hoster::{
         GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, PollError,
         bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
     },
-    config::{CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
+    config::{AiConfig, CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
     control_plane::{
+        ai::AiGateway,
         api::{AppState, router},
         lifecycle::Lifecycle,
         maintenance::{CiPreviewMaintenance, WorkerMaintenance},
@@ -274,6 +275,25 @@ async fn main() -> Result<()> {
             },
         );
     }
+    let ai = match AiConfig::from_env()? {
+        Some(ai_config) => {
+            let gateway = AiGateway::new(pool.clone(), ai_config)?;
+            let runner = gateway.clone();
+            workers.spawn(
+                "ai-jobs",
+                SupervisorConfig::optional(std::time::Duration::from_secs(1)),
+                move || {
+                    let runner = runner.clone();
+                    async move { runner.run_jobs().await.map_err(WorkerError::retryable) }
+                },
+            );
+            Some(gateway)
+        }
+        None => {
+            tracing::info!("ANTHROPIC_API_KEY is not set; the AI assistant is unavailable");
+            None
+        }
+    };
     let listen = config.listen;
     let state = Arc::new(AppState {
         pool,
@@ -285,6 +305,7 @@ async fn main() -> Result<()> {
         config,
         object_store,
         supervision,
+        ai,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())

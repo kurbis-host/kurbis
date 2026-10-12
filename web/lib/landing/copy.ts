@@ -43,8 +43,9 @@ export type OreId = (typeof ORES)[number]["id"];
 
 export const SPAWNER_LINES = [
   { cmd: "/ai ask give everyone night vision", reply: "Done now." },
-  { cmd: "/ai code add a /home command", reply: "Becomes a real command, no restart." },
-  { cmd: "/ai revert", reply: "Oops, undone." },
+  { cmd: "/ai ask where is everyone?", reply: "Steve's in the Nether. Lena's at spawn." },
+  { cmd: "/ai ask make it day and stop the rain", reply: "Sun's up. Sky's clear." },
+  { cmd: "/ai ask op me", reply: "Nope. Ops, bans and the whitelist stay with you." },
 ];
 
 export const BACKUP_ROWS = [

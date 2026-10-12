@@ -32,6 +32,18 @@ prints a one-use browser link for this server using the configured public URL sc
 15 minutes; its redeemed browser grant does not sign in to a Kurbis account and
 remains active until revoked or the server is removed or suspended.
 
+Operators can also ask the Kurbis AI assistant to act on the server.
+`/ai ask <question>` sends the question to the AI gateway on the control
+plane; follow-ups within an hour continue the same conversation, and
+`/ai new <question>` starts a fresh one. `/ai cancel` stops the running
+request and `/ai status` shows the model and this month's spending against the
+server and account budgets. While a request runs, the plugin syncs with the
+gateway every half second: it runs the tools the model asks for (server
+status, players, worlds, entities and server commands, executed as the asking
+operator) and shows progress lines and the answer in that operator's chat. The
+gateway records the cost of every model call and refuses new requests once a
+budget is used up. CI preview servers do not offer `/ai`.
+
 Docker workers use the plugin baked into the hosted Pumpkin image. Native
 workers build it from this crate by default; `KURBIS_CONTROL_PLUGIN_WASM` can
 point to another local build artifact.

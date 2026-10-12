@@ -32,6 +32,8 @@ const surfaces = {
     || path === "/api/v1/servers/{server_id}"
     || path === "/api/v1/servers/{server_id}/commands",
   "server-data": (path) => path.startsWith("/api/v1/servers/{server_id}/")
+    && path !== "/api/v1/servers/{server_id}/ai"
+    && !path.startsWith("/api/v1/servers/{server_id}/ai/")
     && path !== "/api/v1/servers/{server_id}/commands"
     && path !== "/api/v1/servers/{server_id}/runtime-stats"
     && path !== "/api/v1/servers/{server_id}/console/commands"
@@ -39,6 +41,8 @@ const surfaces = {
   "server-stats": (path) => path === "/api/v1/servers/{server_id}/runtime-stats",
   "server-console": (path) => path === "/api/v1/servers/{server_id}/console/commands"
     || path === "/api/v1/servers/{server_id}/console/commands/{command_id}",
+  "server-ai": (path) => path === "/api/v1/servers/{server_id}/ai"
+    || path.startsWith("/api/v1/servers/{server_id}/ai/"),
 };
 for (const path of Object.keys(document.paths)) {
   const owners = Object.values(surfaces).filter((belongs) => belongs(path)).length;

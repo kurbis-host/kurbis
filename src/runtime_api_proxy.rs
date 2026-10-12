@@ -1187,14 +1187,16 @@ pub(crate) fn route_allowed(scope: Scope, method: &Method, path: &str, expected_
             }
             match segments.get(4..) {
                 Some([]) => matches!(*method, Method::GET | Method::PATCH),
-                Some([resource]) => match *resource {
-                    "players" | "logs" | "activity" | "snapshots" | "runtime-stats" => {
-                        *method == Method::GET
-                    }
-                    "whitelist" => matches!(*method, Method::GET | Method::POST | Method::DELETE),
-                    "commands" => *method == Method::POST,
-                    _ => false,
-                },
+                Some(["players" | "logs" | "activity" | "snapshots" | "runtime-stats" | "ai"]) => {
+                    *method == Method::GET
+                }
+                Some(["whitelist"]) => {
+                    matches!(*method, Method::GET | Method::POST | Method::DELETE)
+                }
+                Some(["commands"] | ["ai", "jobs" | "sync"]) => *method == Method::POST,
+                Some(["ai", "jobs", job_id, "cancel"]) => {
+                    *method == Method::POST && Uuid::parse_str(job_id).is_ok()
+                }
                 _ => false,
             }
         }

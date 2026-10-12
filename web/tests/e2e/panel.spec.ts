@@ -71,6 +71,7 @@ function visualRouteName(route: string) {
   if (route.endsWith('/console')) return 'console';
   if (route.endsWith('/backups')) return 'backups';
   if (route.endsWith('/players')) return 'players';
+  if (route.endsWith('/ai')) return 'ai';
   if (route.endsWith('/settings')) return 'settings';
   if (route === '/app/account') return 'account';
   return 'overview';
@@ -287,6 +288,7 @@ test('panel routes support AA accessibility, responsive widths and keyboard dial
     await serverRoute(page, '/console'),
     await serverRoute(page, '/backups'),
     await serverRoute(page, '/players'),
+    await serverRoute(page, '/ai'),
     await serverRoute(page, '/settings'),
     '/app/account',
   ];

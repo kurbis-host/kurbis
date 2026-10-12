@@ -1,5 +1,7 @@
 //! Shared JSON contracts used by the control plane, gateway, and worker clients.
 
+pub mod ai;
+
 pub mod console {
     use chrono::{DateTime, Utc};
     use garde::Validate;

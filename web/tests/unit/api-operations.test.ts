@@ -66,3 +66,29 @@ describe("name-only player mutations", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
+
+describe("AI assistant routes", () => {
+  it("reads the overview and a request, saves settings and cancels through the generated server routes", async () => {
+    const settings = { enabled: true, model: "claude-haiku-5-5", effort: "low" as const, monthly_budget_micros: 2_500_000 };
+    const requests: { method: string; path: string; body: unknown }[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const request = input as Request;
+      const text = await request.text();
+      requests.push({ method: request.method, path: new URL(request.url).pathname, body: text ? JSON.parse(text) : undefined });
+      return Response.json({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await browserApi.getAiOverview("server-1");
+    await browserApi.updateAiSettings("server-1", settings);
+    await browserApi.getAiJob("server-1", "job-1");
+    await browserApi.cancelAiJob("server-1", "job-1");
+
+    expect(requests).toEqual([
+      { method: "GET", path: "/api/v1/servers/server-1/ai", body: undefined },
+      { method: "PUT", path: "/api/v1/servers/server-1/ai/settings", body: settings },
+      { method: "GET", path: "/api/v1/servers/server-1/ai/jobs/job-1", body: undefined },
+      { method: "POST", path: "/api/v1/servers/server-1/ai/jobs/job-1/cancel", body: undefined },
+    ]);
+  });
+});

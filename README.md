@@ -25,6 +25,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - Persistent world snapshots using S3-compatible object storage.
 - Server lifecycle operations with PostgreSQL-backed locking and recovery.
 - OP-only `/kurbis` in-game management, with a one-use 15-minute login link that opens a persistent, independently revocable panel grant for that server without signing into a Kurbis account. Grant authorization remains bound to one server and is also denied after server deletion or owner suspension.
+- OP-only `/ai` in-game assistant: the control plane's AI gateway runs Claude with tools the plugin executes as the asking operator, records the cost of every model call in a usage ledger, and enforces monthly per-server and per-account budgets. Owners turn it off, pick the model and effort, and lower the server budget in the panel.
 - Container isolation through Docker.
 
 ## Repository Layout
@@ -35,7 +36,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 ├── migrations/       # PostgreSQL schema migrations
 ├── tests/            # Integration tests
 ├── web/              # Next.js management panel
-├── test-server/      # Pumpkin test server resources
+├── plugins/          # In-game kurbis-control plugin (WASI component)
 ├── PLAN.md           # Detailed architecture and implementation plan
 └── PROGRESS.md       # Current development progress
 ```
@@ -264,6 +265,8 @@ https://<public-panel-origin>/auth/discord/callback
 ```
 
 Google requests `openid email profile`; Discord requests only `identify email`. The control plane supplies each provider's standard authorization, token, and profile endpoints. The corresponding `*_OAUTH_AUTHORIZE_URL`, `*_OAUTH_TOKEN_URL`, and `*_OAUTH_USERINFO_URL` settings can point to a local OAuth fixture during development and testing.
+
+The in-game AI assistant is optional. Set `ANTHROPIC_API_KEY` to offer it; without a key `/ai` reports that the assistant is not set up and the control plane starts no AI worker. `AI_DEFAULT_MODEL` (default `claude-opus-5-5`; `claude-sonnet-5-5` and `claude-haiku-5-5` are also offered) and `AI_DEFAULT_EFFORT` (`low`, `medium` or `high`; default `medium`) apply to servers whose owner has not chosen otherwise. `AI_SERVER_MONTHLY_BUDGET_USD` (default 5) and `AI_ACCOUNT_MONTHLY_BUDGET_USD` (default 20) cap spending per calendar month in UTC; a server's budget never exceeds its owner's account budget. `AI_MAX_CONCURRENT_CALLS` (default 16) bounds model calls in flight across all servers, and `ANTHROPIC_BASE_URL` can point to a compatible proxy.
 
 The production deployment uses PostgreSQL for durable state and an S3-compatible object store for snapshots.
 

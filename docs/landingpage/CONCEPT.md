@@ -79,10 +79,11 @@ All four ideas combined:
 Chat lines on the wall:
 
 - `/ai ask give everyone night vision` → Done now.
-- `/ai code add a /home command` → Becomes a real command, no restart.
-- `/ai revert` → Oops, undone.
+- `/ai ask where is everyone?` → Steve's in the Nether. Lena's at spawn.
+- `/ai ask make it day and stop the rain` → Sun's up. Sky's clear.
+- `/ai ask op me` → Nope. Ops, bans and the whitelist stay with you.
 
-Caption: Operators only. We cover the AI. No sign-in, no keys.
+Caption: Operators only, with their own permissions. We cover the AI. No sign-in, no keys.
 
 ### 7. Chest (Y -20)
 

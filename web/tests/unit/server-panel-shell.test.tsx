@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerPanelShell } from "../../components/server-panel-shell";
 import { server } from "./fixtures";
@@ -55,5 +55,15 @@ describe("shared server navigation", () => {
 
     expect(screen.getByRole("link", { name: "Account" })).toBeVisible();
     expect(screen.getByRole("link", { name: "kurbis" })).toHaveAttribute("href", "/app/servers");
+  });
+
+  it("links every server page, with the AI assistant before settings", () => {
+    renderShell({ scoped: false });
+
+    const navigation = screen.getByRole("navigation", { name: "Server panel" });
+    expect(within(navigation).getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Overview", "Console", "Backups", "Players", "AI", "Settings", "Account",
+    ]);
+    expect(within(navigation).getByRole("link", { name: "AI" })).toHaveAttribute("href", "/manage/server-1/ai");
   });
 });

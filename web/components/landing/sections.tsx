@@ -321,7 +321,7 @@ function SpawnerSection() {
           </li>
         ))}
       </ul>
-      <p className={body}>Operators only. We cover the AI. No sign-in, no keys.</p>
+      <p className={body}>Operators only, with their own permissions. We cover the AI. No sign-in, no keys.</p>
     </Layer>
   );
 }

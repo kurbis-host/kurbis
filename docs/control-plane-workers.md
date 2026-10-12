@@ -11,6 +11,12 @@ same binary. Those responsibilities have separate internal seams:
 - `ci-poller:<repository-id>` polls source control and drives the durable CI
   build queue.
 - `ci-github-webhook` is optional and drains signed webhook deliveries.
+- `ai-jobs` is optional and runs only when `ANTHROPIC_API_KEY` is set. It
+  claims queued in-game AI requests, calls the model with the call's
+  worst-case cost reserved against the server and account budgets, records
+  every attempt in the `ai_usage` ledger, and times out requests whose tool
+  calls the plugin never answers. API routes wake it when a request becomes
+  runnable, so it does not wait for its next tick.
 
 `control_plane::supervision::Supervisor` owns every long-lived task's join
 handle. A retryable failure updates the worker state and backs off; a fatal

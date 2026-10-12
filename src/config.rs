@@ -9,6 +9,10 @@ use anyhow::{Context, Result, bail, ensure};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+mod ai;
+
+pub use ai::{AiConfig, DEFAULT_AI_MODEL, DEFAULT_ANTHROPIC_BASE_URL, parse_usd_micros};
+
 #[derive(Clone)]
 pub struct CommonConfig {
     pub database_url: String,

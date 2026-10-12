@@ -21,7 +21,7 @@ use crate::{
 use super::export_not_found;
 use super::{
     ApiError, AppState, bounded_worker_error, invalid_export, invalid_snapshot, is_lower_hex,
-    lock_worker_operation, server_not_found, stale_operation, worker_auth,
+    lock_worker_operation, stale_operation, worker_auth,
 };
 
 const MAX_ARCHIVE_BYTES: i64 = SERVER_STORAGE_BYTES;
@@ -58,7 +58,7 @@ pub(in crate::control_plane::api) async fn publish_snapshot(
     .bind(server_id)
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or_else(server_not_found)?;
+    .ok_or_else(ApiError::server_not_found)?;
     let server_generation: i64 = server.try_get("generation")?;
     let current_generation: Option<i64> = server.try_get("current_snapshot_generation")?;
     if server_generation != request.generation {
@@ -537,7 +537,7 @@ async fn lock_export_server(
         .bind(server_id)
         .fetch_optional(&mut **tx)
         .await?
-        .ok_or_else(server_not_found)?;
+        .ok_or_else(ApiError::server_not_found)?;
     Ok(())
 }
 

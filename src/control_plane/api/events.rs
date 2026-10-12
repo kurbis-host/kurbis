@@ -65,6 +65,9 @@ pub enum ServerEventPayload {
     Operators {
         data: Operators,
     },
+    Ai {
+        data: Box<crate::contracts::ai::AiOverview>,
+    },
 }
 
 pub(super) async fn server_event_payload(
@@ -74,13 +77,9 @@ pub(super) async fn server_event_payload(
 ) -> Result<ServerEvent, ApiError> {
     let payload = match ServerEventKind::try_from(row.event_type.as_str())? {
         ServerEventKind::Server => {
-            let server = server_by_id(&state.pool, server_id).await?.ok_or_else(|| {
-                ApiError::with_code(
-                    StatusCode::NOT_FOUND,
-                    "server_not_found",
-                    "server not found",
-                )
-            })?;
+            let server = server_by_id(&state.pool, server_id)
+                .await?
+                .ok_or_else(ApiError::server_not_found)?;
             ServerEventPayload::Server {
                 data: Box::new(server_view(&state.pool, server, &state.config.root_domain).await?),
             }
@@ -129,6 +128,22 @@ pub(super) async fn server_event_payload(
         ServerEventKind::Operators => ServerEventPayload::Operators {
             data: operators_state(&state.pool, server_id).await?,
         },
+        ServerEventKind::Ai => {
+            let server = server_by_id(&state.pool, server_id)
+                .await?
+                .ok_or_else(ApiError::server_not_found)?;
+            ServerEventPayload::Ai {
+                data: Box::new(
+                    crate::control_plane::ai::overview(
+                        &state.pool,
+                        state.ai.as_ref(),
+                        server_id,
+                        server.owner_id,
+                    )
+                    .await?,
+                ),
+            }
+        }
     };
     Ok(ServerEvent {
         id: row.id,

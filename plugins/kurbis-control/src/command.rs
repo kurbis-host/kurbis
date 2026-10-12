@@ -62,10 +62,7 @@ fn settings_command() -> CommandNode {
 fn whitelist_command() -> CommandNode {
     CommandNode::literal("whitelist")
         .execute(Handler("whitelist"))
-        .then(
-            CommandNode::literal("add")
-                .then(word("name").execute(Handler("whitelist_add"))),
-        )
+        .then(CommandNode::literal("add").then(word("name").execute(Handler("whitelist_add"))))
         .then(
             CommandNode::literal("remove")
                 .then(word("player_id").execute(Handler("whitelist_remove"))),
@@ -82,7 +79,7 @@ fn restore_command() -> CommandNode {
         .then(word("generation").execute(Handler(actions::RESTORE_PROMPT_HANDLER)))
 }
 
-fn arg(args: &ConsumedArgs, name: &str) -> Result<String> {
+pub(crate) fn arg(args: &ConsumedArgs, name: &str) -> Result<String> {
     match args.get_value(name) {
         Arg::Simple(value) | Arg::Msg(value) => Ok(value),
         _ => bail!("missing {name}"),
