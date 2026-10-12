@@ -21,7 +21,14 @@ healthy stack and worker lease, then restores the configured `main` source
 branch. A failed rollout keeps the lock and transaction evidence until both app
 and worker recovery are verified.
 
-Respond5 builds the pinned Pumpkin runtime from the exact release source and
+The pinned Pumpkin runtime is compiled once per release on the remote CI
+builder, through the same `tools/ci_bubblewrap_runner.py` job the control plane
+uses for CI builds (`scripts/pumpkin_artifacts.py`, configured by the
+`CI_BUILDER_SSH_TARGET` and `CI_BUBBLEWRAP_*` values in Dokploy). The release
+uploads the two SHA-256-checked binaries to
+`/srv/kurbis/release-artifacts/<sha>` on Respond5, which only packages them
+into the `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`
+images; Compose never compiles or builds Pumpkin. Respond5 then
 checks the executable, WASM plugin, hosted entrypoint, OCI labels, embedded
 revision, worker configuration, and renewing lease. Recovery uses only the
 verified previous SHA and never removes PostgreSQL data, named volumes, worlds,

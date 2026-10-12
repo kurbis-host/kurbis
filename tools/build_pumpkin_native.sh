@@ -8,13 +8,7 @@ case "$profile" in
     release) cargo_profile=release ;;
     *) echo "Usage: $0 [debug|release]" >&2; exit 2 ;;
 esac
-revision=$(cat "$root/runtime/pumpkin/REVISION")
 source_dir="$root/output/native-pumpkin/source"
-mkdir -p "$source_dir"
-if [ ! -d "$source_dir/.git" ]; then
-    git -C "$source_dir" init
-    git -C "$source_dir" remote add origin https://github.com/Pumpkin-MC/Pumpkin.git
-fi
 fingerprint=$(cat "$root/runtime/pumpkin/REVISION" \
     "$root/runtime/pumpkin/host-control.patch" \
     "$root/runtime/pumpkin/snapshot-barrier.patch" \
@@ -22,17 +16,7 @@ fingerprint=$(cat "$root/runtime/pumpkin/REVISION" \
     "$root/runtime/pumpkin/host_control.rs" | shasum -a 256 | cut -d ' ' -f 1)
 stamp="$root/output/native-pumpkin/source-fingerprint"
 if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$fingerprint" ]; then
-    git -C "$source_dir" fetch --depth=1 origin "$revision"
-    # This checkout is exclusively managed by this build script in ignored output/.
-    git -C "$source_dir" reset --hard FETCH_HEAD
-    git -C "$source_dir" submodule update --init --recursive --depth=1
-    git -C "$source_dir" apply --check "$root/runtime/pumpkin/host-control.patch"
-    git -C "$source_dir" apply "$root/runtime/pumpkin/host-control.patch"
-    git -C "$source_dir" apply --check "$root/runtime/pumpkin/snapshot-barrier.patch"
-    git -C "$source_dir" apply "$root/runtime/pumpkin/snapshot-barrier.patch"
-    git -C "$source_dir" apply --unidiff-zero --check "$root/runtime/pumpkin/nethernet-gateway.patch"
-    git -C "$source_dir" apply --unidiff-zero "$root/runtime/pumpkin/nethernet-gateway.patch"
-    cp "$root/runtime/pumpkin/host_control.rs" "$source_dir/crates/pumpkin-core/src/net/host_control.rs"
+    "$root/tools/pumpkin_source.sh" "$root/runtime/pumpkin" "$source_dir"
     printf '%s\n' "$fingerprint" > "$stamp"
 fi
 export CARGO_TARGET_DIR="$root/output/native-pumpkin/target"

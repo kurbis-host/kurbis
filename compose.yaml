@@ -99,16 +99,10 @@ services:
     networks: [hoster, runtime-api-egress]
 
   waiting-pumpkin:
-    image: melon-pumpkin:waiting
-    build:
-      context: .
-      dockerfile: runtime/pumpkin/Dockerfile
-      target: waiting
-      # List form makes Compose read BUILD_REVISION from the --env-file even
-      # when Dokploy invokes Compose through env -i. Mapping interpolation
-      # otherwise falls back to development in that environment.
-      args:
-        - BUILD_REVISION
+    # Compose never builds this image. A release packages the Pumpkin binaries
+    # compiled on the remote CI builder (`runtime/pumpkin/Dockerfile`, target
+    # `waiting`) under the exact release SHA; `start.sh` builds it locally.
+    image: melon-pumpkin:waiting-${BUILD_REVISION:-development}
     environment:
       PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}

@@ -253,7 +253,7 @@ class RolloutTests(unittest.TestCase):
                     "ports": [{"published": "19132", "target": 19132, "protocol": protocol} for protocol in ("tcp", "udp")],
                     "volumes": [{"type": "bind", "source": "/srv/kurbis/certs", "target": "/run/kurbis-tls", "read_only": True}]},
                 "panel": {"build": {"context": str(checkout / "web"), "args": {"BUILD_REVISION": revision}}, "ports": [{"host_ip": "127.0.0.1"}]},
-                "waiting-pumpkin": {"build": {"context": str(checkout), "dockerfile": "runtime/pumpkin/Dockerfile", "target": "waiting", "args": {"BUILD_REVISION": revision}}},
+                "waiting-pumpkin": {"image": f"{sync.WAITING_PREFIX}{revision}"},
                 "postgres": {},
             }}
             def fake_run(args, **kwargs):
@@ -280,11 +280,44 @@ class RolloutTests(unittest.TestCase):
             with patch.object(sync, "CHECKOUT", checkout), patch.object(sync, "ENV", env_file), patch.object(sync, "run", side_effect=fake_run), patch.object(sync, "run_bytes", return_value=b"!! .env\0"), patch.object(sync, "verify_bedrock_tls_assets"):
                 release_env={"BUILD_REVISION":revision,"BEDROCK_TLS_HOST_DIRECTORY":"/srv/kurbis/certs","PANEL_BIND_ADDRESS":"127.0.0.1"}
                 sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
-                config["services"]["waiting-pumpkin"]["build"]["target"] = "host-control"
-                with self.assertRaises(sync.Error):
-                    sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                # Compose must run the image packaged from the remote build, never
+                # another revision's image or one it compiles itself.
+                for waiting in ({"image": f"{sync.WAITING_PREFIX}{'d' * 40}"},
+                                {"image": f"{sync.WAITING_PREFIX}{revision}", "build": {"context": str(checkout)}}):
+                    config["services"]["waiting-pumpkin"] = waiting
+                    with self.assertRaisesRegex(sync.Error, "release-built revision-pinned image"):
+                        sync.verify_build_context(checkout, revision, expected,release_environment=release_env)
+                config["services"]["waiting-pumpkin"] = {"image": f"{sync.WAITING_PREFIX}{revision}"}
                 with self.assertRaisesRegex(sync.Error,"environment overrides differ"):
                     sync.verify_build_context(checkout,revision,expected,release_environment={**release_env,"PANEL_BIND_ADDRESS":"0.0.0.0"})
+
+    def test_release_artifacts_must_match_the_remote_build_digests(self):
+        revision = "c" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "release-artifacts"
+            artifacts = root / revision / "artifacts"
+            artifacts.mkdir(parents=True)
+            for path in (root, root / revision, artifacts):
+                path.chmod(0o700)
+            digests = {}
+            for name in sync.PUMPKIN_ARTIFACTS:
+                (artifacts / name).write_bytes(name.encode())
+                digests[name] = hashlib.sha256(name.encode()).hexdigest()
+            original_stat = Path.stat
+            def root_owned_stat(path, *args, **kwargs):
+                result = original_stat(path, *args, **kwargs)
+                if path in (root, root / revision, artifacts):
+                    result = type("RootOwnedStat", (), {"st_uid": 0, "st_mode": result.st_mode})()
+                return result
+            with patch.object(sync, "RELEASE_ARTIFACTS", root), patch.object(Path, "stat", root_owned_stat):
+                self.assertEqual(sync.release_artifact_context(revision, digests), root / revision)
+                with self.assertRaisesRegex(sync.Error, "differs from the remote build"):
+                    sync.release_artifact_context(revision, {**digests, "pumpkin": "0" * 64})
+                with self.assertRaisesRegex(sync.Error, "digest manifest is invalid"):
+                    sync.release_artifact_context(revision, {"pumpkin": digests["pumpkin"]})
+                (artifacts / "extra").write_bytes(b"unexpected")
+                with self.assertRaisesRegex(sync.Error, "unexpected files"):
+                    sync.release_artifact_context(revision, digests)
 
     def test_pending_worker_rollback_blocks_another_release(self):
         with tempfile.TemporaryDirectory() as directory:

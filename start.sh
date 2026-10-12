@@ -396,8 +396,9 @@ start_docker() {
     "$ROOT"
   printf 'Building the Docker waiting runtime...\n'
   "$ROOT/tools/docker_build_with_limits.sh" \
-    -f "$ROOT/deployment/waiting.Dockerfile" \
-    --tag melon-pumpkin:waiting \
+    -f "$ROOT/runtime/pumpkin/Dockerfile" \
+    --target waiting \
+    --tag "melon-pumpkin:waiting-${BUILD_REVISION:-development}" \
     "$ROOT"
   printf 'Building Compose services with per-step cgroup caps...\n'
   KURBIS_BUILD_MEMORY_BYTES="${KURBIS_DOCKER_BUILD_MEMORY_BYTES:-10737418240}" \

@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -19,12 +20,14 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pumpkin_artifacts
 from migration_manifest import validate_manifest
 from release_manifest import build_release_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_MANIFEST = ROOT / "migrations/MANIFEST.json"
 REMOTE = ROOT / "scripts/dokploy_worker_sync.py"
+REMOTE_RELEASE_ARTIFACTS = "/srv/kurbis/release-artifacts"
 WORKER_TLS = ROOT / "scripts/dokploy_worker_tls.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 PROJECT = "kurbis-hoster-fbikvd"
@@ -69,12 +72,11 @@ def run(command: Sequence[str], *, input_text: str | None = None, cwd: Path | No
 def remote_command_timeout_seconds() -> int:
     """Return the bounded SSH lifetime for long-running remote operations.
 
-    Pumpkin's first host-control release build can take close to an hour on a
-    cold respond5 cache. Keep this timeout long enough for that build while
-    retaining an operator override for slower or faster builders. The lower
+    Remote verification and packaging steps emit no output while they run.
+    Keep this timeout generous while retaining an operator override. The lower
     bound deliberately exceeds the old 30-minute cutoff so an accidental
     override cannot recreate the premature SSH disconnect that left a remote
-    build ambiguous.
+    operation ambiguous.
     """
     raw = os.environ.get(REMOTE_COMMAND_TIMEOUT_ENV)
     if raw is None or not raw.strip():
@@ -390,11 +392,12 @@ def worker_sync_source() -> str:
 def remote(host: str, operation: str, *, token: str | None = None, revision: str | None = None,
            expected: dict | None = None, baseline: dict | None = None,
            pumpkin: str | None = None, upstream: str | None = None,
-           receipt: dict | None = None, release_environment: dict | None = None) -> dict:
+           receipt: dict | None = None, release_environment: dict | None = None,
+           artifacts: dict | None = None) -> dict:
     command = ["python3", "-", "--remote", operation]
     for key, value in (("token", token), ("revision", revision), ("expected", expected),
                        ("baseline", baseline), ("pumpkin", pumpkin), ("upstream", upstream), ("receipt", receipt),
-                       ("release-environment",release_environment)):
+                       ("release-environment",release_environment), ("artifacts", artifacts)):
         if value is not None:
             command.extend([f"--{key}", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))])
     timeout = remote_command_timeout_seconds()
@@ -415,6 +418,24 @@ def remote(host: str, operation: str, *, token: str | None = None, revision: str
     if not isinstance(result, dict):
         raise DeploymentError("respond5 verifier returned invalid result")
     return result
+
+def build_pumpkin_artifacts(host: str, revision: str) -> dict[str, str]:
+    """Compile Pumpkin on the remote CI builder and upload the binaries to the worker host."""
+    settings = parse_env(str(compose_info()["env"]))
+    with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-artifacts-") as directory:
+        local = Path(directory) / "artifacts"
+        try:
+            digests = pumpkin_artifacts.build(settings, local)
+        except pumpkin_artifacts.ArtifactError as error:
+            raise DeploymentError(str(error)) from error
+        target = f"{REMOTE_RELEASE_ARTIFACTS}/{revision}"
+        run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+             f"rm -rf -- {shlex.quote(target)} && install -d -m 0700 {shlex.quote(REMOTE_RELEASE_ARTIFACTS)} {shlex.quote(target)}"], timeout=60)
+        run(["scp", "-q", "-r", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(local), f"{host}:{target}/"], timeout=900)
+        run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+             f"chown -R root:root {shlex.quote(target)} && chmod 0700 {shlex.quote(target)}/artifacts"], timeout=60)
+    return digests
+
 
 def update_build_revision(revision: str) -> None:
     info=compose_info()
@@ -560,7 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                release_environment={"BUILD_REVISION":commit,**ENV_UPDATES})
             if tls_context.get("status")!="build-context-verified" or tls_context.get("revision")!=commit:
                 raise DeploymentError("Respond5 did not verify release build inputs and Bedrock TLS assets before deployment")
-            pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected)
+            artifacts=build_pumpkin_artifacts(args.worker_host,commit)
+            pumpkin=remote(args.worker_host,"build-pumpkin",token=token,revision=commit,expected=expected,artifacts=artifacts)
             if pumpkin.get("status")!="built" or pumpkin.get("pumpkin_image")!=f"melon-pumpkin:host-control-{commit}":
                 raise DeploymentError("respond5 host-control Pumpkin image is not pinned to clean source SHA")
             baseline_result = remote(args.worker_host, "baseline")
