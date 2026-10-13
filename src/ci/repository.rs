@@ -274,10 +274,11 @@ impl CiPreviewRepository {
         Ok(id)
     }
 
-    /// Recover build rows created before queue admission was introduced, and
-    /// any legacy row inserted while a coordinator was unavailable. This is
-    /// deliberately idempotent: the queue remains the scheduling authority and
-    /// existing desired rows are untouched.
+    /// Give a queue entry back to a pull-request build that was explicitly
+    /// requested (see `mark_build_requested`) but has none, for example after
+    /// a coordinator stopped between admission and enqueueing. Build rows that
+    /// polling created only so a preview address exists are not requests:
+    /// queueing those compiled every open pull request. Idempotent.
     pub async fn recover_unqueued_pull_request_builds(&self, repository: &str) -> Result<u64> {
         let result = sqlx::query(
             "INSERT INTO public.ci_build_queue(
@@ -298,6 +299,7 @@ impl CiPreviewRepository {
              WHERE watched.repository = $1 AND watched.enabled
                AND ref.kind = 'pull_request' AND ref.number IS NOT NULL
                AND NOT ref.closed AND NOT ref.deleted
+               AND build.requested_at IS NOT NULL
                AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging', 'failed')
                AND (build.stage <> 'failed' OR build.failure_class = 'transient')
                AND NOT EXISTS (

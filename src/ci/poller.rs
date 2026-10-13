@@ -397,10 +397,9 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         repository: &str,
         builder: &dyn crate::ci::BuildCoordinator,
     ) -> Result<()> {
-        // Queue migration recovers rows that predate the queue table, but a
-        // process can also admit a legacy build between migrations and its next
-        // poll. Reconcile those rows before claiming work so no admitted PR is
-        // stranded merely because queue insertion was unavailable at admission.
+        // A requested build can lose its queue entry when a coordinator stops
+        // between admission and enqueueing; give it one back before claiming.
+        // Unrequested build rows stay lazy until a join asks for them.
         self.repository
             .recover_unqueued_pull_request_builds(repository)
             .await?;

@@ -157,6 +157,31 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     let (queued, _) = repository.ensure_build(&key).await.unwrap();
     assert_eq!(queued.stage, CiBuildStage::Queued);
 
+    // A second open pull request whose build row exists only so its preview
+    // address resolves. Nobody asked for it, so polling must not compile it.
+    let lazy_sha = "0123456789abcdef0123456789abcdef01234567";
+    sqlx::query(
+        "INSERT INTO ci_refs(repository_id,kind,name,number,commit_sha,source_repository,closed,deleted)
+         VALUES($1,'pull_request','pr-78',78,$2,'contributor/Pumpkin',false,false)",
+    )
+    .bind(watched.id)
+    .bind(lazy_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let lazy_key = BuildKey::new(
+        &repository_name,
+        lazy_sha,
+        "patch-recovery-v1",
+        "test-toolchain",
+        "x86_64-linux",
+    )
+    .unwrap();
+    repository.ensure_build(&lazy_key).await.unwrap();
+    // The first one was admitted (a join or a pushed head) before its queue
+    // entry was written.
+    assert!(repository.mark_build_requested(queued.id).await.unwrap());
+
     let source = std::sync::Arc::new(EmptyPollSource);
     let components = std::sync::Arc::new(TestBuildComponents::default());
     let builder = std::sync::Arc::new(ControlledBuildPipeline::new(
@@ -186,6 +211,8 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     poller.poll_once(watched.id).await.unwrap();
     let recovered = repository.ensure_build(&key).await.unwrap().0;
     assert_eq!(recovered.stage, CiBuildStage::Ready);
+    let lazy = repository.ensure_build(&lazy_key).await.unwrap().0;
+    assert_eq!(lazy.stage, CiBuildStage::Queued);
     assert_eq!(
         components
             .compile_calls
