@@ -20,7 +20,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{ServerRuntime, settings::render_pumpkin_config};
+use super::{
+    ServerRuntime,
+    settings::{AccountLookups, render_pumpkin_config},
+};
 use crate::{model::PlacementRecord, pumpkin_control::PumpkinControl};
 
 #[derive(Serialize, Deserialize)]
@@ -167,6 +170,7 @@ impl ServerRuntime for NativeRuntime {
             server_dir.join("pumpkin.toml"),
             render_pumpkin_config(
                 settings,
+                AccountLookups::Direct,
                 placement.java_port.try_into()?,
                 placement.bedrock_port.try_into()?,
                 SocketAddr::new(self.signal_address, placement.signal_port.try_into()?),

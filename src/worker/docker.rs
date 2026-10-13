@@ -11,7 +11,10 @@ use super::{
         ensure_runtime_ingress,
     },
     phase_timer::PhaseTimer,
-    runtime::{ServerRuntime, settings::render_pumpkin_config},
+    runtime::{
+        ServerRuntime,
+        settings::{AccountLookups, render_pumpkin_config},
+    },
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -270,6 +273,7 @@ impl ServerRuntime for DockerRuntime {
             server_dir.join("pumpkin.toml"),
             render_pumpkin_config(
                 settings,
+                AccountLookups::ThroughApiProxy,
                 25565,
                 19132,
                 "0.0.0.0:19132".parse()?,
@@ -702,6 +706,7 @@ mod tests {
     fn config_has_no_player_limit_and_escapes_strings() {
         let config = render_pumpkin_config(
             &json!({"motd":"hello \"kurbis\"","view_distance":8}),
+            AccountLookups::ThroughApiProxy,
             25565,
             19132,
             "0.0.0.0:19132".parse().unwrap(),

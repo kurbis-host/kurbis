@@ -3,6 +3,7 @@ pub mod control_plane;
 pub mod docker;
 mod idle;
 pub mod ingress;
+mod minecraft_services;
 mod panel_state;
 pub mod persistence;
 mod phase_timer;

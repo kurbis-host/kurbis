@@ -33,9 +33,10 @@ use uuid::Uuid;
 
 use crate::{
     runtime_api_proxy::{
-        PROXY_ID_HEADER, PROXY_SCOPE_HEADER, Scope as ProxyScope, route_allowed, valid_token,
+        PROXY_ID_HEADER, PROXY_SCOPE_HEADER, Scope as ProxyScope, minecraft_services_route,
+        route_allowed, valid_token,
     },
-    worker::control_plane::validate_control_plane_url,
+    worker::{control_plane::validate_control_plane_url, minecraft_services},
 };
 
 const RELAY_SOCKET_FILENAME: &str = "relay.sock";
@@ -59,6 +60,8 @@ struct RelayInner {
 struct RelayState {
     upstream: Url,
     client: Client,
+    /// Reaches Mojang and Microsoft for account lookups; never the upstream.
+    minecraft_services: Client,
 }
 
 impl WorkerRuntimeApiRelay {
@@ -98,6 +101,11 @@ impl WorkerRuntimeApiRelay {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .context("build worker runtime API relay client")?,
+            minecraft_services: Client::builder()
+                .redirect(Policy::none())
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("build worker Minecraft services client")?,
         };
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, relay_router(state)).await {
@@ -319,6 +327,10 @@ async fn handle_request(State(state): State<RelayState>, request: Request<Body>)
     else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+    if minecraft_services_route(&method, &path) {
+        return minecraft_services::handle(&state.minecraft_services, &path, request.uri().query())
+            .await;
+    }
     if !route_allowed(scope, &method, &path, expected_id) {
         return empty_response(StatusCode::NOT_FOUND);
     }

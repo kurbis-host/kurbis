@@ -64,6 +64,9 @@ const SCOPE_SERVER: &str = "server";
 const SCOPE_CI: &str = "ci";
 pub(crate) const PROXY_SCOPE_HEADER: &str = "x-kurbis-proxy-scope";
 pub(crate) const PROXY_ID_HEADER: &str = "x-kurbis-proxy-id";
+/// Account lookups the worker answers for a sandboxed server; see
+/// `worker::minecraft_services`.
+pub(crate) const MINECRAFT_SERVICES_PREFIX: &str = "/minecraft/";
 pub(crate) const RELAY_SOCKET_ENV: &str = "KURBIS_RUNTIME_API_PROXY_RELAY_SOCKET";
 
 #[derive(Clone, Debug)]
@@ -1125,10 +1128,20 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
             StatusCode::SERVICE_UNAVAILABLE
         });
     }
-    if request.uri().authority().is_some()
-        || !route_allowed(state.config.scope, &method, &path, state.config.expected_id)
+    if request.uri().authority().is_some() {
+        return status(StatusCode::NOT_FOUND);
+    }
+    // Pumpkin's own account lookups carry no plugin capability. Only the
+    // server on this proxy's private network can reach it, and the worker
+    // forwards nothing but those lookups.
+    let minecraft_services = minecraft_services_route(&method, &path);
+    if !minecraft_services
+        && !route_allowed(state.config.scope, &method, &path, state.config.expected_id)
     {
         return status(StatusCode::NOT_FOUND);
+    }
+    if minecraft_services {
+        return forward_minecraft_services(&state, request).await;
     }
 
     let Some(token) = bearer(request.headers()) else {
@@ -1174,6 +1187,36 @@ async fn handle(State(state): State<ProxyState>, request: Request<Body>) -> Resp
         Err(ForwardError::Timeout) => status(StatusCode::GATEWAY_TIMEOUT),
         Err(ForwardError::Unavailable) => status(StatusCode::BAD_GATEWAY),
         Err(ForwardError::ResponseTooLarge) => status(StatusCode::BAD_GATEWAY),
+    }
+}
+
+pub(crate) fn minecraft_services_route(method: &Method, path: &str) -> bool {
+    *method == Method::GET && path.starts_with(MINECRAFT_SERVICES_PREFIX)
+}
+
+async fn forward_minecraft_services(state: &ProxyState, request: Request<Body>) -> Response {
+    let Ok(upstream) = upstream_url(
+        &state.config.upstream,
+        request.uri().path(),
+        request.uri().query(),
+    ) else {
+        return status(StatusCode::BAD_GATEWAY);
+    };
+    let response = state
+        .client
+        .get(upstream)
+        .header(PROXY_SCOPE_HEADER, state.config.scope.as_str())
+        .header(PROXY_ID_HEADER, state.config.expected_id.to_string())
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return status(StatusCode::BAD_GATEWAY);
+    };
+    let status_code = response.status();
+    let headers = response.headers().clone();
+    match response.bytes().await {
+        Ok(body) if body.len() <= MAX_RESPONSE_BYTES => copy_response(status_code, &headers, body),
+        _ => status(StatusCode::BAD_GATEWAY),
     }
 }
 
