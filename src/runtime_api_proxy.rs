@@ -1311,6 +1311,14 @@ async fn forward(
                 request = request.header(name, value);
             }
         }
+        // The worker relay refuses a request that does not say which server
+        // or preview it is for. These were set on the incoming headers but
+        // never sent, so every plugin call came back as 404.
+        for name in [PROXY_SCOPE_HEADER, PROXY_ID_HEADER] {
+            if let Some(value) = incoming_headers.get(name) {
+                request = request.header(name, value);
+            }
+        }
         match request.body(body.clone()).send().await {
             Ok(response) => {
                 let status_code = response.status();
