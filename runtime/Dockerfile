@@ -10,7 +10,12 @@ COPY migrations ./migrations
 COPY runtime/pumpkin ./runtime/pumpkin
 COPY plugins/kurbis-control ./plugins/kurbis-control
 COPY plugins/kurbis-control /opt/kurbis/plugins/kurbis-control
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo build --jobs 2 --locked --release --bin control-plane --bin gateway --bin worker --bin worker-bundle --bin runtime-api-proxy && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
+# The target directory is kept between builds, so a deploy recompiles this
+# crate and not its 250 dependencies. The binaries are copied out because a
+# cache mount is not part of the image.
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=kurbis-control-plane-target,target=/source/target,sharing=locked \
+    cargo build --jobs 2 --locked --release --bin control-plane --bin gateway --bin worker --bin worker-bundle --bin runtime-api-proxy && mkdir /artifacts && cp target/release/control-plane target/release/gateway target/release/worker target/release/worker-bundle target/release/runtime-api-proxy /artifacts/
 
 FROM debian:bookworm-slim
 ARG BUILD_REVISION=development

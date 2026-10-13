@@ -29,7 +29,12 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
    SHA-256-checked binaries are uploaded to
    `/srv/kurbis/release-artifacts/<sha>` and packaged into
    `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`.
-   Compose never compiles or builds Pumpkin.
+   Compose never compiles or builds Pumpkin. The compile takes about ten
+   minutes, so the binaries are also kept under
+   `/srv/kurbis/release-artifacts/inputs-<key>`, keyed by everything they are
+   built from (`PUMPKIN_INPUTS` in `scripts/release.py` and the builder's
+   toolchain). A release that changes none of it reuses them and only
+   repackages the images.
 4. **Deploy.** Sets `BUILD_REVISION` in Dokploy, keeps auto-deploy off, queues
    one Dokploy deployment of `main` and waits for it. Dokploy builds one
    deployment at a time across all projects, so the wait (`--deploy-wait`,

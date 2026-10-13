@@ -217,16 +217,42 @@ def builder_fixtures(settings: dict[str, str]) -> dict[str, str]:
     return {"CI_BUBBLEWRAP_RUNNER": runner, "CI_BUBBLEWRAP_SOURCE_PREPARER": preparer}
 
 
+# Everything the Pumpkin binaries are compiled from. A release that changes
+# none of it reuses the previous build instead of compiling for ten minutes.
+PUMPKIN_INPUTS = ("runtime/pumpkin", "plugins/kurbis-control", "tools/ci_bubblewrap_runner.py",
+                  "tools/pumpkin_source.sh", "scripts/pumpkin_artifacts.py")
+KEPT_PUMPKIN_BUILDS = 3
+
+
+def pumpkin_inputs_key(settings: dict[str, str]) -> str:
+    trees = run(["git", "-C", str(ROOT), "rev-parse", *(f"HEAD:{path}" for path in PUMPKIN_INPUTS)], timeout=30)
+    builder = [settings.get(key, "") for key in ("CI_TOOLCHAIN_VERSION", "CI_BUBBLEWRAP_TOOLCHAIN", "CI_BUBBLEWRAP_ROOTFS")]
+    return hashlib.sha256("\n".join([trees, *builder]).encode()).hexdigest()[:24]
+
+
 def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-artifacts-") as directory:
-        local = Path(directory) / "artifacts"
-        try:
-            digests = pumpkin_artifacts.build(settings, local)
-        except pumpkin_artifacts.ArtifactError as error:
-            raise ReleaseError(str(error)) from error
-        target = f"{REMOTE_ARTIFACTS}/{commit}"
-        run([*SSH, host, f"rm -rf -- {shlex.quote(target)} && install -d -m 0700 {shlex.quote(target)}"], timeout=60)
-        run(["scp", "-q", "-r", "-o", "BatchMode=yes", str(local), f"{host}:{target}/"], timeout=900)
+    target = shlex.quote(f"{REMOTE_ARTIFACTS}/{commit}")
+    kept = shlex.quote(f"{REMOTE_ARTIFACTS}/inputs-{pumpkin_inputs_key(settings)}")
+    run([*SSH, host, f"rm -rf -- {target} && install -d -m 0700 {target}"], timeout=60)
+    reused = run([*SSH, host, f"if test -f {kept}/digests.json; then cp -a {kept}/artifacts {target}/ && touch {kept} "
+                              f"&& cat {kept}/digests.json; fi"], timeout=120).strip()
+    if reused:
+        say("Pumpkin inputs are unchanged; reusing the previous build")
+        digests = json.loads(reused)
+    else:
+        say("compiling Pumpkin on the CI builder")
+        with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-artifacts-") as directory:
+            local = Path(directory) / "artifacts"
+            try:
+                digests = pumpkin_artifacts.build(settings, local)
+            except pumpkin_artifacts.ArtifactError as error:
+                raise ReleaseError(str(error)) from error
+            run(["scp", "-q", "-r", "-o", "BatchMode=yes", str(local), f"{host}:{target}/"], timeout=900)
+        # Written last, so an interrupted copy is never taken for a build.
+        run([*SSH, host, f"rm -rf -- {kept} && install -d -m 0700 {kept} && cp -a {target}/artifacts {kept}/ "
+                         f"&& cat > {kept}/digests.json && ls -dt {shlex.quote(REMOTE_ARTIFACTS)}/inputs-* "
+                         f"| tail -n +{KEPT_PUMPKIN_BUILDS + 1} | xargs -r rm -rf --"],
+            input_text=json.dumps(digests), timeout=120)
     host_step(host, "package", {"revision": commit, "artifacts": digests}, timeout=1800)
 
 
@@ -284,7 +310,7 @@ def main() -> int:
             commit = release_revision()
             say(f"releasing {commit}")
             gate()
-            say("gate passed; compiling Pumpkin on the CI builder")
+            say("gate passed")
             settings = parse_environment(str(compose()["env"]))
             fixtures = builder_fixtures(settings)
             settings.update(fixtures)
