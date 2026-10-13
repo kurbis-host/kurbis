@@ -42,9 +42,6 @@ pub struct CiPoller<C> {
     check_runs: Option<Arc<dyn CheckRunClient>>,
     builder: Option<Arc<dyn crate::ci::BuildCoordinator>>,
     source_poll_gate: Arc<tokio::sync::Mutex<()>>,
-    /// When enabled, production CI admits only the configured default branch.
-    /// PRs, other branches, and queued webhook heads are intentionally ignored.
-    default_branch_only: bool,
 }
 impl<C> Clone for CiPoller<C>
 where
@@ -58,7 +55,6 @@ where
             check_runs: self.check_runs.clone(),
             builder: self.builder.clone(),
             source_poll_gate: self.source_poll_gate.clone(),
-            default_branch_only: self.default_branch_only,
         }
     }
 }
@@ -71,23 +67,10 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
             check_runs: None,
             builder: None,
             source_poll_gate: Arc::new(tokio::sync::Mutex::new(())),
-            default_branch_only: false,
         }
     }
     pub fn with_config(mut self, config: CiPollerConfig) -> Self {
         self.config = config;
-        self
-    }
-
-    /// Restrict this poller to the repository's configured default branch.
-    ///
-    /// The source-control adapter still records provider state so the watcher
-    /// can maintain its checkpoint, but no PR/branch preview or PR build is
-    /// admitted. This is the production policy: CI builds the latest default
-    /// branch only. Tests and explicitly embedded callers may retain the
-    /// historical preview behavior by leaving this disabled.
-    pub fn default_branch_only(mut self) -> Self {
-        self.default_branch_only = true;
         self
     }
 
@@ -124,17 +107,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         self.repository
             .expire_deleted_branch_aliases(repository_id)
             .await?;
-        if self.default_branch_only {
-            self.repository
-                .cancel_pull_request_builds(&repository_name)
-                .await?;
-        }
         for source_ref in poll.refs {
-            if self.default_branch_only
-                && (source_ref.kind != SourceRefKind::Branch || source_ref.name != default_branch)
-            {
-                continue;
-            }
             if source_ref.deleted
                 || (source_ref.kind == SourceRefKind::PullRequest && source_ref.closed)
             {
@@ -253,9 +226,7 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
                 .await?;
             }
         }
-        if !self.default_branch_only
-            && let Some(builder) = self.builder.as_ref()
-        {
+        if let Some(builder) = self.builder.as_ref() {
             // Queue claims are fenced in PostgreSQL and recovered after a
             // process restart. Provider polling never holds a transaction while
             // the builder performs network or compiler work.
@@ -269,18 +240,6 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
     /// Process queued signed PR lifecycle events without expanding a head into
     /// its ancestors. Each delivery represents exactly one requested PR head.
     pub async fn drain_github_webhooks_once(&self) -> Result<()> {
-        if self.default_branch_only {
-            // PR webhooks are retained only long enough to be acknowledged and
-            // deduplicated. They must never enqueue or build an unsupported PR
-            // head after the deployment switches to main-only CI.
-            for delivery in self.repository.claim_github_pr_deliveries(16).await? {
-                self.repository
-                    .complete_github_pr_delivery(delivery.delivery_id, delivery.claim_token)
-                    .await?;
-            }
-            self.reconcile_check_runs(None).await?;
-            return Ok(());
-        }
         for delivery in self.repository.claim_github_pr_deliveries(16).await? {
             let delivery_id = delivery.delivery_id;
             let claim_token = delivery.claim_token;

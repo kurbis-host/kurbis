@@ -274,26 +274,6 @@ impl CiPreviewRepository {
         Ok(id)
     }
 
-    /// Cancel any still-live PR scheduling intent when the deployment is in
-    /// main-only mode. Historical queue rows remain available for diagnostics,
-    /// but no unsupported PR request may be claimed after the policy switch.
-    pub async fn cancel_pull_request_builds(&self, repository: &str) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE ci_build_queue queue
-             SET state = 'cancelled', claim_token = NULL, claim_expires_at = NULL,
-                 retry_at = NULL, finished_at = COALESCE(finished_at, now()),
-                 last_error = COALESCE(last_error, 'pull-request CI builds are disabled; only the default branch is supported'),
-                 updated_at = now()
-             FROM ci_watched_repositories watched
-             WHERE queue.repository_id = watched.id AND watched.repository = $1
-               AND queue.state IN ('pending', 'running', 'failed')",
-        )
-        .bind(repository)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// Recover build rows created before queue admission was introduced, and
     /// any legacy row inserted while a coordinator was unavailable. This is
     /// deliberately idempotent: the queue remains the scheduling authority and

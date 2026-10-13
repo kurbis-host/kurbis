@@ -99,11 +99,6 @@ pub struct AppState {
     pub pool: PgPool,
     pub ci_build_coordinator: Option<Arc<dyn crate::ci::BuildCoordinator>>,
     pub ci_build_identity: Option<crate::ci::CiBuildIdentity>,
-    /// Production CI deliberately builds only the latest configured default
-    /// branch. Tests and embedded callers can leave this disabled when they
-    /// need the legacy preview orchestration.
-    pub ci_main_only: bool,
-    pub ci_default_branch: Option<String>,
     pub lifecycle: Lifecycle,
     pub config: ControlPlaneConfig,
     pub http: Client,

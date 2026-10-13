@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{Error, Result};
 use kurbis_hoster::{
     ci::{
-        BuildCoordinator, CiBuildIdentity, CiPoller, CiPollerConfig, CiPreviewRepository,
-        GitHubCheckRunClient, GitHubExactSource, GitHubRateLimitConfig, GitHubRateLimitGuard,
-        GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS, PollError,
-        bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
+        BuildCoordinator, CheckRunClient, CiBuildIdentity, CiPoller, CiPollerConfig,
+        CiPreviewRepository, GitHubCheckRunClient, GitHubExactSource, GitHubRateLimitConfig,
+        GitHubRateLimitGuard, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
+        PollError, bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
     },
     config::{AiConfig, CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
@@ -94,8 +94,6 @@ async fn main() -> Result<()> {
     );
     let mut ci_build_coordinator: Option<Arc<dyn BuildCoordinator>> = None;
     let mut ci_build_identity: Option<CiBuildIdentity> = None;
-    let mut ci_main_only = false;
-    let mut ci_default_branch: Option<String> = None;
     if let Some(ci_config) = CiConfig::from_env()? {
         let ci_repository = CiPreviewRepository::new(pool.clone());
         let watched = ci_repository
@@ -125,12 +123,17 @@ async fn main() -> Result<()> {
             "{}/ci/previews",
             config.public_base_url.trim_end_matches('/')
         );
-        let check_runs = std::sync::Arc::new(
-            GitHubCheckRunClient::new(client, ci_config.github_pat)?
-                .with_api_base_url(ci_config.github_api_base_url.clone())
-                .with_rate_limit_guard(github_rate_limit)
-                .with_details_base_url(public_status_base_url.clone())?,
-        );
+        // Check Runs are written to the watched repository's pull requests,
+        // so they exist only when the operator enabled them with their own token.
+        let check_runs: Option<Arc<dyn CheckRunClient>> = match ci_config.check_runs_token.clone() {
+            Some(token) => Some(Arc::new(
+                GitHubCheckRunClient::new(client, token)?
+                    .with_api_base_url(ci_config.github_api_base_url.clone())
+                    .with_rate_limit_guard(github_rate_limit)
+                    .with_details_base_url(public_status_base_url.clone())?,
+            )),
+            None => None,
+        };
         let artifacts =
             std::sync::Arc::new(ObjectArtifactCache::new(pool.clone(), object_store.clone()));
         let (pipeline, effective_toolchain_version): (Arc<dyn BuildCoordinator>, String) =
@@ -145,7 +148,7 @@ async fn main() -> Result<()> {
                         ci_config.toolchain_version.clone(),
                         ci_config.build_concurrency,
                         ci_config.plugin_source.clone(),
-                        Some(check_runs.clone()),
+                        check_runs.clone(),
                     )?
                     .with_public_status_base_url(public_status_base_url.clone());
                     (Arc::new(pipeline), ci_config.toolchain_version.clone())
@@ -169,7 +172,7 @@ async fn main() -> Result<()> {
                         ci_config.toolchain_version.clone(),
                         ci_config.plugin_source.clone(),
                         ci_config.build_concurrency,
-                        Some(check_runs.clone()),
+                        check_runs.clone(),
                     )?;
                     (
                         Arc::new(
@@ -201,7 +204,7 @@ async fn main() -> Result<()> {
                         ci_config.toolchain_version.clone(),
                         ci_config.plugin_source.clone(),
                         ci_config.build_concurrency,
-                        Some(check_runs.clone()),
+                        check_runs.clone(),
                     )
                     .await?;
                     (
@@ -213,8 +216,6 @@ async fn main() -> Result<()> {
                 }
             };
         ci_build_coordinator = Some(pipeline.clone());
-        ci_main_only = true;
-        ci_default_branch = Some(ci_config.default_branch.clone());
         ci_build_identity = Some(CiBuildIdentity {
             repository: ci_config.repository.clone(),
             patch_fingerprint: ci_config.patch_fingerprint.clone(),
@@ -230,9 +231,12 @@ async fn main() -> Result<()> {
                 async move { maintenance.run_once().await.map_err(WorkerError::retryable) }
             },
         );
-        let ci_poller = CiPoller::new(ci_repository, std::sync::Arc::new(source))
-            .default_branch_only()
-            .with_check_runs(check_runs)
+        let ci_poller = CiPoller::new(ci_repository, std::sync::Arc::new(source));
+        let ci_poller = match check_runs {
+            Some(check_runs) => ci_poller.with_check_runs(check_runs),
+            None => ci_poller,
+        };
+        let ci_poller = ci_poller
             .with_config(CiPollerConfig {
                 root_domain: kurbis_hoster::ci::CI_ROOT_DOMAIN.into(),
                 patch_fingerprint: ci_config.patch_fingerprint.clone(),
@@ -299,8 +303,6 @@ async fn main() -> Result<()> {
         pool,
         ci_build_coordinator,
         ci_build_identity,
-        ci_main_only,
-        ci_default_branch,
         lifecycle,
         config,
         object_store,

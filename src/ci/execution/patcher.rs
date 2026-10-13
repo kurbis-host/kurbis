@@ -129,8 +129,11 @@ impl CheckedInPumpkinPatcher {
             return Err(BuildPipelineError::process_failure(
                 crate::ci::CiBuildStage::Patching,
                 check_output.status,
+                // Shown to whoever joins the preview: say what to do, since a
+                // pull request branched before an upstream restructuring can
+                // only be fixed by its author.
                 format!(
-                    "{filename} does not apply cleanly: {}",
+                    "the Kurbis integration ({filename}) does not apply to this commit; a pull request needs to be rebased onto the current default branch: {}",
                     bounded_output(&check_output.stderr)
                 ),
             ));

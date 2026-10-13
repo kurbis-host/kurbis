@@ -10,7 +10,9 @@ A compile job has two phases. The fetch phase has network access but executes
 no source-controlled code: it unpacks the archives, lets Cargo download the
 locked dependencies into the persistent cache, and the runner itself downloads
 the Minecraft server jar that upstream's data build script needs. The build
-phase then compiles with no network at all.
+phase then compiles with no network at all and with that cache read-only:
+pull-request code runs here, and the same cache feeds default-branch and
+release builds, so nothing a build executes may be able to change it.
 """
 import hashlib
 import json
@@ -104,6 +106,9 @@ tar -xzf /work/input/source.tar.gz -C /work/source --no-same-owner --no-same-per
 tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-permissions
 # `cargo fetch` only resolves and downloads the locked dependency set; it never
 # runs build scripts or proc macros, so no fetched code executes with network.
+# Cargo reads configuration from the working directory upwards, so staying in
+# /work keeps a `.cargo/config.toml` inside the source tree out of this phase.
+cd /work
 cargo fetch --locked --manifest-path /work/source/Cargo.toml --target "$KURBIS_RUST_TARGET"
 cargo fetch --locked --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2
 printf 'dependency_fetch=complete\n'
@@ -128,27 +133,6 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 export CARGO_PROFILE_RELEASE_STRIP=debuginfo
-cache_mode=disabled
-if command -v sccache >/dev/null 2>&1 && [ -d /cache ]; then
-  mkdir -p /cache/sccache
-  export SCCACHE_DIR=/cache/sccache
-  export SCCACHE_CACHE_SIZE="$KURBIS_BUILD_CACHE_MAX_BYTES"
-  export RUSTC_WRAPPER=sccache
-  cache_mode=sccache
-fi
-cargo_build() {
-  if cargo "$@"; then
-    return 0
-  fi
-  if [ "$cache_mode" = sccache ]; then
-    echo 'build_cache=sccache_error_retry_without_cache'
-    unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
-    cache_mode=disabled-after-error
-    cargo "$@"
-    return $?
-  fi
-  return 1
-}
 actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 [ "$actual_rustc" = "$KURBIS_EXPECTED_RUSTC" ] || {
   echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
@@ -157,16 +141,17 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
 build_elapsed_seconds=0
 SECONDS=0
 cd /work/source
-cargo_build build --locked --offline --release --jobs 8 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
+cargo build --locked --offline --release --jobs 8 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo_build build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+cargo build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
 build_elapsed_seconds=$SECONDS
 printf 'build_elapsed_seconds=%s\n' "$build_elapsed_seconds"
-printf 'build_cache=%s\n' "$cache_mode"
-if [ "$cache_mode" != disabled ] && command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
+# No compiler cache is shared between builds: a cache that pull-request
+# code can write would let it plant objects in later builds.
+printf 'build_cache=disabled\n'
 printf 'bubblewrap_guarantee=%s\n' "$KURBIS_BWRAP_GUARANTEE"
 printf 'cgroup_delegation=%s\n' "$KURBIS_CGROUP_DELEGATION"
 printf 'workspace_boundary=operator_tmpfs_explicit_size_and_inodes\n'
@@ -299,6 +284,8 @@ def cgroup_mode():
     return "unavailable"
 
 def runner_command(header, workspace, script, network=False, extra_env=None):
+    # Only the fetch phase, which executes no fetched code, may write the cache.
+    cache_bind = "--bind" if network else "--ro-bind"
     bwrap = Path(header["bwrap"])
     rootfs = Path(header["rootfs"])
     toolchain = Path(header["toolchain"])
@@ -321,7 +308,7 @@ def runner_command(header, workspace, script, network=False, extra_env=None):
         str(bwrap), "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
         "--unshare-ipc", "--unshare-uts", "--uid", "0", "--gid", "0",
         "--cap-drop", "ALL", "--ro-bind", str(rootfs), "/", "--ro-bind", str(toolchain), "/toolchain",
-        "--bind", str(private_cache_root(header["cache_root"])), "/cache",
+        cache_bind, str(private_cache_root(header["cache_root"])), "/cache",
         "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev",
         "--bind", str(workspace / "tmp"), "/tmp", "--bind", str(workspace / "run"), "/run",
         "--bind", str(workspace / "root"), "/root", "--bind", str(workspace / "home"), "/home",

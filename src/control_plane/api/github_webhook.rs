@@ -82,11 +82,6 @@ pub(super) async fn ingest(
     if event_name != "pull_request" {
         return Ok(StatusCode::NO_CONTENT);
     }
-    if state.ci_main_only {
-        // PR CI is intentionally unsupported in production. Acknowledge the
-        // signed event without persisting a queue row or starting a build.
-        return Ok(StatusCode::NO_CONTENT);
-    }
     let event: PullRequestEvent = serde_json::from_slice(&body)
         .map_err(|_| bad_request("invalid pull request webhook payload"))?;
     if !matches!(event.action.as_str(), "opened" | "reopened" | "synchronize") {

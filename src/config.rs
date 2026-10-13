@@ -121,6 +121,10 @@ pub struct CiConfig {
     pub github_rate_limit_max_backoff: Duration,
     pub github_rate_limit_jitter: f64,
     pub plugin_source: PathBuf,
+    /// Token for posting GitHub Check Runs on the watched repository's pull
+    /// requests. `None` unless `CI_GITHUB_CHECK_RUNS_ENABLED` is true: Kurbis
+    /// writes nothing to someone else's repository by default.
+    pub check_runs_token: Option<String>,
 }
 
 impl CiConfig {
@@ -244,6 +248,10 @@ impl CiConfig {
         } else {
             env::current_dir()?.join(plugin_source)
         };
+        let check_runs_token = check_runs_token(
+            optional_bool("CI_GITHUB_CHECK_RUNS_ENABLED", false)?,
+            env::var("CI_GITHUB_CHECK_RUNS_TOKEN").ok(),
+        )?;
         let default_branch = value("CI_DEFAULT_BRANCH", "master");
         ensure!(
             !default_branch.trim().is_empty() && default_branch.len() <= 255,
@@ -265,6 +273,7 @@ impl CiConfig {
             github_rate_limit_max_backoff,
             github_rate_limit_jitter,
             plugin_source,
+            check_runs_token,
         }))
     }
 }
@@ -429,6 +438,21 @@ pub fn validate_ci_builder_docker_host(value: &str) -> Result<()> {
         "CI_BUILDER_DOCKER_HOST must use ssh://user@host[:port]"
     );
     Ok(())
+}
+
+/// The token for GitHub Check Runs, which are posted only on explicit opt-in.
+fn check_runs_token(enabled: bool, token: Option<String>) -> Result<Option<String>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let token = token.unwrap_or_default();
+    ensure!(
+        !token.is_empty()
+            && token.len() <= 512
+            && token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
+        "CI_GITHUB_CHECK_RUNS_ENABLED=true requires CI_GITHUB_CHECK_RUNS_TOKEN to be a non-empty visible token"
+    );
+    Ok(Some(token))
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool> {
@@ -1050,8 +1074,8 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommonConfig, GatewayConfig, ObjectStoreConfig, https_public_base_url, parse_bool,
-        validate_ci_remote_path, validate_ci_repository,
+        CommonConfig, GatewayConfig, ObjectStoreConfig, check_runs_token, https_public_base_url,
+        parse_bool, validate_ci_remote_path, validate_ci_repository,
     };
 
     #[test]
@@ -1078,6 +1102,22 @@ mod tests {
                 "accepted {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn check_runs_need_both_the_explicit_flag_and_a_token() {
+        // A token alone never enables writing to the watched repository.
+        assert_eq!(check_runs_token(false, Some("token".into())).unwrap(), None);
+        assert_eq!(check_runs_token(false, None).unwrap(), None);
+        assert_eq!(
+            check_runs_token(true, Some("token".into()))
+                .unwrap()
+                .as_deref(),
+            Some("token")
+        );
+        assert!(check_runs_token(true, None).is_err());
+        assert!(check_runs_token(true, Some(String::new())).is_err());
+        assert!(check_runs_token(true, Some("has space".into())).is_err());
     }
 
     #[test]

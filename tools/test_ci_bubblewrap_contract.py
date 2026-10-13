@@ -29,13 +29,27 @@ class CiBubblewrapContractTests(unittest.TestCase):
             for line in runner.FETCH_SCRIPT.splitlines()
             if line and not line.startswith(("#", "export ", "set ", "umask "))
         ]
-        self.assertEqual(set(commands), {"mkdir", "tar", "cargo", "printf"})
+        self.assertEqual(set(commands), {"mkdir", "tar", "cd", "cargo", "printf"})
         self.assertNotIn("cargo build", runner.FETCH_SCRIPT)
         self.assertIn("--offline", runner.BUILD_SCRIPT)
         source = (ROOT / "tools/ci_bubblewrap_runner.py").read_text(encoding="utf-8")
         self.assertIn('command.append("--unshare-net")', source)
         self.assertIn("runner_command(header, workspace, FETCH_SCRIPT, network=True)", source)
         self.assertEqual(source.count("network=True"), 1)
+
+    def test_code_executing_phases_cannot_write_the_shared_cache(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("runner", ROOT / "tools/ci_bubblewrap_runner.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        # Pull-request code runs in the build phase; the dependency cache it
+        # reads is reused by default-branch and release builds.
+        self.assertNotIn("sccache", runner.BUILD_SCRIPT)
+        self.assertNotIn("mkdir -p /cache", runner.BUILD_SCRIPT)
+        source = (ROOT / "tools/ci_bubblewrap_runner.py").read_text(encoding="utf-8")
+        self.assertIn('cache_bind = "--bind" if network else "--ro-bind"', source)
+        self.assertIn("cd /work\n", runner.FETCH_SCRIPT)
 
     def test_remote_job_header_carries_host_fingerprint(self):
         source = (ROOT / "src/ci/execution/remote_bubblewrap.rs").read_text(encoding="utf-8")
