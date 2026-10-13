@@ -58,6 +58,7 @@ enabled = false
 LOGIN_DISCONNECT, LOGIN_SUCCESS, LOGIN_COMPRESSION = 0, 2, 3
 CONFIG_FINISH, CONFIG_KEEP_ALIVE, CONFIG_PING, CONFIG_KNOWN_PACKS = 3, 4, 5, 15
 PLAY_CHUNK_BATCH_FINISHED, PLAY_DISCONNECT, PLAY_KEEP_ALIVE, PLAY_POSITION = 11, 32, 45, 73
+PLAY_MOVE_POSITION = 30  # Serverbound: x, y, z as doubles and a flags byte.
 
 
 class Server:
@@ -161,6 +162,8 @@ def explore(server, args):
                 send_packet(sock, 0, vi(teleport) + body[offset:offset + 24] + body[offset + 48:offset + 56],
                             compression)
                 send_packet(sock, 44, compression=compression)  # Player loaded
+                # Pumpkin moves the chunk centre only when the client reports a position.
+                send_packet(sock, PLAY_MOVE_POSITION, body[offset:offset + 24] + b"\x00", compression)
             elif packet == PLAY_KEEP_ALIVE:
                 send_packet(sock, 28, body, compression)
             elif packet == PLAY_CHUNK_BATCH_FINISHED:
