@@ -27,6 +27,18 @@ pub(crate) enum PermissionLevel {
     Gamemaster,
 }
 
+/// How Pumpkin loads plugins. Kurbis checks every plugin binary when it is
+/// installed and Pumpkin cannot reach the market to check signatures, so
+/// unsigned plugins load. Pumpkin loads installed plugins while it runs, where
+/// it cannot ask the console for permissions; it grants each plugin what it
+/// asks for except the environment, which holds the host-control token.
+const PLUGIN_CONFIG: &str = "[plugins]\n\
+     allow_unsigned = true\n\
+     verify_signatures = false\n\
+     ask_permission_confirmation = false\n\
+     blocked_permissions = [\"sys.env\", \"sys.env.PUMPKIN_HOST_CONTROL_TOKEN\", \"sys.env.PUMPKIN_HOST_CONTROL_SOCKET\"]\n\
+     max_memory_mb = 256\n";
+
 pub(crate) fn render_pumpkin_config(
     settings: &Value,
     account_lookups: AccountLookups,
@@ -99,15 +111,11 @@ pub(crate) fn render_pumpkin_config(
          stun_servers = []\n\
          [commands]\n\
          default_op_level = {default_op_level}\n\
-         [plugins]\n\
-         allow_unsigned = false\n\
-         [plugins.overrides.kurbis-control]\n\
-         enabled = true\n\
-         allow_unsigned = true\n\
-         allowed_permissions = [\"fs.read.data\", \"http.outbound\"]\n",
+         {plugins}",
         difficulty = serde_json::to_string(difficulty).expect("string serialization cannot fail"),
         gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
         motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
+        plugins = PLUGIN_CONFIG,
         default_op_level = match default_permission_level {
             PermissionLevel::Player => 0,
             PermissionLevel::Gamemaster => 2,
@@ -167,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_runtime_grants_only_the_managed_plugin_permissions() {
+    fn plugins_load_unprompted_without_the_environment() {
         let config = render_pumpkin_config(
             &Value::Null,
             AccountLookups::ThroughApiProxy,
@@ -178,10 +186,9 @@ mod tests {
             "192.0.2.20".parse().unwrap(),
             19132,
         );
-        assert!(config.contains("[plugins]\nallow_unsigned = false"));
-        assert!(config.contains(
-            "[plugins.overrides.kurbis-control]\nenabled = true\nallow_unsigned = true\nallowed_permissions = [\"fs.read.data\", \"http.outbound\"]"
-        ));
-        assert!(!config.contains("ask_permission_confirmation = false"));
+        assert!(config.ends_with(PLUGIN_CONFIG));
+        assert!(!config.contains("[plugins.overrides"));
+        assert!(config.contains("\nask_permission_confirmation = false\n"));
+        assert!(config.contains("\"sys.env\", \"sys.env.PUMPKIN_HOST_CONTROL_TOKEN\""));
     }
 }

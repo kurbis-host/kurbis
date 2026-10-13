@@ -190,6 +190,7 @@ pub struct MaintenanceReport {
     pub garbage_collection: GarbageCollection,
     pub ci_world_snapshot_gc_completed: u64,
     pub github_webhook_processed_gc_deleted: u64,
+    pub plugin_blobs_deleted: u64,
 }
 
 const GITHUB_WEBHOOK_RETENTION_BATCH_SIZE: i64 = 128;
@@ -248,6 +249,8 @@ impl WorkerMaintenance {
         } else {
             0
         };
+        let plugin_blobs_deleted =
+            crate::control_plane::plugins::collect_garbage(&self.pool, &self.object_store).await?;
         Ok(MaintenanceReport {
             operations_assigned,
             exports_assigned,
@@ -256,6 +259,7 @@ impl WorkerMaintenance {
             garbage_collection,
             ci_world_snapshot_gc_completed,
             github_webhook_processed_gc_deleted,
+            plugin_blobs_deleted,
         })
     }
 

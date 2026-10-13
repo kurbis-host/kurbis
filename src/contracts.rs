@@ -1,6 +1,36 @@
 //! Shared JSON contracts used by the control plane, gateway, and worker clients.
 
+/// A closed set of snake_case string values with `ALL`, `as_str` and `parse`.
+macro_rules! string_enum {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+
+            pub fn parse(value: &str) -> Option<Self> {
+                match value {
+                    $($value => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 pub mod ai;
+pub mod plugins;
 
 pub mod console {
     use chrono::{DateTime, Utc};
@@ -185,6 +215,10 @@ pub mod worker {
         pub operator_entries: Vec<WhitelistEntry>,
         pub operator_revision: i64,
         pub operator_applied_revision: i64,
+        /// The enabled plugins the runtime must load.
+        pub plugins: Vec<super::plugins::WorkerServerPlugin>,
+        pub plugin_revision: i64,
+        pub plugin_applied_revision: i64,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]

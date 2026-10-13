@@ -5,7 +5,8 @@ use aide::{
         ApiRouter,
         routing::{
             delete_with as api_delete_with, get as api_get, get_with as api_get_with,
-            post as api_post, post_with as api_post_with, put_with as api_put_with,
+            patch_with as api_patch_with, post as api_post, post_with as api_post_with,
+            put_with as api_put_with,
         },
     },
     openapi::{ApiKeyLocation, Info, OpenApi, SecurityScheme},
@@ -53,6 +54,7 @@ mod openapi;
 mod operators;
 mod player_resolution;
 mod players;
+mod plugins;
 mod runtime_stats;
 mod server;
 mod server_access;
@@ -64,6 +66,7 @@ mod worker_auth;
 mod worker_ci;
 mod worker_control;
 mod worker_objects;
+mod worker_plugins;
 mod worker_snapshots;
 mod worker_state;
 
@@ -107,6 +110,7 @@ pub struct AppState {
     pub supervision: SupervisorRegistry,
     /// The AI gateway, present when a model provider is configured.
     pub ai: Option<crate::control_plane::ai::AiGateway>,
+    pub plugin_market: crate::control_plane::plugins::PluginMarket,
 }
 
 #[derive(Debug)]
@@ -585,6 +589,41 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             }),
         )
         .api_route(
+            "/api/v1/servers/{server_id}/plugins",
+            api_get(plugins::server_plugins),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/plugins/market",
+            api_get_with(plugins::market_plugins, |operation| {
+                operation
+                    .id("listMarketPlugins")
+                    .description("List the free plugins on the Pumpkin market, each marked with the server's installed copy.")
+            })
+            .post_with(plugins::install_market_plugin, |operation| {
+                operation
+                    .id("installMarketPlugin")
+                    .description("Install a market plugin, or update the installed copy to the listing's current version.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/plugins/uploads",
+            api_post_with(plugins::upload_plugin, |operation| {
+                operation
+                    .id("uploadPlugin")
+                    .description("Install a plugin from an uploaded WebAssembly component.")
+                    .response::<201, Json<crate::contracts::plugins::ServerPlugin>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/plugins/{plugin_id}",
+            api_patch_with(plugins::update_plugin, |operation| {
+                operation.id("updatePlugin").description("Enable or disable an installed plugin.")
+            })
+            .delete_with(plugins::remove_plugin, |operation| {
+                operation.id("removePlugin").response::<204, ()>()
+            }),
+        )
+        .api_route(
             "/api/v1/servers/{server_id}/whitelist",
             api_get(whitelist::whitelist)
                 .post_with(whitelist::add_whitelist_entry, |operation| {
@@ -654,6 +693,8 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/worker/control/servers/{server_id}/logs", post(worker_state::append_logs))
         .route("/internal/worker/control/servers/{server_id}/whitelist-applied", post(worker_state::mark_whitelist_applied))
         .route("/internal/worker/control/servers/{server_id}/operators-applied", post(worker_state::mark_operators_applied))
+        .route("/internal/worker/control/servers/{server_id}/plugins/{plugin_id}/binary", get(worker_plugins::plugin_binary))
+        .route("/internal/worker/control/servers/{server_id}/plugins-applied", post(worker_plugins::plugins_applied))
         .route("/internal/worker/control/servers/{server_id}/snapshots/reserve", post(worker_snapshots::reserve_snapshot))
         .route("/internal/worker/control/servers/{server_id}/snapshots/cache-hint", post(worker_snapshots::report_snapshot_cache_hint))
         .route("/internal/worker/control/servers/{server_id}/snapshots/current", get(worker_snapshots::current_snapshot))

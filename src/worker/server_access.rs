@@ -1,10 +1,7 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -15,6 +12,7 @@ use uuid::Uuid;
 use crate::config::{RuntimeConfig, WorkerConfig};
 use crate::worker::{
     control_plane::WorkerControl,
+    managed_files::{atomic_replace_at, ensure_dir_at, open_dir},
     sandbox::{
         PUMPKIN_GID, PUMPKIN_UID, ensure_rootless_volume_owner, rootless_container_identity,
     },
@@ -243,108 +241,4 @@ fn copy_plugin_binary(server_dir: &Path, source: &Path) -> Result<()> {
     let plugins = ensure_dir_at(&root, "plugins")?;
     atomic_replace_at(&plugins, "kurbis-control.wasm", &bytes, 0o644)
         .context("install managed Kurbis plugin")
-}
-
-fn atomic_replace_at(directory: &File, name: &str, bytes: &[u8], mode: u32) -> Result<()> {
-    let directory_metadata = directory.metadata()?;
-    let temporary = format!(".{name}.{}.tmp", Uuid::new_v4());
-    let temporary_c = std::ffi::CString::new(temporary.as_str())?;
-    let name_c = std::ffi::CString::new(name)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            temporary_c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("create managed plugin temporary file");
-    }
-    let write_result = (|| -> Result<()> {
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        if let Some((uid, gid)) = managed_file_owner(
-            unsafe { libc::geteuid() },
-            directory_metadata.uid(),
-            directory_metadata.gid(),
-        ) && unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } < 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("set managed plugin file ownership");
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if unsafe {
-            libc::renameat(
-                directory.as_raw_fd(),
-                temporary_c.as_ptr(),
-                directory.as_raw_fd(),
-                name_c.as_ptr(),
-            )
-        } < 0
-        {
-            return Err(std::io::Error::last_os_error()).context("publish managed plugin file");
-        }
-        Ok(())
-    })();
-    if write_result.is_err() {
-        unsafe {
-            libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0);
-        }
-    }
-    write_result
-}
-
-fn managed_file_owner(
-    worker_uid: u32,
-    directory_uid: u32,
-    directory_gid: u32,
-) -> Option<(u32, u32)> {
-    (worker_uid == 0).then_some((directory_uid, directory_gid))
-}
-
-fn open_dir(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-fn open_dir_at(parent: &File, name: &str) -> std::io::Result<File> {
-    let name = std::ffi::CString::new(name).expect("static path component");
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn ensure_dir_at(parent: &File, name: &str) -> Result<File> {
-    let name_c = std::ffi::CString::new(name).expect("static path component");
-    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o770) };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error).context("create plugin data directory");
-        }
-    }
-    open_dir_at(parent, name).context("open plugin data directory")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::managed_file_owner;
-
-    #[test]
-    fn root_worker_publishes_managed_files_with_the_parent_directory_owner() {
-        assert_eq!(managed_file_owner(0, 2613, 2613), Some((2613, 2613)));
-        assert_eq!(managed_file_owner(501, 2613, 2613), None);
-    }
 }

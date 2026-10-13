@@ -24,7 +24,7 @@ _Inferred from `web/PLAN.md`._ Users enter through OAuth, create one server, sha
 
 ## Capabilities and Constraints
 
-_Inferred from `web/PLAN.md`._ One server per OAuth account; one region; Java + Bedrock; 2 GiB RAM; 5 GiB persistent storage; five-minute automatic sleep; no explicit player-count limit. V1 excludes payments, plugins/mod uploads, unrestricted file management, arbitrary binaries, and general administrative tooling. Authorized server-panel users can run one-line Minecraft commands only while a healthy runtime is already online and can manage a separate persistent operator roster; this does not grant arbitrary worker, gateway, or runtime API access. Browser traffic is same-origin through the Next.js frontend. The control plane exposes a typed `/api/v1` REST API plus authenticated durable SSE. English-only is sufficient for v1.
+_Inferred from `web/PLAN.md`._ One server per OAuth account; one region; Java + Bedrock; 2 GiB RAM; 5 GiB persistent storage; five-minute automatic sleep; no explicit player-count limit. V1 excludes payments, mods, unrestricted file management, arbitrary server binaries, and general administrative tooling. Owners can install free Pumpkin market plugins and upload their own WebAssembly plugins; operators manage market plugins in game with `/plugins`. Authorized server-panel users can run one-line Minecraft commands only while a healthy runtime is already online and can manage a separate persistent operator roster; this does not grant arbitrary worker, gateway, or runtime API access. Browser traffic is same-origin through the Next.js frontend. The control plane exposes a typed `/api/v1` REST API plus authenticated durable SSE. English-only is sufficient for v1.
 
 ## Brand Commitments
 

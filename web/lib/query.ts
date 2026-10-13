@@ -14,6 +14,9 @@ export const queryKeys = {
   ai: (serverId: string) => ["servers", serverId, "ai"] as const,
   aiJobs: (serverId: string) => ["servers", serverId, "ai", "jobs"] as const,
   aiJob: (serverId: string, jobId: string) => ["servers", serverId, "ai", "jobs", jobId] as const,
+  plugins: (serverId: string) => ["servers", serverId, "plugins"] as const,
+  pluginMarket: (serverId: string) => ["servers", serverId, "plugins", "market"] as const,
+  pluginMarketSearch: (serverId: string, query: string) => ["servers", serverId, "plugins", "market", query] as const,
   eventStatus: (serverId: string) => ["servers", serverId, "event-status"] as const,
 };
 

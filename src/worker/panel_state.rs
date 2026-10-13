@@ -3,14 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     contracts::worker::WorkerServerContext,
     pumpkin_control::WhitelistEntry,
-    worker::{control_plane::WorkerControl, runtime::ServerRuntime},
+    worker::{
+        control_plane::WorkerControl,
+        plugins::{sync_plugins, write_plugin_files},
+        runtime::ServerRuntime,
+    },
 };
 
 pub(super) async fn sync_players(
@@ -32,10 +36,62 @@ pub(super) async fn clear_players(
     control.clear_players(server_id, generation).await
 }
 
-pub(super) async fn write_whitelist_file(
+/// Write the panel state the runtime reads when it starts: the whitelist and
+/// the operators.
+pub(super) async fn write_panel_files(
     context: &WorkerServerContext,
     server_dir: &Path,
 ) -> Result<()> {
+    write_json_atomically(
+        &server_dir.join("data/whitelist.json"),
+        &whitelist_entries(context),
+    )
+    .await?;
+    write_operator_file(context, server_dir).await
+}
+
+/// Write everything the runtime reads when it starts. A plugin that could not
+/// be installed is reported once the runtime runs.
+pub(super) async fn write_runtime_files(
+    control: &WorkerControl,
+    context: &WorkerServerContext,
+    server_dir: &Path,
+) -> Result<()> {
+    write_panel_files(context, server_dir).await?;
+    write_plugin_files(control, context, server_dir).await?;
+    Ok(())
+}
+
+/// Bring a running runtime up to date with the whitelist, the operators and
+/// the plugins, each when it changed since the runtime last applied it or
+/// `force` asks for it. A plugin that fails to install never stops the
+/// runtime's other state from being applied.
+pub(super) async fn sync_runtime_state(
+    control: &WorkerControl,
+    runtime: &dyn ServerRuntime,
+    context: &WorkerServerContext,
+    server_dir: &Path,
+    force: bool,
+) -> Result<()> {
+    let whitelist = sync_whitelist(control, runtime, context, server_dir, force)
+        .await
+        .context("synchronize the whitelist");
+    let operators = sync_operators(control, runtime, context, server_dir, force)
+        .await
+        .context("synchronize the operators");
+    if let Err(error) = sync_plugins(control, runtime, context, server_dir, force).await {
+        tracing::warn!(
+            server_id = %context.placement.server_id,
+            ?error,
+            "failed to synchronize plugins"
+        );
+    }
+    whitelist?;
+    operators
+}
+
+/// The whitelist with every owner on it.
+fn whitelist_entries(context: &WorkerServerContext) -> Vec<WhitelistEntry> {
     let mut by_id = context
         .whitelist_entries
         .iter()
@@ -44,12 +100,10 @@ pub(super) async fn write_whitelist_file(
     for owner in &context.owners {
         by_id.insert(owner.id, owner.name.clone());
     }
-    let entries = by_id
+    by_id
         .into_iter()
         .map(|(id, name)| WhitelistEntry { id, name })
-        .collect::<Vec<_>>();
-    write_json_atomically(&server_dir.join("data/whitelist.json"), &entries).await?;
-    Ok(())
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -60,10 +114,7 @@ struct ManagedOperatorState {
     unrelated_ops: Vec<serde_json::Value>,
 }
 
-pub(super) async fn write_operator_file(
-    context: &WorkerServerContext,
-    server_dir: &Path,
-) -> Result<()> {
+async fn write_operator_file(context: &WorkerServerContext, server_dir: &Path) -> Result<()> {
     let state_path = managed_operator_state_path(server_dir);
     let previous_state = read_managed_operator_state(&state_path).await?;
     let managed = managed_operators(context);
@@ -182,7 +233,7 @@ fn operator_id(entry: &serde_json::Value) -> Option<Uuid> {
         .and_then(|value| value.parse().ok())
 }
 
-pub(super) async fn sync_whitelist(
+async fn sync_whitelist(
     control: &WorkerControl,
     runtime: &dyn ServerRuntime,
     context: &WorkerServerContext,
@@ -192,20 +243,12 @@ pub(super) async fn sync_whitelist(
     if !force && context.whitelist_applied_revision >= context.whitelist_revision {
         return Ok(());
     }
-    let mut by_id = context
-        .whitelist_entries
-        .iter()
-        .map(|entry| (entry.id, entry.name.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for owner in &context.owners {
-        by_id.insert(owner.id, owner.name.clone());
-    }
-    let entries = by_id
-        .into_iter()
-        .map(|(id, name)| WhitelistEntry { id, name })
-        .collect::<Vec<_>>();
     runtime
-        .replace_whitelist(server_dir, context.whitelist_enabled, &entries)
+        .replace_whitelist(
+            server_dir,
+            context.whitelist_enabled,
+            &whitelist_entries(context),
+        )
         .await?;
     control
         .mark_whitelist_applied(
@@ -217,7 +260,7 @@ pub(super) async fn sync_whitelist(
     Ok(())
 }
 
-pub(super) async fn sync_operators(
+async fn sync_operators(
     control: &WorkerControl,
     runtime: &dyn ServerRuntime,
     context: &WorkerServerContext,
@@ -275,6 +318,9 @@ mod tests {
             operator_entries,
             operator_revision: 1,
             operator_applied_revision: 0,
+            plugins: Vec::new(),
+            plugin_revision: 0,
+            plugin_applied_revision: 0,
         }
     }
 

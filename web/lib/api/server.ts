@@ -38,3 +38,4 @@ export const getSnapshots = (serverId: string) => withServerApi((api) => api.get
 export const getPlayers = (serverId: string) => withServerApi((api) => api.getPlayers(serverId));
 export const getWhitelist = (serverId: string) => withServerApi((api) => api.getWhitelist(serverId));
 export const getAiOverview = (serverId: string) => withServerApi((api) => api.getAiOverview(serverId));
+export const getPlugins = (serverId: string) => withServerApi((api) => api.getPlugins(serverId));

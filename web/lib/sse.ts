@@ -17,6 +17,7 @@ const eventKinds: Record<ServerEventKind, true> = {
   whitelist: true,
   operators: true,
   ai: true,
+  plugins: true,
 };
 /** Every named event of the per-server stream. */
 export const serverEventKinds = Object.keys(eventKinds) as ServerEventKind[];
@@ -70,6 +71,11 @@ export function applyServerEvent(queryClient: QueryClient, serverId: string, eve
           return !detail || isActiveAiJob(detail.job.state);
         },
       });
+      break;
+    case "plugins":
+      replaceQueryData(queryClient, queryKeys.plugins(serverId), event.data);
+      // Market listings mark the installed copy of each plugin.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.pluginMarket(serverId) });
       break;
     case "log":
       if (event.data) {

@@ -445,3 +445,75 @@ impl aide::operation::OperationInput for ServerContext {
         );
     }
 }
+
+/// A raw `application/wasm` request body of at most the plugin size limit.
+#[derive(Debug)]
+pub struct ApiWasm(pub Vec<u8>);
+
+impl FromRequest<Arc<AppState>> for ApiWasm {
+    type Rejection = ApiError;
+
+    async fn from_request(
+        request: Request<Body>,
+        _state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let wasm = request
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/wasm"));
+        if !wasm {
+            return Err(ApiError::with_code(
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "wasm_content_type_required",
+                "request body must use application/wasm",
+            ));
+        }
+        axum::body::to_bytes(
+            request.into_body(),
+            crate::contracts::plugins::MAX_PLUGIN_BYTES,
+        )
+        .await
+        .map(|bytes| Self(bytes.to_vec()))
+        .map_err(|_| {
+            ApiError::with_code(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "plugin_too_large",
+                "the plugin is larger than 32 MiB",
+            )
+        })
+    }
+}
+
+impl aide::operation::OperationInput for ApiWasm {
+    fn operation_input(
+        context: &mut aide::generate::GenContext,
+        operation: &mut aide::openapi::Operation,
+    ) {
+        aide::operation::set_body(
+            context,
+            operation,
+            aide::openapi::RequestBody {
+                description: Some("A WebAssembly component.".to_owned()),
+                content: [(
+                    "application/wasm".to_owned(),
+                    aide::openapi::MediaType {
+                        schema: Some(aide::openapi::SchemaObject {
+                            json_schema: schemars::json_schema!({
+                                "type": "string",
+                                "format": "binary",
+                            }),
+                            external_docs: None,
+                            example: None,
+                        }),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                required: true,
+                extensions: Default::default(),
+            },
+        );
+    }
+}

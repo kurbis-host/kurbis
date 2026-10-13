@@ -31,8 +31,8 @@ use crate::{
         },
         sandbox::{
             DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, WorkloadLimits,
-            ensure_rootless_volume_owner,
-            scoped_ci_preview_capability, scoped_runtime_token, validate_quota_volume,
+            ensure_rootless_volume_owner, scoped_ci_preview_capability, scoped_runtime_token,
+            validate_quota_volume,
         },
         storage::StorageManager,
     },

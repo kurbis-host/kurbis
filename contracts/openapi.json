@@ -5567,6 +5567,911 @@
         ]
       }
     },
+    "/api/v1/servers/{server_id}/plugins": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerPlugins"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/plugins/market": {
+      "get": {
+        "description": "List the free plugins on the Pumpkin market, each marked with the server's installed copy.",
+        "operationId": "listMarketPlugins",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "query",
+            "name": "query",
+            "description": "Matches names, developers, categories and descriptions; at most 64\n characters are used.",
+            "schema": {
+              "description": "Matches names, developers, categories and descriptions; at most 64\n characters are used.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarketPlugins"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      },
+      "post": {
+        "description": "Install a market plugin, or update the installed copy to the listing's current version.",
+        "operationId": "installMarketPlugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketInstallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One plugin installed on a server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerPlugin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/plugins/uploads": {
+      "post": {
+        "description": "Install a plugin from an uploaded WebAssembly component.",
+        "operationId": "uploadPlugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "query",
+            "name": "file_name",
+            "description": "The uploaded file's name; its stem names the plugin.",
+            "required": true,
+            "schema": {
+              "description": "The uploaded file's name; its stem names the plugin.",
+              "type": "string"
+            },
+            "style": "form"
+          }
+        ],
+        "requestBody": {
+          "description": "A WebAssembly component.",
+          "content": {
+            "application/wasm": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "One plugin installed on a server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerPlugin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/plugins/{plugin_id}": {
+      "delete": {
+        "operationId": "removePlugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plugin_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "no content"
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      },
+      "patch": {
+        "description": "Enable or disable an installed plugin.",
+        "operationId": "updatePlugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plugin_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One plugin installed on a server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerPlugin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          },
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/servers/{server_id}/whitelist": {
       "get": {
         "parameters": [
@@ -7102,6 +8007,109 @@
           "expires_in_seconds"
         ]
       },
+      "MarketInstallRequest": {
+        "type": "object",
+        "properties": {
+          "market_plugin_id": {
+            "description": "The market listing to install, or to update to its latest version.",
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "market_plugin_id"
+        ]
+      },
+      "MarketPlugin": {
+        "description": "One free plugin listed on the Pumpkin market.",
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "developer": {
+            "type": "string"
+          },
+          "downloads": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "icon_url": {
+            "description": "HTTPS image on the market's asset host.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "installed_plugin_id": {
+            "description": "The installed copy of this listing on the server, if any.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "developer",
+          "category",
+          "description",
+          "version",
+          "downloads"
+        ]
+      },
+      "MarketPluginQuery": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Matches names, developers, categories and descriptions; at most 64\n characters are used.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "MarketPlugins": {
+        "type": "object",
+        "properties": {
+          "plugins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MarketPlugin"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "plugins"
+        ]
+      },
       "MinecraftRedeemRequest": {
         "type": "object",
         "properties": {
@@ -7377,6 +8385,49 @@
           "edition",
           "connected_at",
           "last_seen_at"
+        ]
+      },
+      "PluginSource": {
+        "description": "Where an installed plugin came from.",
+        "type": "string",
+        "enum": [
+          "market",
+          "upload"
+        ]
+      },
+      "PluginState": {
+        "description": "Whether the runtime runs the installed binary. `pending` means the\n runtime has not loaded this binary yet; a sleeping server loads it when\n it next starts.",
+        "type": "string",
+        "enum": [
+          "pending",
+          "loaded",
+          "failed",
+          "disabled"
+        ]
+      },
+      "PluginUpdateRequest": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ]
+      },
+      "PluginUploadQuery": {
+        "type": "object",
+        "properties": {
+          "file_name": {
+            "description": "The uploaded file's name; its stem names the plugin.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "file_name"
         ]
       },
       "Problem": {
@@ -7935,6 +8986,22 @@
               "type",
               "data"
             ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "plugins"
+              },
+              "data": {
+                "$ref": "#/components/schemas/ServerPlugins"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ]
           }
         ],
         "required": [
@@ -7951,7 +9018,8 @@
           "players",
           "whitelist",
           "operators",
-          "ai"
+          "ai",
+          "plugins"
         ]
       },
       "ServerExportPath": {
@@ -7982,6 +9050,148 @@
         },
         "required": [
           "server_id"
+        ]
+      },
+      "ServerPlugin": {
+        "description": "One plugin installed on a server.",
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "error": {
+            "description": "Why the runtime could not load this binary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "market_plugin_id": {
+            "description": "The market listing this plugin was installed from.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "runtime_name": {
+            "description": "The name and version the plugin reported when the runtime loaded it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source": {
+            "$ref": "#/components/schemas/PluginSource"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PluginState"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "source",
+          "name",
+          "sha256",
+          "size_bytes",
+          "enabled",
+          "state",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ServerPluginPath": {
+        "type": "object",
+        "properties": {
+          "plugin_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "server_id",
+          "plugin_id"
+        ]
+      },
+      "ServerPlugins": {
+        "type": "object",
+        "properties": {
+          "applied_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_plugin_bytes": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "max_plugins": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "plugins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServerPlugin"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "synchronized": {
+            "description": "Whether a running server has loaded the current list.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "plugins",
+          "revision",
+          "applied_revision",
+          "synchronized",
+          "max_plugins",
+          "max_plugin_bytes"
         ]
       },
       "ServerRedeemRequest": {

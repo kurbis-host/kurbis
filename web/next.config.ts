@@ -9,7 +9,8 @@ const securityHeaders = [
 			"object-src 'none'",
 			"frame-ancestors 'none'",
 			"form-action 'self'",
-			"img-src 'self' data:",
+			// Plugin market icons come from the market's asset host.
+			"img-src 'self' data: https://assets.pumpkinmc.org",
 			"font-src 'self' data:",
 			"style-src 'self' 'unsafe-inline'",
 			`script-src 'self' 'unsafe-inline'${isProduction ? "" : " 'unsafe-eval'"}`,

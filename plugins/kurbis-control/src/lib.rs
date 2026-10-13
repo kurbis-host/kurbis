@@ -4,6 +4,7 @@ mod api;
 mod chat;
 mod command;
 mod menu;
+mod plugins;
 mod stats;
 
 use std::{
@@ -136,6 +137,7 @@ impl Plugin for KurbisControl {
             )?;
             stats::start(&context);
             context.register_command(ai::command(), PERMISSION);
+            context.register_command(plugins::command(), PERMISSION);
             ai::start(&context);
         }
         Ok(())

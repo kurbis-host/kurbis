@@ -1245,6 +1245,11 @@ pub(crate) fn route_allowed(scope: Scope, method: &Method, path: &str, expected_
                     matches!(*method, Method::GET | Method::POST | Method::DELETE)
                 }
                 Some(["commands"] | ["ai", "jobs" | "sync"]) => *method == Method::POST,
+                Some(["plugins"]) => *method == Method::GET,
+                Some(["plugins", "market"]) => matches!(*method, Method::GET | Method::POST),
+                Some(["plugins", plugin_id]) if Uuid::parse_str(plugin_id).is_ok() => {
+                    matches!(*method, Method::PATCH | Method::DELETE)
+                }
                 Some(["ai", "jobs", job_id, rest @ ..]) if Uuid::parse_str(job_id).is_ok() => {
                     match rest {
                         [] => *method == Method::GET,

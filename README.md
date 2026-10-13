@@ -26,6 +26,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - Server lifecycle operations with PostgreSQL-backed locking and recovery.
 - OP-only `/kurbis` in-game management, with a one-use 15-minute login link that opens a persistent, independently revocable panel grant for that server without signing into a Kurbis account. Grant authorization remains bound to one server and is also denied after server deletion or owner suspension.
 - OP-only `/ai` in-game assistant: the control plane's AI gateway runs a model through Anthropic's API or any OpenAI-compatible endpoint, with tools the plugin executes as the asking operator, records the cost of every model call in a usage ledger, and enforces monthly per-server and per-account budgets. Owners turn it off, pick the model and effort, and lower the server budget in the panel.
+- Server plugins: owners install free plugins from the [Pumpkin market](https://market.pumpkinmc.org/) or upload their own WebAssembly component in the web panel; operators install, update, turn on and off and remove market plugins in game with `/plugins` or the `/kurbis` menu. The control plane stores each binary once in object storage and keeps the authoritative plugin list; the worker writes the enabled plugins into the runtime and loads every change into a running server without a restart. Plugins load without the host-control environment and with a 256 MiB memory cap.
 - Container isolation through Docker.
 
 ## Repository Layout

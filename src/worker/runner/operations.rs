@@ -296,28 +296,7 @@ impl WorkerRunner {
             bail!("snapshot runtime restart belongs to another worker");
         }
         let context = self.context_for_operation(op).await?;
-        if !self.runtime.server_is_running(server_id).await? {
-            write_whitelist_file(&context, server_dir).await?;
-            write_operator_file(&context, server_dir).await?;
-        }
-        self.ensure_runtime_ready(server_id, placement, server_dir, &context.settings)
-            .await?;
-        sync_whitelist(
-            &self.control_plane,
-            self.runtime.as_ref(),
-            &context,
-            server_dir,
-            true,
-        )
-        .await?;
-        sync_operators(
-            &self.control_plane,
-            self.runtime.as_ref(),
-            &context,
-            server_dir,
-            true,
-        )
-        .await?;
+        self.ensure_runtime_ready(&context, server_dir).await?;
         let status = self.runtime.player_status(server_dir).await?;
         if let Some(idle) = self.idle_since.get_mut(&server_id) {
             idle.after_snapshot_restart(&status, Instant::now());
@@ -325,14 +304,17 @@ impl WorkerRunner {
         Ok(())
     }
 
+    /// Start the server's runtime unless it runs, wait until it is ready and
+    /// bring it up to date with the server's panel state.
     async fn ensure_runtime_ready(
         &self,
-        server_id: Uuid,
-        placement: &PlacementRecord,
+        context: &WorkerServerContext,
         server_dir: &std::path::Path,
-        settings: &serde_json::Value,
     ) -> Result<()> {
+        let placement = &context.placement;
+        let server_id = placement.server_id;
         if !self.runtime.server_is_running(server_id).await? {
+            write_runtime_files(&self.control_plane, context, server_dir).await?;
             let api_capability = self
                 .server_access
                 .prepare_plugin(server_id, placement.generation, server_dir)
@@ -342,7 +324,7 @@ impl WorkerRunner {
                     server_id,
                     placement,
                     server_dir,
-                    settings,
+                    &context.settings,
                     api_capability.as_deref(),
                 )
                 .await?;
@@ -350,7 +332,14 @@ impl WorkerRunner {
         self.runtime
             .wait_ready(server_id, server_dir, Duration::from_secs(120))
             .await?;
-        Ok(())
+        sync_runtime_state(
+            &self.control_plane,
+            self.runtime.as_ref(),
+            context,
+            server_dir,
+            true,
+        )
+        .await
     }
 
     pub(super) async fn restore(
@@ -378,8 +367,7 @@ impl WorkerRunner {
             snapshots
                 .restore_generation(op.server_id, target_generation, &server_dir)
                 .await?;
-            write_whitelist_file(&context, &server_dir).await?;
-            write_operator_file(&context, &server_dir).await?;
+            write_panel_files(&context, &server_dir).await?;
             self.control_plane
                 .update_operation_payload(op, OperationProgress::stage(OperationStage::Restored))
                 .await?;
@@ -519,8 +507,7 @@ impl WorkerRunner {
                 remove_reset_world(&server_dir.join("world")).await?;
             }
             clear_players(&self.control_plane, op.server_id, op.generation).await?;
-            write_whitelist_file(&context, &server_dir).await?;
-            write_operator_file(&context, &server_dir).await?;
+            write_panel_files(&context, &server_dir).await?;
             self.control_plane
                 .update_operation_payload(op, OperationProgress::stage(OperationStage::Cleared))
                 .await?;
@@ -534,26 +521,7 @@ impl WorkerRunner {
                 if placement.worker_id != self.config.id || placement.generation != op.generation {
                     bail!("reset restart does not match the worker placement");
                 }
-                write_whitelist_file(&context, &server_dir).await?;
-                write_operator_file(&context, &server_dir).await?;
-                self.ensure_runtime_ready(op.server_id, &placement, &server_dir, &context.settings)
-                    .await?;
-                sync_whitelist(
-                    &self.control_plane,
-                    self.runtime.as_ref(),
-                    &context,
-                    &server_dir,
-                    true,
-                )
-                .await?;
-                sync_operators(
-                    &self.control_plane,
-                    self.runtime.as_ref(),
-                    &context,
-                    &server_dir,
-                    true,
-                )
-                .await?;
+                self.ensure_runtime_ready(&context, &server_dir).await?;
                 self.runtime.save(&server_dir).await?;
                 self.runtime
                     .graceful_stop(op.server_id, &server_dir)
@@ -598,29 +566,7 @@ impl WorkerRunner {
 
         if was_running {
             let context = self.context_for_operation(op).await?;
-            let placement = context.placement.clone();
-            if !self.runtime.server_is_running(op.server_id).await? {
-                write_whitelist_file(&context, &server_dir).await?;
-                write_operator_file(&context, &server_dir).await?;
-            }
-            self.ensure_runtime_ready(op.server_id, &placement, &server_dir, &context.settings)
-                .await?;
-            sync_whitelist(
-                &self.control_plane,
-                self.runtime.as_ref(),
-                &context,
-                &server_dir,
-                true,
-            )
-            .await?;
-            sync_operators(
-                &self.control_plane,
-                self.runtime.as_ref(),
-                &context,
-                &server_dir,
-                true,
-            )
-            .await?;
+            self.ensure_runtime_ready(&context, &server_dir).await?;
         }
         ensure_storage_limit(snapshot_size)?;
         self.control_plane
@@ -685,8 +631,7 @@ impl WorkerRunner {
         let storage_bytes = persistent_size(&server_dir)?;
         ensure_storage_limit(storage_bytes)?;
         phases.mark("storage");
-        write_whitelist_file(&context, &server_dir).await?;
-        write_operator_file(&context, &server_dir).await?;
+        write_runtime_files(&self.control_plane, &context, &server_dir).await?;
 
         let api_capability = self
             .server_access
@@ -708,15 +653,7 @@ impl WorkerRunner {
             )
             .await?;
         phases.mark("runtime");
-        sync_whitelist(
-            &self.control_plane,
-            self.runtime.as_ref(),
-            &context,
-            &server_dir,
-            true,
-        )
-        .await?;
-        sync_operators(
+        sync_runtime_state(
             &self.control_plane,
             self.runtime.as_ref(),
             &context,

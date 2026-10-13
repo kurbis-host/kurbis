@@ -87,6 +87,23 @@ fn normal_scope_allows_only_server_capability_routes() {
                 Uuid::new_v4()
             ),
         ),
+        (Method::GET, format!("/api/v1/servers/{expected}/plugins")),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/plugins/market"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/plugins/market"),
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/servers/{expected}/plugins/{}", Uuid::new_v4()),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/servers/{expected}/plugins/{}", Uuid::new_v4()),
+        ),
     ] {
         assert!(
             route_allowed(Scope::Server, &method, &path, expected),
@@ -121,6 +138,19 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
         ),
         (Method::POST, format!("/api/v1/servers/{expected}/ai")),
         (Method::GET, format!("/api/v1/servers/{expected}/ai/sync")),
+        // Plugins are uploaded only from the browser.
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/plugins/uploads"),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/plugins/not-a-plugin"),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/servers/{expected}/plugins/market"),
+        ),
         (
             Method::POST,
             format!("/api/v1/servers/{expected}/ai/jobs/not-a-job/cancel"),

@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     model::PlacementRecord,
-    pumpkin_control::{HostStats, PlayerStatus, PumpkinControl, WaitingPlayer, WhitelistEntry},
+    pumpkin_control::{
+        HostStats, InstalledPluginFile, PlayerStatus, PumpkinControl, WaitingPlayer, WhitelistEntry,
+    },
     runtime_stats::RuntimeStats,
 };
 
@@ -103,6 +105,13 @@ pub trait ServerRuntime: Send + Sync {
         self.control_for(server_dir)
             .await?
             .replace_operators(&self.socket_path(server_dir)?, owners)
+            .await
+    }
+
+    async fn sync_plugins(&self, server_dir: &Path) -> Result<Vec<InstalledPluginFile>> {
+        self.control_for(server_dir)
+            .await?
+            .sync_plugins(&self.socket_path(server_dir)?)
             .await
     }
 

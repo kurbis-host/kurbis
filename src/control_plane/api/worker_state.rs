@@ -187,6 +187,8 @@ pub(super) async fn server_context(
             i64,
             i64,
             i64,
+            i64,
+            i64,
         ),
     >(
         "SELECT jsonb_build_object(
@@ -198,10 +200,12 @@ pub(super) async fn server_context(
                 s.desired_state, s.observed_state, s.settings, s.current_snapshot_generation,
                 COALESCE((s.settings->>'whitelist')::boolean, false),
                 COALESCE(w.revision, 0), COALESCE(w.applied_revision, -1),
-                COALESCE(o.revision, 1), COALESCE(o.applied_revision, 0)
+                COALESCE(o.revision, 1), COALESCE(o.applied_revision, 0),
+                COALESCE(pl.revision, 0), COALESCE(pl.applied_revision, 0)
          FROM servers s JOIN placements p ON p.server_id = s.id
          LEFT JOIN server_whitelist_state w ON w.server_id = s.id
          LEFT JOIN server_operator_state o ON o.server_id = s.id
+         LEFT JOIN server_plugin_state pl ON pl.server_id = s.id
          WHERE s.id = $1 AND s.generation = $2 AND p.worker_id = $3 AND p.generation = $2",
     )
     .bind(server_id)
@@ -234,6 +238,7 @@ pub(super) async fn server_context(
     .bind(server_id)
     .fetch_all(&state.pool)
     .await?;
+    let plugins = crate::control_plane::plugins::worker_plugins(&state.pool, server_id).await?;
     let placement = serde_json::from_value(row.0).map_err(|_| invalid_assignment())?;
     Ok(Json(WorkerServerContext {
         placement,
@@ -246,6 +251,9 @@ pub(super) async fn server_context(
         whitelist_applied_revision: row.7,
         operator_revision: row.8,
         operator_applied_revision: row.9,
+        plugin_revision: row.10,
+        plugin_applied_revision: row.11,
+        plugins,
         whitelist_entries: entries
             .into_iter()
             .map(|(id, name)| WhitelistEntry { id, name })
@@ -471,7 +479,7 @@ pub(super) async fn mark_operators_applied(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn lock_current_placement(
+pub(super) async fn lock_current_placement(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     worker_id: Uuid,
     server_id: Uuid,

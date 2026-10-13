@@ -45,6 +45,10 @@ pub(crate) fn is_runtime_file(relative: &Path) -> bool {
         .components()
         .next()
         .is_some_and(|v| matches!(v.as_os_str().to_str(), Some("logs" | "run")))
+        // The worker writes the installed plugins from the server's plugin
+        // list, and Pumpkin's compiled-plugin cache is specific to the host.
+        || relative.starts_with("plugins/installed")
+        || relative.starts_with("plugins/cache")
 }
 
 /// Persistence providers that can validate and restore the authoritative server snapshot.

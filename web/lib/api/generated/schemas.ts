@@ -354,6 +354,41 @@ export interface components {
             expires_in_seconds: number;
             url: string;
         };
+        MarketInstallRequest: {
+            /**
+             * Format: int64
+             * @description The market listing to install, or to update to its latest version.
+             */
+            market_plugin_id: number;
+        };
+        /** @description One free plugin listed on the Pumpkin market. */
+        MarketPlugin: {
+            description: string;
+            category: string;
+            developer: string;
+            /** Format: int64 */
+            downloads: number;
+            /** @description HTTPS image on the market's asset host. */
+            icon_url?: string | null;
+            /** Format: int64 */
+            id: number;
+            /**
+             * Format: uuid
+             * @description The installed copy of this listing on the server, if any.
+             */
+            installed_plugin_id?: string | null;
+            installed_version?: string | null;
+            name: string;
+            version: string;
+        };
+        MarketPluginQuery: {
+            /** @description Matches names, developers, categories and descriptions; at most 64
+             *      characters are used. */
+            query?: string | null;
+        };
+        MarketPlugins: {
+            plugins: components["schemas"]["MarketPlugin"][];
+        };
         MinecraftRedeemRequest: {
             token: string;
         };
@@ -428,6 +463,25 @@ export interface components {
             name: string;
             /** Format: uuid */
             player_id: string;
+        };
+        /**
+         * @description Where an installed plugin came from.
+         * @enum {string}
+         */
+        PluginSource: "market" | "upload";
+        /**
+         * @description Whether the runtime runs the installed binary. `pending` means the
+         *      runtime has not loaded this binary yet; a sleeping server loads it when
+         *      it next starts.
+         * @enum {string}
+         */
+        PluginState: "pending" | "loaded" | "failed" | "disabled";
+        PluginUpdateRequest: {
+            enabled: boolean;
+        };
+        PluginUploadQuery: {
+            /** @description The uploaded file's name; its stem names the plugin. */
+            file_name: string;
         };
         Problem: {
             code: string;
@@ -575,9 +629,13 @@ export interface components {
             /** @constant */
             type: "ai";
             data: components["schemas"]["AiOverview"];
+        } | {
+            /** @constant */
+            type: "plugins";
+            data: components["schemas"]["ServerPlugins"];
         });
         /** @enum {string} */
-        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist" | "operators" | "ai";
+        ServerEventKind: "server" | "operation" | "snapshot" | "log" | "players" | "whitelist" | "operators" | "ai" | "plugins";
         ServerExportPath: {
             /** Format: uuid */
             export_id: string;
@@ -591,6 +649,52 @@ export interface components {
         ServerIdPath: {
             /** Format: uuid */
             server_id: string;
+        };
+        /** @description One plugin installed on a server. */
+        ServerPlugin: {
+            /** Format: date-time */
+            created_at: string;
+            enabled: boolean;
+            /** @description Why the runtime could not load this binary. */
+            error?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: int64
+             * @description The market listing this plugin was installed from.
+             */
+            market_plugin_id?: number | null;
+            name: string;
+            /** @description The name and version the plugin reported when the runtime loaded it. */
+            runtime_name?: string | null;
+            runtime_version?: string | null;
+            sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+            source: components["schemas"]["PluginSource"];
+            state: components["schemas"]["PluginState"];
+            /** Format: date-time */
+            updated_at: string;
+            version?: string | null;
+        };
+        ServerPluginPath: {
+            /** Format: uuid */
+            plugin_id: string;
+            /** Format: uuid */
+            server_id: string;
+        };
+        ServerPlugins: {
+            /** Format: int64 */
+            applied_revision: number;
+            /** Format: uint */
+            max_plugin_bytes: number;
+            /** Format: uint */
+            max_plugins: number;
+            plugins: components["schemas"]["ServerPlugin"][];
+            /** Format: int64 */
+            revision: number;
+            /** @description Whether a running server has loaded the current list. */
+            synchronized: boolean;
         };
         ServerRedeemRequest: {
             token: string;

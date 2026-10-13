@@ -62,8 +62,9 @@ describe("shared server navigation", () => {
 
     const navigation = screen.getByRole("navigation", { name: "Server panel" });
     expect(within(navigation).getAllByRole("link").map((link) => link.textContent)).toEqual([
-      "Overview", "Console", "Backups", "Players", "AI", "Settings", "Account",
+      "Overview", "Console", "Backups", "Players", "Plugins", "AI", "Settings", "Account",
     ]);
+    expect(within(navigation).getByRole("link", { name: "Plugins" })).toHaveAttribute("href", "/manage/server-1/plugins");
     expect(within(navigation).getByRole("link", { name: "AI" })).toHaveAttribute("href", "/manage/server-1/ai");
   });
 });

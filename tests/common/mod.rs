@@ -54,6 +54,10 @@ pub fn api_state(
         object_store,
         supervision: kurbis_hoster::control_plane::supervision::SupervisorRegistry::new(),
         ai: None,
+        plugin_market: kurbis_hoster::control_plane::plugins::PluginMarket::new(
+            kurbis_hoster::control_plane::plugins::DEFAULT_MARKET_URL,
+        )
+        .unwrap(),
     })
 }
 

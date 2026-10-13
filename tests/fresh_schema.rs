@@ -10,8 +10,8 @@ use uuid::Uuid;
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 const MIGRATION_MANIFEST_SHA256: &str =
-    "a3810200b3ba5615ca3270be897efbdabdf2a02978a5b83463d88ddd4b6e0dc0";
-const LATEST_MIGRATION: i64 = 19;
+    "de04b559f58a4b9b13786ca558795c9ccec6d224f31d717d22d65977704bd2af";
+const LATEST_MIGRATION: i64 = 20;
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -319,6 +319,9 @@ async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
         "ai_tool_calls",
         "ai_job_events",
         "ai_usage",
+        "plugin_blobs",
+        "server_plugins",
+        "server_plugin_state",
     ];
     for table in expected_tables {
         let present: bool = sqlx::query_scalar(
