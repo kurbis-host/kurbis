@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::contracts::ai::{AiBudget, AiUsage};
 
 use super::{
-    catalog::{self, Tokens},
+    catalog::{Catalog, Tokens},
     transitions::Tx,
 };
 
@@ -129,6 +129,7 @@ impl Budgets {
 /// total cost in micro-USD.
 pub async fn record_usage(
     tx: &mut Tx<'_>,
+    catalog: &Catalog,
     owner_id: Uuid,
     server_id: Uuid,
     job_id: Uuid,
@@ -136,7 +137,7 @@ pub async fn record_usage(
 ) -> Result<i64, sqlx::Error> {
     let mut total = 0i64;
     for (model, tokens) in attempts {
-        let cost = catalog::cost_micros(model, *tokens);
+        let cost = catalog.cost_micros(model, *tokens);
         total = total.saturating_add(cost);
         sqlx::query(
             "INSERT INTO ai_usage(owner_id, server_id, job_id, model, input_tokens,

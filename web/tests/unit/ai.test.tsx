@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AiAssistant } from "../../components/ai";
 import {
   aiModelName,
+  aiModelOption,
   aiSettingsFromForm,
   aiSettingsToForm,
   aiToolCallStatus,
@@ -86,6 +87,16 @@ describe("AI request helpers", () => {
   it("names models, falling back to the id of one that is no longer offered", () => {
     expect(aiModelName(aiOverview.models, "claude-haiku-5-5")).toBe("Claude Haiku 5.5");
     expect(aiModelName(aiOverview.models, "claude-retired-1")).toBe("claude-retired-1");
+  });
+
+  it("lists models with their prices, and unpriced models as free", () => {
+    expect(aiModelOption(aiOverview.models[2])).toBe("Claude Haiku 5.5 · $0.10 / $0.50");
+    expect(aiModelOption({ id: "llama3.1:8b", name: "llama3.1:8b", input_micros_per_mtok: 0, output_micros_per_mtok: 0 })).toBe(
+      "llama3.1:8b · free",
+    );
+    expect(aiModelOption({ id: "gpt-oss-120b", name: "gpt-oss-120b", input_micros_per_mtok: 0, output_micros_per_mtok: 600_000 })).toBe(
+      "gpt-oss-120b · $0.00 / $0.60",
+    );
   });
 
   it("resets budgets at the start of the next UTC month", () => {

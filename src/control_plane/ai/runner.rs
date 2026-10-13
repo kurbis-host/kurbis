@@ -13,10 +13,11 @@ use crate::contracts::ai::{AiEffort, AiJobEventKind, AiJobState};
 
 use super::{
     AiGateway,
-    anthropic::{Block, MessageRequest, MessageResponse, Turn},
     budget::{self, Budgets, Exhausted},
-    catalog::{self, ModelSpec},
-    prompt, settings,
+    catalog::Model,
+    prompt,
+    provider::{Block, ModelRequest, ModelResponse, ProviderError, Stop, Turn},
+    settings,
     transitions::{self, ACTIVE_STATES, Tx},
 };
 
@@ -73,7 +74,7 @@ struct Claimed {
     lease_token: Uuid,
     turn: i32,
     tool_calls: i32,
-    model: &'static ModelSpec,
+    model: Model,
     effort: AiEffort,
     max_tokens: u32,
     system_json: String,
@@ -89,7 +90,7 @@ enum Claim {
 
 /// A model call the settings and budgets allow, with its worst case.
 struct Admission {
-    model: &'static ModelSpec,
+    model: Model,
     effort: AiEffort,
     max_tokens: u32,
     reserved_micros: i64,
@@ -106,7 +107,7 @@ enum Outcome {
     Failed(String),
 }
 
-fn interpret(stop_reason: Option<&str>, blocks: Vec<Block>) -> Outcome {
+fn interpret(stop: &Stop, blocks: Vec<Block>) -> Outcome {
     let has_tool_use = blocks
         .iter()
         .any(|block| matches!(block, Block::ToolUse { .. }));
@@ -121,8 +122,14 @@ fn interpret(stop_reason: Option<&str>, blocks: Vec<Block>) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    match stop_reason {
-        Some("tool_use") if has_tool_use => {
+    let unexpected = |reason: Option<&str>| {
+        Outcome::Failed(format!(
+            "The model stopped unexpectedly ({}).",
+            reason.unwrap_or("no reason given")
+        ))
+    };
+    match stop {
+        Stop::ToolUse if has_tool_use => {
             let mut progress = Vec::new();
             let mut calls = Vec::new();
             for block in blocks {
@@ -134,7 +141,7 @@ fn interpret(stop_reason: Option<&str>, blocks: Vec<Block>) -> Outcome {
                         }
                     }
                     Block::ToolUse { id, name, input } => calls.push((id, name, input)),
-                    Block::Other => {}
+                    Block::ToolResult { .. } | Block::Other => {}
                 }
             }
             Outcome::Tools { progress, calls }
@@ -144,7 +151,7 @@ fn interpret(stop_reason: Option<&str>, blocks: Vec<Block>) -> Outcome {
         _ if has_tool_use => {
             Outcome::Failed("The model stopped in the middle of an action.".to_owned())
         }
-        Some("end_turn" | "stop_sequence") => {
+        Stop::EndTurn => {
             let answer = text(&blocks);
             Outcome::Answer(if answer.is_empty() {
                 "Done.".to_owned()
@@ -152,17 +159,15 @@ fn interpret(stop_reason: Option<&str>, blocks: Vec<Block>) -> Outcome {
                 answer
             })
         }
-        Some("max_tokens" | "model_context_window_exceeded") => match text(&blocks) {
+        Stop::MaxTokens => match text(&blocks) {
             answer if answer.is_empty() => {
                 Outcome::Failed("The answer did not fit; try asking for less at once.".to_owned())
             }
             answer => Outcome::Answer(format!("{answer} …")),
         },
-        Some("refusal") => Outcome::Failed("Claude declined this request.".to_owned()),
-        other => Outcome::Failed(format!(
-            "The model stopped unexpectedly ({}).",
-            other.unwrap_or("no reason given")
-        )),
+        Stop::Refusal => Outcome::Failed("The model declined this request.".to_owned()),
+        Stop::ToolUse => unexpected(Some("tool use without a tool call")),
+        Stop::Other(reason) => unexpected(reason.as_deref()),
     }
 }
 
@@ -290,7 +295,8 @@ impl AiGateway {
         job: &QueuedJob,
     ) -> Result<Result<Admission, String>, sqlx::Error> {
         let effective = self.effective(&settings::load(&mut **tx, job.server_id).await?);
-        let Some(model) = catalog::selectable(&job.model) else {
+        let catalog = self.catalog();
+        let Some(model) = catalog.offered(&job.model) else {
             return Ok(Err(
                 "This conversation's model is no longer offered; start a new one with /ai new."
                     .to_owned(),
@@ -324,14 +330,8 @@ impl AiGateway {
             + job.tools_json.len() as i64
             + REQUEST_OVERHEAD_BYTES;
         let prompt_tokens = u64::try_from(prompt_bytes / BYTES_PER_TOKEN).unwrap_or(u64::MAX);
-        let fallbacks = !model.fallback_models.is_empty();
-        let max_tokens = catalog::affordable_max_tokens(
-            model,
-            prompt_tokens,
-            available,
-            MAX_OUTPUT_TOKENS,
-            fallbacks,
-        );
+        let max_tokens =
+            catalog.affordable_max_tokens(model, prompt_tokens, available, MAX_OUTPUT_TOKENS);
         if max_tokens < MIN_OUTPUT_TOKENS {
             return Ok(Err(match cap {
                 Exhausted::Server => {
@@ -342,15 +342,10 @@ impl AiGateway {
             .to_owned()));
         }
         Ok(Ok(Admission {
-            model,
+            model: model.clone(),
             effort: AiEffort::parse(&job.effort).unwrap_or(effective.effort),
             max_tokens,
-            reserved_micros: catalog::worst_case_micros(
-                model,
-                prompt_tokens,
-                max_tokens,
-                fallbacks,
-            ),
+            reserved_micros: catalog.worst_case_micros(model, prompt_tokens, max_tokens),
         }))
     }
 
@@ -361,10 +356,10 @@ impl AiGateway {
             Err(error) => {
                 tracing::warn!(%job_id, error = %error, "AI model call failed");
                 let message = if error
-                    .downcast_ref::<super::anthropic::ProviderError>()
-                    .is_some_and(super::anthropic::ProviderError::is_capacity)
+                    .downcast_ref::<ProviderError>()
+                    .is_some_and(ProviderError::is_capacity)
                 {
-                    "Claude is busy right now; try again in a minute."
+                    "The AI model is busy right now; try again in a minute."
                 } else {
                     "The AI request failed."
                 };
@@ -372,16 +367,15 @@ impl AiGateway {
                 return;
             }
         };
-        let attempts = response.attempts();
-        if let Err(error) = self.settle(&claimed, &attempts, response).await {
+        if let Err(error) = self.settle(&claimed, &response).await {
             // The attempts are logged so a lost ledger write can be recovered.
-            tracing::error!(%job_id, ?error, ?attempts, "AI model response could not be recorded");
+            tracing::error!(%job_id, ?error, attempts = ?response.attempts, "AI model response could not be recorded");
             self.release_and_abort(&claimed, "The AI gateway hit an internal error.")
                 .await;
         }
     }
 
-    async fn call_model(&self, claimed: &Claimed) -> anyhow::Result<MessageResponse> {
+    async fn call_model(&self, claimed: &Claimed) -> anyhow::Result<ModelResponse> {
         let system = RawValue::from_string(claimed.system_json.clone())?;
         let tools = RawValue::from_string(claimed.tools_json.clone())?;
         let contents = claimed
@@ -389,8 +383,8 @@ impl AiGateway {
             .iter()
             .map(|(_, content)| RawValue::from_string(content.clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let request = MessageRequest {
-            model: claimed.model.id,
+        let request = ModelRequest {
+            model: &claimed.model,
             max_tokens: claimed.max_tokens,
             effort: claimed.effort,
             system: &system,
@@ -401,10 +395,8 @@ impl AiGateway {
                 .zip(&contents)
                 .map(|((role, _), content)| Turn { role, content })
                 .collect(),
-            fallbacks: !claimed.model.fallback_models.is_empty(),
-            progress_updates: claimed.model.progress_updates,
         };
-        Ok(self.client().create_message(&request).await?)
+        Ok(self.client().complete(&request).await?)
     }
 
     /// Whether this runner still owns the job's model call.
@@ -418,14 +410,9 @@ impl AiGateway {
         Ok(lease.flatten() == Some(claimed.lease_token))
     }
 
-    async fn settle(
-        &self,
-        claimed: &Claimed,
-        attempts: &[(String, catalog::Tokens)],
-        response: MessageResponse,
-    ) -> Result<(), sqlx::Error> {
+    async fn settle(&self, claimed: &Claimed, response: &ModelResponse) -> Result<(), sqlx::Error> {
         let outcome = match response.blocks() {
-            Ok(blocks) => interpret(response.stop_reason.as_deref(), blocks),
+            Ok(blocks) => interpret(&response.stop, blocks),
             Err(error) => {
                 tracing::warn!(job_id = %claimed.job_id, %error, "AI response content is unreadable");
                 Outcome::Failed("The AI response could not be read.".to_owned())
@@ -436,10 +423,11 @@ impl AiGateway {
         // or timed out meanwhile.
         let cost = budget::record_usage(
             &mut tx,
+            self.catalog(),
             claimed.owner_id,
             claimed.server_id,
             claimed.job_id,
-            attempts,
+            &response.attempts,
         )
         .await?;
         sqlx::query(
@@ -737,7 +725,7 @@ mod tests {
     #[test]
     fn tool_rounds_carry_progress_and_calls_in_order() {
         let outcome = interpret(
-            Some("tool_use"),
+            &Stop::ToolUse,
             blocks(json!([
                 {"type": "thinking", "thinking": "", "signature": "s1"},
                 {"type": "thinking", "thinking": "Checking who is online.", "signature": "s2"},
@@ -761,7 +749,7 @@ mod tests {
     fn answers_join_text_and_failures_explain_themselves() {
         assert_eq!(
             interpret(
-                Some("end_turn"),
+                &Stop::EndTurn,
                 blocks(json!([
                     {"type": "thinking", "thinking": "", "signature": "s"},
                     {"type": "text", "text": "It is day now. "},
@@ -771,16 +759,16 @@ mod tests {
             Outcome::Answer("It is day now.\nEnjoy.".to_owned())
         );
         assert_eq!(
-            interpret(Some("end_turn"), Vec::new()),
+            interpret(&Stop::EndTurn, Vec::new()),
             Outcome::Answer("Done.".to_owned())
         );
         assert!(matches!(
-            interpret(Some("refusal"), Vec::new()),
+            interpret(&Stop::Refusal, Vec::new()),
             Outcome::Failed(_)
         ));
         assert!(matches!(
             interpret(
-                Some("max_tokens"),
+                &Stop::MaxTokens,
                 blocks(
                     json!([{"type": "tool_use", "id": "t", "name": "list_players", "input": {}}])
                 )
@@ -789,18 +777,25 @@ mod tests {
         ));
         assert_eq!(
             interpret(
-                Some("max_tokens"),
+                &Stop::MaxTokens,
                 blocks(json!([{"type": "text", "text": "Partial"}]))
             ),
             Outcome::Answer("Partial …".to_owned())
         );
-        assert!(matches!(interpret(None, Vec::new()), Outcome::Failed(_)));
+        assert_eq!(
+            interpret(&Stop::Other(None), Vec::new()),
+            Outcome::Failed("The model stopped unexpectedly (no reason given).".to_owned())
+        );
+        assert!(matches!(
+            interpret(&Stop::ToolUse, Vec::new()),
+            Outcome::Failed(_)
+        ));
     }
 
     #[test]
     fn interrupted_progress_markers_are_not_shown() {
         let outcome = interpret(
-            Some("tool_use"),
+            &Stop::ToolUse,
             blocks(json!([
                 {"type": "thinking", "thinking": INTERRUPTED, "signature": "s"},
                 {"type": "tool_use", "id": "t", "name": "list_players", "input": {}},

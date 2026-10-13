@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
+use clap::{Parser, Subcommand};
 use kurbis_hoster::{
     ci::{
         BuildCoordinator, CheckRunClient, CiBuildIdentity, CiPoller, CiPollerConfig,
@@ -11,7 +12,7 @@ use kurbis_hoster::{
     config::{AiConfig, CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
     control_plane::{
-        ai::AiGateway,
+        ai::{AiGateway, check_provider},
         api::{AppState, router},
         lifecycle::Lifecycle,
         maintenance::{CiPreviewMaintenance, WorkerMaintenance},
@@ -39,9 +40,27 @@ fn classify_ci_poll_failure(error: Error) -> WorkerError {
     }
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "control-plane", about = "Run the Kurbis control plane")]
+struct Arguments {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run one tool round trip with every offered AI model, then exit.
+    CheckAi,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = Arguments::parse();
     init_tracing("kurbis_hoster=info,tower_http=info");
+    if let Some(Command::CheckAi) = arguments.command {
+        let config = AiConfig::from_env()?.context("AI_PROVIDER is not set")?;
+        return check_provider(&config).await;
+    }
     let config = ControlPlaneConfig::from_env()?;
     let object_store = ObjectStoreConfig::from_env()?.build().await?;
     let pool = db::connect(&config.common.database_url).await?;
@@ -314,7 +333,7 @@ async fn main() -> Result<()> {
             Some(gateway)
         }
         None => {
-            tracing::info!("ANTHROPIC_API_KEY is not set; the AI assistant is unavailable");
+            tracing::info!("AI_PROVIDER is not set; the AI assistant is unavailable");
             None
         }
     };

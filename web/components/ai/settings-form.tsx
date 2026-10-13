@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Save } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
-import { aiEfforts, aiModelName, aiSettingsFromForm, aiSettingsToForm } from "../../lib/ai";
+import { aiEfforts, aiModelName, aiModelOption, aiSettingsFromForm, aiSettingsToForm } from "../../lib/ai";
 import { errorMessage } from "../../lib/api/client";
 import type { components } from "../../lib/api/generated";
 import { browserApi } from "../../lib/api/operations";
@@ -91,7 +91,7 @@ export function AiSettingsForm({
             <option value="">Default ({aiModelName(models, defaults.model)})</option>
             {models.map((model) => (
               <option key={model.id} value={model.id}>
-                {model.name} · {formatUsd(model.input_micros_per_mtok)} / {formatUsd(model.output_micros_per_mtok)}
+                {aiModelOption(model)}
               </option>
             ))}
           </select>

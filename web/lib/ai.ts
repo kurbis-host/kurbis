@@ -1,5 +1,5 @@
 import type { components } from "./api/generated";
-import { parseUsdInput, usdInputValue } from "./format";
+import { formatUsd, parseUsdInput, usdInputValue } from "./format";
 import type { LifecyclePresentation } from "./lifecycle";
 import type { AiSettingsFormValues } from "./schemas";
 
@@ -38,6 +38,13 @@ export const aiEfforts: Record<AiEffort, string> = { low: "Low", medium: "Medium
 
 export function aiModelName(models: AiModel[], id: string) {
   return models.find((model) => model.id === id)?.name ?? id;
+}
+
+/** A model with its prices per million input / output tokens; unpriced models are not charged. */
+export function aiModelOption(model: AiModel) {
+  const { name, input_micros_per_mtok: input, output_micros_per_mtok: output } = model;
+  if (input === 0 && output === 0) return `${name} · free`;
+  return `${name} · ${formatUsd(input)} / ${formatUsd(output)}`;
 }
 
 /** Replace one request of the overview with a newer copy of it. */

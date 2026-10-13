@@ -13,7 +13,7 @@ use crate::contracts::ai::{
 use super::{
     AiError, AiGateway,
     budget::{self, Budgets, Exhausted},
-    catalog, prompt, settings,
+    prompt, settings,
     transitions::{self, ACTIVE_STATES},
 };
 
@@ -164,11 +164,7 @@ pub async fn overview(
     Ok(AiOverview {
         available: gateway.is_some(),
         defaults: gateway.map(AiGateway::defaults),
-        models: if gateway.is_some() {
-            catalog::selectable_models()
-        } else {
-            Vec::new()
-        },
+        models: gateway.map_or_else(Vec::new, |gateway| gateway.catalog().models()),
         usage: budget::usage(pool, server_id, owner_id, server_budget, account_budget).await?,
         jobs: recent_jobs(pool, server_id).await?,
         settings,
@@ -182,7 +178,7 @@ impl AiGateway {
         settings: &AiSettings,
     ) -> Result<(), AiError> {
         if let Some(model) = &settings.model
-            && catalog::selectable(model).is_none()
+            && self.catalog().offered(model).is_none()
         {
             return Err(AiError::UnknownModel);
         }
@@ -273,7 +269,7 @@ impl AiGateway {
             )
             .bind(server_id)
             .bind(request.operator_id)
-            .bind(effective.model.id)
+            .bind(&effective.model.id)
             .bind(effective.effort.as_str())
             .bind(MAX_CONVERSATION_MESSAGES)
             .bind(CONTINUE_WITHIN_MINUTES)
@@ -292,7 +288,7 @@ impl AiGateway {
                 .bind(id)
                 .bind(server_id)
                 .bind(request.operator_id)
-                .bind(effective.model.id)
+                .bind(&effective.model.id)
                 .bind(effective.effort.as_str())
                 .bind(serde_json::Value::from(prompt::SYSTEM_PROMPT).to_string())
                 .bind(prompt::tools().to_string())

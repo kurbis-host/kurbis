@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::contracts::ai::{AiDefaults, AiEffort, AiSettings};
 
-use super::{AiGateway, catalog::ModelSpec};
+use super::{AiGateway, catalog::Model};
 
 /// Settings of a server that never changed them.
 pub fn default_settings() -> AiSettings {
@@ -70,9 +70,9 @@ pub async fn store(
 }
 
 /// Settings with every default filled in.
-pub struct Effective {
+pub struct Effective<'a> {
     pub enabled: bool,
-    pub model: &'static ModelSpec,
+    pub model: &'a Model,
     pub effort: AiEffort,
     pub server_budget_micros: i64,
     pub account_budget_micros: i64,
@@ -82,22 +82,23 @@ impl AiGateway {
     pub fn defaults(&self) -> AiDefaults {
         let config = self.config();
         AiDefaults {
-            model: self.default_model().id.to_owned(),
+            model: self.catalog().default_model().id.clone(),
             effort: config.default_effort,
             server_monthly_budget_micros: config.server_monthly_budget_micros,
             account_monthly_budget_micros: config.account_monthly_budget_micros,
         }
     }
 
-    pub fn effective(&self, settings: &AiSettings) -> Effective {
+    pub fn effective(&self, settings: &AiSettings) -> Effective<'_> {
         let config = self.config();
+        let catalog = self.catalog();
         Effective {
             enabled: settings.enabled,
             model: settings
                 .model
                 .as_deref()
-                .and_then(super::catalog::selectable)
-                .unwrap_or(self.default_model()),
+                .and_then(|model| catalog.offered(model))
+                .unwrap_or(catalog.default_model()),
             effort: settings.effort.unwrap_or(config.default_effort),
             // A server cap above the account cap could never be reached.
             server_budget_micros: settings

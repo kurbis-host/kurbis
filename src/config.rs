@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 mod ai;
 
-pub use ai::{AiConfig, DEFAULT_AI_MODEL, DEFAULT_ANTHROPIC_BASE_URL, parse_usd_micros};
+pub use ai::{AiConfig, AiModelEntry, AiProvider, parse_usd_micros};
 
 #[derive(Clone)]
 pub struct CommonConfig {

@@ -49,11 +49,12 @@ x-control-plane-environment: &control-plane-environment
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
   S3_SECRET_KEY: ${S3_SECRET_KEY:-}
   S3_ALLOW_HTTP: ${S3_ALLOW_HTTP:-false}
-  # The in-game AI assistant is offered only when ANTHROPIC_API_KEY is set.
+  # The in-game AI assistant is offered only when AI_PROVIDER is set.
   # Blank AI settings keep the control plane's defaults.
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
-  AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-}
+  AI_PROVIDER: ${AI_PROVIDER:-}
+  AI_BASE_URL: ${AI_BASE_URL:-}
+  AI_API_KEY: ${AI_API_KEY:-}
+  AI_MODELS: ${AI_MODELS:-}
   AI_DEFAULT_EFFORT: ${AI_DEFAULT_EFFORT:-}
   AI_SERVER_MONTHLY_BUDGET_USD: ${AI_SERVER_MONTHLY_BUDGET_USD:-}
   AI_ACCOUNT_MONTHLY_BUDGET_USD: ${AI_ACCOUNT_MONTHLY_BUDGET_USD:-}

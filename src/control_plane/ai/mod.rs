@@ -1,19 +1,20 @@
 //! AI gateway for the in-game assistant.
 //!
 //! The kurbis-control plugin turns an operator's `/ai` command into a job. The
-//! runner claims queued jobs and calls Claude with the call's worst-case cost
-//! reserved against the server and account budgets. Tool calls the model asks
-//! for wait in the database until the plugin's sync picks them up, runs them
-//! in game and returns the results; the job then continues with its next model
-//! call. Every model attempt is priced into the `ai_usage` ledger, which the
-//! monthly budgets are sums over. Chat lines for the operator travel back
-//! through the same sync.
+//! runner claims queued jobs and calls the configured model provider with the
+//! call's worst-case cost reserved against the server and account budgets.
+//! Tool calls the model asks for wait in the database until the plugin's sync
+//! picks them up, runs them in game and returns the results; the job then
+//! continues with its next model call. Every model attempt is priced into the
+//! `ai_usage` ledger, which the monthly budgets are sums over. Chat lines for
+//! the operator travel back through the same sync.
 
-mod anthropic;
 mod budget;
 pub mod catalog;
+mod check;
 mod jobs;
 mod prompt;
+mod provider;
 mod runner;
 mod settings;
 mod sync;
@@ -21,12 +22,12 @@ mod transitions;
 
 use std::sync::Arc;
 
-use anyhow::Context;
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
 
 use crate::config::AiConfig;
 
+pub use check::check_provider;
 pub use jobs::{cancel_job, job_detail, overview};
 pub use sync::sync;
 
@@ -39,8 +40,8 @@ pub struct AiGateway {
 struct Inner {
     pool: PgPool,
     config: AiConfig,
-    default_model: &'static catalog::ModelSpec,
-    client: anthropic::AnthropicClient,
+    catalog: catalog::Catalog,
+    client: provider::ModelClient,
     /// Signalled when a job becomes runnable, so the runner does not wait for
     /// its next tick.
     wake: Notify,
@@ -49,18 +50,13 @@ struct Inner {
 
 impl AiGateway {
     pub fn new(pool: PgPool, config: AiConfig) -> anyhow::Result<Self> {
-        let default_model = catalog::selectable(&config.default_model).with_context(|| {
-            format!(
-                "AI_DEFAULT_MODEL {} is not one of the offered models",
-                config.default_model
-            )
-        })?;
-        let client = anthropic::AnthropicClient::new(&config)?;
+        let catalog = catalog::Catalog::new(config.provider, &config.models);
+        let client = provider::ModelClient::new(&config)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 pool,
                 config,
-                default_model,
+                catalog,
                 client,
                 wake: Notify::new(),
                 maintenance: Mutex::default(),
@@ -76,11 +72,11 @@ impl AiGateway {
         &self.inner.config
     }
 
-    fn default_model(&self) -> &'static catalog::ModelSpec {
-        self.inner.default_model
+    fn catalog(&self) -> &catalog::Catalog {
+        &self.inner.catalog
     }
 
-    fn client(&self) -> &anthropic::AnthropicClient {
+    fn client(&self) -> &provider::ModelClient {
         &self.inner.client
     }
 

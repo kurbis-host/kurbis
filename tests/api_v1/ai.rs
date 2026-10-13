@@ -2,38 +2,42 @@ use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
 use axum::{Router, extract::State, http::HeaderMap, routing::post};
 use kurbis_hoster::{
-    config::{AiConfig, SecretString},
+    config::{AiConfig, AiModelEntry, AiProvider, SecretString},
     contracts::ai::AiEffort,
     control_plane::ai::{
         AiGateway,
-        catalog::{self, Tokens},
+        catalog::{Catalog, Tokens},
     },
 };
 
 use super::support::*;
 
 const OPUS: &str = "claude-opus-5-5";
+const GPT: &str = "gpt-oss-120b";
 
-/// Scripted stand-in for the Claude Messages API that records every request.
+/// Scripted stand-in for a model provider that records every request. It
+/// serves the Messages API and the Chat Completions API from one script.
 #[derive(Clone, Default)]
-struct FakeClaude {
+struct FakeProvider {
     responses: Arc<StdMutex<VecDeque<Value>>>,
     requests: Arc<StdMutex<Vec<(HeaderMap, Value)>>>,
 }
 
-impl FakeClaude {
+impl FakeProvider {
+    /// Returns the fake and its base URL.
     async fn start() -> (Self, String) {
         let fake = Self::default();
         let app = Router::new()
-            .route("/v1/messages", post(Self::messages))
+            .route("/v1/messages", post(Self::respond_next))
+            .route("/v1/chat/completions", post(Self::respond_next))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (fake, format!("http://{address}"))
+        (fake, format!("http://{address}/v1"))
     }
 
-    async fn messages(
+    async fn respond_next(
         State(fake): State<Self>,
         headers: HeaderMap,
         body: Bytes,
@@ -93,11 +97,26 @@ fn answer(text: &str, usage: Value) -> Value {
     )
 }
 
-fn ai_config(base_url: &str) -> AiConfig {
+fn ai_config(provider: AiProvider, base_url: &str) -> AiConfig {
+    let models: &[(&str, Option<(i64, i64)>)] = match provider {
+        AiProvider::Anthropic => &[
+            (OPUS, None),
+            ("claude-sonnet-5-5", None),
+            ("claude-haiku-5-5", None),
+        ],
+        AiProvider::OpenAi => &[(GPT, Some((150_000, 600_000))), ("llama3.1:8b", None)],
+    };
     AiConfig {
-        api_key: SecretString::new("test-anthropic-key"),
+        provider,
         base_url: base_url.to_owned(),
-        default_model: OPUS.to_owned(),
+        api_key: Some(SecretString::new("test-provider-key")),
+        models: models
+            .iter()
+            .map(|(id, prices)| AiModelEntry {
+                id: (*id).to_owned(),
+                prices: *prices,
+            })
+            .collect(),
         default_effort: AiEffort::Medium,
         server_monthly_budget_micros: 5_000_000,
         account_monthly_budget_micros: 20_000_000,
@@ -105,11 +124,17 @@ fn ai_config(base_url: &str) -> AiConfig {
     }
 }
 
+fn catalog(provider: AiProvider) -> Catalog {
+    let config = ai_config(provider, "http://unused");
+    Catalog::new(config.provider, &config.models)
+}
+
 struct AiFixture {
     pool: PgPool,
     app: axum::Router,
     gateway: AiGateway,
-    fake: FakeClaude,
+    fake: FakeProvider,
+    provider: AiProvider,
     base_url: String,
     owner_id: Uuid,
     owner_token: String,
@@ -121,6 +146,10 @@ struct AiFixture {
 
 impl AiFixture {
     async fn new() -> Self {
+        Self::with_provider(AiProvider::Anthropic).await
+    }
+
+    async fn with_provider(provider: AiProvider) -> Self {
         let pool = test_pool().await;
         // Only these tests create AI jobs. Jobs left behind by an aborted run
         // would otherwise be claimed by this run's runner.
@@ -179,8 +208,8 @@ impl AiFixture {
         .await
         .unwrap();
 
-        let (fake, base_url) = FakeClaude::start().await;
-        let gateway = AiGateway::new(pool.clone(), ai_config(&base_url)).unwrap();
+        let (fake, base_url) = FakeProvider::start().await;
+        let gateway = AiGateway::new(pool.clone(), ai_config(provider, &base_url)).unwrap();
         let mut state = Arc::into_inner(state(pool.clone())).unwrap();
         state.ai = Some(gateway.clone());
         Self {
@@ -188,6 +217,7 @@ impl AiFixture {
             pool,
             gateway,
             fake,
+            provider,
             base_url,
             owner_id,
             owner_token,
@@ -398,7 +428,7 @@ async fn ai_job_runs_a_tool_round_through_the_plugin_and_meters_every_call() {
     let requests = fixture.fake.requests();
     assert_eq!(requests.len(), 2);
     let (headers, second) = &requests[1];
-    assert_eq!(headers["x-api-key"], "test-anthropic-key");
+    assert_eq!(headers["x-api-key"], "test-provider-key");
     assert_eq!(headers["anthropic-version"], "2023-06-01");
     assert_eq!(
         headers["anthropic-beta"],
@@ -426,7 +456,8 @@ async fn ai_job_runs_a_tool_round_through_the_plugin_and_meters_every_call() {
     assert_eq!(messages[2]["content"][1]["tool_use_id"], "toolu_op");
     assert_eq!(messages[2]["content"][1]["is_error"], true);
 
-    let first_cost = catalog::cost_micros(
+    let catalog = catalog(AiProvider::Anthropic);
+    let first_cost = catalog.cost_micros(
         OPUS,
         Tokens {
             input: 12,
@@ -435,7 +466,7 @@ async fn ai_job_runs_a_tool_round_through_the_plugin_and_meters_every_call() {
             cache_read: 0,
         },
     );
-    let second_cost = catalog::cost_micros(
+    let second_cost = catalog.cost_micros(
         OPUS,
         Tokens {
             input: 40,
@@ -778,7 +809,7 @@ async fn cancelled_and_undelivered_tool_rounds_end_cleanly() {
     // makes them overdue.
     let sweep_overdue_calls = |job_id: Uuid| {
         let pool = fixture.pool.clone();
-        let config = ai_config(&fixture.base_url);
+        let config = ai_config(fixture.provider, &fixture.base_url);
         async move {
             sqlx::query(
                 "UPDATE ai_tool_calls SET created_at = now() - interval '1 minute'
@@ -880,6 +911,201 @@ async fn ai_routes_report_an_unconfigured_gateway() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json_body(response).await["code"], "ai_unavailable");
+
+    fixture.cleanup().await;
+}
+
+fn chat_completion(
+    message: Value,
+    finish_reason: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Value {
+    json!({
+        "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
+        "object": "chat.completion",
+        // Gateways often name the variant that served the request.
+        "model": format!("{GPT}-medium"),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+#[tokio::test]
+async fn openai_compatible_provider_runs_tool_rounds_at_configured_prices() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let fixture = AiFixture::with_provider(AiProvider::OpenAi).await;
+    let cursor = fixture.sync(json!([]), None).await["cursor"]
+        .as_i64()
+        .unwrap();
+
+    let (status, overview) = fixture.owner(Method::GET, "", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overview["defaults"]["model"], GPT);
+    assert_eq!(
+        overview["models"],
+        json!([
+            {"id": GPT, "name": GPT, "input_micros_per_mtok": 150_000, "output_micros_per_mtok": 600_000},
+            {"id": "llama3.1:8b", "name": "llama3.1:8b", "input_micros_per_mtok": 0, "output_micros_per_mtok": 0},
+        ])
+    );
+
+    // The server repeats a call id; the gateway keys calls by its own ids.
+    fixture.fake.respond(chat_completion(
+        json!({"role": "assistant", "content": "Checking who is online.", "tool_calls": [
+            {"id": "call_0", "type": "function", "function": {"name": "list_players", "arguments": "{\"reason\":\"asked\"}"}},
+            {"id": "call_0", "type": "function", "function": {"name": "run_server_command", "arguments": "{\"command\":\"op Steve\"}"}},
+        ]}),
+        "tool_calls",
+        1_000,
+        100,
+    ));
+    fixture.fake.respond(chat_completion(
+        json!({"role": "assistant", "content": "Steve and Alex are online."}),
+        "stop",
+        1_200,
+        20,
+    ));
+    let job_id = Uuid::new_v4();
+    let (status, job) = fixture.ask(job_id, "who is online?").await;
+    assert_eq!(status, StatusCode::CREATED, "{job}");
+    assert_eq!(job["model"], GPT);
+    fixture.run().await;
+
+    let delivery = fixture.sync(json!([]), Some(cursor)).await;
+    let calls = delivery["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1, "{delivery}");
+    assert_eq!(calls[0]["name"], "list_players");
+    assert_eq!(calls[0]["input"], json!({"reason": "asked"}));
+    let call_id = calls[0]["call_id"].as_str().unwrap().to_owned();
+    assert!(
+        call_id.starts_with("call_") && call_id != "call_0",
+        "{call_id}"
+    );
+    assert_eq!(delivery["events"][0]["message"], "Checking who is online.");
+    fixture
+        .sync(
+            json!([{"job_id": job_id, "call_id": call_id, "output": "Steve, Alex"}]),
+            Some(delivery["cursor"].as_i64().unwrap()),
+        )
+        .await;
+    fixture.run().await;
+    let (_, detail) = fixture
+        .owner(Method::GET, &format!("/jobs/{job_id}"), None)
+        .await;
+    assert_eq!(detail["job"]["state"], "succeeded", "{detail}");
+    assert_eq!(detail["job"]["answer"], "Steve and Alex are online.");
+
+    // The follow-up call replays the transcript as chat messages.
+    let requests = fixture.fake.requests();
+    assert_eq!(requests.len(), 2);
+    let (headers, second) = &requests[1];
+    assert_eq!(headers[header::AUTHORIZATION], "Bearer test-provider-key");
+    assert!(headers.get("x-api-key").is_none());
+    assert_eq!(second["model"], GPT);
+    assert_eq!(second["max_tokens"], 8192);
+    assert_eq!(second["reasoning_effort"], "medium");
+    assert_eq!(second["tools"][0]["type"], "function");
+    assert_eq!(second["tools"], requests[0].1["tools"]);
+    let messages = second["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 5, "{second}");
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("asks:\nwho is online?")
+    );
+    assert_eq!(messages[2]["content"], "Checking who is online.");
+    let tool_calls = messages[2]["tool_calls"].as_array().unwrap();
+    assert_eq!(tool_calls[0]["id"], call_id.as_str());
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        "{\"reason\":\"asked\"}"
+    );
+    assert_ne!(tool_calls[1]["id"], tool_calls[0]["id"]);
+    assert_eq!(
+        messages[3],
+        json!({"role": "tool", "tool_call_id": call_id, "content": "Steve, Alex"})
+    );
+    assert_eq!(messages[4]["tool_call_id"], tool_calls[1]["id"]);
+    assert!(
+        messages[4]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Error: The /op command is not available"),
+        "{}",
+        messages[4]
+    );
+
+    // Attempts are charged at the requested model's configured prices.
+    let catalog = catalog(AiProvider::OpenAi);
+    let first_cost = catalog.cost_micros(
+        GPT,
+        Tokens {
+            input: 1_000,
+            output: 100,
+            ..Tokens::default()
+        },
+    );
+    assert_eq!(first_cost, 210);
+    let second_cost = catalog.cost_micros(
+        GPT,
+        Tokens {
+            input: 1_200,
+            output: 20,
+            ..Tokens::default()
+        },
+    );
+    let ledger: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT model, input_tokens, output_tokens, cost_micros
+         FROM ai_usage WHERE server_id = $1 ORDER BY id",
+    )
+    .bind(fixture.server_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger,
+        vec![
+            (GPT.to_owned(), 1_000, 100, first_cost),
+            (GPT.to_owned(), 1_200, 20, second_cost),
+        ]
+    );
+
+    // A model without prices runs uncharged.
+    let (status, body) = fixture
+        .owner(
+            Method::PUT,
+            "/settings",
+            Some(json!({"enabled": true, "model": "llama3.1:8b", "effort": "low", "monthly_budget_micros": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fixture.fake.respond(chat_completion(
+        json!({"role": "assistant", "content": "It is day."}),
+        "stop",
+        500,
+        10,
+    ));
+    let unpriced = Uuid::new_v4();
+    fixture.ask(unpriced, "what time is it?").await;
+    fixture.run().await;
+    assert_eq!(fixture.job_state(unpriced).await, "succeeded");
+    let third = &fixture.fake.requests()[2].1;
+    assert_eq!(third["model"], "llama3.1:8b");
+    assert_eq!(third["reasoning_effort"], "low");
+    assert_eq!(third["messages"].as_array().unwrap().len(), 2);
+    let cost: i64 = sqlx::query_scalar("SELECT cost_micros FROM ai_usage WHERE job_id = $1")
+        .bind(unpriced)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(cost, 0);
 
     fixture.cleanup().await;
 }
