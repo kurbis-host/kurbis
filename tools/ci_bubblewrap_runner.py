@@ -111,6 +111,16 @@ tar -xzf /work/input/plugin.tar.gz -C /work/plugin --no-same-owner --no-same-per
 cd /work
 cargo fetch --locked --manifest-path /work/source/Cargo.toml --target "$KURBIS_RUST_TARGET"
 cargo fetch --locked --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2
+# The control plugin pins one revision of Pumpkin's plugin API, but the server
+# built here may be a pull request whose API differs, and Pumpkin refuses a
+# plugin built against another one. Resolve the plugin against this source
+# tree's own API as well; the build phase prefers that resolution.
+cp /work/plugin/Cargo.lock /work/plugin/Cargo.lock.pinned
+if [ -f /work/source/crates/pumpkin-plugin-api/Cargo.toml ] \
+  && cargo fetch --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --config "$KURBIS_PLUGIN_API_FROM_SOURCE"; then
+  cp /work/plugin/Cargo.lock /work/plugin/Cargo.lock.source
+fi
+cp /work/plugin/Cargo.lock.pinned /work/plugin/Cargo.lock
 printf 'dependency_fetch=complete\n'
 """
 
@@ -148,7 +158,22 @@ cd /work/source
 cargo build --locked --offline --release --jobs 8 --package pumpkin --bin pumpkin --target "$KURBIS_RUST_TARGET" --target-dir /work/target
 cp "/work/target/$KURBIS_RUST_TARGET/release/pumpkin" /work/out/pumpkin
 cd /work/plugin
-cargo build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+plugin_api=pinned
+if [ -f /work/plugin/Cargo.lock.source ]; then
+  cp /work/plugin/Cargo.lock.source /work/plugin/Cargo.lock
+  if cargo build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target --config "$KURBIS_PLUGIN_API_FROM_SOURCE"; then
+    plugin_api=source
+  else
+    # A pull request that changes the API so that the plugin no longer
+    # compiles still gets a server; it runs without the control plugin.
+    echo "control plugin does not compile against this source tree's plugin API; building it against the pinned API" >&2
+    cp /work/plugin/Cargo.lock.pinned /work/plugin/Cargo.lock
+  fi
+fi
+if [ "$plugin_api" = pinned ]; then
+  cargo build --locked --offline --release --jobs 8 --manifest-path /work/plugin/Cargo.toml --target wasm32-wasip2 --target-dir /work/plugin-target
+fi
+printf 'plugin_api=%s\n' "$plugin_api"
 cp /work/plugin-target/wasm32-wasip2/release/kurbis_control.wasm /work/out/kurbis-control.wasm
 strip /work/out/pumpkin
 build_elapsed_seconds=$SECONDS
@@ -306,6 +331,7 @@ def runner_command(header, workspace, script, network=False, extra_env=None):
         "KURBIS_BUILD_CACHE_MAX_BYTES": str(validate_cache_size(header["cache_max_bytes"])),
         "KURBIS_BWRAP_GUARANTEE": "bubblewrap_namespace_only",
         "KURBIS_CGROUP_DELEGATION": "remote_probe",
+        "KURBIS_PLUGIN_API_FROM_SOURCE": PLUGIN_API_FROM_SOURCE,
     }
     env_values.update(extra_env or {})
     command = [
@@ -388,6 +414,11 @@ def minecraft_server_jar(workspace, cache_root):
         temporary.replace(jar)
     return f"/cache/minecraft/{jar.name}"
 
+
+# A Cargo `--config` value that replaces the control plugin's pinned plugin API
+# with the one in the source tree being built.
+PLUGIN_API_FROM_SOURCE = ('patch."https://github.com/Pumpkin-MC/Pumpkin.git".pumpkin-plugin-api.path='
+                          '"/work/source/crates/pumpkin-plugin-api"')
 
 DEPENDENCY_TARGETS = ("target", "plugin-target")
 KEPT_DEPENDENCY_CACHES = 2
@@ -505,6 +536,10 @@ def main():
                 server_jar = minecraft_server_jar(workspace, private_cache_root(header["cache_root"]))
                 if server_jar:
                     build_env["PUMPKIN_MINECRAFT_SERVER_JAR"] = server_jar
+                revision = header.get("source_revision")
+                if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+                    # Shown to players as the server brand on the F3 screen.
+                    build_env["KURBIS_SERVER_BRAND"] = f"Pumpkin {revision} (Kurbis)"
                 dependencies = dependency_cache_path(header, workspace)
                 restored = restore_dependency_cache(dependencies, workspace)
                 completed = run_phase(runner_command(header, workspace, BUILD_SCRIPT, extra_env=build_env), deadline)

@@ -29,7 +29,7 @@ class CiBubblewrapContractTests(unittest.TestCase):
             for line in runner.FETCH_SCRIPT.splitlines()
             if line and not line.startswith(("#", "export ", "set ", "umask "))
         ]
-        self.assertEqual(set(commands), {"mkdir", "tar", "cd", "cargo", "printf"})
+        self.assertEqual(set(commands), {"mkdir", "tar", "cd", "cargo", "printf", "cp", "if", "&&", "fi"})
         self.assertNotIn("cargo build", runner.FETCH_SCRIPT)
         self.assertIn("--offline", runner.BUILD_SCRIPT)
         source = (ROOT / "tools/ci_bubblewrap_runner.py").read_text(encoding="utf-8")
