@@ -282,8 +282,13 @@ pub(super) fn write_runtime_owner(runtime_dir: &Path, preview_id: Uuid) -> Resul
 
 pub(super) fn remove_owned_runtime_dir(allowed_root: &Path, preview_id: Uuid) -> Result<()> {
     let path = allowed_root.join(preview_id.to_string());
-    let root =
-        fs::canonicalize(allowed_root).context("CI runtime allowlisted root is unavailable")?;
+    // A worker that has never run a preview has no runtime root yet, so there
+    // is nothing of this preview's to remove.
+    let root = match fs::canonicalize(allowed_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("CI runtime allowlisted root is unavailable"),
+    };
     let resolved = match fs::canonicalize(&path) {
         Ok(resolved) => resolved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
