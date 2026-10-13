@@ -44,9 +44,12 @@ impl TryFrom<CiRuntimeRow> for CiRuntimePlacement {
             repository: row.repository,
             commit_sha: row.commit_sha,
             build_id: row.build_id,
-            artifact_digest: row
-                .artifact_digest
-                .context("ready CI runtime has no artifact digest")?,
+            // A stopped runtime can outlive its artifact: the same commit is
+            // rebuilt when the integration patches change. Failing here made
+            // the worker's whole runtime listing fail. A start with an empty
+            // digest cannot verify an artifact, so it fails for that preview
+            // alone.
+            artifact_digest: row.artifact_digest.unwrap_or_default(),
             hostname: row.hostname,
             worker_id: row.worker_id,
             worker_address: row.worker_address,

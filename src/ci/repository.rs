@@ -1417,7 +1417,13 @@ impl CiPreviewRepository {
                 return existing.try_into();
             }
             sqlx::query_as::<_, CiPreviewRow>(
-                "UPDATE ci_preview_aliases SET build_id = $2, ref_name = COALESCE($3, ref_name), updated_at = now()
+                // The same commit gets a new build when the integration
+                // patches change. An alias that was ready then has no artifact
+                // again, so it goes back to queued and the next join builds it.
+                "UPDATE ci_preview_aliases SET build_id = $2, ref_name = COALESCE($3, ref_name), updated_at = now(),
+                        state = CASE WHEN state = 'ready' AND NOT EXISTS (
+                            SELECT 1 FROM ci_builds build WHERE build.id = $2 AND build.stage = 'ready'
+                        ) THEN 'queued' ELSE state END
                  WHERE id = $1 RETURNING id, repository, commit_sha, kind, hostname, build_id, state, runtime_generation, NULL::text AS failure_message, ''::text AS build_log, expires_at",
             ).bind(existing.id).bind(build_id).bind(ref_name).fetch_one(&mut *tx).await?
         } else {
