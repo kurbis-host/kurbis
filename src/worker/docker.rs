@@ -10,6 +10,7 @@ use super::{
         GatewayIngressPolicy, PublishedWorkloadPorts, cleanup_ingress_through,
         ensure_runtime_ingress,
     },
+    phase_timer::PhaseTimer,
     runtime::{ServerRuntime, settings::render_pumpkin_config},
 };
 use anyhow::{Context, Result, bail};
@@ -225,10 +226,12 @@ impl ServerRuntime for DockerRuntime {
             }
             None => {}
         }
+        let mut phases = PhaseTimer::start();
         self.remove_stopped(&name).await?;
         runtime_api_proxy::remove_containers_through(server_id, placement.generation).await?;
         cleanup_ingress_through(&self.ingress, server_id, placement.generation).await?;
         self.sandbox.remove_isolated_networks(server_id).await?;
+        phases.mark("cleanup");
         self.sandbox
             .verify_with_limits(
                 &self.image,
@@ -237,6 +240,7 @@ impl ServerRuntime for DockerRuntime {
             .await?;
         validate_quota_volume(server_dir, SERVER_STORAGE_BYTES as u64).await?;
         self.ingress.verify_host_policy().await?;
+        phases.mark("sandbox");
         tokio::fs::create_dir_all(server_dir.join("run")).await?;
         tokio::fs::write(
             server_dir.join("pumpkin.toml"),
@@ -265,6 +269,7 @@ impl ServerRuntime for DockerRuntime {
             .rootless_container_identity(PUMPKIN_UID, PUMPKIN_GID)
             .await?;
         ensure_rootless_volume_owner(server_dir, runtime_uid, runtime_gid).await?;
+        phases.mark("storage");
 
         let published_ports = workload_ports(self.public_address, self.signal_address, placement)?;
         let volume = format!(
@@ -307,6 +312,7 @@ impl ServerRuntime for DockerRuntime {
         self.sandbox
             .create_isolated_network(server_id, placement.generation)
             .await?;
+        phases.mark("network");
         if let Err(error) = runtime_api_proxy::start_container(
             &self.runtime_api_proxy_image,
             "server",
@@ -329,6 +335,7 @@ impl ServerRuntime for DockerRuntime {
             remove_control_socket_alias(server_id).await?;
             return Err(error).context("start scoped managed-plugin API proxy");
         }
+        phases.mark("api_proxy");
         let output = match tokio::time::timeout(
             Duration::from_secs(30),
             Command::new("docker")
@@ -387,6 +394,7 @@ impl ServerRuntime for DockerRuntime {
             }
             return Err(error).context("workload network isolation check failed");
         }
+        phases.mark("container");
         if let Err(error) = self
             .ensure_ingress_relay(
                 server_id,
@@ -404,6 +412,7 @@ impl ServerRuntime for DockerRuntime {
             }
             return Err(error);
         }
+        phases.mark("ingress");
         if let Err(error) = self
             .wait_ready(server_id, server_dir, Duration::from_secs(120))
             .await
@@ -417,6 +426,8 @@ impl ServerRuntime for DockerRuntime {
             }
             bail!("Pumpkin readiness failed: {error}; container logs:\n{logs}");
         }
+        phases.mark("ready");
+        tracing::info!(%server_id, generation = placement.generation, %phases, "Docker runtime started");
         Ok(())
     }
 

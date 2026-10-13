@@ -57,6 +57,26 @@ python3 tools/verify_worker_runtime.py --bin-dir target/debug \
 
 This harness uses an explicit offline identity fixture only for its disposable servers. It verifies the managed plugin load, OP-only login command, same-server link redemption, replay and origin checks, account/cross-server isolation, and expired-session rejection. It also verifies that unverified players receive no account login link. Results are written to result.json; check passed and individual checks. Native success cannot establish Docker hard-quota enforcement. See PROGRESS.md for executed results and outstanding plan requirements.
 
+## Measure a server start
+
+`tools/measure_server_start.py` brings up the control plane, gateway, waiting
+runtime and one native worker against an empty disposable database, joins a
+sleeping server through the gateway with the Java protocol client, and prints
+where the time between connecting and spawning went:
+
+```sh
+createdb kurbis_start_timing
+python3 tools/measure_server_start.py --bin-dir target/debug \
+  --native-binary output/native-pumpkin/target/release/pumpkin \
+  --database-url postgres://localhost/kurbis_start_timing
+```
+
+The first run generates a new world; the median it prints covers the later
+runs, which restore a snapshot the way a real wake does. Docker-only steps do
+not run in native mode. Every worker logs the same split for each start it
+performs (`server start completed`, and `Docker runtime started` on Docker
+workers), so production numbers come from the worker's log.
+
 ## Run the gateway locally without Docker
 
 Run the real control plane and panel using the README’s OAuth configuration.

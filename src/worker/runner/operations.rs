@@ -1,8 +1,11 @@
 use super::WorkerRunner;
 use super::*;
-use crate::contracts::{
-    lifecycle::ResetMode,
-    worker::{OperationPayload, OperationProgress, OperationStage},
+use crate::{
+    contracts::{
+        lifecycle::ResetMode,
+        worker::{OperationPayload, OperationProgress, OperationStage},
+    },
+    worker::phase_timer::PhaseTimer,
 };
 
 impl WorkerRunner {
@@ -648,6 +651,7 @@ impl WorkerRunner {
         payload: &OperationPayload,
         snapshots: &SnapshotManager,
     ) -> Result<()> {
+        let mut phases = PhaseTimer::start();
         let context = self.context_for_operation(op).await?;
         let placement = context.placement.clone();
         if placement.worker_id != self.config.id || placement.generation != op.generation {
@@ -655,6 +659,7 @@ impl WorkerRunner {
         }
         let settings = context.settings.clone();
         let current_snapshot = context.current_snapshot_generation;
+        phases.mark("context");
 
         let server_dir = match self.runtime.server_generation(op.server_id).await? {
             Some(generation) if generation == op.generation => {
@@ -675,6 +680,7 @@ impl WorkerRunner {
         };
         let storage_bytes = persistent_size(&server_dir)?;
         ensure_storage_limit(storage_bytes)?;
+        phases.mark("storage");
         write_whitelist_file(&context, &server_dir).await?;
         write_operator_file(&context, &server_dir).await?;
 
@@ -687,6 +693,7 @@ impl WorkerRunner {
                 .update_operation_payload(op, OperationProgress::stage(OperationStage::Starting))
                 .await?;
         }
+        phases.mark("access");
         self.runtime
             .start(
                 op.server_id,
@@ -696,6 +703,7 @@ impl WorkerRunner {
                 api_capability.as_deref(),
             )
             .await?;
+        phases.mark("runtime");
         sync_whitelist(
             &self.control_plane,
             self.runtime.as_ref(),
@@ -714,7 +722,20 @@ impl WorkerRunner {
         .await?;
         let storage_bytes = persistent_size(&server_dir)?;
         ensure_storage_limit(storage_bytes)?;
+        phases.mark("sync");
         self.control_plane.complete_start(op, storage_bytes).await?;
+        phases.mark("complete");
+        tracing::info!(
+            server_id = %op.server_id,
+            generation = op.generation,
+            attempt = op.attempt,
+            // Time since the start was requested, including the wait for this
+            // worker to claim it and any earlier attempts.
+            since_request_ms = (Utc::now() - op.created_at).num_milliseconds(),
+            worker_ms = phases.total().as_millis() as u64,
+            %phases,
+            "server start completed"
+        );
         self.idle_since.remove(&op.server_id);
         self.last_snapshot
             .insert(op.server_id, SnapshotSchedule::new(Instant::now()));
