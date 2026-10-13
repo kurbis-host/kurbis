@@ -51,6 +51,12 @@ pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
     }
 }
 
+const LOGIN_INTENT: i32 = 2;
+/// A client that follows the lobby's transfer packet reconnects with this
+/// intent instead of a plain login. It is the same login; dropping it closed
+/// every redirect from the lobby with "Connection reset by peer".
+const TRANSFER_INTENT: i32 = 3;
+
 async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCache) -> Result<()> {
     let handshake = match read_handshake(&mut client).await {
         Ok(handshake) => handshake,
@@ -68,7 +74,9 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
                     .await?;
                 handle_ci_status(&mut client, &handshake, target.as_ref()).await
             }
-            2 => handle_ci_login(client, config, routes, handshake, ci_root_domain).await,
+            LOGIN_INTENT | TRANSFER_INTENT => {
+                handle_ci_login(client, config, routes, handshake, ci_root_domain).await
+            }
             _ => Ok(()),
         };
     }
@@ -84,7 +92,7 @@ async fn handle(mut client: TcpStream, config: &GatewayConfig, routes: &RouteCac
             )
             .await
         }
-        2 => {
+        LOGIN_INTENT | TRANSFER_INTENT => {
             if !routes.accepts_server_address(&handshake.hostname) {
                 return send_login_disconnect(&mut client, "Unknown server address").await;
             }
