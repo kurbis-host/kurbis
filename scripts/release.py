@@ -17,6 +17,7 @@ import argparse
 import fcntl
 import json
 import os
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ HOST_STEPS = ROOT / "scripts/release_host.py"
 COMPOSE_ID = "KZyAZl_v1hgoqWi-W77ot"
 PROJECT = "kurbis-hoster-fbikvd"
 REMOTE_ARTIFACTS = "/srv/kurbis/release-artifacts"
+HOST_RUN_DIRECTORY = "/run/kurbis-release"
 # Settings every release pins in Dokploy next to the revision it deploys.
 ENVIRONMENT = {"BEDROCK_TLS_HOST_DIRECTORY": "/srv/kurbis/certs", "PANEL_BIND_ADDRESS": "127.0.0.1"}
 # Dokploy setting naming the server every release starts to prove starts work.
@@ -128,16 +130,38 @@ def patch_environment(text: str, changes: dict[str, str]) -> str:
 
 
 def host_step(host: str, step: str, arguments: dict, *, timeout: int) -> dict:
-    command = shlex.join(["python3", "-", step, json.dumps(arguments, separators=(",", ":"))])
-    result = subprocess.run([*SSH, host, command], input=HOST_STEPS.read_text(encoding="utf-8"), text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout)
+    """Run one step of `release_host.py` on the host and return its result.
+
+    The step runs detached from the SSH session and leaves its result in a
+    file that is polled over fresh connections. Connections to the host have
+    been reset in the middle of image builds; a step must neither die with
+    the connection nor leave the release without its result.
+    """
+    base = f"{HOST_RUN_DIRECTORY}/{secrets.token_hex(8)}"
+    command = shlex.join(["python3", f"{base}.py", step, json.dumps(arguments, separators=(",", ":"))])
+    launch = (f"install -d -m 0700 {HOST_RUN_DIRECTORY} && cat > {base}.py && "
+              f"(setsid sh -c {shlex.quote(f'{command} > {base}.out 2> {base}.err; touch {base}.done')} "
+              "< /dev/null > /dev/null 2>&1 &)")
+    run([*SSH, host, launch], input_text=HOST_STEPS.read_text(encoding="utf-8"), timeout=60)
+    deadline = time.monotonic() + timeout
     try:
-        answer = json.loads(result.stdout.strip().splitlines()[-1])
-    except (IndexError, json.JSONDecodeError) as error:
-        raise ReleaseError(f"host step {step} returned no result: {result.stderr.strip()[-2000:]}") from error
-    if "error" in answer:
-        raise ReleaseError(f"host step {step}: {answer['error']}")
-    return answer
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            poll = subprocess.run([*SSH, host, f"test -f {base}.done && cat {base}.out {base}.err"],
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=60)
+            if poll.returncode:
+                continue  # still running, or this connection was lost
+            try:
+                answer = json.loads(poll.stdout.strip().splitlines()[0])
+            except (IndexError, json.JSONDecodeError) as error:
+                raise ReleaseError(f"host step {step} returned no result: {poll.stdout.strip()[-2000:]}") from error
+            if "error" in answer:
+                raise ReleaseError(f"host step {step}: {answer['error']}")
+            return answer
+        raise ReleaseError(f"host step {step} did not finish within {timeout}s")
+    finally:
+        subprocess.run([*SSH, host, f"rm -f {base}.py {base}.out {base}.err {base}.done"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=60)
 
 
 def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
