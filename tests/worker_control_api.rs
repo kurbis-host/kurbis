@@ -18,8 +18,10 @@ use uuid::Uuid;
 use common::{api_state, create_user, test_pool};
 use kurbis_hoster::control_plane::{
     api::router,
-    lifecycle::{Lifecycle, LifecycleActor},
+    lifecycle::{Lifecycle, LifecycleActor, enqueue_operation},
+    operation_signal::OperationSignal,
 };
+use kurbis_hoster::model::OperationKind;
 
 struct TestWorker {
     id: Uuid,
@@ -996,6 +998,62 @@ async fn worker_claims_are_authenticated_scoped_and_replayable() {
     let b = states.iter().find(|row| row.0 == op_b).unwrap();
     assert_eq!((&*a.1, a.2), ("running", 1));
     assert_eq!((&*b.1, b.2), ("pending", 0));
+}
+
+#[tokio::test]
+async fn a_waiting_worker_is_released_when_a_queued_operation_commits() {
+    let pool = test_pool().await;
+    let worker = create_worker(&pool, "wait").await;
+    let server = create_server(&pool, "wait").await;
+    let state = api_state(
+        pool.clone(),
+        "shared-internal-test-token",
+        Arc::new(InMemory::new()),
+    );
+    let signal = state.lifecycle.operation_signal().clone();
+    let listener = OperationSignal::listener(&state.config.common.database_url)
+        .await
+        .unwrap();
+    let forwarding = tokio::spawn(async move { signal.forward(listener).await });
+    let service = router(state);
+    let wait_uri = "/internal/worker/control/operations/wait";
+
+    let stranger = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    assert_eq!(
+        worker_api_request(service.clone(), wait_uri, &stranger, None, json!({})).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let waiting = {
+        let service = service.clone();
+        let token = worker.token.clone();
+        let lease_id = worker.lease_id;
+        tokio::spawn(async move {
+            worker_api_request(service, wait_uri, &token, Some(lease_id), json!({})).await
+        })
+    };
+    let mut tx = pool.begin().await.unwrap();
+    enqueue_operation(
+        &mut tx,
+        server,
+        Some(worker.id),
+        OperationKind::Start,
+        1,
+        json!({}),
+    )
+    .await
+    .unwrap();
+    // A worker woken before the commit would claim, find nothing, and go
+    // back to waiting for an announcement that has already been spent.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+
+    tx.commit().await.unwrap();
+    let released = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the queued operation releases the waiting worker");
+    assert_eq!(released.unwrap(), StatusCode::NO_CONTENT);
+    forwarding.abort();
 }
 
 #[tokio::test]

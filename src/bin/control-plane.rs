@@ -15,6 +15,7 @@ use kurbis_hoster::{
         api::{AppState, router},
         lifecycle::Lifecycle,
         maintenance::{CiPreviewMaintenance, WorkerMaintenance},
+        operation_signal::OperationSignal,
     },
     db, init_tracing,
 };
@@ -59,6 +60,25 @@ async fn main() -> Result<()> {
                     .drain_queue_once()
                     .await
                     .map(|_| ())
+                    .map_err(WorkerError::retryable)
+            }
+        },
+    );
+    let operation_signal = lifecycle.operation_signal().clone();
+    let operation_signal_database = config.common.database_url.clone();
+    workers.spawn(
+        "operation-signal",
+        SupervisorConfig::required(std::time::Duration::from_secs(1)),
+        move || {
+            let signal = operation_signal.clone();
+            let database_url = operation_signal_database.clone();
+            async move {
+                let listener = OperationSignal::listener(&database_url)
+                    .await
+                    .map_err(WorkerError::retryable)?;
+                signal
+                    .forward(listener)
+                    .await
                     .map_err(WorkerError::retryable)
             }
         },

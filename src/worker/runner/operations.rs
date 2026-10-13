@@ -47,7 +47,11 @@ impl WorkerRunner {
                 self.gc_stale_local_storage().await?;
                 self.last_local_gc = Instant::now();
             }
-            sleep(Duration::from_secs(2)).await;
+            // Maintenance runs on this tick; a queued operation ends it early.
+            tokio::select! {
+                _ = sleep(Duration::from_secs(2)) => {}
+                _ = self.operation_queued.notified() => {}
+            }
         }
     }
 

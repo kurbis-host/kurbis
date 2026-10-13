@@ -1,8 +1,11 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use tokio::time::{Instant, sleep};
+use tokio::{
+    sync::Notify,
+    time::{Instant, sleep},
+};
 use uuid::Uuid;
 
 mod exports;
@@ -55,6 +58,7 @@ pub struct WorkerRunner {
     last_log_read: HashMap<Uuid, DateTime<Utc>>,
     last_local_gc: Instant,
     world_export_task: Option<tokio::task::JoinHandle<()>>,
+    operation_queued: Arc<Notify>,
 }
 
 impl WorkerRunner {
@@ -182,6 +186,7 @@ impl WorkerRunner {
             last_log_read: HashMap::new(),
             last_local_gc: Instant::now(),
             world_export_task: None,
+            operation_queued: Arc::new(Notify::new()),
         })
     }
 
@@ -189,9 +194,28 @@ impl WorkerRunner {
         self.gc_stale_local_storage().await?;
         self.heartbeat().await?;
         let control_plane = self.control_plane.clone();
+        let operations = self.control_plane.clone();
+        let operation_queued = self.operation_queued.clone();
         tokio::select! {
             result = maintain_heartbeat(control_plane) => result,
+            result = watch_for_operations(operations, operation_queued) => result,
             result = self.run_operations() => result,
+        }
+    }
+}
+
+/// Wake the operation loop as soon as the control plane queues work, so a
+/// start does not wait for the loop's next tick.
+async fn watch_for_operations(control_plane: WorkerControl, queued: Arc<Notify>) -> Result<()> {
+    loop {
+        match control_plane.wait_for_operation().await {
+            Ok(()) => queued.notify_one(),
+            Err(error) => {
+                // The loop still claims on its own tick, as it does against a
+                // control plane that predates the wait endpoint.
+                tracing::debug!(?error, "waiting for worker operations failed");
+                sleep(Duration::from_secs(5)).await;
+            }
         }
     }
 }

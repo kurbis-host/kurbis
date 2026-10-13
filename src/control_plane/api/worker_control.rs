@@ -129,6 +129,22 @@ pub(super) async fn heartbeat(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// How long a worker's wait for work is held open before it asks again.
+const OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Hold the request until an operation is queued, so a worker claims a start
+/// the moment it exists instead of on its next poll. The answer carries no
+/// work; the worker claims as before, with the same fencing.
+pub(super) async fn wait_for_operation(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let mut queued = state.lifecycle.operation_signal().subscribe();
+    let _ = tokio::time::timeout(OPERATION_WAIT, queued.changed()).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(super) async fn claim_operation(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,

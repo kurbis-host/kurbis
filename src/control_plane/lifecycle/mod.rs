@@ -36,6 +36,7 @@ use crate::contracts::{
     lifecycle::ResetMode,
     worker::{OperationPayload, OperationStage},
 };
+use crate::control_plane::operation_signal::OperationSignal;
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus, ServerRecord};
 
 mod commands;
@@ -63,11 +64,20 @@ pub use placement::{
 #[derive(Clone)]
 pub struct Lifecycle {
     pool: PgPool,
+    operations: OperationSignal,
 }
 
 impl Lifecycle {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            operations: OperationSignal::default(),
+        }
+    }
+
+    /// Fires when an operation has been queued for a worker.
+    pub fn operation_signal(&self) -> &OperationSignal {
+        &self.operations
     }
 
     pub async fn request_start(&self, server_id: Uuid, reason: &str) -> Result<ObservedState> {

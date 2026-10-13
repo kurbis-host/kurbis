@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::{LifecycleFailure, bail};
 use crate::contracts::worker::OperationPayload;
+use crate::control_plane::operation_signal::OperationSignal;
 use crate::model::{
     DesiredState, ObservedState, OperationKind, PlacementRecord, SERVER_CPU_MILLIS,
     SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES, ServerRecord, WorkerRecord,
@@ -249,6 +250,7 @@ pub async fn enqueue_operation(
     .bind(payload)
     .execute(&mut **tx)
     .await?;
+    OperationSignal::announce(tx).await?;
     Ok(id)
 }
 

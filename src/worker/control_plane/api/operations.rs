@@ -17,6 +17,22 @@ impl WorkerControl {
         .await
     }
 
+    /// Returns when the control plane has queued an operation or its wait
+    /// window has passed. It carries no work; the caller claims next.
+    pub async fn wait_for_operation(&self) -> Result<()> {
+        let path = "/internal/worker/control/operations/wait";
+        let response = self
+            .authorized_request(Method::POST, self.endpoint(path)?)?
+            // Longer than the control plane holds the request open.
+            .timeout(std::time::Duration::from_secs(40))
+            .json(&EmptyRequest {})
+            .send()
+            .await
+            .context("wait for a worker operation")?;
+        super::super::require_success(path, response).await?;
+        Ok(())
+    }
+
     pub async fn update_operation_payload(
         &self,
         operation: &OperationRecord,

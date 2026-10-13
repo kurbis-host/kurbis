@@ -656,6 +656,10 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             post(worker_control::claim_operation),
         )
         .route(
+            "/internal/worker/control/operations/wait",
+            post(worker_control::wait_for_operation),
+        )
+        .route(
             "/internal/worker/control/operations/{operation_id}/progress",
             post(worker_control::operation_progress),
         )
