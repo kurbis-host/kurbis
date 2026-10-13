@@ -456,14 +456,15 @@ async fn owner_of_a_failed_server_gets_a_panel_login_link_at_admission() {
     // so the lobby hands them the login link instead.
     let owner = admit(java_uuid).await;
     assert_eq!(owner["owner"], true);
-    let message = owner["private_message"].as_str().unwrap();
-    assert!(message.contains("/auth/server#token="), "{message}");
+    let link = owner["private_link"].as_str().unwrap();
+    assert!(link.contains("/auth/server#token="), "{link}");
+    assert!(owner["private_message"].is_null());
     assert_eq!(login_tokens().await, 1);
 
     // Anyone else joining the same address learns nothing and gets no link.
     let guest = admit(Uuid::new_v4()).await;
     assert_eq!(guest["owner"], false);
-    assert!(guest["private_message"].is_null());
+    assert!(guest["private_link"].is_null());
     assert_eq!(login_tokens().await, 1);
 
     // A healthy server needs no link: the owner uses /kurbis once it runs.
@@ -474,6 +475,6 @@ async fn owner_of_a_failed_server_gets_a_panel_login_link_at_admission() {
         .unwrap();
     let owner = admit(java_uuid).await;
     assert_eq!(owner["owner"], true);
-    assert!(owner["private_message"].is_null());
+    assert!(owner["private_link"].is_null());
     assert_eq!(login_tokens().await, 1);
 }

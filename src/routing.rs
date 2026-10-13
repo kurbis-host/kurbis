@@ -33,6 +33,10 @@ pub struct AdmissionRequest {
 pub struct AdmissionResponse {
     pub target: RouteTarget,
     pub private_message: Option<String>,
+    /// Panel login link for an owner whose server failed to start. The lobby
+    /// shows `private_link_label` as clickable chat text that opens it.
+    #[serde(default)]
+    pub private_link: Option<String>,
     pub created: bool,
     /// Whether the verified joining account owns the target server.
     #[serde(default)]

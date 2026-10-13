@@ -33,6 +33,9 @@ struct WaitingState {
     /// Admission already saw the failed start, so an owner has been given
     /// the panel login link for it.
     admitted_while_failed: bool,
+    /// The owner's panel login link, shown once after the notice that says
+    /// what is happening to their failed server.
+    pending_login_link: Option<String>,
     last_failed_retry: Option<Instant>,
     last_ci_admission: Option<Instant>,
     ci_admission_state: Option<CiPreviewState>,
@@ -54,6 +57,7 @@ impl WaitingState {
             admission_complete: false,
             owner: false,
             admitted_while_failed: false,
+            pending_login_link: None,
             last_failed_retry: None,
             last_ci_admission: None,
             ci_admission_state: None,
@@ -179,6 +183,7 @@ async fn handle_player(
                     admission.target.subdomain, config.root_domain
                 ));
                 state.owner = admission.owner;
+                state.pending_login_link = admission.private_link;
                 state.admitted_while_failed = admission.target.state == ObservedState::Failed;
                 state.admission_target = Some(admission.target);
                 state.admission_complete = true;
@@ -308,6 +313,28 @@ async fn send_notice_once(
     Ok(())
 }
 
+const LOGIN_LINK_LABEL: &str =
+    "Click here to open your server panel and see what went wrong (valid for 15 minutes).";
+
+async fn send_login_link_once(
+    config: &GatewayConfig,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+) -> Result<()> {
+    if let Some(url) = state.pending_login_link.take() {
+        control
+            .link(
+                &config.waiting_control_socket,
+                player.id,
+                LOGIN_LINK_LABEL,
+                &url,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// Restart a server whose last start failed, on behalf of the joining player.
 ///
 /// A failed server used to be reachable only through the panel's retry
@@ -337,26 +364,28 @@ async fn handle_failed_server(
     if request_failed_server_retry(config, target.server_id).await? {
         // The new attempt gets the full startup budget.
         state.startup_since = None;
-        return send_notice_once(
+        send_notice_once(
             config,
             control,
             player,
             state,
             "Your server failed to start last time. Trying again…",
         )
-        .await;
+        .await?;
+        return send_login_link_once(config, control, player, state).await;
     }
     if state.owner {
         // The owner stays so the login link in chat remains usable; the
         // retry above repeats and succeeds once the control plane allows it.
-        return send_notice_once(
+        send_notice_once(
             config,
             control,
             player,
             state,
             "Your server failed to start. It is retried automatically every few minutes while you wait here.",
         )
-        .await;
+        .await?;
+        return send_login_link_once(config, control, player, state).await;
     }
     control
         .kick(
@@ -520,7 +549,13 @@ fn java_ci_notice_for_transition(
     current: CiPreviewState,
     target: &CiRouteTarget,
 ) -> Option<String> {
-    (state.last_ci_state != Some(current)).then(|| {
+    // Ready and booting share one line of text, and a runtime that fails to
+    // boot moves between them; only a change the player can read is news.
+    let unchanged = state.last_ci_state.is_some_and(|last| {
+        ci_preview_status_message(last).chat_message
+            == ci_preview_status_message(current).chat_message
+    });
+    (!unchanged).then(|| {
         ci_preview_chat_message(
             current,
             target.failure_message.as_deref(),
@@ -741,6 +776,7 @@ mod tests {
                                 bedrock_port: None,
                             },
                             private_message: None,
+                            private_link: None,
                             created: true,
                             owner: true,
                         })

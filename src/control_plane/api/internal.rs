@@ -262,7 +262,7 @@ pub(super) async fn admit(
         // An owner who never opened the panel can only get there through the
         // in-game login link, which needs a running server. When the server
         // cannot start, hand that link out in the lobby instead.
-        let private_message = if owner && target.state == ObservedState::Failed {
+        let private_link = if owner && target.state == ObservedState::Failed {
             let mut tx = state.pool.begin().await?;
             let link = super::server_access::create_server_login_link(
                 &mut tx,
@@ -271,18 +271,14 @@ pub(super) async fn admit(
             )
             .await?;
             tx.commit().await?;
-            Some(match link {
-                Some(url) => format!(
-                    "Your server failed to start. To see why and manage it, open {url} (valid for 15 minutes)."
-                ),
-                None => "Your server failed to start.".to_owned(),
-            })
+            link
         } else {
             None
         };
         return Ok(Json(AdmissionResponse {
             target,
-            private_message,
+            private_message: None,
+            private_link,
             created: false,
             owner,
         }));
@@ -355,6 +351,7 @@ pub(super) async fn admit(
         return Ok(Json(AdmissionResponse {
             target,
             private_message: None,
+            private_link: None,
             created: false,
             owner: false,
         }));
@@ -391,6 +388,7 @@ pub(super) async fn admit(
             private_message: Some(format!(
                 "You already have a server at {address}; connecting you there."
             )),
+            private_link: None,
             created: false,
             owner: true,
         }));
@@ -418,6 +416,7 @@ pub(super) async fn admit(
                 return Ok(Json(AdmissionResponse {
                     target,
                     private_message: None,
+                    private_link: None,
                     created: false,
                     owner: false,
                 }));
@@ -440,6 +439,7 @@ pub(super) async fn admit(
     Ok(Json(AdmissionResponse {
         target,
         private_message: None,
+        private_link: None,
         created: true,
         owner: true,
     }))

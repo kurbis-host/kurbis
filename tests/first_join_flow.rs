@@ -45,6 +45,9 @@ struct FakeHostControlState {
     player: Option<WaitingPlayer>,
     messages: Vec<String>,
     chat_messages: Vec<String>,
+    /// Clickable messages as (label, address), in the order they arrived
+    /// relative to `messages`.
+    links: Vec<(String, String, usize)>,
     transfers: Vec<(Uuid, String, u16)>,
     kicks: Vec<(Uuid, String)>,
     status_requests: usize,
@@ -102,7 +105,14 @@ async fn spawn_host_control(
                     }
                     Some("message") => {
                         let mut state = state.lock().await;
-                        if let Some(message) = request["message"].as_str() {
+                        if let (Some(message), Some(url)) =
+                            (request["message"].as_str(), request["url"].as_str())
+                        {
+                            let earlier = state.messages.len();
+                            state
+                                .links
+                                .push((message.to_owned(), url.to_owned(), earlier));
+                        } else if let Some(message) = request["message"].as_str() {
                             state.messages.push(message.to_owned());
                             if request["chat"].as_bool() == Some(true) {
                                 state.chat_messages.push(message.to_owned());
@@ -597,20 +607,22 @@ async fn failed_start_keeps_the_owner_in_the_lobby_with_a_login_link_until_the_j
             state
                 .messages
                 .iter()
-                .any(|message| message.contains("/auth/server#token="))
-        },
-        "owner login link after the failed start",
-    )
-    .await;
-    wait_for_control_event(
-        &control_state,
-        |state| {
-            state
-                .messages
-                .iter()
                 .any(|message| message.contains("retried automatically"))
         },
         "deferred retry notice",
+    )
+    .await;
+    // The link arrives as clickable text, after the notice it belongs to.
+    wait_for_control_event(
+        &control_state,
+        |state| {
+            state.links.iter().any(|(label, url, earlier)| {
+                label.starts_with("Click here")
+                    && url.contains("/auth/server#token=")
+                    && *earlier > 0
+            })
+        },
+        "clickable owner login link after the failed start",
     )
     .await;
     {

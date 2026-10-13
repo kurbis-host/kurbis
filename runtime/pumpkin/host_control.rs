@@ -13,7 +13,7 @@ use pumpkin_protocol::{
     java::client::play::CTransfer as JavaTransfer,
 };
 use pumpkin_util::PermissionLvl;
-use pumpkin_util::text::TextComponent;
+use pumpkin_util::text::{TextComponent, click::ClickEvent, color::NamedColor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
@@ -58,6 +58,9 @@ struct Request {
     /// Mirror status messages into Java chat in addition to the action bar.
     /// Older gateways omit this field and retain overlay-only behavior.
     chat: Option<bool>,
+    /// Opened when a Java player clicks the chat message. Bedrock chat has no
+    /// clickable text, so the address is appended to the message instead.
+    url: Option<String>,
     enabled: Option<bool>,
     whitelist_entries: Option<Vec<WhitelistEntry>>,
     operators: Option<Vec<WhitelistEntry>>,
@@ -338,12 +341,29 @@ async fn handle(
                 )
                 .await;
             };
-            let text = TextComponent::text(message);
-            player.send_system_message_raw(&text, true);
-            if request.chat.unwrap_or(false)
-                && matches!(player.client.as_ref(), ClientPlatform::Java(_))
-            {
-                player.send_system_message_raw(&text, false);
+            let java = matches!(player.client.as_ref(), ClientPlatform::Java(_));
+            let url = request
+                .url
+                .filter(|url| url.len() <= 512 && url.starts_with("https://"));
+            match url {
+                Some(url) if java => {
+                    let link = TextComponent::text(message)
+                        .color_named(NamedColor::Aqua)
+                        .underlined()
+                        .click_event(ClickEvent::OpenUrl { url: url.into() });
+                    player.send_system_message_raw(&link, false);
+                }
+                Some(url) => {
+                    let text = TextComponent::text(format!("{message} {url}"));
+                    player.send_system_message_raw(&text, true);
+                }
+                None => {
+                    let text = TextComponent::text(message);
+                    player.send_system_message_raw(&text, true);
+                    if request.chat.unwrap_or(false) && java {
+                        player.send_system_message_raw(&text, false);
+                    }
+                }
             }
             write_response(&mut write_half, json!({"ok": true})).await
         }

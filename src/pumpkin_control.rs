@@ -174,6 +174,27 @@ impl PumpkinControl {
         Ok(())
     }
 
+    /// Send a chat message that opens `url` when a Java player clicks it.
+    pub async fn link(
+        &self,
+        socket: &Path,
+        player_id: Uuid,
+        message: &str,
+        url: &str,
+    ) -> Result<()> {
+        self.request(
+            socket,
+            json!({
+                "action":"message",
+                "player_id":player_id,
+                "message":message,
+                "url":url,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn transfer(
         &self,
         socket: &Path,
