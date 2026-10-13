@@ -5,6 +5,7 @@ import { ApiError, apiRequest, apiVoid } from "./client";
 export function apiOperations(client: Client<paths>) {
   const serverParams = (serverId: string) => ({ params: { path: { server_id: serverId } } });
   const aiJobParams = (serverId: string, jobId: string) => ({ params: { path: { server_id: serverId, job_id: jobId } } });
+  const pluginParams = (serverId: string, pluginId: string) => ({ params: { path: { server_id: serverId, plugin_id: pluginId } } });
 
   return {
     getSession: () => apiRequest(client.GET("/api/v1/session")),
@@ -52,6 +53,27 @@ export function apiOperations(client: Client<paths>) {
       apiRequest(client.PUT("/api/v1/servers/{server_id}/ai/settings", { ...serverParams(serverId), body })),
     getAiJob: (serverId: string, jobId: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/ai/jobs/{job_id}", aiJobParams(serverId, jobId))),
     cancelAiJob: (serverId: string, jobId: string) => apiRequest(client.POST("/api/v1/servers/{server_id}/ai/jobs/{job_id}/cancel", aiJobParams(serverId, jobId))),
+    getPlugins: (serverId: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/plugins", serverParams(serverId))),
+    getMarketPlugins: (serverId: string, query?: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/plugins/market", {
+      params: { path: { server_id: serverId }, query: query ? { query } : {} },
+    })),
+    installMarketPlugin: (serverId: string, marketPluginId: number) => apiRequest(client.POST("/api/v1/servers/{server_id}/plugins/market", {
+      ...serverParams(serverId),
+      body: { market_plugin_id: marketPluginId },
+    })),
+    /** The file is sent as it is; its name names the plugin. */
+    uploadPlugin: (serverId: string, file: File) => apiRequest(client.POST("/api/v1/servers/{server_id}/plugins/uploads", {
+      params: { path: { server_id: serverId }, query: { file_name: file.name } },
+      // The contract types a binary body as a string; the browser sends the file's bytes.
+      body: file as unknown as string,
+      bodySerializer: (body) => body,
+      headers: { "content-type": "application/wasm" },
+    })),
+    setPluginEnabled: (serverId: string, pluginId: string, enabled: boolean) => apiRequest(client.PATCH("/api/v1/servers/{server_id}/plugins/{plugin_id}", {
+      ...pluginParams(serverId, pluginId),
+      body: { enabled },
+    })),
+    removePlugin: (serverId: string, pluginId: string) => apiVoid(client.DELETE("/api/v1/servers/{server_id}/plugins/{plugin_id}", pluginParams(serverId, pluginId))),
     createWorldExport: (serverId: string) => apiRequest(client.POST("/api/v1/servers/{server_id}/exports", serverParams(serverId))),
     cancelWorldExport: (serverId: string, exportId: string) => apiRequest(client.DELETE("/api/v1/servers/{server_id}/exports/{export_id}", {
       params: { path: { server_id: serverId, export_id: exportId } },

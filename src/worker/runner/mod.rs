@@ -33,8 +33,7 @@ use crate::{
         docker::DockerRuntime,
         idle::IdleTimer,
         panel_state::{
-            clear_players, sync_operators, sync_players, sync_whitelist, write_operator_file,
-            write_whitelist_file,
+            clear_players, sync_players, sync_runtime_state, write_panel_files, write_runtime_files,
         },
         runtime::{ServerRuntime, native::NativeRuntime},
         runtime_api_relay::WorkerRuntimeApiRelay,

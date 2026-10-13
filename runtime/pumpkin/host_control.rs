@@ -38,6 +38,15 @@ const MIN_TOKEN_BYTES: usize = 32;
 const MAX_COMMAND_BYTES: usize = 512;
 const MAX_COMMAND_OUTPUT_LINES: usize = 100;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+/// The worker writes the owner's installed plugins here, one file per plugin.
+/// Pumpkin loads only the files directly inside `plugins/` on start, so these
+/// load when the worker asks, after the managed plugin is already running.
+const INSTALLED_PLUGIN_DIR: &str = "./plugins/installed";
+/// The managed Kurbis plugin, which Pumpkin loads from the top-level plugin
+/// directory at startup.
+const MANAGED_PLUGIN: &str = "kurbis-control";
+const MANAGED_PLUGIN_DATA: &str = "./plugins/data/kurbis-control";
+const MAX_PLUGIN_ERROR_BYTES: usize = 1024;
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +92,7 @@ enum Action {
     OperatorsReplace,
     ExecuteCommand,
     Stats,
+    SyncPlugins,
 }
 
 #[derive(Debug, Serialize)]
@@ -602,6 +612,10 @@ async fn handle(
             )
             .await
         }
+        Action::SyncPlugins => {
+            let plugins = sync_installed_plugins(server).await;
+            write_response(&mut write_half, json!({"ok": true, "plugins": plugins})).await
+        }
         Action::Save => match server.save_all().await {
             Ok(()) => write_response(&mut write_half, json!({"ok": true})).await,
             Err(error) => {
@@ -950,6 +964,87 @@ fn write_managed_operator_state(path: &Path, state: &ManagedOperatorState) -> io
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(temporary, path)
+}
+
+/// Make the loaded installed plugins match the files in their directory:
+/// unload the ones whose file is gone, load each new file, and report every
+/// file as loaded (with its plugin's name and version) or with its error.
+async fn sync_installed_plugins(server: &Arc<Server>) -> Vec<serde_json::Value> {
+    let directory = Path::new(INSTALLED_PLUGIN_DIR);
+    let mut files = match std::fs::read_dir(directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "wasm"))
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            warn!("Host control could not list installed plugins: {error}");
+            Vec::new()
+        }
+    };
+    files.sort();
+    let manager = &server.plugin_manager;
+    // A plugin's name selects its data folder, which holds the managed
+    // plugin's server credential. The managed plugin claims its name at
+    // startup; while it is not running, an installed plugin could claim it.
+    if Path::new(MANAGED_PLUGIN_DATA).exists()
+        && !manager
+            .loaded_plugin_files()
+            .iter()
+            .any(|(metadata, _)| metadata.name == MANAGED_PLUGIN)
+    {
+        return files
+            .iter()
+            .map(|path| {
+                json!({
+                    "file": plugin_file_name(path),
+                    "error": "The Kurbis plugin is not running, so other plugins cannot load.",
+                })
+            })
+            .collect();
+    }
+    for (metadata, path) in manager.loaded_plugin_files() {
+        if path.starts_with(directory) && !files.contains(&path) {
+            if let Err(error) = manager.unload_plugin(&metadata.name).await {
+                warn!("Host control could not unload plugin {}: {error}", metadata.name);
+            }
+        }
+    }
+    let mut report = Vec::with_capacity(files.len());
+    for path in files {
+        let loaded = manager
+            .loaded_plugin_files()
+            .into_iter()
+            .find(|(_, loaded)| *loaded == path)
+            .map(|(metadata, _)| metadata);
+        let result = match loaded {
+            Some(metadata) => Ok(metadata),
+            None => manager.load_plugin_file(server, &path).await,
+        };
+        let file = plugin_file_name(&path);
+        report.push(match result {
+            Ok(metadata) => json!({"file": file, "name": metadata.name, "version": metadata.version}),
+            Err(mut error) => {
+                if error.len() > MAX_PLUGIN_ERROR_BYTES {
+                    let mut end = MAX_PLUGIN_ERROR_BYTES;
+                    while !error.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    error.truncate(end);
+                }
+                json!({"file": file, "error": error})
+            }
+        });
+    }
+    report
+}
+
+fn plugin_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 async fn write_response(

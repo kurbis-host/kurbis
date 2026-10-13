@@ -7,6 +7,14 @@ import { activeAiJob, aiOverview, finishedAiJob, server } from "./fixtures";
 
 type AiJobDetail = components["schemas"]["AiJobDetail"];
 type ServerEvent = components["schemas"]["ServerEvent"];
+const plugins: components["schemas"]["ServerPlugins"] = {
+  plugins: [],
+  revision: 1,
+  applied_revision: 1,
+  synchronized: true,
+  max_plugins: 16,
+  max_plugin_bytes: 1024,
+};
 
 describe("server event integration", () => {
   it("patches authoritative server state into the shared cache", () => {
@@ -111,6 +119,7 @@ describe("server event integration", () => {
       { id: 6, type: "operators", data: { revision: 0, applied_revision: 0, synchronized: true, entries: [] } },
       { id: 7, type: "log" },
       { id: 8, type: "ai", data: aiOverview },
+      { id: 9, type: "plugins", data: plugins },
     ];
 
     for (const event of events) {
@@ -134,6 +143,17 @@ describe("server event integration", () => {
     expect(client.getQueryData(queryKeys.ai(server.id))).toEqual(aiOverview);
     expect(client.getQueryState(queryKeys.aiJob(server.id, activeAiJob.id))?.isInvalidated).toBe(true);
     expect(client.getQueryState(queryKeys.aiJob(server.id, finishedAiJob.id))?.isInvalidated).toBe(false);
+  });
+
+  it("replaces the plugin list and refreshes market install states from plugin events", () => {
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const parsed = parseServerEvent(JSON.stringify({ id: 32, type: "plugins", data: plugins }));
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    applyServerEvent(client, server.id, parsed.data);
+    expect(client.getQueryData(queryKeys.plugins(server.id))).toEqual(plugins);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.pluginMarket(server.id) });
   });
 
   it("rejects events of unknown kinds", () => {

@@ -80,7 +80,7 @@ impl WorkerRunner {
                     .control_plane
                     .server_context(server_id, WorkerAssignment::Placement { generation })
                     .await?;
-                if let Err(error) = sync_whitelist(
+                if let Err(error) = sync_runtime_state(
                     &self.control_plane,
                     self.runtime.as_ref(),
                     &context,
@@ -89,18 +89,7 @@ impl WorkerRunner {
                 )
                 .await
                 {
-                    tracing::warn!(%server_id, ?error, "failed to synchronize whitelist state");
-                }
-                if let Err(error) = sync_operators(
-                    &self.control_plane,
-                    self.runtime.as_ref(),
-                    &context,
-                    &server_dir,
-                    false,
-                )
-                .await
-                {
-                    tracing::warn!(%server_id, ?error, "failed to synchronize owner operators");
+                    tracing::warn!(%server_id, ?error, "failed to synchronize panel state");
                 }
                 let now = Instant::now();
                 let idle = self

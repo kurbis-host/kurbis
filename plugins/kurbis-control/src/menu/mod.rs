@@ -1,8 +1,9 @@
 //! The `/kurbis` chest menu: views and their navigation, click actions, text
-//! input and the shared item widgets. The pages themselves live in `server`
-//! and `ai`.
+//! input and the shared item widgets. The pages themselves live in `server`,
+//! `plugins` and `ai`.
 
 mod ai;
+mod plugins;
 mod server;
 
 use std::{
@@ -62,6 +63,18 @@ pub(crate) enum View {
         generation: i64,
         page: usize,
     },
+    Plugins,
+    Plugin(Uuid),
+    ConfirmRemovePlugin(Uuid),
+    Market {
+        query: Option<String>,
+        page: usize,
+    },
+    MarketPlugin {
+        id: i64,
+        query: Option<String>,
+        page: usize,
+    },
     Ai,
     AiRequest {
         job: Uuid,
@@ -78,6 +91,10 @@ impl View {
             Self::Whitelist(_) => Some(Self::Whitelist(page)),
             Self::Snapshots(_) => Some(Self::Snapshots(page)),
             Self::AiRequest { job, .. } => Some(Self::AiRequest { job: *job, page }),
+            Self::Market { query, .. } => Some(Self::Market {
+                query: query.clone(),
+                page,
+            }),
             _ => None,
         }
     }
@@ -94,7 +111,14 @@ impl View {
             | Self::Whitelist(_)
             | Self::Snapshots(_)
             | Self::Controls
+            | Self::Plugins
             | Self::Ai => Some(Self::Home),
+            Self::Plugin(_) | Self::Market { .. } => Some(Self::Plugins),
+            Self::ConfirmRemovePlugin(id) => Some(Self::Plugin(*id)),
+            Self::MarketPlugin { query, page, .. } => Some(Self::Market {
+                query: query.clone(),
+                page: *page,
+            }),
             Self::SelectDifficulty | Self::SelectGamemode => Some(Self::Settings),
             Self::ConfirmRemoveWhitelist { page, .. } => Some(Self::Whitelist(*page)),
             Self::LifecycleConfirm(_) => Some(Self::Controls),
@@ -139,6 +163,16 @@ enum Action {
         outcome: String,
         failed: bool,
     },
+    InstallMarketPlugin {
+        id: i64,
+    },
+    SetPluginEnabled {
+        id: Uuid,
+        enabled: bool,
+    },
+    RemovePlugin {
+        id: Uuid,
+    },
 }
 
 /// Text the player types after closing the menu: in chat on Java, in a form
@@ -147,6 +181,7 @@ enum Action {
 enum TextInputTarget {
     Motd,
     WhitelistAdd(usize),
+    MarketSearch,
     AiPrompt { new_conversation: bool },
 }
 
@@ -186,6 +221,13 @@ impl TextInputTarget {
                 argument: "<name>",
                 typed: "the player name",
             },
+            Self::MarketSearch => InputPrompt {
+                title: "Search the plugin market",
+                label: "Search for:",
+                command: "/plugins search ",
+                argument: "<words>",
+                typed: "what to search for",
+            },
             Self::AiPrompt {
                 new_conversation: false,
             } => ask("Ask the AI assistant", "/ai ask "),
@@ -200,12 +242,17 @@ impl TextInputTarget {
         match self {
             Self::Motd => View::Settings,
             Self::WhitelistAdd(page) => View::Whitelist(*page),
+            Self::MarketSearch => View::Market {
+                query: None,
+                page: 0,
+            },
             Self::AiPrompt { .. } => View::Ai,
         }
     }
 
-    /// Apply the text and reopen the page, except after asking the AI: its
-    /// progress and answer arrive in chat.
+    /// Apply the text and reopen the page, except after asking the AI, whose
+    /// progress and answer arrive in chat, and after a search, which opens
+    /// its results.
     fn submit(&self, player: &Player, text: &str) {
         let done = match self {
             Self::Motd => api::update_setting("motd", Value::String(text.to_owned()))
@@ -215,13 +262,21 @@ impl TextInputTarget {
             Self::AiPrompt { new_conversation } => {
                 crate::ai::ask(player, text, *new_conversation).map(|()| None)
             }
+            Self::MarketSearch => open(
+                player,
+                View::Market {
+                    query: Some(text.to_owned()),
+                    page: 0,
+                },
+            )
+            .map(|()| None),
         };
         match done {
             Ok(Some(message)) => tell(player, &message),
             Ok(None) => {}
             Err(error) => tell(player, &format!("Kurbis: {error:#}")),
         }
-        if !matches!(self, Self::AiPrompt { .. }) {
+        if matches!(self, Self::Motd | Self::WhitelistAdd(_)) {
             let _ = open(player, self.view());
         }
     }
@@ -271,6 +326,12 @@ pub(crate) fn page_data(view: &View) -> Result<Value> {
         View::Snapshots(_) => "/snapshots".into(),
         View::Ai => "/ai".into(),
         View::AiRequest { job, .. } => format!("/ai/jobs/{job}"),
+        View::Plugins | View::Plugin(_) | View::ConfirmRemovePlugin(_) => {
+            return crate::plugins::installed();
+        }
+        View::Market { query, .. } | View::MarketPlugin { query, .. } => {
+            return crate::plugins::market(query.as_deref());
+        }
         View::Home | View::Controls | View::LifecycleConfirm(_) | View::RestoreConfirm { .. } => {
             return Ok(Value::Null);
         }
@@ -378,6 +439,11 @@ fn render_menu(
         View::RestoreConfirm { generation, page } => {
             server::render_restore_confirm(inv, actions, *generation, *page)?;
         }
+        View::Plugins => plugins::render_installed(inv, actions, data)?,
+        View::Plugin(id) => plugins::render_plugin(inv, actions, data, *id)?,
+        View::ConfirmRemovePlugin(id) => plugins::render_confirm_remove(inv, actions, data, *id)?,
+        View::Market { .. } => plugins::render_market(inv, actions, data, view)?,
+        View::MarketPlugin { id, .. } => plugins::render_listing(inv, actions, data, *id)?,
         View::Ai => ai::render_overview(inv, actions, data)?,
         View::AiRequest { page, .. } => ai::render_request(inv, actions, data, *page, view)?,
     }
@@ -400,6 +466,11 @@ fn view_title(view: &View) -> &'static str {
         View::Controls => "Kurbis • Controls",
         View::LifecycleConfirm(_) => "Kurbis • Confirm action",
         View::RestoreConfirm { .. } => "Kurbis • Confirm restore",
+        View::Plugins => "Kurbis • Plugins",
+        View::Plugin(_) => "Kurbis • Plugin",
+        View::ConfirmRemovePlugin(_) => "Kurbis • Remove plugin",
+        View::Market { .. } => "Kurbis • Plugin market",
+        View::MarketPlugin { .. } => "Kurbis • Market plugin",
         View::Ai => "Kurbis • AI assistant",
         View::AiRequest { .. } => "Kurbis • AI request",
     }
@@ -539,7 +610,7 @@ fn clip(value: &str, max_chars: usize) -> String {
 /// Word-wrap text into at most `max_lines` lines of `width` characters.
 /// Words longer than a line fill it and continue on the next; the last line
 /// ends in "…" when text was left out.
-fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -707,6 +778,23 @@ fn activate(player: &Player, server: &Server, action: Action) -> Result<()> {
             outcome,
             failed,
         } => ai::show_outcome(player, &heading, &outcome, failed),
+        Action::InstallMarketPlugin { id } => {
+            let plugin = crate::plugins::install(id)?;
+            tell(player, &crate::plugins::installed_message(&plugin));
+            let installed = plugin["id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok());
+            open(player, installed.map_or(View::Plugins, View::Plugin))?;
+        }
+        Action::SetPluginEnabled { id, enabled } => {
+            crate::plugins::set_enabled(id, enabled)?;
+            open(player, View::Plugin(id))?;
+        }
+        Action::RemovePlugin { id } => {
+            crate::plugins::remove(id)?;
+            tell(player, "Removed the plugin.");
+            open(player, View::Plugins)?;
+        }
     }
     Ok(())
 }
@@ -718,7 +806,9 @@ fn prompt_text_input(player: &Player, target: TextInputTarget) -> Result<()> {
     if let Some(bedrock) = player.as_bedrock() {
         let current = match target {
             TextInputTarget::Motd => value(&page_data(&View::Settings)?, &["settings", "motd"]),
-            TextInputTarget::WhitelistAdd(_) | TextInputTarget::AiPrompt { .. } => String::new(),
+            TextInputTarget::WhitelistAdd(_)
+            | TextInputTarget::MarketSearch
+            | TextInputTarget::AiPrompt { .. } => String::new(),
         };
         lock_state().menus.remove(&key);
         let form = CustomFormBuilder::new(TextComponent::text(prompt.title))
@@ -864,6 +954,18 @@ mod tests {
                 generation: 1,
                 page: 0,
             },
+            View::Plugins,
+            View::Plugin(Uuid::nil()),
+            View::ConfirmRemovePlugin(Uuid::nil()),
+            View::Market {
+                query: Some("bar".into()),
+                page: 1,
+            },
+            View::MarketPlugin {
+                id: 55,
+                query: None,
+                page: 0,
+            },
             View::Ai,
             View::AiRequest {
                 job: Uuid::nil(),
@@ -932,7 +1034,7 @@ mod tests {
     fn back_leads_from_every_view_to_home() {
         for view in every_view() {
             let mut current = view.clone();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if let Some(parent) = current.parent() {
                     current = parent;
                 }
@@ -975,6 +1077,10 @@ mod tests {
         assert_eq!(ask.view(), View::Ai);
         assert_eq!(TextInputTarget::Motd.view(), View::Settings);
         assert_eq!(TextInputTarget::WhitelistAdd(2).view(), View::Whitelist(2));
+        assert_eq!(
+            TextInputTarget::MarketSearch.prompt().command,
+            "/plugins search "
+        );
     }
 
     #[test]

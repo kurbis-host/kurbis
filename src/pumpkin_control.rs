@@ -11,6 +11,9 @@ use tokio::{
 use uuid::Uuid;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Compiling a large WebAssembly component takes far longer than any other
+/// host-control request.
+const PLUGIN_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -71,6 +74,16 @@ struct OnlineAuthentication {
     bedrock: bool,
 }
 
+/// What the runtime did with one file in its installed-plugin directory.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledPluginFile {
+    pub file: String,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Response {
     ok: bool,
@@ -80,6 +93,7 @@ struct Response {
     waiting_players: Option<Vec<WaitingPlayer>>,
     stats: Option<HostStats>,
     output: Option<Vec<String>>,
+    plugins: Option<Vec<InstalledPluginFile>>,
     error: Option<String>,
 }
 
@@ -253,7 +267,29 @@ impl PumpkinControl {
         Ok(())
     }
 
-    async fn request(&self, socket: &Path, mut payload: Value) -> Result<Response> {
+    /// Load the files in the runtime's installed-plugin directory and unload
+    /// the plugins whose file is gone.
+    pub async fn sync_plugins(&self, socket: &Path) -> Result<Vec<InstalledPluginFile>> {
+        self.request_within(
+            socket,
+            json!({"action":"sync_plugins"}),
+            PLUGIN_SYNC_TIMEOUT,
+        )
+        .await?
+        .plugins
+        .context("plugin sync response omitted plugins")
+    }
+
+    async fn request(&self, socket: &Path, payload: Value) -> Result<Response> {
+        self.request_within(socket, payload, IO_TIMEOUT).await
+    }
+
+    async fn request_within(
+        &self,
+        socket: &Path,
+        mut payload: Value,
+        response_timeout: Duration,
+    ) -> Result<Response> {
         let object = payload
             .as_object_mut()
             .context("host-control request payload must be an object")?;
@@ -272,7 +308,7 @@ impl PumpkinControl {
         let reader = BufReader::new(read_half);
         let mut bytes = Vec::new();
         let read = timeout(
-            IO_TIMEOUT,
+            response_timeout,
             reader
                 .take(MAX_RESPONSE_BYTES + 1)
                 .read_until(b'\n', &mut bytes),

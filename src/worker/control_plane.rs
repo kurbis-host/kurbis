@@ -163,6 +163,20 @@ impl WorkerControl {
         path: &str,
         assignment: WorkerAssignment,
     ) -> Result<R> {
+        self.get_with_assignment(path, assignment)
+            .await?
+            .json::<R>()
+            .await
+            .context("decode worker control-plane response")
+    }
+
+    /// GET a route that the control plane authorizes by the worker's current
+    /// assignment for the server.
+    async fn get_with_assignment(
+        &self,
+        path: &str,
+        assignment: WorkerAssignment,
+    ) -> Result<reqwest::Response> {
         let mut url = self.endpoint(path)?;
         {
             let mut query = url.query_pairs_mut();
@@ -198,11 +212,7 @@ impl WorkerControl {
             .send()
             .await
             .context("send worker control-plane request")?;
-        require_success(path, response)
-            .await?
-            .json::<R>()
-            .await
-            .context("decode worker control-plane response")
+        require_success(path, response).await
     }
 }
 

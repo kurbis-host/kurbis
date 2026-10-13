@@ -60,13 +60,14 @@ Public API/panel supports:
 - Start, stop, restart, snapshot, reset, restore, and delete through the shared server-command contract.
 - Built-in OP-only Pumpkin management menu and commands for server status, players, logs, activity, settings, whitelist, snapshots, and lifecycle controls.
 - One-use server-only login link from the in-game plugin into the existing panel. It creates a server-scoped browser session and does not sign in to a Kurbis account.
+- Server plugins from the Pumpkin market (free, published listings only) and uploaded WebAssembly components, managed in the panel and in game with `/plugins`. Uploads are browser-only; the in-game capability can install market listings but never upload code.
 - Current state: sleeping, queued, restoring, starting, online, stopping, snapshotting, failed.
 - Basic console/log viewing.
 - Curated Pumpkin settings only.
 - Storage usage and 5 GiB quota.
 - Server address for Java and Bedrock.
 
-No payments, arbitrary binaries, plugin uploads, or unrestricted file manager in v1.
+No payments, arbitrary server binaries, mods, or unrestricted file manager in v1.
 
 ### API, authorization, and lifecycle commands
 
@@ -146,9 +147,11 @@ Add only a small stable host-control interface where polling or external control
 
 ### Kurbis server plugins
 
-Kurbis should ship first-party Pumpkin plugins that bring hosting controls into Minecraft while reusing the existing HTTP API. V1 starts with the built-in management plugin and its one-use server login link; this is the foundation for future Kurbis-owned server plugins, not a third-party plugin marketplace or arbitrary upload feature.
+Kurbis should ship first-party Pumpkin plugins that bring hosting controls into Minecraft while reusing the existing HTTP API. V1 starts with the built-in management plugin and its one-use server login link.
 
-The worker keeps each server capability outside its container and stages only that server's credential for the managed plugin. The API derives server scope from the capability; a plugin cannot select another server ID. Placement changes rotate the capability. Hosted runtime configuration grants the managed plugin only its declared permissions and keeps unsigned third-party plugins disabled.
+The worker keeps each server capability outside its container and stages only that server's credential for the managed plugin. The API derives server scope from the capability; a plugin cannot select another server ID. Placement changes rotate the capability. Hosted runtime configuration grants the managed plugin only its declared permissions.
+
+Owners may add third-party plugins: free listings from the Pumpkin market or their own uploaded WebAssembly components. `server_plugins` is the control plane's authoritative list, each binary is stored once under `plugins/<sha256>.wasm`, and a revision counts every change the runtime must load. Pumpkin loads only the top-level `plugins/*.wasm` at startup, which is the managed plugin; the worker writes enabled third-party binaries into `plugins/installed/` and asks host control to load and unload them, so the managed plugin always claims its name first and host control refuses to load others when it is missing. Every plugin runs with Pumpkin's `blocked_permissions` removing the environment (and with it the host-control token) and with a memory cap; unsigned plugins are allowed because the market does not sign them. Installed binaries and Pumpkin's compilation cache are runtime files, not part of world snapshots.
 
 Workers are isolated from one another through the authenticated control-plane API. The deployment CLI provisions a distinct worker ID and API credential for each worker; the control plane stores only a hash of each API credential and derives worker identity from that credential, never from a request field. Workers have no direct database credentials or SQL pool and receive no bucket credentials. A worker may obtain a server capability and access server-scoped data only while that server's current placement belongs to it. Shared internal credentials cannot issue server capabilities. Snapshot and export object transfers go through control-plane endpoints that authorize the worker, server, assignment kind, and generation for every request and reauthorize streamed reads. Placement ownership, lease generations, server ownership, and desired state remain control-plane managed. Missing, duplicated, stale, or revoked worker credentials fail closed.
 

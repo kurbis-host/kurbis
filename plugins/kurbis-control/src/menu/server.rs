@@ -23,8 +23,8 @@ pub(super) fn render_home(inv: &Inventory, actions: &mut HashMap<i16, Action>) -
         "Operator access • this server only",
         None,
     );
-    let ai = crate::config().is_ok_and(|config| !config.ci_preview);
-    for (row, entries) in home_rows(ai) {
+    let hosted = crate::config().is_ok_and(|config| !config.ci_preview);
+    for (row, entries) in home_rows(hosted) {
         for (slot, entry) in row_slots(row, entries.len()).zip(entries) {
             button(
                 inv,
@@ -48,8 +48,8 @@ struct HomeEntry {
 }
 
 /// Home's buttons by row: what to look at, what to configure, what to do.
-/// CI previews run without the AI assistant.
-fn home_rows(ai: bool) -> [(u32, Vec<HomeEntry>); 3] {
+/// CI previews run without plugins and the AI assistant.
+fn home_rows(hosted: bool) -> [(u32, Vec<HomeEntry>); 3] {
     let entry = |material, label, description, action| HomeEntry {
         material,
         label,
@@ -62,7 +62,7 @@ fn home_rows(ai: bool) -> [(u32, Vec<HomeEntry>); 3] {
         "Start, stop, restart, or snapshot",
         Action::Open(View::Controls),
     )];
-    if ai {
+    if hosted {
         act.push(entry(
             "enchanted_book",
             "AI assistant",
@@ -127,7 +127,17 @@ fn home_rows(ai: bool) -> [(u32, Vec<HomeEntry>); 3] {
                     "Browse snapshots and restore world backups",
                     Action::Open(View::Snapshots(0)),
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(hosted.then(|| {
+                entry(
+                    "ender_chest",
+                    "Plugins",
+                    "Install plugins from the market and manage them",
+                    Action::Open(View::Plugins),
+                )
+            }))
+            .collect(),
         ),
         (4, act),
     ]
@@ -813,9 +823,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn home_rows_stay_centred_with_and_without_the_assistant() {
-        let slots = |ai| {
-            home_rows(ai)
+    fn home_rows_stay_centred_on_hosted_servers_and_ci_previews() {
+        let slots = |hosted| {
+            home_rows(hosted)
                 .into_iter()
                 .map(|(row, entries)| row_slots(row, entries.len()).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
@@ -826,7 +836,7 @@ mod tests {
         );
         assert_eq!(
             slots(true),
-            vec![vec![10, 12, 14, 16], vec![29, 31, 33], vec![38, 40, 42]]
+            vec![vec![10, 12, 14, 16], vec![28, 30, 32, 34], vec![38, 40, 42]]
         );
         assert_eq!(row_slots(1, 5).collect::<Vec<_>>(), vec![9, 11, 13, 15, 17]);
         assert_eq!(row_slots(2, 0).count(), 0);

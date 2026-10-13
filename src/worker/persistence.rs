@@ -49,12 +49,16 @@ mod tests {
             "run/host-control.sock",
             "plugins/kurbis-control.wasm",
             "plugins/data/kurbis-control/config.json",
+            "plugins/installed/0123-abcd.wasm",
+            "plugins/installed/cache/abcd-0.1.0.cwasm",
+            "plugins/cache/abcd-0.1.0.cwasm",
         ] {
             assert!(is_runtime_file(Path::new(path)));
         }
         for path in [
             "plugins/other-plugin/plugin.wasm",
             "plugins/data/other-plugin/config.json",
+            "plugins/installed-notes.txt",
             "plugins/data/other-plugin/whitelist.json",
             "plugins/data/kurbis-control/operator-config.json",
         ] {

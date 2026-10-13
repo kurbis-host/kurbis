@@ -17,6 +17,7 @@ use kurbis_hoster::{
         lifecycle::Lifecycle,
         maintenance::{CiPreviewMaintenance, WorkerMaintenance},
         operation_signal::OperationSignal,
+        plugins::{self, PluginMarket},
     },
     db, init_tracing,
 };
@@ -121,6 +122,7 @@ async fn main() -> Result<()> {
                             || report.garbage_collection.staging_deleted > 0
                             || report.ci_world_snapshot_gc_completed > 0
                             || report.github_webhook_processed_gc_deleted > 0
+                            || report.plugin_blobs_deleted > 0
                         {
                             tracing::info!(?report, "worker maintenance completed");
                         }
@@ -347,6 +349,10 @@ async fn main() -> Result<()> {
         object_store,
         supervision,
         ai,
+        plugin_market: PluginMarket::new(
+            &std::env::var("PLUGIN_MARKET_URL")
+                .unwrap_or_else(|_| plugins::DEFAULT_MARKET_URL.to_owned()),
+        )?,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())

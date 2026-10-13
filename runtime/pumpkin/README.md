@@ -7,7 +7,10 @@ Bedrock 1.26.51/protocol 2193.
 
 The checked-in integration adds the authenticated Unix host-control socket
 used by workers for player state, messages, transfers, saves, whitelist and
-operator updates, and shutdown. Snapshot saves flush watched chunk regions and
+operator updates, installed plugins, and shutdown. `sync_plugins` loads every
+`plugins/installed/*.wasm` that is not loaded, unloads loaded ones whose file is
+gone, and reports each file's plugin name, version or load error; it refuses
+to load anything while the managed `kurbis-control` plugin is missing. Snapshot saves flush watched chunk regions and
 return write failures so the worker can avoid marking an incomplete recovery
 point as complete. `tools/protocol/verify_java_263.py` exercises real protocol
 777 logins, transfers, commands, inventory, and reconnect persistence.

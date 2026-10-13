@@ -16,34 +16,6 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 /// Tool results accepted in one sync request.
 pub const MAX_SYNC_RESULTS: usize = 8;
 
-macro_rules! string_enum {
-    ($(#[$meta:meta])* $name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name {
-            $($variant),+
-        }
-
-        impl $name {
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $value),+
-                }
-            }
-
-            pub fn parse(value: &str) -> Option<Self> {
-                match value {
-                    $($value => Some(Self::$variant),)+
-                    _ => None,
-                }
-            }
-        }
-    };
-}
-
 string_enum!(
     /// How much the model thinks before answering.
     AiEffort {

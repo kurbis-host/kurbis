@@ -68,6 +68,9 @@ pub enum ServerEventPayload {
     Ai {
         data: Box<crate::contracts::ai::AiOverview>,
     },
+    Plugins {
+        data: crate::contracts::plugins::ServerPlugins,
+    },
 }
 
 pub(super) async fn server_event_payload(
@@ -144,6 +147,9 @@ pub(super) async fn server_event_payload(
                 ),
             }
         }
+        ServerEventKind::Plugins => ServerEventPayload::Plugins {
+            data: crate::control_plane::plugins::server_plugins(&state.pool, server_id).await?,
+        },
     };
     Ok(ServerEvent {
         id: row.id,

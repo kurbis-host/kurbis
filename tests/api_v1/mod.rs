@@ -4,6 +4,7 @@ mod admission;
 mod ai;
 mod events;
 mod exports;
+mod plugins;
 mod resources;
 mod routing;
 mod runtime_stats;

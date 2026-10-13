@@ -319,6 +319,10 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
         object_store: Arc::new(object_store::memory::InMemory::new()),
         supervision: crate::control_plane::supervision::SupervisorRegistry::new(),
         ai: None,
+        plugin_market: crate::control_plane::plugins::PluginMarket::new(
+            crate::control_plane::plugins::DEFAULT_MARKET_URL,
+        )
+        .unwrap(),
     })
 }
 

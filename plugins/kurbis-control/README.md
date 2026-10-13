@@ -52,6 +52,23 @@ and the on/off switch are changed in the web panel; the menu's settings button
 prints a login link.
 CI preview servers do not offer `/ai`.
 
+`/plugins` manages the server's plugins and replaces Pumpkin's built-in
+listing, which shows only what is loaded. On its own it opens the plugins page
+of the menu: every installed plugin with what the server does with it
+(running, waiting to load, failed with Pumpkin's error, or turned off), a
+plugin's page to turn it on or off, update it from the market or remove it
+with confirmation, and the market: free plugins from market.pumpkinmc.org,
+most downloaded first, with a search that uses the same chat prompt or Bedrock
+form as the MOTD control. `/plugins market` opens the market and
+`/plugins search <text>` searches it; from the console both print a list
+whose `[Install]` buttons run `/plugins install <id>`.
+`/plugins install <name|id>` installs a listing or updates it to the market's
+current version, `/plugins enable|disable <name>` turns a plugin on or off and
+`/plugins remove <name>` asks for `/plugins remove confirm <name>`. A running
+server loads each change without a restart. Uploading a plugin needs the web
+panel; the menu's upload button prints a login link. CI preview servers do not
+offer `/plugins`.
+
 Docker workers use the plugin baked into the hosted Pumpkin image. Native
 workers build it from this crate by default; `KURBIS_CONTROL_PLUGIN_WASM` can
 point to another local build artifact.
