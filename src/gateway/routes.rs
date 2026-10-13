@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use sqlx::{PgPool, postgres::PgListener};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 
 use crate::routing::RouteRepository;
 use crate::{model::RouteTarget, routing::CiRouteTarget};
@@ -15,6 +15,7 @@ use crate::{model::RouteTarget, routing::CiRouteTarget};
 pub struct RouteCache {
     repository: RouteRepository,
     cache: Arc<RwLock<CacheState>>,
+    changed: watch::Sender<u64>,
     ttl: Duration,
 }
 
@@ -35,6 +36,7 @@ impl RouteCache {
         Self {
             repository: RouteRepository::new(pool, root_domain),
             cache: Arc::new(RwLock::new(CacheState::default())),
+            changed: watch::Sender::new(0),
             ttl: Duration::from_secs(10),
         }
     }
@@ -110,6 +112,15 @@ impl RouteCache {
         let mut cache = self.cache.write().await;
         cache.revision = cache.revision.wrapping_add(1);
         cache.entries.clear();
+        drop(cache);
+        self.changed
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Fires whenever a route may have changed, so a caller waiting for a
+    /// server to come online can look again at once instead of on a timer.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     pub async fn invalidation_listener(&self) -> Result<PgListener> {

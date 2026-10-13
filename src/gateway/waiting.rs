@@ -102,6 +102,7 @@ pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
     );
 
     let mut states = HashMap::<Uuid, WaitingState>::new();
+    let mut route_changes = routes.changes();
     loop {
         match control.players(&config.waiting_control_socket).await {
             Ok(players) => {
@@ -123,7 +124,12 @@ pub async fn run(config: GatewayConfig, routes: RouteCache) -> Result<()> {
             }
             Err(error) => tracing::error!(?error, "failed to query waiting Pumpkin players"),
         }
-        sleep(Duration::from_millis(500)).await;
+        // A route change (a server coming online) moves its waiting players
+        // on at once; the tick picks up players who have just arrived.
+        tokio::select! {
+            _ = sleep(Duration::from_millis(500)) => {}
+            _ = route_changes.changed() => {}
+        }
     }
 }
 

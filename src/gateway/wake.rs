@@ -1,9 +1,14 @@
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 use anyhow::{Result, bail};
 use uuid::Uuid;
 
 use crate::{config::GatewayConfig, contracts::lifecycle::ServerCommandRequest};
+
+/// One HTTP client for every control-plane call. Building a client loads the
+/// system's root certificates, which took longer than the wake request itself
+/// when each join built its own.
+static CONTROL_PLANE: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 pub async fn request_wake(config: &GatewayConfig, server_id: Uuid) -> Result<()> {
     let status = send_wake(config, server_id).await?;
@@ -34,7 +39,7 @@ async fn send_wake(config: &GatewayConfig, server_id: Uuid) -> Result<reqwest::S
         "{}/api/v1/servers/{server_id}/commands",
         config.control_plane_url.trim_end_matches('/'),
     );
-    let response = reqwest::Client::new()
+    let response = CONTROL_PLANE
         .post(url)
         .bearer_auth(&config.internal_token)
         .json(&ServerCommandRequest::Start {
@@ -54,7 +59,7 @@ pub async fn request_ci_preview_admission(
         "{}/internal/ci/previews/admit",
         config.control_plane_url.trim_end_matches('/')
     );
-    let response = reqwest::Client::new()
+    let response = CONTROL_PLANE
         .post(url)
         .bearer_auth(&config.internal_token)
         .json(&serde_json::json!({ "hostname": hostname }))

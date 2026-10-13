@@ -241,6 +241,7 @@ async fn wait_for_backend(
 ) -> Result<()> {
     let deadline = Instant::now() + config.wake_timeout;
     let mut wake_requested = false;
+    let mut route_changes = routes.changes();
 
     loop {
         if target.account_suspended {
@@ -301,7 +302,12 @@ async fn wait_for_backend(
             )
             .await;
         }
-        sleep((deadline - now).min(ROUTE_POLL_INTERVAL)).await;
+        // The poll bounds how long a vanished client is held; a route change
+        // (the server coming online) ends the wait at once.
+        tokio::select! {
+            _ = sleep((deadline - now).min(ROUTE_POLL_INTERVAL)) => {}
+            _ = route_changes.changed() => {}
+        }
         if client_disconnected(&client).await {
             return Ok(());
         }
