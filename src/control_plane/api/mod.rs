@@ -325,12 +325,30 @@ fn add_security_schemes(
     )
 }
 
-async fn healthz(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.supervision.is_healthy().await {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+/// An unhealthy answer names each required worker and its state, so a red
+/// health check says what is wrong. Error text stays in the log.
+async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
+    let snapshot = state.supervision.snapshot().await;
+    if snapshot.healthy {
+        return (StatusCode::NO_CONTENT, String::new());
     }
+    let now = chrono::Utc::now();
+    let workers = snapshot
+        .workers
+        .iter()
+        .filter(|worker| worker.required)
+        .map(|worker| {
+            let heartbeat = worker.last_heartbeat.map_or_else(
+                || "never".to_owned(),
+                |at| format!("{}s ago", (now - at).num_seconds()),
+            );
+            format!(
+                "{} state={:?} heartbeat={heartbeat} failures={}\n",
+                worker.name, worker.state, worker.consecutive_failures
+            )
+        })
+        .collect();
+    (StatusCode::SERVICE_UNAVAILABLE, workers)
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {

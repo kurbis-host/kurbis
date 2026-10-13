@@ -274,6 +274,15 @@ impl WorkerHandle {
 
     pub async fn failure(&self, error: &Error, class: FailureClass) {
         let mut record = self.record.write().await;
+        // A failing required worker turns the health check red, which stops
+        // a deploy; without this line nothing says which worker or why.
+        tracing::warn!(
+            worker = %record.snapshot.name,
+            required = record.snapshot.required,
+            ?class,
+            error = %format!("{error:#}"),
+            "control-plane worker failed"
+        );
         record.snapshot.last_heartbeat = Some(Utc::now());
         record.snapshot.last_error = Some(error.to_string());
         record.snapshot.consecutive_failures =
