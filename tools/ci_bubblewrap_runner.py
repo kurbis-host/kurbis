@@ -138,6 +138,10 @@ actual_rustc="$(rustc -vV | awk -F': ' '/^release: / { print $2; exit }')"
   echo "builder Rust compiler mismatch: expected $KURBIS_EXPECTED_RUSTC, got $actual_rustc" >&2
   exit 78
 }
+# Restored dependency output is older than nothing in particular, so make the
+# sources newer than all of it: Cargo then rebuilds every crate of this
+# checkout and reuses only the dependencies, which it identifies by version.
+find /work/source /work/plugin -type f -exec touch {} +
 build_elapsed_seconds=0
 SECONDS=0
 cd /work/source
@@ -385,6 +389,65 @@ def minecraft_server_jar(workspace, cache_root):
     return f"/cache/minecraft/{jar.name}"
 
 
+DEPENDENCY_TARGETS = ("target", "plugin-target")
+KEPT_DEPENDENCY_CACHES = 2
+MAX_DEPENDENCY_CACHE_SECONDS = 15 * 60
+
+
+def dependency_cache_path(header, workspace):
+    """Where the compiled dependencies of this exact dependency set are kept.
+
+    Compiling Pumpkin's dependencies is most of a build and they change far
+    less often than Pumpkin. The key covers everything their output depends
+    on: both lock files, the compiler, the target and the build script.
+    """
+    digest = hashlib.sha256()
+    for part in (header["rustc"], header["target"], BUILD_SCRIPT):
+        digest.update(part.encode() + b"\0")
+    for lock in ("source/Cargo.lock", "plugin/Cargo.lock"):
+        digest.update((workspace / lock).read_bytes() + b"\0")
+    directory = private_cache_root(header["cache_root"]) / "dependencies"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory / f"{digest.hexdigest()[:32]}.tar"
+
+
+def restore_dependency_cache(archive, workspace):
+    if not archive.is_file():
+        return False
+    completed = subprocess.run(["tar", "-xf", str(archive), "-C", str(workspace), "--no-same-owner"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               timeout=MAX_DEPENDENCY_CACHE_SECONDS, check=False)
+    if completed.returncode:
+        # A damaged archive must cost a cold build, not a failed one.
+        for name in DEPENDENCY_TARGETS:
+            shutil.rmtree(workspace / name, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+        return False
+    os.utime(archive)
+    return True
+
+
+def save_dependency_cache(archive, workspace):
+    """Keep this build's compiled output for the next build with the same key.
+
+    Only a build of trusted source may call this: its build scripts wrote the
+    files every later build will link against.
+    """
+    partial = archive.with_suffix(f".{os.getpid()}.partial")
+    try:
+        subprocess.run(["tar", "-cf", str(partial), "-C", str(workspace), *DEPENDENCY_TARGETS],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       timeout=MAX_DEPENDENCY_CACHE_SECONDS, check=True)
+        partial.replace(archive)
+    except (OSError, subprocess.SubprocessError):
+        partial.unlink(missing_ok=True)
+        return False
+    archives = sorted(archive.parent.glob("*.tar"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale in archives[KEPT_DEPENDENCY_CACHES:]:
+        stale.unlink(missing_ok=True)
+    return True
+
+
 def run_phase(command, deadline, limit=None):
     remaining = deadline - time.monotonic()
     if limit is not None:
@@ -442,7 +505,12 @@ def main():
                 server_jar = minecraft_server_jar(workspace, private_cache_root(header["cache_root"]))
                 if server_jar:
                     build_env["PUMPKIN_MINECRAFT_SERVER_JAR"] = server_jar
+                dependencies = dependency_cache_path(header, workspace)
+                restored = restore_dependency_cache(dependencies, workspace)
                 completed = run_phase(runner_command(header, workspace, BUILD_SCRIPT, extra_env=build_env), deadline)
+                saved = (completed.returncode == 0 and not restored and header.get("trusted_source") is True
+                         and save_dependency_cache(dependencies, workspace))
+                fetch_log += f"dependency_cache={'restored' if restored else 'saved' if saved else 'cold'}\n".encode()
         stdout = (fetch_log + completed.stdout)[-MAX_LOG:].decode("utf-8", "replace")
         stderr = completed.stderr[-MAX_LOG:].decode("utf-8", "replace")
         artifacts = []

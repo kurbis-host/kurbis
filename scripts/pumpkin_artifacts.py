@@ -77,6 +77,9 @@ def job_header(settings: dict[str, str], source: bytes, plugin: bytes) -> dict[s
         "toolchain": settings["CI_BUBBLEWRAP_TOOLCHAIN"],
         "source_preparer": settings["CI_BUBBLEWRAP_SOURCE_PREPARER"],
         "patch_fingerprint": "release", "capability_fingerprint": "release",
+        # A release builds this repository's own pinned source, so its compiled
+        # dependencies may be kept for later builds; see the runner.
+        "trusted_source": True,
         "cache_max_bytes": int(settings.get("CI_BUILD_CACHE_MAX_BYTES") or 8 * 1024 ** 3),
         "source_len": len(source), "plugin_len": len(plugin), "timeout_seconds": BUILD_TIMEOUT_SECONDS,
         # The runner validates these as the builder's fixed workspace contract.
