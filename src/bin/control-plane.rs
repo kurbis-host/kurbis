@@ -266,7 +266,12 @@ async fn main() -> Result<()> {
         let ci_maintenance = CiPreviewMaintenance::new(pool.clone(), object_store.clone());
         workers.spawn(
             "ci-preview-maintenance",
-            SupervisorConfig::required(std::time::Duration::from_secs(60)),
+            // CI previews are a side feature. Their upkeep failing must not
+            // turn the health check red: the worker waits for a healthy
+            // control plane before it starts, and that upkeep fails exactly
+            // while the worker is away, so the two blocked each other and
+            // took every hosted server down with them.
+            SupervisorConfig::optional(std::time::Duration::from_secs(60)),
             move || {
                 let maintenance = ci_maintenance.clone();
                 async move { maintenance.run_once().await.map_err(WorkerError::retryable) }
@@ -308,7 +313,7 @@ async fn main() -> Result<()> {
         let repository_id = watched.id;
         workers.spawn(
             format!("ci-poller:{repository_id}"),
-            SupervisorConfig::required(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)),
+            SupervisorConfig::optional(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)),
             move || {
                 let poller = ci_poller.clone();
                 async move {

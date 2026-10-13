@@ -1075,12 +1075,20 @@ impl CiPreviewRuntimeRepository {
         for preview_id in preview_ids {
             let capability = rand::random::<[u8; 32]>();
             let hash = blake3::hash(&capability);
-            match self.claim_start(preview_id, hash.as_bytes()).await? {
-                RuntimeLease::Claimed(_) => reclaimed += 1,
-                RuntimeLease::Starting(_)
-                | RuntimeLease::Stopping(_)
-                | RuntimeLease::AlreadyRunning(_)
-                | RuntimeLease::NoWorker => {}
+            match self.claim_start(preview_id, hash.as_bytes()).await {
+                Ok(RuntimeLease::Claimed(_)) => reclaimed += 1,
+                Ok(
+                    RuntimeLease::Starting(_)
+                    | RuntimeLease::Stopping(_)
+                    | RuntimeLease::AlreadyRunning(_)
+                    | RuntimeLease::NoWorker,
+                ) => {}
+                // One preview that cannot be rehomed, for example because its
+                // alias moved to a build that is not ready, must not stop the
+                // sweep for every other preview.
+                Err(error) => {
+                    tracing::warn!(%preview_id, ?error, "could not rehome a CI preview from a stale worker");
+                }
             }
         }
         Ok(reclaimed)
