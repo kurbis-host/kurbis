@@ -71,6 +71,11 @@ pub(super) async fn select_worker(
                    WHERE l.worker_id = w.id
                      AND l.port IN (candidate.port, candidate.port + 1, candidate.port + 2)
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM ci_port_leases l
+                   WHERE l.worker_id = w.id
+                     AND l.port IN (candidate.port, candidate.port + 1, candidate.port + 2)
+               )
            )
            AND w.signal_address <> ''
          ORDER BY CASE WHEN EXISTS (
@@ -135,6 +140,13 @@ pub(super) async fn place_and_enqueue_worker_operation(
          FROM generate_series($2, $3 - 2) AS p
          WHERE NOT EXISTS (
              SELECT 1 FROM port_leases l
+             WHERE l.worker_id = $1 AND l.port IN (p, p + 1, p + 2)
+         )
+         -- CI previews lease ports on the same worker from the same range.
+         -- Ignoring them gave a server a running preview's ports, and its
+         -- ingress relay then could not bind them.
+         AND NOT EXISTS (
+             SELECT 1 FROM ci_port_leases l
              WHERE l.worker_id = $1 AND l.port IN (p, p + 1, p + 2)
          )
          ORDER BY p
