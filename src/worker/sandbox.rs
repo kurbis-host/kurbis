@@ -895,7 +895,6 @@ pub async fn rootless_container_identity(
     container_uid: u32,
     container_gid: u32,
 ) -> Result<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
     let endpoint = docker_output([
         "context",
         "inspect",
@@ -907,10 +906,27 @@ pub async fn rootless_container_identity(
         .trim()
         .strip_prefix("unix://")
         .context("production workloads require a local Unix Docker socket")?;
-    let metadata = tokio::fs::metadata(socket).await?;
-    let username = rootless_owner_name(metadata.uid())?;
-    let uid = subordinate_id("/etc/subuid", &username, container_uid)?;
-    let gid = subordinate_id("/etc/subgid", &username, container_gid)?;
+    // Ask the kernel how the daemon's user namespace maps ids instead of
+    // recomputing it from /etc/subuid: rootless Docker maps container id 0 to
+    // the daemon's own account and ids from 1 onto the subordinate range, so
+    // "range start + id" is off by one and hands the storage to a different
+    // account than the one the workload runs as.
+    let pid_file = Path::new(socket).with_file_name("docker.pid");
+    let pid = tokio::fs::read_to_string(&pid_file)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot read rootless Docker pid from {}",
+                pid_file.display()
+            )
+        })?;
+    let pid = pid.trim();
+    let uid_map = tokio::fs::read_to_string(format!("/proc/{pid}/uid_map")).await?;
+    let gid_map = tokio::fs::read_to_string(format!("/proc/{pid}/gid_map")).await?;
+    let uid = host_id_for(&uid_map, container_uid)
+        .context("rootless Docker user namespace does not map the workload uid")?;
+    let gid = host_id_for(&gid_map, container_gid)
+        .context("rootless Docker user namespace does not map the workload gid")?;
     Ok((uid, gid))
 }
 
@@ -922,38 +938,22 @@ pub async fn rootless_container_identity(
     bail!("rootless workload sandbox requires a Linux worker host")
 }
 
-#[cfg(target_os = "linux")]
-fn rootless_owner_name(uid: u32) -> Result<String> {
-    let output = std::process::Command::new("id")
-        .args(["-nu", &uid.to_string()])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "cannot resolve rootless Docker owner name"
-    );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn subordinate_id(path: &str, username: &str, value: u32) -> Result<u32> {
-    for line in std::fs::read_to_string(path)?.lines() {
-        let mut parts = line.split(':');
-        if parts.next() != Some(username) {
-            continue;
-        }
-        let start: u32 = parts
-            .next()
-            .context("invalid subordinate id range")?
-            .parse()?;
-        let count: u32 = parts
-            .next()
-            .context("invalid subordinate id range")?
-            .parse()?;
-        if value < count {
-            return start.checked_add(value).context("subordinate id overflow");
-        }
-    }
-    bail!("rootless Docker subordinate id range does not cover container id {value}")
+/// The host id that a user namespace's `uid_map`/`gid_map` assigns to an id
+/// inside it. Each line is `<first inside id> <first host id> <count>`.
+#[cfg(any(target_os = "linux", test))]
+fn host_id_for(id_map: &str, inside: u32) -> Option<u32> {
+    id_map.lines().find_map(|line| {
+        let mut fields = line.split_whitespace().map(str::parse::<u32>);
+        let (first_inside, first_host, count) = (
+            fields.next()?.ok()?,
+            fields.next()?.ok()?,
+            fields.next()?.ok()?,
+        );
+        let offset = inside.checked_sub(first_inside)?;
+        (offset < count)
+            .then(|| first_host.checked_add(offset))
+            .flatten()
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

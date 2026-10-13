@@ -183,3 +183,18 @@ fn capability_derivation_rejects_weak_keys_and_invalid_generations() {
     assert!(scoped_runtime_token("weak", server, 1).is_err());
     assert!(scoped_runtime_token(&"x".repeat(32), server, 0).is_err());
 }
+
+#[test]
+fn workload_storage_owner_follows_the_rootless_daemons_real_id_map() {
+    // /proc/<dockerd>/uid_map of the production rootless daemon: container
+    // root is the daemon account and ids from 1 use the subordinate range.
+    let id_map = "         0       1800          1\n         1     100000      65536\n     65537     180000      65536\n";
+    assert_eq!(host_id_for(id_map, 0), Some(1800));
+    assert_eq!(host_id_for(id_map, 1), Some(100_000));
+    // Pumpkin's account. "Range start + id" would give 102613, which is the
+    // host id of container uid 2614, and Pumpkin could not write its storage.
+    assert_eq!(host_id_for(id_map, PUMPKIN_UID), Some(102_612));
+    assert_eq!(host_id_for(id_map, 65_537), Some(180_000));
+    assert_eq!(host_id_for(id_map, 200_000), None);
+    assert_eq!(host_id_for("garbage", 1), None);
+}
