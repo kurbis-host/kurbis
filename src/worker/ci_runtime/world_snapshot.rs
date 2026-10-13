@@ -30,11 +30,6 @@ pub(super) fn pack_world(source: &Path, destination: &Path, maximum: u64) -> Res
         if path == source {
             continue;
         }
-        if entry.file_type().is_symlink()
-            || !(entry.file_type().is_dir() || entry.file_type().is_file())
-        {
-            bail!("CI world contains a symlink or special file");
-        }
         let relative = path.strip_prefix(source)?;
         // These are worker/runtime-owned inputs, not durable world state.
         // The capability JSON contains a generation secret and pumpkin.toml
@@ -45,6 +40,13 @@ pub(super) fn pack_world(source: &Path, destination: &Path, maximum: u64) -> Res
             || relative.starts_with("run")
         {
             continue;
+        }
+        // Checked after the exclusions: `run` holds the live host-control
+        // socket, which made every snapshot of a running preview fail.
+        if entry.file_type().is_symlink()
+            || !(entry.file_type().is_dir() || entry.file_type().is_file())
+        {
+            bail!("CI world contains a symlink or special file");
         }
         let name = relative
             .to_str()
@@ -199,6 +201,24 @@ fn set_tree_owner_and_mode(root: &Path, uid: u32, gid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_preview_with_its_control_socket_can_be_packed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("run")).unwrap();
+        fs::write(source.join("level.dat"), b"level data").unwrap();
+        let _socket =
+            std::os::unix::net::UnixListener::bind(source.join("run/host-control.sock")).unwrap();
+        pack_world(&source, &root.path().join("world.tar.gz"), 1024 * 1024).unwrap();
+
+        // A special file anywhere else is still refused.
+        let _stray = std::os::unix::net::UnixListener::bind(source.join("stray.sock")).unwrap();
+        let error = pack_world(&source, &root.path().join("again.tar.gz"), 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink or special file"), "{error}");
+    }
 
     #[test]
     fn world_snapshot_round_trips_and_rejects_unsafe_archive_members() {
