@@ -539,7 +539,7 @@ def main():
                 revision = header.get("source_revision")
                 if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
                     # Shown to players as the server brand on the F3 screen.
-                    build_env["KURBIS_SERVER_BRAND"] = f"Pumpkin {revision} (Kurbis)"
+                    build_env["KURBIS_SERVER_BRAND"] = f"Pumpkin {revision[:7]} (Kurbis)"
                 dependencies = dependency_cache_path(header, workspace)
                 restored = restore_dependency_cache(dependencies, workspace)
                 completed = run_phase(runner_command(header, workspace, BUILD_SCRIPT, extra_env=build_env), deadline)
