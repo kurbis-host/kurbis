@@ -58,10 +58,29 @@ impl SnapshotStore {
             }
             let physical_manifest =
                 physical_object_path(snapshot.server_id, manifest_key.path().as_ref())?;
-            let object = store
-                .get(&physical_manifest)
-                .await
-                .context("retained snapshot manifest is missing")?;
+            let object = match store.get(&physical_manifest).await {
+                Ok(object) => object,
+                Err(object_store::Error::NotFound { .. }) => {
+                    // Without its manifest the snapshot cannot be restored,
+                    // so it retains nothing. Failing here instead stopped
+                    // all maintenance and turned the control plane's health
+                    // check red over one lost file.
+                    tracing::error!(
+                        server_id = %snapshot.server_id,
+                        generation = snapshot.generation,
+                        manifest = %snapshot.manifest_key,
+                        "snapshot manifest is missing from the object store; marking the snapshot incomplete"
+                    );
+                    sqlx::query("UPDATE snapshots SET complete = false WHERE id = $1")
+                        .bind(snapshot.id)
+                        .execute(&mut *guard)
+                        .await?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context("read retained snapshot manifest");
+                }
+            };
             if object.meta.size > MAX_MANIFEST_BYTES {
                 bail!("retained snapshot manifest exceeds the maximum object size");
             }
