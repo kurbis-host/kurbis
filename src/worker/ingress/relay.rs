@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     process::Stdio,
     time::Duration,
 };
@@ -24,6 +24,21 @@ pub fn container_name(runtime_id: Uuid, generation: i64) -> Result<String> {
         "kurbis-ingress-{}-g{generation}",
         runtime_id.simple()
     ))
+}
+
+/// Whether the relay's own health check currently passes. That check is a
+/// Java status ping to the Pumpkin backend the relay forwards to.
+pub async fn is_healthy(runtime_id: Uuid, generation: i64) -> Result<bool> {
+    let name = container_name(runtime_id, generation)?;
+    let output = Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Health.Status}}", &name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "healthy")
 }
 
 pub fn network_name(runtime_id: Uuid, generation: i64) -> Result<String> {
@@ -238,16 +253,6 @@ pub async fn start_container(
     );
     let java =
         docker_publish_binding(ports.java_tcp.ip(), ports.java_tcp.port(), JAVA_PORT, "tcp")?;
-    let java_health = docker_publish_binding(
-        if ports.java_tcp.is_ipv4() {
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        } else {
-            IpAddr::V6(Ipv6Addr::LOCALHOST)
-        },
-        ports.java_tcp.port(),
-        JAVA_PORT,
-        "tcp",
-    )?;
     let bedrock = docker_publish_binding(
         ports.bedrock_udp.ip(),
         ports.bedrock_udp.port(),
@@ -320,15 +325,13 @@ pub async fn start_container(
     .into_iter()
     .map(str::to_owned)
     .collect::<Vec<_>>();
+    // One publish per host port. Rootless Docker forwards every published
+    // address to the same loopback port inside its network namespace, so
+    // publishing the Java port a second time on host loopback for health
+    // probes made the second proxy wait for a port the first one held, time
+    // out, and leave a forward behind that blocked every later start.
+    // Readiness is taken from the relay's own health check instead.
     push_publish(&mut docker_args, &java);
-    let java_loopback = if ports.java_tcp.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else {
-        IpAddr::V6(Ipv6Addr::LOCALHOST)
-    };
-    if ports.java_tcp.ip() != java_loopback {
-        push_publish(&mut docker_args, &java_health);
-    }
     push_publish(&mut docker_args, &bedrock);
     push_publish(&mut docker_args, &signal);
     docker_args.extend(
@@ -594,21 +597,15 @@ fn verify_container_security(
         "ingress relay must be generation-supervised, not auto-restarted"
     );
 
-    let expected_java = PublishedBinding::for_socket(ports.java_tcp, JAVA_PORT, "tcp");
-    let health_ip = if ports.java_tcp.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else {
-        IpAddr::V6(Ipv6Addr::LOCALHOST)
-    };
-    let mut java_bindings = vec![expected_java];
-    if ports.java_tcp.ip() != health_ip {
-        java_bindings.push(PublishedBinding {
-            ip: health_ip,
-            port: ports.java_tcp.port(),
-        });
-    }
     let expected = [
-        ("25565/tcp", java_bindings),
+        (
+            "25565/tcp",
+            vec![PublishedBinding::for_socket(
+                ports.java_tcp,
+                JAVA_PORT,
+                "tcp",
+            )],
+        ),
         (
             "19132/udp",
             vec![PublishedBinding::for_socket(
@@ -965,7 +962,7 @@ mod tests {
                 "CapAdd":["NET_ADMIN","SETUID","SETGID","SETPCAP"], "CapDrop":["ALL"],
                 "SecurityOpt":["no-new-privileges:true"], "RestartPolicy":{"Name":"no"},
                 "PortBindings":{
-                    "25565/tcp":[{"HostIp":"192.0.2.10","HostPort":"23001"},{"HostIp":"127.0.0.1","HostPort":"23001"}],
+                    "25565/tcp":[{"HostIp":"192.0.2.10","HostPort":"23001"}],
                     "19132/udp":[{"HostIp":"192.0.2.10","HostPort":"23002"}],
                     "19132/tcp":[{"HostIp":"192.0.2.11","HostPort":"23003"}]
                 }, "Mounts":[]
@@ -993,12 +990,9 @@ mod tests {
             bedrock_signal_tcp: "192.0.2.11:23003".parse().unwrap(),
         };
         let bindings = crate::worker::ingress::ingress_bindings(gateway, ports);
-        assert_eq!(bindings.len(), 4);
-        assert_eq!(bindings[0].2, gateway);
-        assert_eq!(bindings[1].2, gateway);
-        assert_eq!(bindings[2].2, gateway);
-        assert_eq!(bindings[3].1, "127.0.0.1:23001".parse().unwrap());
-        assert_eq!(bindings[3].2, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        // Exactly the three published sockets, each open to the gateway only.
+        assert_eq!(bindings.len(), 3);
+        assert!(bindings.iter().all(|binding| binding.2 == gateway));
     }
 
     #[test]
