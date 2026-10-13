@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     control_plane::identity,
-    model::ServerRecord,
+    model::{ObservedState, ServerRecord},
     routing::{AdmissionRequest, AdmissionResponse, BedrockSignalTarget, RouteRepository},
 };
 
@@ -242,10 +242,49 @@ pub(super) async fn admit(
     };
 
     if let Some(target) = routes.resolve_subdomain(&subdomain).await? {
+        let owner = match minecraft_account.as_ref() {
+            Some((key, profile_id)) => {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM identities i
+                     JOIN servers s ON s.owner_id = i.user_id
+                     WHERE i.provider = $1 AND i.subject = $2 AND i.minecraft_player_id = $3
+                       AND s.id = $4)",
+                )
+                .bind(key.provider)
+                .bind(&key.subject)
+                .bind(profile_id)
+                .bind(target.server_id)
+                .fetch_one(&state.pool)
+                .await?
+            }
+            None => false,
+        };
+        // An owner who never opened the panel can only get there through the
+        // in-game login link, which needs a running server. When the server
+        // cannot start, hand that link out in the lobby instead.
+        let private_message = if owner && target.state == ObservedState::Failed {
+            let mut tx = state.pool.begin().await?;
+            let link = super::server_access::create_server_login_link(
+                &mut tx,
+                &state.config.public_base_url,
+                target.server_id,
+            )
+            .await?;
+            tx.commit().await?;
+            Some(match link {
+                Some(url) => format!(
+                    "Your server failed to start. To see why and manage it, open {url} (valid for 15 minutes)."
+                ),
+                None => "Your server failed to start.".to_owned(),
+            })
+        } else {
+            None
+        };
         return Ok(Json(AdmissionResponse {
             target,
-            private_message: None,
+            private_message,
             created: false,
+            owner,
         }));
     }
 
@@ -317,6 +356,7 @@ pub(super) async fn admit(
             target,
             private_message: None,
             created: false,
+            owner: false,
         }));
     }
 
@@ -352,6 +392,7 @@ pub(super) async fn admit(
                 "You already have a server at {address}; connecting you there."
             )),
             created: false,
+            owner: true,
         }));
     }
     if account_has_server {
@@ -378,6 +419,7 @@ pub(super) async fn admit(
                     target,
                     private_message: None,
                     created: false,
+                    owner: false,
                 }));
             }
             return Err(super::mutation_error(
@@ -399,6 +441,7 @@ pub(super) async fn admit(
         target,
         private_message: None,
         created: true,
+        owner: true,
     }))
 }
 

@@ -143,6 +143,15 @@ impl Lifecycle {
         {
             bail!(not_found: "server is deleted");
         }
+        if matches!(actor, LifecycleActor::Gateway)
+            && server.observed_state == ObservedState::Failed
+            && let Some(seconds) = failed_start_cooldown(&mut tx, server_id).await?
+        {
+            // A join restarts a failed server, but reconnecting players must
+            // not restart a broken one in a tight loop. Owners starting it
+            // from the panel are never held back.
+            bail!("server failed to start recently; a join may retry it in {seconds}s");
+        }
         if matches!(
             server.observed_state,
             ObservedState::Online
@@ -1023,4 +1032,34 @@ async fn has_live_snapshot(tx: &mut Transaction<'_, Postgres>, server_id: Uuid) 
     .bind(server_id)
     .fetch_one(&mut **tx)
     .await?)
+}
+
+/// Seconds a join still has to wait before it may restart a failed server.
+///
+/// The wait grows with the number of start operations that failed in a row
+/// since the last successful start: one minute, five minutes, then fifteen.
+async fn failed_start_cooldown(
+    tx: &mut Transaction<'_, Postgres>,
+    server_id: Uuid,
+) -> Result<Option<i64>> {
+    let (failures, seconds_since_last): (i64, Option<f64>) = sqlx::query_as(
+        "SELECT count(*), extract(epoch FROM now() - max(updated_at))::float8
+         FROM operations
+         WHERE server_id = $1 AND kind = 'start' AND status = 'failed'
+           AND updated_at > COALESCE(
+               (SELECT max(updated_at) FROM operations
+                WHERE server_id = $1 AND kind = 'start' AND status = 'succeeded'),
+               '-infinity')",
+    )
+    .bind(server_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let cooldown = match failures {
+        0 => return Ok(None),
+        1 => 60,
+        2 => 5 * 60,
+        _ => 15 * 60,
+    };
+    let remaining = cooldown - seconds_since_last.unwrap_or_default() as i64;
+    Ok((remaining > 0).then_some(remaining))
 }

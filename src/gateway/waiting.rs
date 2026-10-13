@@ -9,7 +9,7 @@ use crate::{
     config::GatewayConfig,
     gateway::{
         routes::RouteCache,
-        wake::{request_ci_preview_admission, request_wake},
+        wake::{request_ci_preview_admission, request_failed_server_retry, request_wake},
     },
     model::{ObservedState, RouteTarget},
     pumpkin_control::{PlayerEdition, PumpkinControl, WaitingPlayer},
@@ -17,6 +17,8 @@ use crate::{
 };
 
 const CI_ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a waiting player re-asks for a failed server to be restarted.
+const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 struct WaitingState {
     startup_since: Option<Instant>,
@@ -26,6 +28,12 @@ struct WaitingState {
     admission_target: Option<RouteTarget>,
     admission_hostname: Option<String>,
     admission_complete: bool,
+    /// The verified player owns the server they are waiting for.
+    owner: bool,
+    /// Admission already saw the failed start, so an owner has been given
+    /// the panel login link for it.
+    admitted_while_failed: bool,
+    last_failed_retry: Option<Instant>,
     last_ci_admission: Option<Instant>,
     ci_admission_state: Option<CiPreviewState>,
     /// CI chat notices are keyed by lifecycle state, not rendered text.
@@ -44,6 +52,9 @@ impl WaitingState {
             admission_target: None,
             admission_hostname: None,
             admission_complete: false,
+            owner: false,
+            admitted_while_failed: false,
+            last_failed_retry: None,
             last_ci_admission: None,
             ci_admission_state: None,
             last_ci_state: None,
@@ -161,6 +172,8 @@ async fn handle_player(
                     "{}.{}",
                     admission.target.subdomain, config.root_domain
                 ));
+                state.owner = admission.owner;
+                state.admitted_while_failed = admission.target.state == ObservedState::Failed;
                 state.admission_target = Some(admission.target);
                 state.admission_complete = true;
             }
@@ -217,14 +230,7 @@ async fn handle_player(
     };
 
     if target.state == ObservedState::Failed {
-        control
-            .kick(
-                &config.waiting_control_socket,
-                player.id,
-                "Server failed to start. Retry it from the panel.",
-            )
-            .await?;
-        return Ok(());
+        return handle_failed_server(config, control, player, state, &target).await;
     }
 
     if target.worker_healthy == Some(false)
@@ -266,13 +272,7 @@ async fn handle_player(
         state.last_wake = Some(Instant::now());
     }
 
-    let notice = notice_for(target.state);
-    if state.last_notice.as_deref() != Some(notice) {
-        control
-            .message(&config.waiting_control_socket, player.id, notice)
-            .await?;
-        state.last_notice = Some(notice.to_owned());
-    }
+    send_notice_once(config, control, player, state, notice_for(target.state)).await?;
 
     if state.startup_timed_out(target.state, Instant::now(), config.wake_timeout) {
         control
@@ -283,6 +283,82 @@ async fn handle_player(
             )
             .await?;
     }
+    Ok(())
+}
+
+async fn send_notice_once(
+    config: &GatewayConfig,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+    notice: &str,
+) -> Result<()> {
+    if state.last_notice.as_deref() != Some(notice) {
+        control
+            .message(&config.waiting_control_socket, player.id, notice)
+            .await?;
+        state.last_notice = Some(notice.to_owned());
+    }
+    Ok(())
+}
+
+/// Restart a server whose last start failed, on behalf of the joining player.
+///
+/// A failed server used to be reachable only through the panel's retry
+/// button. An owner who registered by joining has no panel access until their
+/// server runs, so the join itself has to be able to bring it back.
+async fn handle_failed_server(
+    config: &GatewayConfig,
+    control: &PumpkinControl,
+    player: &WaitingPlayer,
+    state: &mut WaitingState,
+    target: &RouteTarget,
+) -> Result<()> {
+    if !state.admitted_while_failed {
+        // The start failed while this player was already waiting. Admit them
+        // again so an owner receives the panel login link for the failure.
+        state.admitted_while_failed = true;
+        state.admission_complete = false;
+        return Ok(());
+    }
+    if state
+        .last_failed_retry
+        .is_some_and(|last| last.elapsed() < FAILED_RETRY_INTERVAL)
+    {
+        return Ok(());
+    }
+    state.last_failed_retry = Some(Instant::now());
+    if request_failed_server_retry(config, target.server_id).await? {
+        // The new attempt gets the full startup budget.
+        state.startup_since = None;
+        return send_notice_once(
+            config,
+            control,
+            player,
+            state,
+            "Your server failed to start last time. Trying again…",
+        )
+        .await;
+    }
+    if state.owner {
+        // The owner stays so the login link in chat remains usable; the
+        // retry above repeats and succeeds once the control plane allows it.
+        return send_notice_once(
+            config,
+            control,
+            player,
+            state,
+            "Your server failed to start. It is retried automatically every few minutes while you wait here.",
+        )
+        .await;
+    }
+    control
+        .kick(
+            &config.waiting_control_socket,
+            player.id,
+            "Server failed to start. It is retried automatically; reconnect in a few minutes.",
+        )
+        .await?;
     Ok(())
 }
 
@@ -660,6 +736,7 @@ mod tests {
                             },
                             private_message: None,
                             created: true,
+                            owner: true,
                         })
                     }
                 }

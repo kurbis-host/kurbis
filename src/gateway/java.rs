@@ -134,12 +134,10 @@ async fn handle_login(
     }
 
     if target.state == ObservedState::Failed {
-        let mut client = client;
-        return send_login_disconnect(
-            &mut client,
-            "Server failed to start. Retry it from the panel.",
-        )
-        .await;
+        // The lobby authenticates the player, retries the start, and gives
+        // the owner a panel login link; a login-phase disconnect can do none
+        // of that.
+        return proxy_to_waiting(client, config, handshake).await;
     }
 
     if target.state == ObservedState::Online || target.worker_healthy == Some(false) {
@@ -253,11 +251,8 @@ async fn wait_for_backend(
             .await;
         }
         if target.state == ObservedState::Failed {
-            return send_login_disconnect(
-                &mut client,
-                "Server failed to start. Retry it from the panel.",
-            )
-            .await;
+            // The start failed while this player waited in the login phase.
+            return proxy_to_waiting(client, config, handshake).await;
         }
         if java_lease(&target).is_some() {
             target = match routes.resolve_current(&handshake.hostname).await? {

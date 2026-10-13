@@ -3,9 +3,10 @@ mod common;
 use common::{create_user, test_pool};
 use kurbis_hoster::{
     control_plane::lifecycle::{
-        Lifecycle, claim_operation, complete_reset, complete_start, complete_stop,
-        healthy_worker_template, heartbeat_worker, mark_runtime_lost, recover_running_operations,
-        retry_operation, update_operation_payload,
+        Lifecycle, LifecycleActor, LifecycleCommand, LifecycleCommandError, claim_operation,
+        complete_reset, complete_start, complete_stop, fail_operation, healthy_worker_template,
+        heartbeat_worker, mark_runtime_lost, recover_running_operations, retry_operation,
+        update_operation_payload,
     },
     model::{ObservedState, OperationKind},
     routing::resolve_subdomain,
@@ -1201,3 +1202,123 @@ async fn queue_drain_snapshot_cannot_restart_a_cancelled_or_deleted_server() {
 
 #[path = "lifecycle/operation_completion.rs"]
 mod operation_completion;
+
+#[tokio::test]
+async fn a_join_restarts_a_failed_server_with_growing_spacing_and_owners_are_never_held_back() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_test_rows(&pool).await;
+
+    let server_id = Uuid::new_v4();
+    let worker_id = Uuid::new_v4();
+    let user_id = create_user(
+        &pool,
+        "google",
+        &format!("lifecycle-test-{server_id}"),
+        "Failed Start Test",
+        "active",
+        None,
+    )
+    .await;
+    sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
+        .bind(server_id)
+        .bind(user_id)
+        .bind(format!("loss-{}", &server_id.simple().to_string()[..12]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let worker = healthy_worker_template(
+        worker_id,
+        format!("loss-worker-{worker_id}"),
+        "127.0.0.1".into(),
+        8 * 1024 * 1024 * 1024,
+        40 * 1024 * 1024 * 1024,
+        4000,
+        25000,
+        25100,
+    );
+    heartbeat_worker(&pool, &worker).await.unwrap();
+    let lifecycle = Lifecycle::new(pool.clone());
+    let join = || {
+        lifecycle.dispatch_command(
+            LifecycleActor::Gateway,
+            server_id,
+            LifecycleCommand::Start {
+                reason: "gateway_join".into(),
+            },
+        )
+    };
+    // One failed start: the worker reports the cause, then confirms cleanup.
+    let fail_running_start = || async {
+        let start = claim_operation(&pool, worker_id)
+            .await
+            .unwrap()
+            .expect("start operation");
+        fail_operation(&pool, &start, "Pumpkin exited with status 1 during startup")
+            .await
+            .unwrap();
+        mark_runtime_lost(
+            &pool,
+            worker_id,
+            server_id,
+            start.generation,
+            "Server failed to start; its runtime was removed",
+        )
+        .await
+        .unwrap();
+        start
+    };
+
+    lifecycle.request_start(server_id, "test").await.unwrap();
+    fail_running_start().await;
+    let (state, last_error): (ObservedState, Option<String>) =
+        sqlx::query_as("SELECT observed_state, last_error FROM servers WHERE id = $1")
+            .bind(server_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ObservedState::Failed);
+    // The cleanup report must not replace the cause of the failure.
+    assert_eq!(
+        last_error.as_deref(),
+        Some("Pumpkin exited with status 1 during startup")
+    );
+
+    // A join right after the failure is held back for a minute...
+    assert!(matches!(join().await, Err(LifecycleCommandError::Conflict)));
+    sqlx::query(
+        "UPDATE operations SET updated_at = now() - interval '61 seconds' WHERE server_id = $1",
+    )
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // ...and then restarts the server without anyone opening the panel.
+    assert_eq!(join().await.unwrap(), ObservedState::Restoring);
+
+    // A second failure in a row is spaced out further than a minute.
+    let second = fail_running_start().await;
+    sqlx::query("UPDATE operations SET updated_at = now() - interval '61 seconds' WHERE id = $1")
+        .bind(second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(join().await, Err(LifecycleCommandError::Conflict)));
+
+    // The owner's own start is never throttled.
+    assert_eq!(
+        lifecycle.request_start(server_id, "panel").await.unwrap(),
+        ObservedState::Restoring
+    );
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workers WHERE id = $1")
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

@@ -34,6 +34,9 @@ pub struct AdmissionResponse {
     pub target: RouteTarget,
     pub private_message: Option<String>,
     pub created: bool,
+    /// Whether the verified joining account owns the target server.
+    #[serde(default)]
+    pub owner: bool,
 }
 
 /// Current private Bedrock signaling assignment returned by the control plane.

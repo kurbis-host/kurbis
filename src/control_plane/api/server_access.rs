@@ -163,6 +163,31 @@ pub(super) async fn mint_server_login_link(
         return Err(invalid_capability());
     };
     let server_id: Uuid = current.try_get("server_id")?;
+    let url = create_server_login_link(&mut tx, &state.config.public_base_url, server_id).await?;
+    tx.commit().await?;
+    let Some(url) = url else {
+        return Err(ApiError::with_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "login_link_rate_limited",
+            "too many login links requested for this server; try again shortly",
+        ));
+    };
+    Ok(no_store(Json(LoginLinkResponse {
+        url,
+        expires_in_seconds: LOGIN_TOKEN_TTL_SECONDS,
+    }))
+    .into())
+}
+
+/// Mint a one-use panel login link for a server.
+///
+/// Returns `None` when the server has used up its per-minute link budget.
+/// The caller commits the transaction either way so the attempt is counted.
+pub(super) async fn create_server_login_link(
+    tx: &mut Transaction<'_, Postgres>,
+    public_base_url: &str,
+    server_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
     let count: i32 = sqlx::query_scalar(
         "INSERT INTO server_login_rate_limits(server_id, window_started_at, request_count)
          VALUES($1, now(), 1)
@@ -179,19 +204,14 @@ pub(super) async fn mint_server_login_link(
     )
     .bind(server_id)
     .bind(MAX_LINKS_PER_MINUTE + 1)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if count > MAX_LINKS_PER_MINUTE {
-        tx.commit().await?;
-        return Err(ApiError::with_code(
-            StatusCode::TOO_MANY_REQUESTS,
-            "login_link_rate_limited",
-            "too many login links requested for this server; try again shortly",
-        ));
+        return Ok(None);
     }
 
     sqlx::query("DELETE FROM server_login_tokens WHERE expires_at <= now()")
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let token = random_token();
     sqlx::query(
@@ -201,18 +221,12 @@ pub(super) async fn mint_server_login_link(
     .bind(auth::token_hash(&token))
     .bind(server_id)
     .bind(LOGIN_TOKEN_TTL_SECONDS as f64)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
-
-    Ok(no_store(Json(LoginLinkResponse {
-        url: format!(
-            "{}/auth/server#token={token}",
-            state.config.public_base_url.trim_end_matches('/')
-        ),
-        expires_in_seconds: LOGIN_TOKEN_TTL_SECONDS,
-    }))
-    .into())
+    Ok(Some(format!(
+        "{}/auth/server#token={token}",
+        public_base_url.trim_end_matches('/')
+    )))
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Validate)]

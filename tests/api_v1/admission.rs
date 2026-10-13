@@ -394,3 +394,86 @@ async fn authenticated_admission_serializes_creation_redirects_and_keeps_existin
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn owner_of_a_failed_server_gets_a_panel_login_link_at_admission() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner_id, _) = user_session(&pool, "active").await;
+    let java_uuid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'Failed Owner', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind(java_uuid.to_string())
+    .bind(java_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let server_id = Uuid::new_v4();
+    let subdomain = format!("failed-{}", &server_id.simple().to_string()[..12]);
+    sqlx::query(
+        "INSERT INTO servers(id, owner_id, subdomain, observed_state)
+         VALUES($1, $2, $3, 'failed')",
+    )
+    .bind(server_id)
+    .bind(owner_id)
+    .bind(&subdomain)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = router(state(pool.clone()));
+    let hostname = format!("{subdomain}.mc.example.test");
+    let admit = |uuid: Uuid| {
+        let app = app.clone();
+        let hostname = hostname.clone();
+        async move {
+            let response = app
+                .oneshot(internal_admission_request(
+                    &hostname,
+                    Some(json!({"kind":"java", "uuid":uuid})),
+                    Some(uuid),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        }
+    };
+    let login_tokens = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM server_login_tokens WHERE server_id = $1",
+        )
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    // The owner cannot reach the panel through a server that will not start,
+    // so the lobby hands them the login link instead.
+    let owner = admit(java_uuid).await;
+    assert_eq!(owner["owner"], true);
+    let message = owner["private_message"].as_str().unwrap();
+    assert!(message.contains("/auth/server#token="), "{message}");
+    assert_eq!(login_tokens().await, 1);
+
+    // Anyone else joining the same address learns nothing and gets no link.
+    let guest = admit(Uuid::new_v4()).await;
+    assert_eq!(guest["owner"], false);
+    assert!(guest["private_message"].is_null());
+    assert_eq!(login_tokens().await, 1);
+
+    // A healthy server needs no link: the owner uses /kurbis once it runs.
+    sqlx::query("UPDATE servers SET observed_state = 'sleeping' WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let owner = admit(java_uuid).await;
+    assert_eq!(owner["owner"], true);
+    assert!(owner["private_message"].is_null());
+    assert_eq!(login_tokens().await, 1);
+}

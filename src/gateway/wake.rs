@@ -6,6 +6,30 @@ use uuid::Uuid;
 use crate::{config::GatewayConfig, contracts::lifecycle::ServerCommandRequest};
 
 pub async fn request_wake(config: &GatewayConfig, server_id: Uuid) -> Result<()> {
+    let status = send_wake(config, server_id).await?;
+    if !status.is_success() {
+        bail!("control plane rejected wake with {status}");
+    }
+    Ok(())
+}
+
+/// Ask the control plane to start a server whose last start failed.
+///
+/// Returns `false` when the control plane turns the retry down for now: it
+/// spaces out join-triggered retries of a failing server, and a start is not
+/// admitted until the worker has confirmed the failed runtime is gone.
+pub async fn request_failed_server_retry(config: &GatewayConfig, server_id: Uuid) -> Result<bool> {
+    let status = send_wake(config, server_id).await?;
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(false);
+    }
+    bail!("control plane rejected the retry with {status}");
+}
+
+async fn send_wake(config: &GatewayConfig, server_id: Uuid) -> Result<reqwest::StatusCode> {
     let url = format!(
         "{}/api/v1/servers/{server_id}/commands",
         config.control_plane_url.trim_end_matches('/'),
@@ -19,10 +43,7 @@ pub async fn request_wake(config: &GatewayConfig, server_id: Uuid) -> Result<()>
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
-    if !response.status().is_success() {
-        bail!("control plane rejected wake with {}", response.status());
-    }
-    Ok(())
+    Ok(response.status())
 }
 
 pub async fn request_ci_preview_admission(
@@ -173,5 +194,30 @@ mod tests {
 
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_server_retry_is_deferred_by_a_conflict_and_fails_on_other_rejections() {
+        for (status, expected) in [
+            (StatusCode::OK, Some(true)),
+            (StatusCode::CONFLICT, Some(false)),
+            (StatusCode::FORBIDDEN, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/api/v1/servers/{server_id}/commands",
+                post(move || async move { status }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let outcome =
+                request_failed_server_retry(&config(format!("http://{address}")), Uuid::new_v4())
+                    .await;
+            assert_eq!(outcome.ok(), expected, "{status}");
+
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
     }
 }

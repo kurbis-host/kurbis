@@ -16,7 +16,7 @@ use kurbis_hoster::{
     control_plane::{
         api::router,
         lifecycle::{
-            Lifecycle, claim_operation, complete_start, fail_operation, healthy_worker_template,
+            claim_operation, complete_start, fail_operation, healthy_worker_template,
             heartbeat_worker, mark_runtime_lost,
         },
     },
@@ -564,15 +564,14 @@ async fn first_verified_java_and_bedrock_join_wake_and_transfer_without_reconnec
 }
 
 #[tokio::test]
-async fn genuine_start_failure_kicks_without_blind_retry_and_operator_retry_can_recover() {
+async fn failed_start_keeps_the_owner_in_the_lobby_with_a_login_link_until_the_join_retries_it() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let (waiting_player, _identity, _subject) = player(PlayerEdition::Java);
     let hostname = waiting_player.server_address.clone();
-    let player_id = waiting_player.id;
     let worker_id = provision_worker(&pool).await;
     let control_state = Arc::new(Mutex::new(FakeHostControlState {
-        player: Some(waiting_player.clone()),
+        player: Some(waiting_player),
         ..FakeHostControlState::default()
     }));
     let (routes, control_plane_task, host_control_task, invalidation_task, waiting_task, socket) =
@@ -589,48 +588,41 @@ async fn genuine_start_failure_kicks_without_blind_retry_and_operator_retry_can_
         .await
         .unwrap();
     routes.invalidate_all().await;
+    // The first-join player owns the server and has no panel access yet.
+    // Instead of being disconnected they stay in the lobby and are handed a
+    // panel login link for the failure.
     wait_for_control_event(
         &control_state,
         |state| {
             state
-                .kicks
+                .messages
                 .iter()
-                .any(|(_, message)| message.contains("Server failed to start"))
+                .any(|message| message.contains("/auth/server#token="))
         },
-        "failed-start disconnect",
+        "owner login link after the failed start",
+    )
+    .await;
+    wait_for_control_event(
+        &control_state,
+        |state| {
+            state
+                .messages
+                .iter()
+                .any(|message| message.contains("retried automatically"))
+        },
+        "deferred retry notice",
     )
     .await;
     {
         let state = control_state.lock().await;
         assert!(state.transfers.is_empty());
-        assert!(state.kicks.iter().all(|(id, _)| *id == player_id));
+        assert!(state.kicks.is_empty(), "{:?}", state.kicks);
     }
-    assert_single_start(&pool, server_id, 1).await;
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if control_state.lock().await.empty_player_polls > 0 {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("waiting gateway retires the failed connection before recovery");
-    let empty_poll_count = control_state.lock().await.empty_player_polls;
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if control_state.lock().await.empty_player_polls > empty_poll_count {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("waiting gateway remained idle without automatically retrying a failed start");
+    // The failed runtime is not confirmed gone and the failure is seconds
+    // old, so the waiting join must not blindly start another copy.
     assert_single_start(&pool, server_id, 1).await;
 
-    // Simulate the worker's confirmed cleanup boundary before an explicit
-    // owner/panel retry; the failed generation is never silently restarted.
+    // The worker confirms cleanup and the retry spacing elapses.
     mark_runtime_lost(
         &pool,
         worker_id,
@@ -640,26 +632,37 @@ async fn genuine_start_failure_kicks_without_blind_retry_and_operator_retry_can_
     )
     .await
     .unwrap();
-    let manual_retry = Lifecycle::new(pool.clone())
-        .request_start(server_id, "panel")
-        .await
-        .unwrap();
-    assert_eq!(manual_retry, ObservedState::Restoring);
-    let second_start = claim_operation(&pool, worker_id).await.unwrap().unwrap();
+    sqlx::query(
+        "UPDATE operations SET updated_at = now() - interval '61 seconds' WHERE server_id = $1",
+    )
+    .bind(server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    routes.invalidate_all().await;
+
+    // The same waiting connection now restarts the server by itself: nobody
+    // opens the panel and the player does not have to reconnect.
+    let second_start = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(operation) = claim_operation(&pool, worker_id).await.unwrap() {
+                break operation;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the waiting join retries the failed start");
     assert_eq!(second_start.generation, generation + 1);
     complete_start(&pool, &second_start, 0).await.unwrap();
     routes.invalidate_all().await;
-
-    // Model the player's later reconnect to the same hostname after recovery.
-    let mut reconnected = waiting_player;
-    reconnected.connection_id = Uuid::new_v4();
-    control_state.lock().await.player = Some(reconnected);
     wait_for_control_event(
         &control_state,
         |state| state.transfers.len() == 1,
-        "transfer after explicit recovery",
+        "transfer after the join-triggered retry",
     )
     .await;
+    assert!(control_state.lock().await.kicks.is_empty());
     let starts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT status::text, generation FROM operations WHERE server_id = $1 AND kind = 'start' ORDER BY generation",
     )
