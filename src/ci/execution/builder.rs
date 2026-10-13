@@ -126,6 +126,7 @@ pub trait RootlessBuildRuntime: Send + Sync {
         plugin_archive: &[u8],
         output_dir: &Path,
         target: &str,
+        source_revision: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError>;
 }
@@ -1071,6 +1072,8 @@ impl RootlessBuildRuntime for DockerRootlessBuildRuntime {
         plugin_archive: &[u8],
         output_dir: &Path,
         target: &str,
+        // Only the remote builder labels the server with its revision.
+        _source_revision: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
         self.run_docker(source_archive, plugin_archive, output_dir, target, limits)
@@ -1226,6 +1229,7 @@ where
                     &plugin_archive,
                     output.path(),
                     target,
+                    &key.commit_sha,
                     self.limits,
                 )
                 .await?;

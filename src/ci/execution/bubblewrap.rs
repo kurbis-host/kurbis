@@ -649,6 +649,7 @@ impl RootlessBuildRuntime for BubblewrapBuildRuntime {
         plugin_archive: &[u8],
         output_dir: &Path,
         target: &str,
+        _source_revision: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
         validate_limits(limits)?;

@@ -313,6 +313,7 @@ impl SshBubblewrapBuildRuntime {
                 &[],
                 &[],
                 "x86_64-unknown-linux-gnu",
+                None,
                 self.profile.limits,
                 None,
             )
@@ -367,6 +368,7 @@ impl SshBubblewrapBuildRuntime {
         source: &[u8],
         plugin: &[u8],
         target: &str,
+        source_revision: Option<&str>,
         limits: SandboxLimits,
         output_dir: Option<&Path>,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
@@ -400,6 +402,7 @@ impl SshBubblewrapBuildRuntime {
             toolchain: self.toolchain.clone(),
             source_preparer: self.source_preparer.clone(),
             patch_fingerprint: self.patch_fingerprint.clone(),
+            source_revision: source_revision.map(str::to_owned),
             cache_root: self.compiler_cache_root.clone(),
             cache_max_bytes: self.compiler_cache_size,
             source_len: source.len(),
@@ -719,6 +722,9 @@ struct JobHeader {
     toolchain: String,
     source_preparer: String,
     patch_fingerprint: String,
+    /// The Pumpkin commit being built; the server reports it as its brand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>,
     cache_root: String,
     cache_max_bytes: u64,
     source_len: usize,
@@ -776,6 +782,7 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
                 &[],
                 &[],
                 "x86_64-unknown-linux-gnu",
+                None,
                 limits,
                 None,
             )
@@ -790,6 +797,7 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
         plugin_archive: &[u8],
         output_dir: &Path,
         target: &str,
+        source_revision: &str,
         limits: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
         self.assert_capability_lease()?;
@@ -813,6 +821,7 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
                 source_archive,
                 plugin_archive,
                 target,
+                Some(source_revision),
                 limits,
                 Some(output_dir),
             )

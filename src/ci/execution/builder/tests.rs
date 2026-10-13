@@ -21,6 +21,7 @@ impl RootlessBuildRuntime for StubBuildRuntime {
         _: &[u8],
         out: &Path,
         _: &str,
+        _: &str,
         _: SandboxLimits,
     ) -> Result<BuildProcessReport, BuildPipelineError> {
         fs::write(out.join("pumpkin"), fake_elf(62)).unwrap();

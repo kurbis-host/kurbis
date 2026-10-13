@@ -602,3 +602,21 @@ index 9371ab66..afb91e80 100644
      pub async fn shutdown(&self) {
          let world_id = self.level_folder.root_folder.display();
          info!("Saving level ({})...", world_id);
+diff --git a/crates/pumpkin-core/src/server/connection_cache.rs b/crates/pumpkin-core/src/server/connection_cache.rs
+index 1d194ef..17efb57 100644
+--- a/crates/pumpkin-core/src/server/connection_cache.rs
++++ b/crates/pumpkin-core/src/server/connection_cache.rs
+@@ -52,7 +52,12 @@ impl Default for CachedBranding {
+ }
+ 
+ impl CachedBranding {
+-    const BRAND: &'static str = "Pumpkin";
++    /// A hosted build names the exact revision it was compiled from, so the
++    /// F3 screen tells players and operators which server they are on.
++    const BRAND: &'static str = match option_env!("KURBIS_SERVER_BRAND") {
++        Some(brand) => brand,
++        None => "Pumpkin",
++    };
+     const BRAND_BYTES: &'static [u8] = &{
+         let brand = Self::BRAND.as_bytes();
+         let len = brand.len();
