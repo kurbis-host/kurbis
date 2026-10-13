@@ -300,6 +300,9 @@ impl CiPreviewRepository {
                AND ref.kind = 'pull_request' AND ref.number IS NOT NULL
                AND NOT ref.closed AND NOT ref.deleted
                AND build.requested_at IS NOT NULL
+               -- A live lease means a coordinator is building it right now;
+               -- queueing it again only records an empty success every poll.
+               AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
                AND build.stage IN ('queued', 'fetching', 'patching', 'compiling', 'packaging', 'failed')
                AND (build.stage <> 'failed' OR build.failure_class = 'transient')
                AND NOT EXISTS (
