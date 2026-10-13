@@ -242,7 +242,7 @@ def main() -> int:
             canary = settings.get(CANARY_SETTING)
             if canary:
                 say("worker updated; starting the canary server")
-                started = host_step(arguments.host, "canary", {"server": canary}, timeout=600)
+                started = host_step(arguments.host, "canary", {"server": canary}, timeout=25 * 60)
                 say(f"canary server online after {started['seconds']}s")
             else:
                 say(f"WARNING: {CANARY_SETTING} is not set in Dokploy, so no server start was tested")

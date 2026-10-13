@@ -507,16 +507,14 @@ impl CiPreviewWorker {
     async fn wait_for_java(&self, placement: &CiRuntimePlacement) -> Result<()> {
         timeout(JAVA_READY_TIMEOUT, async {
             loop {
-                if java_status_probe(SocketAddr::new(
-                    if self.worker_address.is_ipv4() {
-                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                    } else {
-                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                    },
-                    placement.java_port as u16,
-                ))
-                .await
-                .is_ok()
+                // The relay pings Pumpkin's Java status itself. A probe from
+                // this host would need the Java port published a second time
+                // on loopback, which rootless Docker cannot do.
+                if crate::worker::ingress::relay_is_healthy(
+                    placement.preview_id,
+                    placement.generation,
+                )
+                .await?
                 {
                     return Ok(());
                 }
@@ -1166,53 +1164,5 @@ mod tests {
     fn ci_artifact_metadata_rejects_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(unpack_artifact(b"no", tmp.path()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod readiness_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn readiness_uses_a_real_java_status_handshake_and_validates_the_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let backend = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let handshake_size = read_varint_async(&mut stream).await.unwrap() as usize;
-            let mut handshake = vec![0; handshake_size];
-            stream.read_exact(&mut handshake).await.unwrap();
-            let mut cursor = 0;
-            assert_eq!(read_varint(&handshake, &mut cursor).unwrap(), 0);
-            assert_eq!(read_varint(&handshake, &mut cursor).unwrap(), 777);
-            let host_len = read_varint(&handshake, &mut cursor).unwrap() as usize;
-            assert_eq!(&handshake[cursor..cursor + host_len], b"ci-preview");
-
-            let status_size = read_varint_async(&mut stream).await.unwrap() as usize;
-            let mut status_request = vec![0; status_size];
-            stream.read_exact(&mut status_request).await.unwrap();
-            let mut cursor = 0;
-            assert_eq!(read_varint(&status_request, &mut cursor).unwrap(), 0);
-
-            let json = serde_json::json!({
-                "version": { "name": "Pumpkin", "protocol": 767 },
-                "players": { "online": 0, "max": 0 },
-                "description": { "text": "ready" }
-            })
-            .to_string();
-            let mut packet = Vec::new();
-            write_varint(0, &mut packet);
-            write_varint(json.len() as i32, &mut packet);
-            packet.extend_from_slice(json.as_bytes());
-            let mut frame = Vec::new();
-            write_varint(packet.len() as i32, &mut frame);
-            frame.extend(packet);
-            stream.write_all(&frame).await.unwrap();
-        });
-
-        java_status_probe(address).await.unwrap();
-        backend.await.unwrap();
     }
 }

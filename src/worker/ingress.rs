@@ -14,7 +14,7 @@ const NFT_CHAIN: &str = "gateway_only";
 const NFT_TIMEOUT: Duration = Duration::from_secs(10);
 
 mod relay;
-pub use relay::{cleanup_ingress_through, ensure_runtime_ingress};
+pub use relay::{cleanup_ingress_through, ensure_runtime_ingress, is_healthy as relay_is_healthy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedWorkloadPorts {
@@ -504,24 +504,11 @@ fn ingress_bindings(
     gateway_address: IpAddr,
     ports: PublishedWorkloadPorts,
 ) -> Vec<(&'static str, SocketAddr, IpAddr)> {
-    let mut bindings = vec![
+    vec![
         ("tcp", ports.java_tcp, gateway_address),
         ("udp", ports.bedrock_udp, gateway_address),
         ("tcp", ports.bedrock_signal_tcp, gateway_address),
-    ];
-    let loopback = if ports.java_tcp.is_ipv4() {
-        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-    } else {
-        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-    };
-    if ports.java_tcp.ip() != loopback {
-        bindings.push((
-            "tcp",
-            SocketAddr::new(loopback, ports.java_tcp.port()),
-            loopback,
-        ));
-    }
-    bindings
+    ]
 }
 
 fn rule_prefix(server_id: Uuid, generation: i64, protocol: &str, socket: SocketAddr) -> String {

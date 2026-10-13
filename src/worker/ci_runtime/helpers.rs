@@ -1,22 +1,15 @@
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
-    net::SocketAddr,
     os::fd::{AsRawFd, FromRawFd},
     os::unix::fs::OpenOptionsExt,
     path::Path,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use tar::Archive;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::timeout,
-};
 use uuid::Uuid;
 
 use crate::{
@@ -323,79 +316,4 @@ pub(super) fn ensure_linux() -> Result<()> {
         bail!("CI previews require a Linux rootless Docker worker");
     }
     Ok(())
-}
-
-pub(super) async fn java_status_probe(address: SocketAddr) -> Result<()> {
-    let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(address)).await??;
-    let host = "ci-preview";
-    let mut handshake = Vec::new();
-    write_varint(0, &mut handshake);
-    write_varint(777, &mut handshake);
-    write_varint(host.len() as i32, &mut handshake);
-    handshake.extend_from_slice(host.as_bytes());
-    handshake.extend_from_slice(&25565u16.to_be_bytes());
-    write_varint(1, &mut handshake);
-    let mut frame = Vec::new();
-    write_varint(handshake.len() as i32, &mut frame);
-    frame.extend(handshake);
-    stream.write_all(&frame).await?;
-    let mut packet = Vec::new();
-    write_varint(0, &mut packet);
-    let mut frame = Vec::new();
-    write_varint(packet.len() as i32, &mut frame);
-    frame.extend(packet);
-    stream.write_all(&frame).await?;
-    let size = read_varint_async(&mut stream).await?;
-    if !(1..=65_536).contains(&size) {
-        bail!("invalid Minecraft status frame");
-    }
-    let mut response = vec![0; size as usize];
-    stream.read_exact(&mut response).await?;
-    let mut cursor = 0;
-    if read_varint(&response, &mut cursor)? != 0 {
-        bail!("unexpected Java status packet");
-    }
-    let string_len = read_varint(&response, &mut cursor)?;
-    if string_len <= 0 || string_len as usize > response.len().saturating_sub(cursor) {
-        bail!("invalid Java status JSON");
-    }
-    let status: serde_json::Value =
-        serde_json::from_slice(&response[cursor..cursor + string_len as usize])?;
-    if status.get("version").is_none() || status.get("players").is_none() {
-        bail!("Java status response missing required fields");
-    }
-    Ok(())
-}
-pub(super) fn write_varint(mut value: i32, out: &mut Vec<u8>) {
-    loop {
-        if value & !0x7f == 0 {
-            out.push(value as u8);
-            return;
-        }
-        out.push(((value & 0x7f) | 0x80) as u8);
-        value = ((value as u32) >> 7) as i32;
-    }
-}
-pub(super) fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<i32> {
-    let mut value = 0i32;
-    for shift in (0..35).step_by(7) {
-        let byte = *bytes.get(*cursor).context("truncated Java status varint")?;
-        *cursor += 1;
-        value |= ((byte & 0x7f) as i32) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    bail!("oversized Java status varint")
-}
-pub(super) async fn read_varint_async(stream: &mut TcpStream) -> Result<i32> {
-    let mut value = 0i32;
-    for shift in (0..35).step_by(7) {
-        let byte = stream.read_u8().await?;
-        value |= ((byte & 0x7f) as i32) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    bail!("oversized Java frame length")
 }
