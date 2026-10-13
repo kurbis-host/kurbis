@@ -45,6 +45,12 @@ const PROXY_UID: libc::uid_t = 65_532;
 #[cfg(target_os = "linux")]
 const PROXY_GID: libc::gid_t = 65_532;
 pub const SERVICE_BASE_URL: &str = "http://kurbis-runtime-api-proxy:8080";
+/// How often Docker probes a helper container's health while it starts.
+///
+/// With a start period set, Docker otherwise waits five seconds before the
+/// first probe, whatever `--health-interval` says, and a server start waits
+/// on that probe twice: once for this proxy and once for the ingress relay.
+pub const HEALTH_START_INTERVAL: &str = "100ms";
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -218,6 +224,8 @@ pub async fn start_container(
         "45".into(),
         "--health-start-period".into(),
         "45s".into(),
+        "--health-start-interval".into(),
+        HEALTH_START_INTERVAL.into(),
         "--label".into(),
         generation_label.clone(),
         "--label".into(),
@@ -343,7 +351,7 @@ pub async fn start_container(
             if health == "unhealthy" || health == "missing" {
                 bail!("runtime API proxy {name} did not become healthy");
             }
-            sleep(Duration::from_millis(250)).await;
+            sleep(Duration::from_millis(50)).await;
         }
     })
     .await;

@@ -24,9 +24,9 @@ use crate::{
     pumpkin_control::PumpkinControl,
     runtime_api_proxy,
     worker::sandbox::{
-        DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, WorkloadLimits,
-        ensure_rootless_volume_owner, scoped_runtime_environment_args, scoped_runtime_token,
-        validate_quota_volume,
+        DaemonInstance, DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, WorkloadLimits,
+        ensure_rootless_volume_owner, rootless_daemon_instance, scoped_runtime_environment_args,
+        scoped_runtime_token, validate_quota_volume,
     },
 };
 
@@ -46,6 +46,8 @@ pub struct DockerRuntime {
     runtime_api_proxy_egress_network: String,
     runtime_api_proxy_allow_insecure: bool,
     runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
+    /// The Docker daemon run whose sandbox has passed the live probes.
+    verified_daemon: std::sync::Arc<tokio::sync::Mutex<Option<DaemonInstance>>>,
 }
 
 impl DockerRuntime {
@@ -85,7 +87,35 @@ impl DockerRuntime {
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
             runtime_api_relay,
+            verified_daemon: Default::default(),
         })
+    }
+
+    /// Run the live sandbox probes unless this run of the Docker daemon has
+    /// already passed them.
+    ///
+    /// The probes start three throwaway containers and add and remove a
+    /// trial firewall rule, about a second of every server start. What they
+    /// prove can only change when the daemon restarts, so they run when the
+    /// worker boots and again after any daemon restart, not on every start.
+    async fn ensure_sandbox_verified(&self) -> Result<()> {
+        let daemon = rootless_daemon_instance().await?;
+        let mut verified = self.verified_daemon.lock().await;
+        if *verified == Some(daemon) {
+            return Ok(());
+        }
+        self.sandbox
+            .verify_with_limits(
+                &self.image,
+                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
+            )
+            .await?;
+        self.ingress
+            .verify_host_policy()
+            .await
+            .context("Gateway-only workload ingress requires nftables host firewall access")?;
+        *verified = Some(daemon);
+        Ok(())
     }
 
     async fn ensure_ingress_relay(
@@ -232,14 +262,8 @@ impl ServerRuntime for DockerRuntime {
         cleanup_ingress_through(&self.ingress, server_id, placement.generation).await?;
         self.sandbox.remove_isolated_networks(server_id).await?;
         phases.mark("cleanup");
-        self.sandbox
-            .verify_with_limits(
-                &self.image,
-                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            )
-            .await?;
+        self.ensure_sandbox_verified().await?;
         validate_quota_volume(server_dir, SERVER_STORAGE_BYTES as u64).await?;
-        self.ingress.verify_host_policy().await?;
         phases.mark("sandbox");
         tokio::fs::create_dir_all(server_dir.join("run")).await?;
         tokio::fs::write(
@@ -538,16 +562,7 @@ impl DockerRuntime {
         )
         .await
         .context("verify managed-plugin runtime API proxy dependencies")?;
-        self.sandbox
-            .verify_with_limits(
-                &self.image,
-                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            )
-            .await?;
-        self.ingress
-            .verify_host_policy()
-            .await
-            .context("Gateway-only workload ingress requires nftables host firewall access")
+        self.ensure_sandbox_verified().await
     }
 
     async fn running_generation(&self, name: &str) -> Result<Option<i64>> {

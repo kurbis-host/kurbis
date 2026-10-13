@@ -938,6 +938,59 @@ pub async fn rootless_container_identity(
     bail!("rootless workload sandbox requires a Linux worker host")
 }
 
+/// One run of the rootless Docker daemon.
+///
+/// What the sandbox probes establish (rootless mode, cgroup v2 delegation,
+/// enforced memory and tmpfs limits) is fixed when the daemon starts and
+/// cannot change while it runs, so a verified sandbox stays verified for as
+/// long as this value does. A pid alone could be reused by a later daemon;
+/// the kernel's start time for that pid cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonInstance {
+    pid: u32,
+    started_at_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub async fn rootless_daemon_instance() -> Result<DaemonInstance> {
+    let socket = rootless_docker_socket().await?;
+    let pid_file = socket.with_file_name("docker.pid");
+    let pid = tokio::fs::read_to_string(&pid_file)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot read rootless Docker pid from {}",
+                pid_file.display()
+            )
+        })?
+        .trim()
+        .parse::<u32>()
+        .context("rootless Docker pid file does not hold a pid")?;
+    let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .await
+        .context("rootless Docker daemon is not running")?;
+    let started_at_ticks = process_start_ticks(&stat)
+        .context("cannot read the rootless Docker daemon's start time")?;
+    Ok(DaemonInstance {
+        pid,
+        started_at_ticks,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn rootless_daemon_instance() -> Result<DaemonInstance> {
+    bail!("rootless workload sandbox requires a Linux worker host")
+}
+
+/// Field 22 of `/proc/<pid>/stat`: when the process started, in clock ticks
+/// since boot. The command name in field 2 may itself contain spaces and
+/// parentheses, so fields are counted from its closing parenthesis.
+#[cfg(any(target_os = "linux", test))]
+fn process_start_ticks(stat: &str) -> Option<u64> {
+    let (_, after_command) = stat.rsplit_once(')')?;
+    after_command.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// The host id that a user namespace's `uid_map`/`gid_map` assigns to an id
 /// inside it. Each line is `<first inside id> <first host id> <count>`.
 #[cfg(any(target_os = "linux", test))]

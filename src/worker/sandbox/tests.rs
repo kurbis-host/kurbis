@@ -198,3 +198,15 @@ fn workload_storage_owner_follows_the_rootless_daemons_real_id_map() {
     assert_eq!(host_id_for(id_map, 200_000), None);
     assert_eq!(host_id_for("garbage", 1), None);
 }
+
+#[test]
+fn daemon_start_time_is_read_past_a_command_name_with_spaces_and_parentheses() {
+    // /proc/<pid>/stat of a rootless daemon; field 22 is its start time.
+    let stat = "2059296 (dockerd) S 2059201 2059296 2059201 0 -1 4194560 31337 0 12 0 \
+                 4821 1933 0 0 20 0 27 0 88213377 2412412928 19874 18446744073709551615";
+    assert_eq!(process_start_ticks(stat), Some(88_213_377));
+    let renamed = stat.replace("(dockerd)", "(my (odd) name)");
+    assert_eq!(process_start_ticks(&renamed), Some(88_213_377));
+    assert_eq!(process_start_ticks("2059296 (dockerd) S 1 2"), None);
+    assert_eq!(process_start_ticks("garbage"), None);
+}

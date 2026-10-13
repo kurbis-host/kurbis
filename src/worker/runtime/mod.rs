@@ -153,7 +153,9 @@ pub trait ServerRuntime: Send + Sync {
                             return Err(error).context("Pumpkin exited before readiness");
                         }
                         tracing::debug!(?error, "waiting for Pumpkin host-control readiness");
-                        sleep(Duration::from_millis(500)).await;
+                        // Pumpkin is ready a few hundred milliseconds after it
+                        // is spawned; a coarser poll would dominate that.
+                        sleep(Duration::from_millis(50)).await;
                     }
                 }
             }

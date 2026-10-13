@@ -308,6 +308,8 @@ pub async fn start_container(
         "10",
         "--health-start-period",
         "120s",
+        "--health-start-interval",
+        crate::runtime_api_proxy::HEALTH_START_INTERVAL,
         "--label",
         &generation_label,
         "--label",
@@ -466,7 +468,7 @@ async fn wait_healthy(name: &str, max_wait: Duration) -> Result<()> {
                 "unhealthy" | "missing" => {
                     anyhow::bail!("ingress relay {name} is unhealthy or has no health check")
                 }
-                _ => sleep(Duration::from_millis(250)).await,
+                _ => sleep(Duration::from_millis(50)).await,
             }
         }
     })

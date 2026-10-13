@@ -46,7 +46,7 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 - Rust 1.98.1
 - PostgreSQL
 - Native host processes for local development (Docker is not needed)
-- Docker Engine and Compose v2 for the container deployment and Docker workers
+- Docker Engine 25 or later and Compose v2 for the container deployment and Docker workers
 - Node.js and pnpm 11.2.2 (for the web panel)
 
 ## Development
