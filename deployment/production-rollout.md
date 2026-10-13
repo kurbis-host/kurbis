@@ -15,7 +15,14 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
 
 1. **Gate.** Refuses a dirty checkout or any commit other than `origin/main`,
    validates `migrations/MANIFEST.json`, and runs the tests.
-2. **Pumpkin.** Compiles the pinned Pumpkin integration once on the remote CI
+2. **Builder files.** Installs this commit's `tools/ci_bubblewrap_runner.py`
+   and, when the patches or the control plugin changed, builds its
+   `ci-source-preparer` on the CI builder, both under content-derived
+   directories next to the configured ones. The control plane will not start
+   unless the builder's preparer reports the patch fingerprint compiled into
+   it, so the release points `CI_BUBBLEWRAP_RUNNER` and
+   `CI_BUBBLEWRAP_SOURCE_PREPARER` at these files in the same deployment.
+3. **Pumpkin.** Compiles the pinned Pumpkin integration once on the remote CI
    builder, through the same `tools/ci_bubblewrap_runner.py` job the control
    plane uses for CI builds (`scripts/pumpkin_artifacts.py`, configured by the
    `CI_BUILDER_SSH_TARGET` and `CI_BUBBLEWRAP_*` values in Dokploy). The two
@@ -23,20 +30,20 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
    `/srv/kurbis/release-artifacts/<sha>` and packaged into
    `melon-pumpkin:host-control-<sha>` and `melon-pumpkin:waiting-<sha>`.
    Compose never compiles or builds Pumpkin.
-3. **Deploy.** Sets `BUILD_REVISION` in Dokploy, keeps auto-deploy off, queues
+4. **Deploy.** Sets `BUILD_REVISION` in Dokploy, keeps auto-deploy off, queues
    one Dokploy deployment of `main` and waits for it. Dokploy builds one
    deployment at a time across all projects, so the wait (`--deploy-wait`,
    four hours by default) includes its queue.
-4. **Verify.** Every Compose service must be running, healthy, and labelled
+5. **Verify.** Every Compose service must be running, healthy, and labelled
    with the release SHA, and Dokploy must have deployed that commit.
-5. **Worker.** The native `kurbis-worker` service gets the worker binary from
+6. **Worker.** The native `kurbis-worker` service gets the worker binary from
    the deployed app image and the new Pumpkin image. One worker process has to
    stay up for 40 seconds and send heartbeats within four minutes; otherwise
    the previous binary and settings are put back and the release fails. The
    first starts normally exit with `worker_already_active` until the previous
    worker's lease lapses.
 
-6. **Canary.** The server named by `RELEASE_CANARY_SERVER_ID` in Dokploy is
+7. **Canary.** The server named by `RELEASE_CANARY_SERVER_ID` in Dokploy is
    started with the same command the gateway sends when a player joins, and
    has to reach `online` within six minutes. Healthy containers do not prove a
    server can start; this does. On failure the release fails and prints the

@@ -2,7 +2,8 @@
 """Release the current origin/main commit to production.
 
   1. Refuse anything but a clean checkout of origin/main and run the gate.
-  2. Compile Pumpkin on the remote CI builder and package it on the host.
+  2. Install this commit's builder files, compile Pumpkin on the remote CI
+     builder, and package it on the host.
   3. Deploy the Compose stack through Dokploy and wait for it to be healthy.
   4. Move the native worker onto the release, restoring it if it fails.
   5. Start the canary server like a joining player would and wait for it.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -164,6 +166,57 @@ def host_step(host: str, step: str, arguments: dict, *, timeout: int) -> dict:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=60)
 
 
+def builder_fixtures(settings: dict[str, str]) -> dict[str, str]:
+    """Install this commit's runner and patch-check binary on the CI builder.
+
+    The control plane refuses to start unless the builder's
+    `ci-source-preparer` reports the patch fingerprint compiled into the
+    control plane, and the runner has to speak its job protocol. Both used to
+    be copied to the builder by hand, so a release that changed the patches or
+    the control plugin without that step took the control plane down. Files
+    are installed under content-derived names next to the configured ones and
+    never replaced, so the running control plane keeps its own. Returns the
+    Dokploy settings that name the installed files.
+    """
+    target = settings["CI_BUILDER_SSH_TARGET"]
+    root = str(Path(settings["CI_BUBBLEWRAP_RUNNER"]).parent.parent)
+    runner_source = ROOT / "tools/ci_bubblewrap_runner.py"
+    runner_directory = f"{root}/runner-{hashlib.sha256(runner_source.read_bytes()).hexdigest()[:12]}"
+    runner = f"{runner_directory}/ci_bubblewrap_runner.py"
+    fingerprint = run(["cargo", "run", "--locked", "--quiet", "--bin", "ci-source-preparer", "--", "--print-fingerprint"],
+                      timeout=1800).splitlines()[-1]
+    preparer_directory = f"{root}/preparer-{fingerprint[:12]}"
+    preparer = f"{preparer_directory}/ci-source-preparer"
+
+    def builder(command: str, *, input_bytes: bytes | None = None, timeout: int = 120) -> str:
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
+                                 target, command], input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, timeout=timeout)
+        if result.returncode:
+            raise ReleaseError(f"CI builder command failed: {result.stderr.decode('utf-8', 'replace').strip()[-2000:]}")
+        return result.stdout.decode("utf-8", "replace").strip()
+
+    if builder(f"test -x {shlex.quote(runner)} && echo present || true") != "present":
+        builder(f"install -d -m 0700 {shlex.quote(runner_directory)} && cat > {shlex.quote(runner)} "
+                f"&& chmod 0700 {shlex.quote(runner)}", input_bytes=runner_source.read_bytes())
+    if builder(f"test -x {shlex.quote(preparer)} && echo present || true") != "present":
+        say("building the CI builder's patch-check binary for this patch set")
+        build = f"{root}/preparer-build"
+        source = subprocess.run(["git", "archive", "--format=tar", "HEAD", "--", ".", ":(exclude)web"], cwd=ROOT,
+                                stdout=subprocess.PIPE, check=True).stdout
+        builder(f"rm -rf {shlex.quote(build)}/source && install -d -m 0700 {shlex.quote(build)}/source "
+                f"&& tar -xf - -C {shlex.quote(build)}/source", input_bytes=source, timeout=600)
+        toolchain = shlex.quote(settings["CI_BUBBLEWRAP_TOOLCHAIN"] + "/bin")
+        builder(f"cd {shlex.quote(build)}/source && PATH={toolchain}:$PATH CARGO_TARGET_DIR={shlex.quote(build)}/target "
+                "nice cargo build --release --locked --jobs 8 --bin ci-source-preparer "
+                f"&& install -d -m 0700 {shlex.quote(preparer_directory)} "
+                f"&& install -m 0700 {shlex.quote(build)}/target/release/ci-source-preparer {shlex.quote(preparer)}",
+                timeout=3600)
+    if builder(f"{shlex.quote(preparer)} --print-fingerprint") != fingerprint:
+        raise ReleaseError("the CI builder's patch-check binary reports a different patch fingerprint than this commit")
+    return {"CI_BUBBLEWRAP_RUNNER": runner, "CI_BUBBLEWRAP_SOURCE_PREPARER": preparer}
+
+
 def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
     with tempfile.TemporaryDirectory(prefix="kurbis-pumpkin-artifacts-") as directory:
         local = Path(directory) / "artifacts"
@@ -177,7 +230,7 @@ def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
     host_step(host, "package", {"revision": commit, "artifacts": digests}, timeout=1800)
 
 
-def deploy(commit: str, wait_seconds: int) -> None:
+def deploy(commit: str, wait_seconds: int, fixtures: dict[str, str]) -> None:
     info = compose()
     # Releases are the only deployments: a plain Dokploy deploy has no Pumpkin
     # images for its commit and no matching worker.
@@ -185,7 +238,7 @@ def deploy(commit: str, wait_seconds: int) -> None:
         dokploy("compose.update", {"composeId": COMPOSE_ID, "autoDeploy": False}, post=True)
     if info.get("branch") != "main":
         run(["dokploy", "compose", "update", "--composeId", COMPOSE_ID, "--branch", "main", "--json"], timeout=60)
-    environment = patch_environment(str(info["env"]), {**ENVIRONMENT, "BUILD_REVISION": commit})
+    environment = patch_environment(str(info["env"]), {**ENVIRONMENT, **fixtures, "BUILD_REVISION": commit})
     dokploy("compose.saveEnvironment", {"composeId": COMPOSE_ID, "env": environment}, post=True)
     known = {item["deploymentId"] for item in dokploy("deployment.allByCompose", {"composeId": COMPOSE_ID})}
     run(["dokploy", "compose", "deploy", "--composeId", COMPOSE_ID, "--title", f"Release {commit[:12]}",
@@ -233,9 +286,11 @@ def main() -> int:
             gate()
             say("gate passed; compiling Pumpkin on the CI builder")
             settings = parse_environment(str(compose()["env"]))
+            fixtures = builder_fixtures(settings)
+            settings.update(fixtures)
             build_pumpkin(arguments.host, commit, settings)
             say("Pumpkin images packaged; deploying through Dokploy")
-            deploy(commit, arguments.deploy_wait)
+            deploy(commit, arguments.deploy_wait, fixtures)
             wait_until_healthy(arguments.host, commit)
             say("stack healthy; updating the worker")
             record = host_step(arguments.host, "worker", {"revision": commit}, timeout=600)
