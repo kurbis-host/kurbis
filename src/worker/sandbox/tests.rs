@@ -51,7 +51,7 @@ fn network_identity_is_per_server_and_generation() {
 fn docker_policy_sets_isolation_and_hard_limits_without_host_mounts() {
     let args = DockerSandbox
         .run_security_args(
-            WorkloadLimits::server(2 * 1024 * 1024 * 1024, SERVER_STORAGE_BYTES as u64),
+            WorkloadLimits::server(2 * 1024 * 1024 * 1024, SERVER_STORAGE_BYTES as u64, 8000),
             "2613:2613",
             "workload-net",
             true,
@@ -87,6 +87,9 @@ fn docker_policy_sets_isolation_and_hard_limits_without_host_mounts() {
     }
     assert!(!args.contains(&"--privileged"));
     assert!(!args.contains(&"/var/run/docker.sock"));
+    // A server may burst to the worker's whole CPU budget: eight CPUs here.
+    let cpu_quota = args.iter().position(|arg| *arg == "--cpu-quota").unwrap();
+    assert_eq!(args[cpu_quota + 1], "800000");
 }
 
 #[test]

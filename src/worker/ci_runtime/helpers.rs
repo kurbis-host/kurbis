@@ -12,11 +12,6 @@ use serde::Deserialize;
 use tar::Archive;
 use uuid::Uuid;
 
-use crate::{
-    ci::{CI_RUNTIME_DISK_BYTES, CI_RUNTIME_MEMORY_BYTES},
-    worker::sandbox::WorkloadLimits,
-};
-
 #[derive(Debug, Deserialize)]
 pub(super) struct ArtifactMetadata {
     pub(super) repository: String,
@@ -312,10 +307,6 @@ pub(super) fn remove_owned_runtime_dir(allowed_root: &Path, preview_id: Uuid) ->
 pub(super) fn container_name(preview_id: Uuid) -> String {
     format!("kurbis-ci-{}", preview_id.simple())
 }
-pub(super) fn ci_limits() -> WorkloadLimits {
-    WorkloadLimits::server(CI_RUNTIME_MEMORY_BYTES as u64, CI_RUNTIME_DISK_BYTES as u64)
-}
-
 pub(super) fn ensure_linux() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("CI previews require a Linux rootless Docker worker");

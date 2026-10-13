@@ -78,10 +78,17 @@ impl WorkloadLimits {
         }
     }
 
-    pub const fn server(memory_bytes: u64, disk_bytes: u64) -> Self {
+    /// A Minecraft server may use the worker's whole CPU budget. Its
+    /// placement reservation (`SERVER_CPU_MILLIS`) is what it is guaranteed
+    /// when every server on the worker is busy, because all servers carry the
+    /// same CPU weight; it is not a ceiling. Pumpkin generates terrain on a
+    /// thread pool sized from the CPUs it may use, so a one-CPU quota left a
+    /// lone exploring player generating on a throttled core while the rest of
+    /// the worker sat idle.
+    pub const fn server(memory_bytes: u64, disk_bytes: u64, worker_cpu_millis: u64) -> Self {
         Self {
             memory_bytes,
-            cpu_millis: 1000,
+            cpu_millis: worker_cpu_millis,
             pid_limit: 512,
             disk_bytes,
         }

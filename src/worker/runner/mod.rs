@@ -68,6 +68,8 @@ impl WorkerRunner {
             .parse()
             .context("WORKER_ADDRESS must be an IP address for Bedrock ICE")?;
         let signal_address = config.signal_address;
+        let worker_cpu_millis =
+            u64::try_from(config.total_cpu_millis).context("WORKER_CPU_MILLIS must be positive")?;
         let control_plane = WorkerControl::new(
             &config.control_plane_url,
             &config.api_token,
@@ -97,6 +99,7 @@ impl WorkerRunner {
                     image.clone(),
                     config.host_control_token.clone(),
                     config.root.clone(),
+                    worker_cpu_millis,
                     public_address,
                     signal_address,
                     config
@@ -133,6 +136,7 @@ impl WorkerRunner {
             RuntimeConfig::Docker { image } => Some(CiPreviewWorker::new(
                 control_plane.clone(),
                 config.root.clone(),
+                worker_cpu_millis,
                 image.clone(),
                 config.id,
                 config.host_control_token.clone(),
@@ -156,7 +160,7 @@ impl WorkerRunner {
                 config.runtime_api_proxy_egress_network.clone(),
                 config.allow_insecure_local_control_plane_http,
                 runtime_api_relay.clone().expect("Docker CI runtime relay"),
-            )),
+            )?),
             RuntimeConfig::Native { .. } => None,
         };
         control_plane

@@ -39,6 +39,7 @@ pub struct DockerRuntime {
     worker_control_key: String,
     root: PathBuf,
     sandbox: DockerSandbox,
+    limits: WorkloadLimits,
     ingress: GatewayIngressPolicy,
     public_address: IpAddr,
     signal_address: IpAddr,
@@ -59,6 +60,7 @@ impl DockerRuntime {
         image: String,
         host_control_token: String,
         root: PathBuf,
+        worker_cpu_millis: u64,
         public_address: IpAddr,
         signal_address: IpAddr,
         gateway_address: IpAddr,
@@ -80,6 +82,12 @@ impl DockerRuntime {
             worker_control_key: host_control_token,
             root,
             sandbox: DockerSandbox,
+            limits: WorkloadLimits::server(
+                SERVER_MEMORY_BYTES as u64,
+                SERVER_STORAGE_BYTES as u64,
+                worker_cpu_millis,
+            )
+            .validate()?,
             public_address,
             signal_address,
             gateway_bedrock_ip,
@@ -108,10 +116,7 @@ impl DockerRuntime {
             return Ok(());
         }
         self.sandbox
-            .verify_with_limits(
-                &self.image,
-                WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            )
+            .verify_with_limits(&self.image, self.limits)
             .await?;
         self.ingress
             .verify_host_policy()
@@ -319,12 +324,10 @@ impl ServerRuntime for DockerRuntime {
             "--stop-timeout".to_owned(),
             "10".to_owned(),
         ];
-        args.extend(self.sandbox.run_security_args(
-            WorkloadLimits::server(SERVER_MEMORY_BYTES as u64, SERVER_STORAGE_BYTES as u64),
-            PUMPKIN_USER,
-            &network,
-            true,
-        )?);
+        args.extend(
+            self.sandbox
+                .run_security_args(self.limits, PUMPKIN_USER, &network, true)?,
+        );
         let runtime_environment_args = scoped_runtime_environment_args(
             &self.worker_control_key,
             server_id,

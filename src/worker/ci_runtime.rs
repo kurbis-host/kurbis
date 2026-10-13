@@ -19,7 +19,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    ci::{CI_RUNTIME_DISK_BYTES, CiRuntimePlacement, CiRuntimeState},
+    ci::{CI_RUNTIME_DISK_BYTES, CI_RUNTIME_MEMORY_BYTES, CiRuntimePlacement, CiRuntimeState},
     config::StorageMode,
     pumpkin_control::PumpkinControl,
     worker::runtime::settings::{AccountLookups, PermissionLevel, render_pumpkin_config},
@@ -30,7 +30,8 @@ use crate::{
             ensure_runtime_ingress,
         },
         sandbox::{
-            DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, ensure_rootless_volume_owner,
+            DockerSandbox, PUMPKIN_GID, PUMPKIN_UID, PUMPKIN_USER, WorkloadLimits,
+            ensure_rootless_volume_owner,
             scoped_ci_preview_capability, scoped_runtime_token, validate_quota_volume,
         },
         storage::StorageManager,
@@ -53,6 +54,7 @@ pub struct CiPreviewWorker {
     gateway_bedrock_ip: std::net::Ipv4Addr,
     gateway_bedrock_port: u16,
     sandbox: DockerSandbox,
+    limits: WorkloadLimits,
     runtime_api_proxy_image: String,
     runtime_api_proxy_upstream: String,
     runtime_api_proxy_egress_network: String,
@@ -65,6 +67,7 @@ impl CiPreviewWorker {
     pub fn new(
         control_plane: WorkerControl,
         root: PathBuf,
+        worker_cpu_millis: u64,
         image: String,
         worker_id: Uuid,
         worker_key: String,
@@ -79,10 +82,10 @@ impl CiPreviewWorker {
         runtime_api_proxy_egress_network: String,
         runtime_api_proxy_allow_insecure: bool,
         runtime_api_relay: std::sync::Arc<crate::worker::runtime_api_relay::WorkerRuntimeApiRelay>,
-    ) -> Self {
+    ) -> Result<Self> {
         let runtime_root = root.join("ci-preview-runtime");
         let storage = StorageManager::new(root.join("ci-preview-storage"), storage_mode);
-        Self {
+        Ok(Self {
             control_plane,
             runtime_root,
             storage,
@@ -95,12 +98,18 @@ impl CiPreviewWorker {
             gateway_bedrock_ip,
             gateway_bedrock_port,
             sandbox: DockerSandbox,
+            limits: WorkloadLimits::server(
+                CI_RUNTIME_MEMORY_BYTES as u64,
+                CI_RUNTIME_DISK_BYTES as u64,
+                worker_cpu_millis,
+            )
+            .validate()?,
             runtime_api_proxy_image,
             runtime_api_proxy_upstream,
             runtime_api_proxy_egress_network,
             runtime_api_proxy_allow_insecure,
             runtime_api_relay,
-        }
+        })
     }
 
     pub async fn reconcile(&self) -> Result<()> {
@@ -241,7 +250,7 @@ impl CiPreviewWorker {
         self.remove_stale(placement.preview_id, placement.generation)
             .await?;
         self.sandbox
-            .verify_with_limits(&self.image, ci_limits())
+            .verify_with_limits(&self.image, self.limits)
             .await
             .context("verify rootless preview runtime limits")?;
         ingress.verify_host_policy().await?;
@@ -399,7 +408,7 @@ impl CiPreviewWorker {
         let container = container_name(placement.preview_id);
         let security = self
             .sandbox
-            .run_security_args(ci_limits(), PUMPKIN_USER, &network, true)?;
+            .run_security_args(self.limits, PUMPKIN_USER, &network, true)?;
         let mut owned = [
             "run",
             "--detach",
