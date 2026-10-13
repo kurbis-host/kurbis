@@ -259,7 +259,7 @@ impl PumpkinControl {
             .context("host-control request payload must be an object")?;
         object.insert("token".into(), Value::String(self.token.clone()));
 
-        let stream = timeout(IO_TIMEOUT, UnixStream::connect(socket))
+        let stream = timeout(IO_TIMEOUT, connect(socket))
             .await
             .context("host-control connection timed out")??;
         let (read_half, mut write_half) = stream.into_split();
@@ -294,6 +294,30 @@ impl PumpkinControl {
         }
         Ok(response)
     }
+}
+
+/// Longest path a Unix socket address can hold, without its terminator.
+const MAX_SOCKET_PATH_BYTES: usize = 107;
+
+/// Connect to a host-control socket wherever its directory is.
+///
+/// A socket address holds at most 107 path bytes, and a preview runtime's
+/// control socket lies deeper than that. Linux resolves a path through an
+/// open directory handle, which keeps the address short for any depth.
+async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    if socket.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH_BYTES || !cfg!(target_os = "linux") {
+        return UnixStream::connect(socket).await;
+    }
+    let (Some(directory), Some(name)) = (socket.parent(), socket.file_name()) else {
+        return UnixStream::connect(socket).await;
+    };
+    let directory = std::fs::File::open(directory)?;
+    let through_handle = Path::new("/proc/self/fd")
+        .join(directory.as_raw_fd().to_string())
+        .join(name);
+    UnixStream::connect(through_handle).await
 }
 
 #[cfg(test)]
