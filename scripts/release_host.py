@@ -38,6 +38,8 @@ WORKER_SETTLE_SECONDS = 40
 WORKER_START_SECONDS = 240
 # A start restores the world, boots Pumpkin, and is retried by the worker.
 CANARY_SECONDS = 6 * 60
+# Longest spacing the control plane puts between join-triggered retries.
+CANARY_ADMISSION_SECONDS = 16 * 60
 
 
 class Failure(RuntimeError):
@@ -256,10 +258,20 @@ def canary(arguments: dict) -> dict:
     database = state["postgres"]["name"]
     # The gateway's wake request, sent from inside the control plane so its
     # internal token never leaves the container.
-    wake = ('curl --fail --silent --show-error --max-time 20 -X POST -H "Authorization: Bearer $INTERNAL_TOKEN" '
-            '-H "Content-Type: application/json" --data \'{"command":"start","reason":"gateway_join"}\' '
+    wake = ('curl --silent --show-error --max-time 20 --output /dev/null --write-out "%{http_code}" -X POST '
+            '-H "Authorization: Bearer $INTERNAL_TOKEN" -H "Content-Type: application/json" '
+            '--data \'{"command":"start","reason":"gateway_join"}\' '
             f"http://127.0.0.1:8080/api/v1/servers/{server}/commands")
-    run(["docker", "exec", state["control-plane"]["name"], "sh", "-c", wake])
+    asked = time.monotonic()
+    while True:
+        code = run(["docker", "exec", state["control-plane"]["name"], "sh", "-c", wake])
+        if code.startswith("2"):
+            break
+        # After failed starts the control plane spaces out join-triggered
+        # retries; the canary waits that out like a player would have to.
+        if code != "409" or time.monotonic() - asked > CANARY_ADMISSION_SECONDS:
+            raise Failure(f"the control plane refused to start the canary server (HTTP {code})")
+        time.sleep(20)
     started, observed = time.monotonic(), ""
     while time.monotonic() - started < CANARY_SECONDS:
         time.sleep(5)

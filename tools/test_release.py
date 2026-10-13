@@ -90,9 +90,10 @@ class ReleaseTests(unittest.TestCase):
         state = {name: service(name=name) for name in host.SERVICES}
         answers = iter(["restoring", "failed", "Pumpkin exited with status 1 during startup"])
         commands = []
+        codes = iter(["409", "202"])
         def run(command, **_):
             commands.append(command)
-            return ""
+            return next(codes)
         with patch.object(host, "services", return_value=state), patch.object(host, "run", side_effect=run), \
              patch.object(host, "query", side_effect=lambda *_: next(answers)), patch.object(host.time, "sleep"):
             with self.assertRaisesRegex(host.Failure, r"state: failed\): Pumpkin exited with status 1"):
@@ -103,9 +104,15 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(commands[0][:3], ["docker", "exec", "control-plane"])
         self.assertIn('"reason":"gateway_join"', commands[0][-1])
         self.assertIn(f"/api/v1/servers/{server}/commands", commands[0][-1])
-        with patch.object(host, "services", return_value=state), patch.object(host, "run", return_value=""), \
+        # A start refused during the retry spacing was asked for again.
+        self.assertEqual(len(commands), 2)
+        with patch.object(host, "services", return_value=state), patch.object(host, "run", return_value="200"), \
              patch.object(host, "query", return_value="online"), patch.object(host.time, "sleep"):
             self.assertEqual(host.canary({"server": server})["server"], server)
+        with patch.object(host, "services", return_value=state), patch.object(host, "run", return_value="403"), \
+             patch.object(host.time, "sleep"):
+            with self.assertRaisesRegex(host.Failure, "HTTP 403"):
+                host.canary({"server": server})
 
     def test_a_worker_that_fails_to_start_is_replaced_by_the_previous_one(self):
         with tempfile.TemporaryDirectory() as directory:
