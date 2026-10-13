@@ -22,10 +22,20 @@ release = load("release")
 host = load("release_host")
 migration = load("migration_manifest")
 REVISION = "a" * 40
+KEPT = {"gateway": "melon-hoster:gateway-" + "1" * 24, "waiting-pumpkin": "melon-pumpkin:waiting-" + "2" * 24}
+KEPT_ARGUMENTS = {"gateway_image": KEPT["gateway"], "waiting_image": KEPT["waiting-pumpkin"]}
 
 
 def service(**changes):
     return {"status": "running", "health": "healthy", "revision": REVISION, "image": "sha256:app", "name": "c", **changes}
+
+
+def stack():
+    """A healthy stack: the gateway and lobby on their kept images, the rest on this release."""
+    state = {name: service() for name in host.SERVICES}
+    for name, image in KEPT.items():
+        state[name].update(image_name=image, revision="c" * 40)
+    return state
 
 
 class ReleaseTests(unittest.TestCase):
@@ -45,12 +55,33 @@ class ReleaseTests(unittest.TestCase):
         # The gateway has no health check and Postgres carries no revision label.
         state["gateway"]["health"] = "none"
         state["postgres"]["revision"] = ""
-        self.assertEqual(host.problems(state, REVISION), [])
+        # The gateway and lobby outlive releases: they are held to their
+        # content-keyed image, not to this release's revision.
+        kept = KEPT
+        for name, image in kept.items():
+            state[name].update(image_name=image, revision="c" * 40)
+        self.assertEqual(host.problems(state, REVISION, kept), [])
         state["panel"] = {"status": "missing"}
         state["control-plane"]["health"] = "starting"
-        state["waiting-pumpkin"]["revision"] = "b" * 40
-        self.assertEqual(host.problems(state, REVISION),
-                         ["control-plane is starting", "panel is missing", "waiting-pumpkin runs bbbbbbbbbbbb"])
+        state["waiting-pumpkin"]["image_name"] = "melon-pumpkin:waiting-" + "3" * 24
+        state["worker-image"] = {"status": "running", "health": "healthy", "revision": "b" * 40}
+        self.assertEqual(host.problems(state, REVISION, kept),
+                         ["control-plane is starting", "panel is missing",
+                          f"waiting-pumpkin runs melon-pumpkin:waiting-{'3' * 24}, not melon-pumpkin:waiting-{'2' * 24}",
+                          "worker-image runs bbbbbbbbbbbb"])
+
+    def test_the_gateway_image_follows_only_what_the_gateway_is_built_from(self):
+        modules = release.gateway_modules(release.ROOT)
+        self.assertIn("gateway", modules)
+        self.assertIn("routing", modules)
+        # The worker and the control plane change in most releases; neither
+        # is part of the gateway, so neither may replace it.
+        self.assertNotIn("worker", modules)
+        self.assertNotIn("control_plane", modules)
+        self.assertRegex(release.gateway_image(), r"^melon-hoster:gateway-[0-9a-f]{24}$")
+        self.assertEqual(host.image_name(release.gateway_image()), release.gateway_image())
+        with self.assertRaises(host.Failure):
+            host.image_name("melon-hoster:local; rm -rf /")
 
     def test_package_rejects_binaries_that_differ_from_the_builder(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -61,7 +92,7 @@ class ReleaseTests(unittest.TestCase):
             digests = {name: host.sha256(artifacts / name) for name in host.PUMPKIN_ARTIFACTS}
             with patch.object(host, "ARTIFACTS", Path(directory)), patch.object(host, "run") as run:
                 with self.assertRaisesRegex(host.Failure, "differs from the build"):
-                    host.package({"revision": REVISION, "artifacts": {**digests, "pumpkin": "0" * 64}})
+                    host.package({"revision": REVISION, "artifacts": {**digests, "pumpkin": "0" * 64}, **KEPT_ARGUMENTS})
                 run.assert_not_called()
 
     def test_images_are_copied_only_when_the_worker_has_its_own_daemon(self):
@@ -119,7 +150,9 @@ class ReleaseTests(unittest.TestCase):
             worker, environment = Path(directory) / "worker", Path(directory) / "worker.env"
             worker.write_bytes(b"old worker")
             environment.write_text("export PUMPKIN_IMAGE=melon-pumpkin:host-control-old\n", encoding="utf-8")
-            state = {name: service(name=name) for name in host.SERVICES}
+            state = stack()
+            for name in state:
+                state[name]["name"] = name
             started = []
             def start(binary, env, database):
                 started.append((binary, env))
@@ -132,7 +165,7 @@ class ReleaseTests(unittest.TestCase):
                  patch.object(host, "RECORD", Path(directory) / "record.json"), patch.object(host, "services", return_value=state), \
                  patch.object(host, "run", side_effect=run), patch.object(host, "start_worker", side_effect=start):
                 with self.assertRaisesRegex(host.Failure, "No such image.*previous worker was restored and is healthy"):
-                    host.worker({"revision": REVISION})
+                    host.worker({"revision": REVISION, **KEPT_ARGUMENTS})
             self.assertEqual(started[0], (b"new worker", f"export PUMPKIN_IMAGE=melon-pumpkin:host-control-{REVISION}\n".encode()))
             self.assertEqual(started[1], (b"old worker", b"export PUMPKIN_IMAGE=melon-pumpkin:host-control-old\n"))
             self.assertFalse((Path(directory) / "record.json").exists())

@@ -19,6 +19,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -230,6 +231,54 @@ def pumpkin_inputs_key(settings: dict[str, str]) -> str:
     return hashlib.sha256("\n".join([trees, *builder]).encode()).hexdigest()[:24]
 
 
+# The gateway binary is compiled from the whole crate, but only some of its
+# modules can change what the gateway does. These are found from the source,
+# not listed, so a new dependency of the gateway is picked up by itself.
+GATEWAY_ROOTS = ("src/bin/gateway.rs", "src/gateway")
+GATEWAY_ALWAYS = ("Cargo.toml", "Cargo.lock", "runtime/Dockerfile", "migrations", "src/lib.rs")
+WAITING_INPUTS = ("deployment/waiting.toml",)
+
+
+def gateway_modules(source: Path) -> list[str]:
+    """Top-level modules of the crate the gateway can reach, itself included."""
+    modules = {path.stem if path.is_file() else path.name for path in (source / "src").iterdir()
+               if path.name not in ("bin", "lib.rs", "main.rs")}
+
+    def files(module: str) -> list[Path]:
+        single = source / "src" / f"{module}.rs"
+        return ([single] if single.is_file() else []) + sorted((source / "src" / module).rglob("*.rs"))
+
+    reached: set[str] = set()
+    pending = ["gateway"] + re.findall(r"\bkurbis_hoster::(\w+)", (source / "src/bin/gateway.rs").read_text(encoding="utf-8"))
+    while pending:
+        module = pending.pop()
+        if module in reached or module not in modules:
+            continue
+        reached.add(module)
+        for path in files(module):
+            # `super::` from a top-level module also names a sibling module.
+            pending.extend(re.findall(r"\b(?:crate|super)::(\w+)", path.read_text(encoding="utf-8")))
+    return sorted(reached)
+
+
+def tree_key(paths: list[str], *extra: str) -> str:
+    trees = run(["git", "-C", str(ROOT), "rev-parse", *(f"HEAD:{path}" for path in paths)], timeout=30)
+    return hashlib.sha256("\n".join([*paths, trees, *extra]).encode()).hexdigest()[:24]
+
+
+def gateway_image() -> str:
+    paths = [*GATEWAY_ALWAYS, "src/bin/gateway.rs"]
+    for module in gateway_modules(ROOT):
+        paths.append(f"src/{module}" if (ROOT / "src" / module).is_dir() else f"src/{module}.rs")
+        if (ROOT / "src" / module).is_dir() and (ROOT / "src" / f"{module}.rs").is_file():
+            paths.append(f"src/{module}.rs")
+    return f"melon-hoster:gateway-{tree_key(sorted(set(paths)))}"
+
+
+def waiting_image(settings: dict[str, str]) -> str:
+    return f"melon-pumpkin:waiting-{tree_key(list(WAITING_INPUTS), pumpkin_inputs_key(settings))}"
+
+
 def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
     target = shlex.quote(f"{REMOTE_ARTIFACTS}/{commit}")
     kept = shlex.quote(f"{REMOTE_ARTIFACTS}/inputs-{pumpkin_inputs_key(settings)}")
@@ -253,10 +302,11 @@ def build_pumpkin(host: str, commit: str, settings: dict[str, str]) -> None:
                          f"&& cat > {kept}/digests.json && ls -dt {shlex.quote(REMOTE_ARTIFACTS)}/inputs-* "
                          f"| tail -n +{KEPT_PUMPKIN_BUILDS + 1} | xargs -r rm -rf --"],
             input_text=json.dumps(digests), timeout=120)
-    host_step(host, "package", {"revision": commit, "artifacts": digests}, timeout=1800)
+    host_step(host, "package", {"revision": commit, "artifacts": digests, "waiting_image": waiting_image(settings),
+                                "gateway_image": gateway_image()}, timeout=3600)
 
 
-def deploy(commit: str, wait_seconds: int, fixtures: dict[str, str]) -> None:
+def deploy(commit: str, wait_seconds: int, settings: dict[str, str]) -> None:
     info = compose()
     # Releases are the only deployments: a plain Dokploy deploy has no Pumpkin
     # images for its commit and no matching worker.
@@ -264,7 +314,7 @@ def deploy(commit: str, wait_seconds: int, fixtures: dict[str, str]) -> None:
         dokploy("compose.update", {"composeId": COMPOSE_ID, "autoDeploy": False}, post=True)
     if info.get("branch") != "main":
         run(["dokploy", "compose", "update", "--composeId", COMPOSE_ID, "--branch", "main", "--json"], timeout=60)
-    environment = patch_environment(str(info["env"]), {**ENVIRONMENT, **fixtures, "BUILD_REVISION": commit})
+    environment = patch_environment(str(info["env"]), {**ENVIRONMENT, **settings, "BUILD_REVISION": commit})
     dokploy("compose.saveEnvironment", {"composeId": COMPOSE_ID, "env": environment}, post=True)
     known = {item["deploymentId"] for item in dokploy("deployment.allByCompose", {"composeId": COMPOSE_ID})}
     run(["dokploy", "compose", "deploy", "--composeId", COMPOSE_ID, "--title", f"Release {commit[:12]}",
@@ -280,12 +330,13 @@ def deploy(commit: str, wait_seconds: int, fixtures: dict[str, str]) -> None:
     raise ReleaseError("the Dokploy deployment did not finish in time; it may still be queued behind other deployments")
 
 
-def wait_until_healthy(host: str, commit: str) -> None:
+def wait_until_healthy(host: str, commit: str, images: dict[str, str]) -> None:
     # Compose returns once containers are started; the panel and control plane
     # need up to a few minutes more before their health checks pass.
     deadline = time.monotonic() + HEALTHY_WAIT_SECONDS
     while True:
-        found = host_step(host, "status", {"revision": commit}, timeout=120)["problems"]
+        found = host_step(host, "status", {"revision": commit, "gateway_image": images["GATEWAY_IMAGE"],
+                                           "waiting_image": images["WAITING_IMAGE"]}, timeout=120)["problems"]
         if not found:
             return
         if time.monotonic() >= deadline:
@@ -316,10 +367,12 @@ def main() -> int:
             settings.update(fixtures)
             build_pumpkin(arguments.host, commit, settings)
             say("Pumpkin images packaged; deploying through Dokploy")
-            deploy(commit, arguments.deploy_wait, fixtures)
-            wait_until_healthy(arguments.host, commit)
+            images = {"GATEWAY_IMAGE": gateway_image(), "WAITING_IMAGE": waiting_image(settings)}
+            deploy(commit, arguments.deploy_wait, {**fixtures, **images})
+            wait_until_healthy(arguments.host, commit, images)
             say("stack healthy; updating the worker")
-            record = host_step(arguments.host, "worker", {"revision": commit}, timeout=600)
+            record = host_step(arguments.host, "worker", {"revision": commit, "gateway_image": images["GATEWAY_IMAGE"],
+                                                         "waiting_image": images["WAITING_IMAGE"]}, timeout=600)
             canary = settings.get(CANARY_SETTING)
             if canary:
                 say("worker updated; starting the canary server")

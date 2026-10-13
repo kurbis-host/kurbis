@@ -67,6 +67,23 @@ def revision_of(value: object) -> str:
     return value
 
 
+def image_name(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"melon-(hoster|pumpkin):[a-z]+-[0-9a-f]{24}", value):
+        raise Failure("release image names must be content-keyed melon-hoster or melon-pumpkin tags")
+    return value
+
+
+def kept_images(arguments: dict) -> dict[str, str]:
+    """The services a release leaves running, with the image each must be on."""
+    return {"gateway": image_name(arguments.get("gateway_image")),
+            "waiting-pumpkin": image_name(arguments.get("waiting_image"))}
+
+
+def image_exists(image: str) -> bool:
+    return subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          check=False).returncode == 0
+
+
 def worker_setting(name: str) -> str | None:
     values = [line.split("=", 1)[1].strip().strip("\"'") for line in WORKER_ENV.read_text(encoding="utf-8").splitlines()
               if line.startswith(f"export {name}=")]
@@ -102,18 +119,27 @@ def package(arguments: dict) -> dict:
     for name in PUMPKIN_ARTIFACTS:
         if sha256(context / "artifacts" / name) != arguments["artifacts"][name]:
             raise Failure(f"uploaded {name} differs from the build on the CI builder")
-    images = {"host-control": f"melon-pumpkin:host-control-{revision}", "waiting": f"melon-pumpkin:waiting-{revision}"}
+    images = {"host-control": f"melon-pumpkin:host-control-{revision}", "waiting": image_name(arguments["waiting_image"])}
+    gateway = image_name(arguments["gateway_image"])
     with tempfile.TemporaryDirectory(prefix="kurbis-release-source-") as directory:
         source = Path(directory) / "source"
         run(["git", "init", "--quiet", str(source)])
         run(["git", "-C", str(source), "fetch", "--quiet", "--depth=1", REPOSITORY, revision])
         run(["git", "-C", str(source), "checkout", "--quiet", "--detach", "FETCH_HEAD"])
         for target, image in images.items():
+            # The lobby and gateway images are named by what they are built
+            # from. Building one again under the same name would give it a
+            # new identity, and Compose would replace its container and
+            # disconnect every player for nothing.
+            if target == "waiting" and image_exists(image):
+                continue
             # The named context replaces the Dockerfile's from-source stage.
             run(["docker", "build", "--target", target, "--build-arg", f"BUILD_REVISION={revision}",
                  "--build-context", f"artifacts={context}", "-f", "runtime/pumpkin/Dockerfile", "-t", image, "."], cwd=source)
+        if not image_exists(gateway):
+            run(["docker", "build", "--build-arg", f"BUILD_REVISION={revision}", "-f", "runtime/Dockerfile", "-t", gateway, "."], cwd=source)
     publish_to_worker(images["host-control"])
-    return {"images": images}
+    return {"images": {**images, "gateway": gateway}}
 
 
 def services() -> dict[str, dict[str, str]]:
@@ -130,18 +156,24 @@ def services() -> dict[str, dict[str, str]]:
             "health": container["State"].get("Health", {}).get("Status", "none"),
             "revision": container["Config"].get("Labels", {}).get("org.opencontainers.image.revision", ""),
             "image": container["Image"],
+            "image_name": container["Config"].get("Image", ""),
             "name": container["Name"].lstrip("/"),
         }
     return state
 
 
-def problems(state: dict[str, dict[str, str]], revision: str) -> list[str]:
+def problems(state: dict[str, dict[str, str]], revision: str, kept: dict[str, str]) -> list[str]:
+    """What is wrong with the stack. `kept` names the image of each service
+    that outlives releases; the others must run this release's revision."""
     found = []
     for service, item in state.items():
         if item["status"] != "running":
             found.append(f"{service} is {item['status']}")
         elif service not in UNCHECKED and item["health"] != "healthy":
             found.append(f"{service} is {item['health']}")
+        elif service in kept:
+            if item.get("image_name") != kept[service]:
+                found.append(f"{service} runs {item.get('image_name') or 'an unnamed image'}, not {kept[service]}")
         elif service != "postgres" and item["revision"] != revision:
             found.append(f"{service} runs {item['revision'][:12] or 'an unlabelled image'}")
     return found
@@ -150,7 +182,7 @@ def problems(state: dict[str, dict[str, str]], revision: str) -> list[str]:
 def status(arguments: dict) -> dict:
     revision = revision_of(arguments.get("revision"))
     state = services()
-    found = problems(state, revision)
+    found = problems(state, revision, kept_images(arguments))
     # Dokploy deploys the branch head, which may have moved past this release.
     deployed = run(["git", "-C", str(CHECKOUT), "rev-parse", "HEAD"])
     if deployed != revision:
@@ -210,7 +242,7 @@ def worker(arguments: dict) -> dict:
     """Run the worker binary and Pumpkin image of the deployed release."""
     revision = revision_of(arguments.get("revision"))
     state = services()
-    found = problems(state, revision)
+    found = problems(state, revision, kept_images(arguments))
     if found:
         raise Failure("the deployed stack is not healthy at this release: " + "; ".join(found))
     pumpkin_image = f"melon-pumpkin:host-control-{revision}"

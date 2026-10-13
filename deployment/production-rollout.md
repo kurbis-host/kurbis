@@ -35,6 +35,14 @@ Dokploy CLI must be logged in (or set `DOKPLOY_URL` and `DOKPLOY_API_KEY`), and
    built from (`PUMPKIN_INPUTS` in `scripts/release.py` and the builder's
    toolchain). A release that changes none of it reuses them and only
    repackages the images.
+   The gateway and the lobby (`waiting-pumpkin`) carry every player
+   connection, so a release must not replace them without need. Their images
+   are named by what they are built from (`GATEWAY_IMAGE`: the crate modules
+   the gateway can reach, found by `gateway_modules` in `scripts/release.py`;
+   `WAITING_IMAGE`: the Pumpkin inputs and `deployment/waiting.toml`), built
+   here only when no image of that name exists, and Compose leaves a container
+   alone while its image name is unchanged. A release that changes neither
+   disconnects nobody.
 4. **Deploy.** Sets `BUILD_REVISION` in Dokploy, keeps auto-deploy off, queues
    one Dokploy deployment of `main` and waits for it. Dokploy builds one
    deployment at a time across all projects, so the wait (`--deploy-wait`,
