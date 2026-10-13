@@ -13,7 +13,7 @@ use super::{
     phase_timer::PhaseTimer,
     runtime::{
         ServerRuntime,
-        settings::{AccountLookups, render_pumpkin_config},
+        settings::{AccountLookups, PermissionLevel, render_pumpkin_config},
     },
 };
 use anyhow::{Context, Result, bail};
@@ -274,6 +274,7 @@ impl ServerRuntime for DockerRuntime {
             render_pumpkin_config(
                 settings,
                 AccountLookups::ThroughApiProxy,
+                PermissionLevel::Player,
                 25565,
                 19132,
                 "0.0.0.0:19132".parse()?,
@@ -707,6 +708,7 @@ mod tests {
         let config = render_pumpkin_config(
             &json!({"motd":"hello \"kurbis\"","view_distance":8}),
             AccountLookups::ThroughApiProxy,
+            PermissionLevel::Player,
             25565,
             19132,
             "0.0.0.0:19132".parse().unwrap(),

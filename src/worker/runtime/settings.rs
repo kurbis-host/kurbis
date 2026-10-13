@@ -17,9 +17,20 @@ pub(crate) enum AccountLookups {
     ThroughApiProxy,
 }
 
+/// The permission level of players who are not operators.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PermissionLevel {
+    /// A hosted server: only its operators may run privileged commands.
+    Player,
+    /// A CI preview exists to try a change out, so everyone who joins may
+    /// use gamemaster commands such as /gamemode, /give and /tp.
+    Gamemaster,
+}
+
 pub(crate) fn render_pumpkin_config(
     settings: &Value,
     account_lookups: AccountLookups,
+    default_permission_level: PermissionLevel,
     java_port: u16,
     bedrock_port: u16,
     signal_address: SocketAddr,
@@ -86,6 +97,8 @@ pub(crate) fn render_pumpkin_config(
          external_port = {external_port}\n\
          identity_key = \"nethernet-key.der\"\n\
          stun_servers = []\n\
+         [commands]\n\
+         default_op_level = {default_op_level}\n\
          [plugins]\n\
          allow_unsigned = false\n\
          [plugins.overrides.kurbis-control]\n\
@@ -95,6 +108,10 @@ pub(crate) fn render_pumpkin_config(
         difficulty = serde_json::to_string(difficulty).expect("string serialization cannot fail"),
         gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
         motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
+        default_op_level = match default_permission_level {
+            PermissionLevel::Player => 0,
+            PermissionLevel::Gamemaster => 2,
+        },
     )
 }
 
@@ -122,6 +139,7 @@ mod tests {
         let config = render_pumpkin_config(
             &Value::Null,
             AccountLookups::ThroughApiProxy,
+            PermissionLevel::Player,
             25565,
             19132,
             "0.0.0.0:19132".parse().unwrap(),
@@ -135,6 +153,7 @@ mod tests {
         );
         assert!(config.contains("[networking.bedrock]\nenabled = true\nonline_mode = true"));
         assert!(config.contains("[networking.bedrock.authentication]\nenabled = true"));
+        assert!(config.contains("[commands]\ndefault_op_level = 0\n"));
         assert!(config.contains(
             "[networking.java.authentication]\nurl = \"http://kurbis-runtime-api-proxy:8080/minecraft/session/hasJoined?username={username}&serverId={server_hash}\""
         ));
@@ -152,6 +171,7 @@ mod tests {
         let config = render_pumpkin_config(
             &Value::Null,
             AccountLookups::ThroughApiProxy,
+            PermissionLevel::Player,
             25565,
             19132,
             "0.0.0.0:19132".parse().unwrap(),

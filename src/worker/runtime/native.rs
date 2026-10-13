@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::{
     ServerRuntime,
-    settings::{AccountLookups, render_pumpkin_config},
+    settings::{AccountLookups, PermissionLevel, render_pumpkin_config},
 };
 use crate::{model::PlacementRecord, pumpkin_control::PumpkinControl};
 
@@ -171,6 +171,7 @@ impl ServerRuntime for NativeRuntime {
             render_pumpkin_config(
                 settings,
                 AccountLookups::Direct,
+                PermissionLevel::Player,
                 placement.java_port.try_into()?,
                 placement.bedrock_port.try_into()?,
                 SocketAddr::new(self.signal_address, placement.signal_port.try_into()?),

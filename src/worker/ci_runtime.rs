@@ -22,7 +22,7 @@ use crate::{
     ci::{CI_RUNTIME_DISK_BYTES, CiRuntimePlacement, CiRuntimeState},
     config::StorageMode,
     pumpkin_control::PumpkinControl,
-    worker::runtime::settings::{AccountLookups, render_pumpkin_config},
+    worker::runtime::settings::{AccountLookups, PermissionLevel, render_pumpkin_config},
     worker::{
         control_plane::WorkerControl,
         ingress::{
@@ -302,6 +302,7 @@ impl CiPreviewWorker {
         let pumpkin_config = render_pumpkin_config(
             &json!({"motd": format!("Kurbis preview {}", &placement.commit_sha[..12]), "view_distance": 10}),
             AccountLookups::ThroughApiProxy,
+            PermissionLevel::Gamemaster,
             25565,
             19132,
             "0.0.0.0:19132"
