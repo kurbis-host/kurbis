@@ -604,49 +604,28 @@ impl CiPreviewWorker {
             .storage
             .path(placement.preview_id)
             .join("run/host-control.sock");
-        if self.container_generation(placement.preview_id).await? == Some(placement.generation) {
-            self.recover_snapshot_barrier(placement).await?;
-            let mut boundary = WorkerSnapshotBoundary {
+        let exit = if self.container_generation(placement.preview_id).await?
+            == Some(placement.generation)
+        {
+            let mut runtime = WorkerRuntimeShutdown {
                 worker: self,
                 placement,
-                control: control.clone(),
-                socket: socket.clone(),
+                control,
+                socket,
             };
-            boundary
-                .begin_application_barrier()
-                .await
-                .context("establish durable application barrier before idle stop")?;
-            if let Err(shutdown_error) = control.shutdown(&socket).await {
-                if let Err(release_error) = boundary.end_application_barrier().await {
-                    return Err(shutdown_error).context(format!(
-                        "shutdown CI Pumpkin after quiescent save; barrier release failed: {release_error:#}"
-                    ));
-                }
-                return Err(shutdown_error).context("shutdown CI Pumpkin after quiescent save");
-            }
-            timeout(Duration::from_secs(60), async {
-                loop {
-                    if self
-                        .container_generation(placement.preview_id)
-                        .await?
-                        .is_none()
-                    {
-                        break;
-                    }
-                    sleep(Duration::from_millis(250)).await;
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .context("CI Pumpkin did not stop within 60 seconds")??;
+            shut_down_runtime(&mut runtime).await?
+        } else {
+            RuntimeExit::Killed
+        };
+        if exit == RuntimeExit::ShutDown {
             // Shutdown completed all final world writes; with the process gone,
             // this archive is a point-in-time checkpoint of the stopped world.
             self.persist_world_snapshot(placement).await?;
             self.clear_snapshot_barrier_marker(placement)?;
         } else {
-            // If the process disappeared during the stop, never archive its
-            // potentially partial local write set. Restore the last verified
-            // shared checkpoint or leave the stop claim retryable.
+            // If the process disappeared or was killed during the stop, never
+            // archive its potentially partial local write set. Restore the last
+            // verified shared checkpoint or leave the stop claim retryable.
             let runtime_dir = self.runtime_dir(placement.preview_id);
             let snapshot_path = runtime_dir.join("idle-recovery.tar.gz");
             let Some(_) = self
@@ -656,6 +635,8 @@ impl CiPreviewWorker {
             else {
                 bail!("CI runtime exited before a durable idle-stop checkpoint existed");
             };
+            tracing::warn!(preview_id = %placement.preview_id, generation = placement.generation,
+                "CI Pumpkin did not shut down cleanly; restoring its last verified world snapshot");
             let world = self.storage.path(placement.preview_id);
             self.storage.reset(placement.preview_id).await?;
             let (daemon_uid, daemon_gid) = self
@@ -1113,12 +1094,62 @@ impl SnapshotBarrier for WorkerSnapshotBoundary<'_> {
     }
 }
 
+struct WorkerRuntimeShutdown<'a> {
+    worker: &'a CiPreviewWorker,
+    placement: &'a CiRuntimePlacement,
+    control: PumpkinControl,
+    socket: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl RuntimeShutdown for WorkerRuntimeShutdown<'_> {
+    async fn host_control_listening(&mut self) -> Result<bool> {
+        match fs::symlink_metadata(&self.socket) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("inspect CI Pumpkin host-control socket"),
+        }
+    }
+
+    async fn release_interrupted_barrier(&mut self) -> Result<()> {
+        self.worker.recover_snapshot_barrier(self.placement).await
+    }
+
+    async fn request_shutdown(&mut self) -> Result<()> {
+        self.control.shutdown(&self.socket).await
+    }
+
+    async fn wait_for_exit(&mut self) -> Result<bool> {
+        let exited = timeout(Duration::from_secs(60), async {
+            while self
+                .worker
+                .container_generation(self.placement.preview_id)
+                .await?
+                .is_some()
+            {
+                sleep(Duration::from_millis(250)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        match exited {
+            Ok(result) => result.map(|()| true),
+            Err(_elapsed) => Ok(false),
+        }
+    }
+
+    async fn kill(&mut self) -> Result<()> {
+        self.worker.force_stop(self.placement).await
+    }
+}
+
 mod helpers;
 mod snapshot_barrier;
 mod world_snapshot;
 use helpers::*;
 use snapshot_barrier::{
-    SnapshotBarrier, publish_at_quiescent_boundary, recover_interrupted_boundary,
+    RuntimeExit, RuntimeShutdown, SnapshotBarrier, publish_at_quiescent_boundary,
+    recover_interrupted_boundary, shut_down_runtime,
 };
 use world_snapshot::{pack_world, unpack_world_snapshot};
 

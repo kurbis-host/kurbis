@@ -15,6 +15,51 @@ pub(super) trait SnapshotBarrier: Send {
     async fn end_application_barrier(&mut self) -> Result<()>;
 }
 
+/// How a CI Pumpkin left during an idle stop. Only a shutdown the worker asked
+/// for and saw finish has saved the world it leaves on disk.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RuntimeExit {
+    ShutDown,
+    Killed,
+}
+
+/// Worker-side steps of an idle stop.
+#[async_trait]
+pub(super) trait RuntimeShutdown: Send {
+    /// Pumpkin removes its host-control socket once it starts shutting down,
+    /// and from then on accepts no request, not even a barrier release.
+    async fn host_control_listening(&mut self) -> Result<bool>;
+    async fn release_interrupted_barrier(&mut self) -> Result<()>;
+    async fn request_shutdown(&mut self) -> Result<()>;
+    /// Wait a bounded time for the process to exit; false if it still runs.
+    async fn wait_for_exit(&mut self) -> Result<bool>;
+    async fn kill(&mut self) -> Result<()>;
+}
+
+/// Stop Pumpkin through its own shutdown, or kill it when that cannot finish.
+///
+/// Pumpkin's player-leave path waits for the snapshot barrier, so a shutdown
+/// under a held barrier never ends while a player is online. A runtime that
+/// is already shutting down without being asked, or never exits, is killed
+/// rather than retried forever.
+pub(super) async fn shut_down_runtime(runtime: &mut impl RuntimeShutdown) -> Result<RuntimeExit> {
+    if runtime.host_control_listening().await? {
+        runtime.release_interrupted_barrier().await?;
+        runtime
+            .request_shutdown()
+            .await
+            .context("shutdown CI Pumpkin")?;
+        if runtime.wait_for_exit().await? {
+            return Ok(RuntimeExit::ShutDown);
+        }
+    }
+    runtime
+        .kill()
+        .await
+        .context("kill CI Pumpkin that did not shut down")?;
+    Ok(RuntimeExit::Killed)
+}
+
 /// Recover the two-part quiescence protocol after a worker crashes. The
 /// generation marker is removed by the release future only after the app-level
 /// barrier acknowledges, so either failure leaves recovery retryable.
@@ -215,6 +260,111 @@ mod tests {
             *self.app_barrier.lock().unwrap() = false;
             Ok(())
         }
+    }
+
+    /// Pumpkin as an idle stop sees it. Its shutdown ends player tasks, and a
+    /// leaving player waits for the snapshot barrier, as the patch makes it.
+    #[derive(Default)]
+    struct FakePumpkin {
+        listening: bool,
+        barrier_held: bool,
+        player_online: bool,
+        hangs_in_shutdown: bool,
+        shutting_down: bool,
+        running: bool,
+        events: Vec<&'static str>,
+    }
+
+    impl FakePumpkin {
+        fn running() -> Self {
+            Self {
+                listening: true,
+                running: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeShutdown for FakePumpkin {
+        async fn host_control_listening(&mut self) -> Result<bool> {
+            Ok(self.listening)
+        }
+
+        async fn release_interrupted_barrier(&mut self) -> Result<()> {
+            anyhow::ensure!(self.listening, "No such file or directory (os error 2)");
+            self.barrier_held = false;
+            self.events.push("released");
+            Ok(())
+        }
+
+        async fn request_shutdown(&mut self) -> Result<()> {
+            anyhow::ensure!(self.listening, "No such file or directory (os error 2)");
+            self.listening = false;
+            self.shutting_down = true;
+            self.events.push("shutdown");
+            Ok(())
+        }
+
+        async fn wait_for_exit(&mut self) -> Result<bool> {
+            let deadlocked = self.barrier_held && self.player_online;
+            if self.shutting_down && !deadlocked && !self.hangs_in_shutdown {
+                self.running = false;
+            }
+            Ok(!self.running)
+        }
+
+        async fn kill(&mut self) -> Result<()> {
+            self.running = false;
+            self.events.push("killed");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_with_a_player_online_releases_the_barrier_before_shutdown() {
+        let mut pumpkin = FakePumpkin {
+            barrier_held: true,
+            player_online: true,
+            ..FakePumpkin::running()
+        };
+
+        let exit = shut_down_runtime(&mut pumpkin).await.unwrap();
+
+        assert_eq!(exit, RuntimeExit::ShutDown);
+        assert_eq!(pumpkin.events, vec!["released", "shutdown"]);
+    }
+
+    #[tokio::test]
+    async fn stop_kills_a_runtime_that_stopped_listening_without_asking_it_anything() {
+        // Production state of 2026-10-13: the old stop held the barrier across
+        // shutdown, a player was online, and Pumpkin hung with its socket gone.
+        let mut pumpkin = FakePumpkin {
+            listening: false,
+            barrier_held: true,
+            player_online: true,
+            shutting_down: true,
+            ..FakePumpkin::running()
+        };
+
+        let exit = shut_down_runtime(&mut pumpkin).await.unwrap();
+
+        assert_eq!(exit, RuntimeExit::Killed);
+        assert_eq!(pumpkin.events, vec!["killed"]);
+        assert!(!pumpkin.running);
+    }
+
+    #[tokio::test]
+    async fn stop_kills_a_runtime_that_does_not_exit_after_shutdown() {
+        let mut pumpkin = FakePumpkin {
+            hangs_in_shutdown: true,
+            ..FakePumpkin::running()
+        };
+
+        let exit = shut_down_runtime(&mut pumpkin).await.unwrap();
+
+        assert_eq!(exit, RuntimeExit::Killed);
+        assert_eq!(pumpkin.events, vec!["released", "shutdown", "killed"]);
     }
 
     #[tokio::test]
