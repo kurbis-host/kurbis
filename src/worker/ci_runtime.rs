@@ -546,14 +546,6 @@ impl CiPreviewWorker {
             self.control_plane.ci_runtime_lost(placement).await?;
             return Ok(());
         }
-        self.recover_snapshot_barrier(placement).await?;
-        if self
-            .control_plane
-            .ci_world_snapshot_requested(placement)
-            .await?
-        {
-            self.publish_quiescent_snapshot(placement, true).await?;
-        }
         let capability = fs::read_to_string(
             self.runtime_dir(placement.preview_id)
                 .join("runtime.capability"),
@@ -563,6 +555,28 @@ impl CiPreviewWorker {
             .path(placement.preview_id)
             .join("run/host-control.sock");
         let control = PumpkinControl::new(capability.trim().to_owned());
+        let mut runtime = WorkerRuntimeShutdown {
+            worker: self,
+            placement,
+            control: control.clone(),
+            socket: socket.clone(),
+        };
+        // Its next start restores the last verified snapshot, so killing it
+        // loses nothing its own shutdown would have kept.
+        if kill_if_shutting_down(&mut runtime).await? {
+            tracing::warn!(preview_id = %placement.preview_id, generation = placement.generation,
+                "CI Pumpkin began shutting down by itself; killed it and reported it lost");
+            self.control_plane.ci_runtime_lost(placement).await?;
+            return Ok(());
+        }
+        self.recover_snapshot_barrier(placement).await?;
+        if self
+            .control_plane
+            .ci_world_snapshot_requested(placement)
+            .await?
+        {
+            self.publish_quiescent_snapshot(placement, true).await?;
+        }
         control.status(&socket).await?;
         let players = control.players(&socket).await?;
         let report = players
@@ -1148,8 +1162,8 @@ mod snapshot_barrier;
 mod world_snapshot;
 use helpers::*;
 use snapshot_barrier::{
-    RuntimeExit, RuntimeShutdown, SnapshotBarrier, publish_at_quiescent_boundary,
-    recover_interrupted_boundary, shut_down_runtime,
+    RuntimeExit, RuntimeShutdown, SnapshotBarrier, kill_if_shutting_down,
+    publish_at_quiescent_boundary, recover_interrupted_boundary, shut_down_runtime,
 };
 use world_snapshot::{pack_world, unpack_world_snapshot};
 
