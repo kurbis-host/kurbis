@@ -221,21 +221,21 @@ impl CiPreviewRuntimeRepository {
         .await?;
         sqlx::query(
             "UPDATE ci_preview_aliases SET state = 'booting', runtime_generation = $2,
-                 expires_at = now() + interval '72 hours', updated_at = now() WHERE id = $1",
+                 expires_at = now() + interval '336 hours', updated_at = now() WHERE id = $1",
         )
         .bind(preview_id)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
+            "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '336 hours') END, updated_at = now()
              WHERE id = $1",
         )
         .bind(preview.build_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '72 hours') END
+            "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '336 hours') END
              FROM ci_builds build WHERE build.id = $1 AND artifact.digest = build.artifact_digest",
         )
         .bind(preview.build_id)
@@ -451,7 +451,7 @@ impl CiPreviewRuntimeRepository {
     pub async fn touch_player_activity(&self, preview_id: Uuid) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let build_id: Option<Uuid> = sqlx::query_scalar(
-            "UPDATE ci_preview_aliases SET expires_at = now() + interval '72 hours', updated_at = now()
+            "UPDATE ci_preview_aliases SET expires_at = now() + interval '336 hours', updated_at = now()
              WHERE id = $1 AND state = 'running' AND expires_at > now() RETURNING build_id",
         )
         .bind(preview_id)
@@ -466,14 +466,14 @@ impl CiPreviewRuntimeRepository {
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
+                "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '336 hours') END, updated_at = now()
                  WHERE id = $1",
             )
             .bind(build_id)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '72 hours') END
+                "UPDATE ci_artifacts artifact SET expires_at = CASE WHEN artifact.expires_at IS NULL THEN NULL ELSE GREATEST(artifact.expires_at, now() + interval '336 hours') END
                  FROM ci_builds build WHERE build.id = $1 AND artifact.digest = build.artifact_digest",
             )
             .bind(build_id)

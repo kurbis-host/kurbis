@@ -9,10 +9,10 @@ pub const CI_ROOT_DOMAIN: &str = "pumpkin.kurbis.host";
 /// The only repository admitted to the active CI watcher. Pull-request head
 /// repositories remain separate source inputs and are validated independently.
 pub const CI_TARGET_REPOSITORY: &str = "Pumpkin-MC/Pumpkin";
-pub const BUILD_TTL_HOURS: i64 = 72;
+pub const BUILD_TTL_HOURS: i64 = 14 * 24;
 
 /// Retention policy for immutable Pumpkin builds and their content-addressed artifacts.
-/// Preview builds follow the sliding 72-hour cache lifetime; the default-branch build
+/// Preview builds follow the sliding 14-day cache lifetime; the default-branch build
 /// is permanent until its build key changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

@@ -124,7 +124,7 @@ async fn object_artifact_cache_verifies_content_and_removes_expired_blobs() {
             &digest,
             &key,
             bytes,
-            Some(Utc::now() + chrono::Duration::hours(72)),
+            Some(Utc::now() + chrono::Duration::hours(BUILD_TTL_HOURS)),
         )
         .await
         .unwrap();

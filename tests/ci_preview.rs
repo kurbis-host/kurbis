@@ -10,8 +10,8 @@ use axum::{
 };
 use chrono::Utc;
 use kurbis_hoster::ci::{
-    BuildKey, CiBuildStage, CiHostname, CiPreviewRepository, CiRefKind, PollCheckpoint, PollResult,
-    SourceControlClient, SourceRef, SourceRefKind,
+    BUILD_TTL_HOURS, BuildKey, CiBuildStage, CiHostname, CiPreviewRepository, CiRefKind,
+    PollCheckpoint, PollResult, SourceControlClient, SourceRef, SourceRefKind,
 };
 use kurbis_hoster::{db, routing::RouteRepository};
 use sqlx::PgPool;

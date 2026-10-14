@@ -745,7 +745,7 @@ async fn runtime_coordinator_retains_world_on_idle_restarts_generation_and_delet
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(extended_ttl_hours >= 71.9);
+    assert!(extended_ttl_hours >= BUILD_TTL_HOURS as f64 - 0.1);
     let initial_worker = worker_id;
     let replacement_worker = foreign_worker;
     sqlx::query("UPDATE workers SET heartbeat_at=now()-interval '10 minutes' WHERE id=$1")

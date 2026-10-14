@@ -6,8 +6,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use kurbis_hoster::ci::{
-    ArtifactCache, BuildKey, BuildPipelineError, BuildRequest, CheckRunClient, CiBuildRetention,
-    CiBuildStage, CiHostname, CiPoller, CiPollerConfig, CiPreviewRepository,
+    ArtifactCache, BUILD_TTL_HOURS, BuildKey, BuildPipelineError, BuildRequest, CheckRunClient,
+    CiBuildRetention, CiBuildStage, CiHostname, CiPoller, CiPollerConfig, CiPreviewRepository,
     CiPreviewRuntimeCoordinator, CiPreviewRuntimeHost, CiPreviewRuntimeRepository, CiPreviewState,
     CiRefKind, CiRuntimePlacement, CiRuntimeState, ControlledBuildOutput, ControlledBuildPipeline,
     ControlledBuilder, PatchApplier, PollCheckpoint, PollError, PollResult, RuntimeCapability,
@@ -650,7 +650,7 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
             == CiPreviewState::Running
     );
 
-    // 4. A join/activity heartbeat slides the shared 72-hour TTL for alias,
+    // 4. A join/activity heartbeat slides the shared 14-day TTL for alias,
     // immutable build, and artifact together.
     sqlx::query("UPDATE ci_preview_aliases SET expires_at=now()+interval '1 minute' WHERE id=$1")
         .bind(placement.preview_id)
@@ -671,7 +671,7 @@ async fn pr_to_remote_receipt_to_runtime_join_ttl_and_expiry_is_atomic() {
     .await
     .unwrap();
     assert!(
-        ttl_hours > 71.9,
+        ttl_hours > BUILD_TTL_HOURS as f64 - 0.1,
         "join activity must slide preview TTL, got {ttl_hours}"
     );
 

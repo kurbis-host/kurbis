@@ -171,8 +171,8 @@ async fn ci_builds_deduplicate_and_stable_aliases_advance_only_when_ready() {
     let ttl_hours: f64 = sqlx::query_scalar("SELECT (extract(epoch FROM (expires_at - now())) / 3600)::float8 FROM ci_preview_aliases WHERE id = $1")
         .bind(running.id).fetch_one(&pool).await.unwrap();
     assert!(
-        ttl_hours >= 71.9,
-        "use should slide preview TTL to about 72h, got {ttl_hours}"
+        ttl_hours >= BUILD_TTL_HOURS as f64 - 0.1,
+        "use should slide preview TTL to about 14 days, got {ttl_hours}h"
     );
     sqlx::query(
         "UPDATE ci_preview_aliases SET expires_at = now() - interval '1 second' WHERE id = $1",

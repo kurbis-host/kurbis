@@ -114,7 +114,7 @@ impl CiPreviewRepository {
             "INSERT INTO ci_builds (repository, commit_sha, patch_fingerprint, toolchain_version,
                  target_architecture, stage, retention_policy, expires_at)
              VALUES ($1, $2, $3, $4, $5, 'queued', $6,
-                     CASE WHEN $6 = 'permanent' THEN NULL ELSE now() + interval '72 hours' END)
+                     CASE WHEN $6 = 'permanent' THEN NULL ELSE now() + interval '336 hours' END)
              ON CONFLICT (repository, commit_sha, patch_fingerprint, toolchain_version, target_architecture)
              DO NOTHING",
         )
@@ -168,7 +168,7 @@ impl CiPreviewRepository {
             sqlx::query_as::<_, CiBuildRow>(
                 "UPDATE ci_builds SET stage = 'queued', artifact_digest = NULL,
                     failure_stage = NULL, failure_message = NULL, failure_class = NULL, retry_at = NULL,
-                    expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '72 hours' END,
+                    expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '336 hours' END,
                     lease_token = NULL, lease_expires_at = NULL, updated_at = now()
                  WHERE id = $1 AND (lease_expires_at IS NULL OR lease_expires_at <= now())
                  RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -870,7 +870,7 @@ impl CiPreviewRepository {
                     failure_message = CASE WHEN $2 = 'failed' THEN $3 ELSE failure_message END,
                     failure_class = CASE WHEN $2 = 'failed' THEN 'permanent' ELSE failure_class END,
                     retry_at = CASE WHEN $2 = 'failed' THEN NULL ELSE retry_at END,
-                    expires_at = CASE WHEN $2 = 'ready' AND retention_policy = 'preview' THEN now() + interval '72 hours' ELSE expires_at END,
+                    expires_at = CASE WHEN $2 = 'ready' AND retention_policy = 'preview' THEN now() + interval '336 hours' ELSE expires_at END,
                     updated_at = now() WHERE id = $1
              RETURNING id, repository, commit_sha, patch_fingerprint, toolchain_version,
                        target_architecture, stage, artifact_digest, failure_stage, failure_message, build_log,
@@ -1324,7 +1324,7 @@ impl CiPreviewRepository {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO ci_artifacts (digest, object_key, size_bytes, expires_at)
-             SELECT $1, $2, $3, CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '72 hours' END
+             SELECT $1, $2, $3, CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '336 hours' END
              FROM ci_builds WHERE id = $4
              ON CONFLICT (digest) DO UPDATE SET expires_at = CASE
                  WHEN ci_artifacts.expires_at IS NULL OR EXCLUDED.expires_at IS NULL THEN NULL
@@ -1367,7 +1367,7 @@ impl CiPreviewRepository {
         if !owned {
             bail!("CI build lease is stale while publishing artifact");
         }
-        sqlx::query("INSERT INTO ci_artifacts(digest, object_key, size_bytes, expires_at) SELECT $1, $2, $3, CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '72 hours' END FROM ci_builds WHERE id = $4 ON CONFLICT(digest) DO UPDATE SET object_key = EXCLUDED.object_key, size_bytes = EXCLUDED.size_bytes, expires_at = CASE WHEN ci_artifacts.expires_at IS NULL OR EXCLUDED.expires_at IS NULL THEN NULL ELSE GREATEST(ci_artifacts.expires_at, EXCLUDED.expires_at) END")
+        sqlx::query("INSERT INTO ci_artifacts(digest, object_key, size_bytes, expires_at) SELECT $1, $2, $3, CASE WHEN retention_policy = 'permanent' THEN NULL ELSE now() + interval '336 hours' END FROM ci_builds WHERE id = $4 ON CONFLICT(digest) DO UPDATE SET object_key = EXCLUDED.object_key, size_bytes = EXCLUDED.size_bytes, expires_at = CASE WHEN ci_artifacts.expires_at IS NULL OR EXCLUDED.expires_at IS NULL THEN NULL ELSE GREATEST(ci_artifacts.expires_at, EXCLUDED.expires_at) END")
             .bind(digest).bind(object_key).bind(size_bytes).bind(build_id).execute(&mut *tx).await?;
         let updated = sqlx::query("UPDATE ci_builds SET artifact_digest = $3, updated_at = now() WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now() AND stage = 'packaging'")
             .bind(build_id).bind(lease).bind(digest).execute(&mut *tx).await?.rows_affected();
@@ -1429,7 +1429,7 @@ impl CiPreviewRepository {
         } else {
             sqlx::query_as::<_, CiPreviewRow>(
                 "INSERT INTO ci_preview_aliases (repository, commit_sha, kind, ref_name, hostname, build_id, state, expires_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $3 = 'branch' THEN 'lobby' ELSE 'queued' END, now() + interval '72 hours')
+                 VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $3 = 'branch' THEN 'lobby' ELSE 'queued' END, now() + interval '336 hours')
                  RETURNING id, repository, commit_sha, kind, hostname, build_id, state, runtime_generation, NULL::text AS failure_message, ''::text AS build_log, expires_at",
             ).bind(repository).bind(commit_sha).bind(kind.as_str()).bind(ref_name).bind(&alias.value).bind(build_id).fetch_one(&mut *tx).await?
         };
@@ -1624,7 +1624,7 @@ impl CiPreviewRepository {
                                                   WHERE artifact.digest = build.artifact_digest
                                                     AND (artifact.expires_at IS NULL OR artifact.expires_at > now()))
                                   THEN 'ready' ELSE 'queued' END,
-                     expires_at = CASE WHEN build.expires_at IS NULL THEN GREATEST(alias.expires_at, now() + interval '72 hours') ELSE GREATEST(alias.expires_at, build.expires_at, now() + interval '72 hours') END,
+                     expires_at = CASE WHEN build.expires_at IS NULL THEN GREATEST(alias.expires_at, now() + interval '336 hours') ELSE GREATEST(alias.expires_at, build.expires_at, now() + interval '336 hours') END,
                      updated_at = now()
                  FROM ci_builds build
                  WHERE alias.id = $1 AND alias.kind = 'branch' AND alias.state = 'lobby'
@@ -1710,11 +1710,11 @@ impl CiPreviewRepository {
     pub async fn touch_build(&self, build_id: Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let digest: Option<String> = sqlx::query_scalar(
-            "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
+            "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '336 hours') END, updated_at = now()
              WHERE id = $1 RETURNING artifact_digest",
         ).bind(build_id).fetch_optional(&mut *tx).await?.flatten();
         if let Some(digest) = digest {
-            sqlx::query("UPDATE ci_artifacts SET expires_at = CASE WHEN expires_at IS NULL THEN NULL ELSE GREATEST(expires_at, now() + interval '72 hours') END WHERE digest = $1")
+            sqlx::query("UPDATE ci_artifacts SET expires_at = CASE WHEN expires_at IS NULL THEN NULL ELSE GREATEST(expires_at, now() + interval '336 hours') END WHERE digest = $1")
                 .bind(digest).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -1724,16 +1724,16 @@ impl CiPreviewRepository {
     pub async fn touch_preview(&self, preview_id: Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let build_id: Option<Uuid> = sqlx::query_scalar(
-            "UPDATE ci_preview_aliases SET expires_at = GREATEST(expires_at, now() + interval '72 hours'), updated_at = now()
+            "UPDATE ci_preview_aliases SET expires_at = GREATEST(expires_at, now() + interval '336 hours'), updated_at = now()
              WHERE id = $1 AND state <> 'expired' RETURNING build_id",
         ).bind(preview_id).fetch_optional(&mut *tx).await?;
         if let Some(build_id) = build_id {
             let digest: Option<String> = sqlx::query_scalar(
-                "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '72 hours') END, updated_at = now()
+                "UPDATE ci_builds SET expires_at = CASE WHEN retention_policy = 'permanent' THEN NULL ELSE GREATEST(COALESCE(expires_at, now()), now() + interval '336 hours') END, updated_at = now()
                  WHERE id = $1 RETURNING artifact_digest",
             ).bind(build_id).fetch_one(&mut *tx).await?;
             if let Some(digest) = digest {
-                sqlx::query("UPDATE ci_artifacts SET expires_at = CASE WHEN expires_at IS NULL THEN NULL ELSE GREATEST(expires_at, now() + interval '72 hours') END WHERE digest = $1")
+                sqlx::query("UPDATE ci_artifacts SET expires_at = CASE WHEN expires_at IS NULL THEN NULL ELSE GREATEST(expires_at, now() + interval '336 hours') END WHERE digest = $1")
                     .bind(digest).execute(&mut *tx).await?;
             }
         }
@@ -1758,7 +1758,7 @@ impl CiPreviewRepository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        // Expired build diagnostics have the same 72-hour lifetime as the
+        // Expired build diagnostics have the same 14-day lifetime as the
         // artifact. Preserve only the small provider reconciliation tombstone
         // if GitHub has not yet accepted the terminal Check Run update.
         sqlx::query(
