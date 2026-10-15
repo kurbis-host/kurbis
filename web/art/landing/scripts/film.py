@@ -53,9 +53,12 @@ PART = {
     "dungeon": 4.05,  # stop
     "portal": 4.75,
     "nether": 5.55,  # stop
-    "end": 6.2,
+    "home": 6.25,  # through the second frame, and out in the valley
+    "ending": 6.5,  # stop
+    "end": 6.8,  # the film's last view: the browser's credits roll after it
 }
 END = PART["end"]
+NAME_STOP = 6.2  # where the camera rests on the Nether's name field
 
 # Moments of the story, as scroll positions.
 WAKE_UP = 0.25  # the pumpkin wakes on its cloud
@@ -70,7 +73,11 @@ BOARD = 3.64  # it is in the cart
 ARRIVE = 4.03  # the cart stops in the dungeon
 PORTAL_LIT = 4.90  # it jumps into the frame, and the portal lights
 THROUGH = 5.26  # the camera is in the portal: the set changes here, under the swirl
-WHITE = (0.645, 0.66, 0.705, 0.76)  # the cloud the dive goes through: closing, white, white, clear
+WHITE = (0.655, 0.668, 0.695, 0.72)  # the puff the dive goes through: closing, white, white, clear
+HOME = 6.34  # the camera is through the second frame: the set changes back to the valley, under the swirl
+SWIRL = ((5.13, 5.22, 5.30, 5.46), (6.27, 6.31, 6.37, 6.45))  # the portal's swirl fills the frame: closing, full, full, clear
+# The closing set's signs: what the service is, a pair of lines each (lib/landing/copy.ts says the same).
+SPECS = (["ONE SERVER", "PER PLAYER"], ["2 GB RAM", "5 GB WORLD"], ["JAVA AND", "BEDROCK"], ["STARTS IN", "ABOUT 5 S"], ["STOPS AFTER", "5 MIN EMPTY"], ["NO PLAYER", "LIMIT"])
 
 PACE = 2.0  # seconds per screen in the previs
 FRAME = {"tall": False}  # which way up the frame is: wide (16:9) or tall (9:16)
@@ -92,9 +99,9 @@ S = {}  # scene state shared by the builders
 AT_SKY = {"sky_hover": 1.0, "sky_click": 2.6, "cloud_click": 4.6}
 AT_SURFACE = {"pond_click": 1.8, "friend_click": 4.2, "tree_click": 6.4, "pumpkin_click": 8.4}
 AT_CAVE = {"lever_hover": 1.4, "lever_off": 2.6, "lever_on": 8.0}
-AT_ORES = {"tile_2": 1.4, "tile_5": 3.9}  # points at one tile of the ore wall, then at the chest
-AT_SPAWNER = {"sign_1": 2.0}  # clicks the second sign
+AT_HOME = {}  # (the page plays the homestead's features; nothing to point at here)
 AT_NETHER = {"name_focus": 1.2, "name_type": 2.0, "name_enter": 5.6}
+AT_ENDING = {}  # (the page plays the closing set's book; nothing to point at here)
 
 
 def sessions():
@@ -103,11 +110,11 @@ def sessions():
     stop and stay there, to look at its life on its own."""
     return {
         "scroll": anim.Session("scroll", END, PACE),
-        "visit": anim.Session("visit", END, PACE, lead=1.0, tail=1.5, stops=[(0.12, 7.0, AT_SKY), (1.30, 10.5, AT_SURFACE), (3.40, 12.5, AT_CAVE), (4.22, 7.2, AT_ORES), (4.62, 11.0, AT_SPAWNER), (END, 8.0, AT_NETHER)]),
+        "visit": anim.Session("visit", END, PACE, lead=1.0, tail=1.5, stops=[(0.12, 7.0, AT_SKY), (1.30, 10.5, AT_SURFACE), (3.40, 12.5, AT_CAVE), (4.18, 7.2, AT_HOME), (4.38, 7.2, AT_HOME), (NAME_STOP, 8.0, AT_NETHER), (6.62, 9.0, AT_ENDING), (END, 6.0)]),
         # The end: the visitor types a name, it is free, the frame lights, Enter.
-        "nether": anim.Session("nether", END, PACE, lead=0.0, tail=1.5, stops=[(END, 9.0, AT_NETHER)]),
+        "nether": anim.Session("nether", NAME_STOP, PACE, lead=0.0, tail=1.5, stops=[(NAME_STOP, 9.0, AT_NETHER)]),
         # The dungeon: left alone, its two chambers show themselves.
-        "dungeon": anim.Session("dungeon", 4.62, PACE, lead=0.0, tail=1.0, stops=[(4.22, 14.0), (4.62, 21.0)]),
+        "dungeon": anim.Session("dungeon", 4.74, PACE, lead=0.0, tail=1.0, stops=[(4.18, 8.0), (4.38, 8.0)]),
         # The first two stops only: left alone, and played with.
         "idle": anim.Session("idle", 1.30, PACE, lead=0.0, tail=12.0, stops=[(0.12, 6.0)]),
         "play": anim.Session("play", 1.30, PACE, lead=0.0, tail=1.5, stops=[(0.12, 7.0, AT_SKY), (1.30, 10.5, AT_SURFACE)]),
@@ -159,21 +166,6 @@ def type_block(name, lines, at, palettes="gold", cell=0.1, depth=4, leading=3, y
 
 
 # -- base --------------------------------------------------------------------
-def ore_wall():
-    """The dungeon's ore wall, by aspect: the room's height, the five ore tiles in
-    reading order as (south edge y, feet above the floor), and the backups chest as
-    (y, feet above the floor, standing on a ledge of the wall or not).
-
-    Wide: five in a row, the chest on the floor under the middle one. Tall: two across
-    and three up, the chest on a ledge as the sixth tile, in a room high enough for them."""
-    d = wld.SPOTS["dungeon"]
-    mid = (d["ores"][0] + d["ores"][-1]) / 2 + 1.0
-    return P(
-        {"height": d["height"], "tiles": [(y, 3) for y in d["ores"]], "chest": (mid, 0, False)},
-        {"height": 12, "tiles": [(20, 7), (16, 7), (20, 4), (16, 4), (20, 1)], "chest": (17.0, 2, True)},
-    )
-
-
 # Facts embossed on the cut face beside the dig: (lines, palettes, cell, (centre x, bottom z))
 def bands(tall=None):
     """Wide: two lines each, beside the dig. Tall: four short lines each, close beside
@@ -181,12 +173,12 @@ def bands(tall=None):
     Without an argument, the ones for the frame being built."""
     return (
         (
-            (("COST: NOTHING.", "NO CARD. NO ADS."), ("gold", "cream"), 0.1, (6.6, -3.9)),
-            (("2 GB RAM. 5 GB WORLD.", "ONE SERVER EACH."), ("gold", "cream"), 0.085, (2.0, -12.9)),
+            (("ONE SERVER EACH.", "2 GB RAM. 5 GB WORLD."), ("gold", "cream"), 0.085, (6.2, -3.9)),
+            (("BIGGER SERVERS ARE PAID.", "THEY PAY FOR YOURS."), ("gold", "cream"), 0.085, (2.0, -12.9)),
         ),
         (
-            (("COST:", "NOTHING.", "NO CARD.", "NO ADS."), ("gold", "gold", "cream", "cream"), 0.09, (2.75, -5.4)),
-            (("2 GB RAM.", "5 GB WORLD.", "ONE SERVER", "EACH."), ("gold", "gold", "cream", "cream"), 0.08, (-0.75, -14.5)),
+            (("ONE SERVER", "EACH.", "2 GB RAM.", "5 GB WORLD."), ("gold", "gold", "cream", "cream"), 0.09, (2.75, -5.4)),
+            (("BIGGER", "SERVERS", "ARE PAID.", "THEY PAY", "FOR YOURS."), ("gold", "gold", "gold", "cream", "cream"), 0.08, (-0.75, -14.5)),
         ),
     )[FRAME["tall"] if tall is None else tall]
 
@@ -198,6 +190,12 @@ def build_base():
     S.clear()
     b = blk.build_registry()
     mascot.register(b)
+    pumpkin_faces = boxmodel.pumpkin_faces(b)  # (what the friends wear on Halloween: see `pumpkins`)
+    # The hero's cloud has blocks of its own, a flat colour on each face (see `SKY_TONES`). They
+    # draw from the world's atlas but stay out of its registry, which the page gets with the grids.
+    sky = blk.Blocks(b.atlas)
+    for name, tone in SKY_TONES.items():
+        sky.cube(name, side=sky.flat(tone["side"]), front=sky.flat(tone["front"]), top=sky.flat(tone["top"]), bottom=sky.flat(tone["bottom"]), group="cloud")
     b.atlas.bake()
     mats = {
         "voxel": blk.voxel_material("Voxel", b.atlas, emit_strength=4.0),
@@ -212,7 +210,7 @@ def build_base():
         "wave": blk.flat_material("SnapshotWave", (1.0, 0.78, 0.3), alpha=0.99, emit=5.0),
         "water": blk.flat_material("Water", (0.03, 0.22, 0.80), alpha=0.74, roughness=0.3),
         "cloud": blk.flat_material("Cloud", (1.0, 0.80, 0.74), alpha=0.8, emit=0.16, emit_rgb=(1.0, 0.50, 0.46), roughness=1.0, dither=True),
-        "cloud_near": blk.flat_material("CloudNear", (0.90, 0.80, 0.82), emit=0.05, emit_rgb=(1.0, 0.6, 0.6), roughness=1.0),
+        "sky_cloud": blk.voxel_material("SkyCloud", b.atlas, emit_strength=0.0, self_illum=0.5, roughness=1.0),  # (the hero's: its faces' colours carry its shading)
         "leaf": blk.flat_material("Leaf", (1.0, 0.42, 0.08), emit=0.5, roughness=0.8),
         "petal": blk.flat_material("Petal", (1.0, 0.62, 0.78), emit=0.45, roughness=0.8),
         "line": blk.flat_material("Line", (0.92, 0.92, 0.95), emit=0.3),
@@ -230,9 +228,7 @@ def build_base():
         cols = max(font.line_mask(line).shape[1] for line in lines)
         rows = len(lines) * font.ROWS + (len(lines) - 1) * 3
         flat.append((x - cols * cell / 2 - 0.8, x + cols * cell / 2 + 0.8, z - 0.8, z + rows * cell + 0.8))
-    ow = ore_wall()
-    cy, cup, shelf = ow["chest"]
-    w = wld.World(b, flat=flat, dungeon={"height": ow["height"], "ores": ow["tiles"], "ledge": (int(cy) - 1, cup - 1) if shelf else None}).generate()
+    w = wld.World(b, flat=flat).generate()
     closed = voxel.ALL_CLOSED_BUT_FRONT_AND_TOP
     voxel.grid_object("Terrain", w.grid, b, mats["voxel"], "World", origin=w.origin, closed=closed)
     # Everything that grows moves in the wind, and the water swells (see kurbis/life.py).
@@ -277,7 +273,7 @@ def build_base():
     cam = look.camera("Cam_Film", (0.0, 4.0, 31.0), (0.0, 60.0, 33.9), lens=28)
     scene.camera = cam
     S.update(
-        scene=scene, b=b, mats=mats, w=w, cam=cam, sun=sun, comp=comp,
+        scene=scene, b=b, sky=sky, mats=mats, w=w, cam=cam, sun=sun, comp=comp, pumpkin_faces=pumpkin_faces,
         white=look.overlay("Cover_Cloud", cam, rgb=(1.0, 0.84, 0.80), strength=1.3),
         swirl=look.overlay("Cover_Portal", cam, image_rel="block/nether_portal.png", strength=2.4),
     )
@@ -310,6 +306,15 @@ def new_actor(name):
     return actor
 
 
+def pumpkins(rig):
+    """What a friend wears on Halloween, as the game's mobs do: a carved pumpkin, and a lit
+    one for the dark (see `boxmodel.pumpkin`). Both hidden: only the page shows one, and
+    only on that day (lib/landing/film/dates.ts)."""
+    for worn in boxmodel.pumpkin(rig, S["b"], S["pumpkin_faces"], S["mats"]["voxel"]).values():
+        hidden(worn)
+    return rig
+
+
 # -- sky and valley -----------------------------------------------------------
 HERO_EYE = V(0.0, 4.0, 31.0)
 HERO_PUMPKIN = V(0.425, 11.4, 30.5)
@@ -323,6 +328,216 @@ def toward(obj, k=0.5, eye=HERO_EYE):
     from the eye is unchanged, but the thing is nearer and smaller."""
     obj.location = Vector(obj.location) * k + eye * (1 - k)
     obj.scale = Vector(obj.scale) * k
+
+
+# -- the hero's cloud ----------------------------------------------------------
+# What the pumpkin sleeps on in the hero. Change the word and export: nothing else needs to
+# know (each perch is built round its type and says where the caption, the name field and the
+# cue go; the page lays the field out where the art put `Hero_Field`).
+#   "game"     the game's own clouds: one flat slab of big square cells, a little see-through,
+#              shaded as the game shades their faces; the caption and the field together on its face
+#   "cumulus"  a cumulus in blocks a quarter of the sleeper's size: one body, the sleeper on its
+#              top step, the caption and the field on two terraces in its front
+#   "island"   a floating island at the game's scale, grass and earth over stone, sitting in a ring
+#              of cloud: the caption and the field on its earth
+# The cumulus keeps clear of the treeline where someone is seen now and then (`set_valley`); the
+# game's slab stands in front of him in both frames, and the island's earth in the tall one, so
+# either of those needs another place for him.
+PERCH = "cumulus"
+# Where the sleeper's floor is, and how near the lens the cloud may come (the pumpkin's fall
+# off it must clear it), before `toward` pulls the hero in.
+PERCH_TOP, PERCH_FRONT = 30.0, 15.8
+# The faces of the clouds' blocks (sRGB): top, the sides, the front, the underside. The game's
+# cloud is shaded as the game shades one (the sides along x a little brighter than front and
+# back). The cumulus is lit from behind by the sunset: gold on top, lilac in front, lighter high
+# up and bluer underneath. (The hero's warm light makes all of them pinker on screen.)
+SKY_TONES = {
+    "game": {"top": (1.0, 0.94, 0.86), "side": (0.86, 0.80, 0.90), "front": (0.80, 0.74, 0.86), "bottom": (0.62, 0.56, 0.76)},
+    "puff_high": {"top": (1.0, 0.90, 0.74), "side": (0.80, 0.68, 0.86), "front": (0.86, 0.76, 0.84), "bottom": (0.64, 0.56, 0.82)},
+    "puff": {"top": (1.0, 0.88, 0.74), "side": (0.73, 0.62, 0.85), "front": (0.79, 0.71, 0.84), "bottom": (0.60, 0.52, 0.82)},
+    "puff_low": {"top": (0.90, 0.80, 0.82), "side": (0.62, 0.54, 0.80), "front": (0.70, 0.63, 0.85), "bottom": (0.50, 0.43, 0.76)},
+}
+
+
+def perch_type(cap_lines, cap_cell, field):
+    """The room the hero's type takes (before `toward`): the caption's width and height, and
+    the name field's line at its widest as the page lays it (film/sky-field.ts: the room, the
+    cursor after it, a cell and the host), its height over its foot and its underline's under it."""
+    rows, cols = font.text_mask(cap_lines, leading=3).shape
+    host = font.line_mask(".KURBIS.HOST").shape[1]
+    cell = field["cell"]
+    return {"cap": (cols * cap_cell, rows * cap_cell), "field": ((field["room"] + 7 + 1 + host) * cell, 8 * cell, 3 * cell)}
+
+
+def perch_game(t, cx):
+    """The game's own cloud: one flat slab a third as thick as its cells are wide, as the
+    game's are, with cells missing round its edge, and a little see-through, as the game's are.
+    The cells in front are as many as the type needs, and the caption and the field share their
+    face, the field under the caption."""
+    b, sky, mats = S["b"], S["sky"], S["mats"]
+    (cap_w, cap_h), (f_w, f_up, f_down) = t["cap"], t["field"]
+    margin, gap = 0.3, 0.34
+    thick = margin + cap_h + gap + f_up + f_down + margin
+    cell = 3 * thick
+    front = math.ceil((max(cap_w, f_w) + 1.2) / cell)
+    # Seen from above, front row first. The cells either side of the face sit a cell back,
+    # where the frame's edges cut them; behind the sleeper the slab goes on out of sight.
+    mask = np.array(P(["0110", "1111", "0111"], ["010", "111", "110"]) if front <= 2 else ["1" * front] * 3)
+    mask = np.array([[c == "1" for c in row] for row in mask]).T
+    grid = np.zeros(mask.shape + (1,), np.uint8)
+    grid[mask, 0] = sky["game"]
+    nx = mask.shape[0]
+    thin = blk.voxel_material("SkyCloudThin", b.atlas, emit_strength=0.0, self_illum=0.5, roughness=1.0, alpha=0.85)
+    slab = voxel.grid_object("Hero_Perch", grid, sky, thin, "World", group="cloud", scale=(cell, cell, thick), origin=(cx - nx * cell / 2, PERCH_FRONT, PERCH_TOP - thick))
+    cap_z = PERCH_TOP - margin - cap_h
+    foot = cap_z - gap - f_up
+    return {"root": slab, "caption": (cx, PERCH_FRONT, cap_z), "palette": "plum", "field": (cx, PERCH_FRONT, foot), "bottom": PERCH_TOP - thick}
+
+
+def _stack(boxes, puffs=()):
+    """A grid of round puffs, each ((x, y, z), (rx, ry, rz), block), filling the cells whose
+    middles are inside, and boxes of cells over them, each (x0, x1, y0, y1, z0, z1, block), later
+    ones over earlier ones (block 0 carves). All in cells, counted from the middle of the perch's
+    face (x), back from it (y) and up from the sleeper's floor (z). Returns the grid and where
+    its first cell is."""
+    ends = [box[:6] for box in boxes] + [(x - rx, x + rx, y - ry, y + ry, z - rz, z + rz) for (x, y, z), (rx, ry, rz), _ in puffs]
+    lo = np.floor(np.min([end[0:6:2] for end in ends], axis=0)).astype(int)
+    hi = np.ceil(np.max([end[1:6:2] for end in ends], axis=0)).astype(int)
+    grid = np.zeros(tuple(hi - lo), np.uint8)
+    middles = np.indices(grid.shape).transpose(1, 2, 3, 0) + lo + 0.5
+    for centre, radii, block in puffs:
+        grid[(((middles - centre) / np.asarray(radii)) ** 2).sum(-1) <= 1.0] = block
+    for x0, x1, y0, y1, z0, z1, block in boxes:
+        grid[max(x0 - lo[0], 0) : x1 - lo[0], max(y0 - lo[1], 0) : y1 - lo[1], max(z0 - lo[2], 0) : z1 - lo[2]] = block
+    return grid, lo
+
+
+def perch_cumulus(t, cx):
+    """A cumulus in blocks a quarter of the sleeper's size: one body, with a flat top for it to
+    sleep on (nothing rises beside it), its shoulders stepping down either side, lumps under
+    it, and in its front two terraces, the caption's and the field's, a block nearer and a
+    block wider, each its line of type's width and a margin. The lumps underneath are bluer,
+    as a cloud is further from the sun there."""
+    sky, mats = S["sky"], S["mats"]
+    (cap_w, cap_h), (f_w, f_up, f_down) = t["cap"], t["field"]
+    v = 0.5
+    c = math.ceil((cap_w / 2 + 0.3) / v)  # the caption's terrace, either side of the middle
+    f = max(math.ceil((f_w / 2 + 0.3) / v), c + 1)  # and the field's
+    cr = math.ceil((cap_h + 0.15) / v)  # their heights
+    fr = math.ceil((f_up + f_down + 0.3) / v)
+    d = cr + fr
+    puff, low = sky["puff"], sky["puff_low"]
+    w = P(c + 2, c + 3)
+    # Its shoulders: round, and stepping down from the top to a smaller puff at each end (by the Zs, a little lower).
+    puffs = P(
+        [
+            ((-w, 7.0, -2.0), (4.5, 5.0, 2.2), puff),
+            ((-w - 4.5, 6.5, -1.8), (2.0, 3.5, 1.0), puff),
+            ((w, 7.5, -2.2), (4.0, 5.0, 2.0), puff),
+            ((w + 4.0, 7.0, -2.6), (1.8, 3.5, 1.0), puff),
+            ((-4.0, 6.0, -d - 1), (5.0, 4.0, 1.6), low),
+            ((4.0, 6.5, -d - 1.2), (4.5, 4.0, 1.4), low),
+        ],
+        [
+            ((-w, 6.5, -2.2), (3.5, 4.5, 2.2), puff),
+            ((-w - 3.5, 6.0, -2.4), (1.8, 3.5, 1.2), puff),
+            ((w, 7.0, -2.4), (3.2, 4.5, 2.0), puff),
+            ((w + 3.2, 6.5, -2.8), (1.6, 3.5, 1.0), puff),
+            ((-3.0, 6.0, -d - 1), (4.0, 3.5, 1.5), low),
+            ((4.0, 6.0, -d - 1.2), (4.0, 3.5, 1.5), low),
+        ],
+    )
+    boxes = [
+        (-w, w, 2, 13, -d - 1, 0, puff),  # the body
+        (-2, 5, 1, 13, 0, 12, 0),  # the sleeper's room, and the Zs'
+        (-c, c, -9, 1, -cr, 12, 0),  # nothing in front of the caption,
+        (-f, f, -9, 0, -d, -cr, 0),  # nor of the field
+        (-c, c, 1, 4, -cr, 0, puff),  # the caption's terrace
+        (-f, f, 0, 3, -d, -cr, puff),  # the field's
+    ]
+    grid, lo = _stack(boxes, puffs)
+    x, z = np.indices(grid.shape)[0] + lo[0], np.indices(grid.shape)[2] + lo[2]
+    # Its wings are thinner than its belly, which holds the type: under the left one is the
+    # treeline where, now and then, someone stands looking up (`set_valley`).
+    wing, under = P((9, -3), (5, -4))
+    grid[(np.abs(x + 0.5) > wing) & (z < under)] = 0
+    # Seen from the lens, no column of its front stands nearer than the one beside it toward the middle: its side
+    # would show there, a seam of shade on the light front. Such a column is filled forward to it, from the ends in.
+    first = np.where((grid > 0).any(1), (grid > 0).argmax(1), -1)  # (x, z): where each column starts, from the front (-1: empty)
+    middle = -lo[0]
+    for i, inner in [(i, i + 1) for i in range(middle)] + [(i, i - 1) for i in range(grid.shape[0] - 1, middle, -1)]:
+        for k in np.nonzero((first[i] >= 0) & (first[inner] > first[i]))[0]:
+            grid[inner, first[i, k] : first[inner, k], k] = puff
+            first[inner, k] = first[i, k]
+    grid[(grid > 0) & (z >= 2)] = sky["puff_high"]  # (lighter as it rises toward the sun, bluer underneath)
+    grid[(grid > 0) & (z < -d)] = low
+    cloud = voxel.grid_object("Hero_Perch", grid, sky, mats["sky_cloud"], "World", group="cloud", scale=v, origin=(cx + lo[0] * v, PERCH_FRONT + lo[1] * v, PERCH_TOP + lo[2] * v))
+    cap_z = PERCH_TOP - (cr * v + cap_h) / 2
+    foot = PERCH_TOP - cr * v - (fr * v + f_up - f_down) / 2
+    return {"root": cloud, "caption": (cx, PERCH_FRONT + v, cap_z), "palette": "plum", "field": (cx, PERCH_FRONT, foot), "bottom": PERCH_TOP - d * v}
+
+
+def perch_island(t, cx):
+    """A floating island at the game's own scale (a block is the sleeper's size): grass over
+    earth, stone under them narrowing to a point, with an ore in it, sitting in a ring of cloud.
+    The type is on the earth of its face: the caption under the grass's lip, the field under the
+    caption (on the block below, in the tall frame, whose caption takes three lines)."""
+    b, sky, mats = S["b"], S["sky"], S["mats"]
+    (cap_w, cap_h), (f_w, f_up, f_down) = t["cap"], t["field"]
+    s, v = 2.0, 0.5  # the island's blocks, and the cloud's
+    n = math.ceil((max(cap_w, f_w) + 0.8) / s)
+    # Layers from the top, seen from above, front row first: grass, earth, stone, stone.
+    layers = P(
+        (["1111", "1111", "0110"], ["1111", "1111", "0110"], ["0110", "1111", "0100"], ["0110", "0010", "0000"], ["0100", "0000", "0000"]),
+        (["111", "111", "011"], ["111", "111", "010"], ["011", "110", "000"], ["010", "000", "000"]),
+    )
+    kinds = ("grass", "dirt", "stone", "stone", "stone")
+    depth = len(layers)
+    grid = np.zeros((n, 3, depth), np.uint8)
+    for z, (rows, kind) in enumerate(zip(layers, kinds)):
+        for y, row in enumerate(rows):
+            for x, c in enumerate(row[:n]):
+                if c == "1":
+                    grid[x, y, depth - 1 - z] = b[kind]
+    grid[n // 2, 0, depth - 3] = b["coal_ore"]  # (something to dig for)
+    island = voxel.grid_object("Hero_Perch", grid, b, mats["voxel"], "World", scale=s, origin=(cx - n * s / 2, PERCH_FRONT, PERCH_TOP - depth * s))
+    lip = PERCH_TOP - s / 4  # (the grass hangs a quarter of the way down its block's face)
+    gap = 0.17
+    if FRAME["tall"]:
+        cap_z = lip - (lip - (PERCH_TOP - s) + cap_h) / 2
+        foot = PERCH_TOP - s - 0.25 - f_up
+    else:
+        cap_z = lip - (lip - (PERCH_TOP - s) - cap_h - gap - f_up - f_down) / 2 - cap_h
+        foot = cap_z - gap - f_up
+    under = foot - f_down - 0.2  # the cloud's top, under the type
+    # The ring of cloud, in its own blocks counted from the middle of the face, back from it and up
+    # from the sleeper's floor: a band across the front, puffs either side and one behind.
+    side = n * s / v / 2
+    top = math.floor((under - PERCH_TOP) / v)
+    puffs = [
+        ((0.0, 1.0, top - 1.6), (side + 3.0, 3.0, 1.6), sky["puff"]),
+        ((-side - 2.5, 5.0, top - 2.2), (3.0, 4.5, 2.2), sky["puff"]),  # (no higher than the band: the treeline is under the left one)
+        ((side + 2.5, 5.5, top - 2.0), (2.8, 4.0, 2.0), sky["puff"]),
+        ((1.0, 11.0, top - 1.0), (side + 1.0, 3.0, 1.6), sky["puff"]),
+    ]
+    k = round(s / v)  # (the cloud's blocks to one of the island's)
+    inside = [(k * x - k * n // 2, k * x - k * n // 2 + k, k * y, k * y + k, k * (z - depth), k * (z - depth) + k, 0) for x, y, z in zip(*np.nonzero(grid))]
+    ring, lo = _stack([(-k * n // 2, k * n // 2, -9, 0, top, 0, 0)] + inside, puffs)  # (nothing over the type, nor in the island)
+    zs = np.indices(ring.shape)[2] + lo[2]
+    ring[(ring > 0) & (zs < top - 2)] = sky["puff_low"]
+    skirt = voxel.grid_object("Hero_Perch_Cloud", ring, sky, mats["sky_cloud"], "World", group="cloud", scale=v, origin=(cx + lo[0] * v, PERCH_FRONT + lo[1] * v, PERCH_TOP + lo[2] * v))
+    skirt.parent = island
+    return {"root": island, "caption": (cx, PERCH_FRONT, cap_z), "palette": "plum", "field": (cx, PERCH_FRONT, foot), "bottom": PERCH_TOP + top * v}
+
+
+# Each perch is given the room its type takes (`perch_type`) and the middle of its face, and
+# gives back its root, where the caption and the field's line go (the middle of each one's foot,
+# on the face it stands out of), the caption's colours, and its face's foot (the tall frame's cue
+# hangs under it).
+PERCHES = {"game": perch_game, "cumulus": perch_cumulus, "island": perch_island}
+# The type's cells on each perch, wide and tall: the caption's and the name field's. The island's
+# face is one of the game's blocks, which holds both lines in the wide frame only a size smaller.
+TYPE_CELLS = {"game": ((0.042, 0.042), (0.042, 0.034)), "cumulus": ((0.042, 0.042), (0.042, 0.034)), "island": ((0.036, 0.036), (0.042, 0.034))}
 
 
 def set_valley():
@@ -343,8 +558,18 @@ def set_valley():
     for name, center, cells, cell, seed in clouds:
         far = scenery.cloud(f"Cloud_{name}", b, mats["cloud"], center, cells, cell, seed, "World", profile=(1, 0))
         live(far, "location", lambda t: (0.22 * t, 0.04 * t, 0.0))  # they drift with the wind
-    # The layer the dive goes through: out of the hero frame, right under the camera.
-    scenery.cloud("Cloud_dive", b, mats["cloud"], (-1, 3, 19.8), (7, 5), (3.0, 3.0, 1.4), 12, "World", profile=(1, 0))
+    # The deck the dive goes through: out of the hero frame, under the camera. Puffs with the
+    # meadow showing between them, so it reads as cloud from above; the pumpkin drops into
+    # the one on its line, and the camera follows it through (the only white of the dive).
+    for k, (center, cells, seed) in enumerate((
+        ((-0.7, 3.0, 19.8), (3, 3), 12),  # on the line of the fall
+        ((-13.0, 9.0, 20.6), (4, 3), 3),
+        ((10.0, 13.0, 19.4), (4, 3), 7),
+        ((-4.0, 20.5, 21.2), (5, 2), 9),
+        ((-13.0, -4.0, 19.0), (3, 3), 5),
+        ((11.0, 0.0, 21.6), (3, 3), 11),
+    )):
+        scenery.cloud(f"Cloud_dive_{k}", b, mats["cloud"], center, cells, (3.0, 3.0, 1.4), seed, "World", profile=(1, 0))
     # Leaves on the wind, each travelling for ever inside its box. The boxes keep clear of
     # the lens and of the air in front of the address.
     for name, material, lo, hi, count, size, seed, velocity in (
@@ -367,23 +592,30 @@ def set_valley():
         card.parent = title
         card.location = (0, 6 * 0.5 + 0.5, rows * 0.5 / 2)
 
-    # The perch: a slab with a riser on it, the caption on the riser's face. Narrower and
-    # with a taller riser in the tall frame, where the caption takes three lines.
-    footprint, risers = P((12, 8), (9, 8)), P(3, 4)
-    step, perch = (0.7, 0.7, 0.35), V(0.5, 18.6, 30.0 - 0.35 * (2 + risers))
-    mask = np.ones(footprint, bool)
-    mask[:1, 1:] = mask[-1:, 2:] = False
-    mask[:3, -2:] = mask[-3:, -1:] = False
-    near = [scenery.cloud("Hero_Perch", b, mats["cloud_near"], perch, footprint, step, col="World", profile=(1, 0) + (1,) * risers, mask=mask)]
-    ledge = perch.z + step[2] * 2
-    cap_cell, depth = 0.042, 3
+    # The perch: the pumpkin's cloud (`PERCH`), built round its type, so that the caption and
+    # the name field fit on it in either frame, centred under the title. Under the caption is
+    # the field's place: the foot of its line, which the page lays out (film/sky-field.ts) at
+    # its cell, a name having `room` cells before it is set smaller.
+    (cap_cell, field_cell), depth = P(*TYPE_CELLS[PERCH]), 3
     cap_lines = P(["FREE MINECRAFT SERVERS", "FOR YOU AND YOUR FRIENDS"], ["FREE MINECRAFT", "SERVERS FOR YOU", "AND YOUR FRIENDS"])
-    cap_rows = len(cap_lines) * font.ROWS + (len(cap_lines) - 1) * 3
-    caption = font.text_object("Hero_Caption", cap_lines, b, mats["type"], "Type", palette="plum", cell=cap_cell, depth=depth, leading=3)
-    caption.location = (perch.x, perch.y - step[1] * 3 - depth * cap_cell, ledge + (step[2] * risers - cap_rows * cap_cell) / 2)
-    cue = font.text_object("Hero_Cue", ["DIG DOWN ↓"], b, mats["type"], "Type", palette="cream", cell=P(0.022, 0.03), depth=3)
-    cue.location = (0.5, 15.0, P(28.27, 26.0))  # (its nudge stays inside the safe area)
-    near += [caption, cue]
+    field = {"cell": field_cell, "room": P(72, 56)}
+    perch = PERCHES[PERCH](perch_type(cap_lines, cap_cell, field), 0.0)
+    caption = font.text_object("Hero_Caption", cap_lines, b, mats["type"], "Type", palette=perch["palette"], cell=cap_cell, depth=depth, leading=3)
+    caption.location = V(*perch["caption"]) - V(0, depth * cap_cell, 0)  # (standing out of the face it is on)
+    spot = core.empty("Hero_Field", "Type", perch["field"])
+    core.note(spot, kind="field", cell=field["cell"], room=field["room"], depth=depth)
+    # The cue. Wide, it is on the cloud under the field's line, at its right end as the line rests
+    # (the page hangs a hint from the left end until something is typed). Tall, the hint takes
+    # the line's whole width, and the cue is under the cloud, in front of it.
+    cue_cell = P(0.022, 0.03)
+    cue = font.text_object("Hero_Cue", ["DIG DOWN ↓"], b, mats["type"], "Type", palette=P(perch["palette"], "cream"), cell=cue_cell, depth=3)
+    if FRAME["tall"]:
+        cue.location = (0.0, 15.0, perch["bottom"] - 1.9)  # (its nudge stays inside the safe area)
+    else:
+        rest = (max(font.line_mask(name).shape[1] for name in NAMES) + 7 + 1 + font.line_mask(".KURBIS.HOST").shape[1]) * field["cell"]  # (the line with the longest name the page types itself)
+        x, y, foot = perch["field"]
+        cue.location = (x + (rest - font.line_mask("DIG DOWN ↓").shape[1] * cue_cell) / 2, y - 3 * cue_cell, foot - 3 * field["cell"] - 0.05 - font.ROWS * cue_cell)
+    near = [perch["root"], caption, spot, cue]
     zs = []
     for i, ((dx, dz), cell) in enumerate(zip(((1.75, 1.3), (2.5, 1.6), (3.35, 1.95)), (0.034, 0.046, 0.062))):
         z = font.text_object(f"Hero_Zzz_{i}", ["Z"], b, mats["type"], "Type", palette="plum", cell=cell, depth=2)
@@ -415,6 +647,20 @@ def set_valley():
         anim.TL.add(z, "scale", WAKE_UP - 0.01, lambda s, dt, z_size=z_size: tuple(c * max(1.0 - dt / 0.15, 0.0) for c in z_size(anim.now())))
     live(title, "location", lambda t: (0.0, 59.5, title_z + 0.28 * math.sin(t * 2 * math.pi / 6.5)))
     live(cue, "location", lambda t, home=Vector(cue.location): tuple(home + V(0, 0, 0.012 * math.sin(t * 2 * math.pi / 1.1))))
+
+    # Far below, at the edge of a wood, someone who looks like Steve, beside a trunk and
+    # looking up at the camera. Only the page shows him (lib/landing/film/sighting.ts), and
+    # only to a visitor who stays with the hero a long while; left alone, he steps back to
+    # the marker, where the trunk hides all of him. Each frame has him where it sees him
+    # whole, clear of the copy and the splash, on level ground all the way back.
+    (fx, fy), (bx, by) = P(((-34.5, 80.5), (-34.31, 82.49)), ((-19.5, 81.5), (-18.81, 83.9)))
+    seen_at = V(fx, fy, ground_at(fx, fy))
+    up = HERO_EYE - seen_at - V(0, 0, 1.6)  # from his eyes to the lens
+    him = boxmodel.player("Sky_Herobrine", "steve")
+    him.place(tuple(seen_at), yaw=math.degrees(math.atan2(up.x, -up.y)))
+    him.pose(head=(-math.degrees(math.atan2(up.z, up.xy.length)), 0, 0))
+    hidden(him.root)
+    core.empty("Sky_Herobrine_Back", "Characters", (bx, by, ground_at(bx, by)))
 
     hero_key = look.sun("Hero_Key", (-0.5, -0.62, 0.6), energy=2.1, color=(1.0, 0.60, 0.40), angle_deg=8.0, volume=0.0)
     light_ramp(hero_key, [(0.0, 2.1), (0.78, 2.1), (0.95, 0.0)])
@@ -450,6 +696,42 @@ def set_valley():
 
 # -- the surface -----------------------------------------------------------------
 NAMES = ("STEVE", "LENA", "BIGFARM")  # the address retypes itself through these
+
+
+def run_line(corners, step=0.25, fine=0.05):
+    """A run across the meadow through `corners`, rounded off (a Catmull-Rom curve through
+    them): its line as points every `step` blocks along it, and the ground under it as
+    [blocks along it, height] wherever the height changes. It must be open ground all the
+    way: not the pond, nothing standing on the ground beside the line (a trunk, the barrel,
+    a pumpkin), clear of the reeds, the friends and the pumpkin that landed."""
+    p = np.asarray([corners[0], *corners, corners[-1]], np.float64)
+    curve = []
+    for i in range(1, len(p) - 2):
+        p0, p1, p2, p3 = p[i - 1 : i + 3]
+        for t in np.linspace(0.0, 1.0, max(int(np.linalg.norm(p2 - p1) / 0.02), 2), endpoint=False):
+            curve.append(0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (3 * p1 - p0 - 3 * p2 + p3) * t**3))
+    curve = np.asarray([*curve, p[-1]])
+    far = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(curve, axis=0), axis=1))])
+    at = lambda d: (float(np.interp(d, far, curve[:, 0])), float(np.interp(d, far, curve[:, 1])))  # noqa: E731
+    w, b = S["w"], S["b"]
+    cane = [(cx + 0.5, cy + 0.5) for cx, cy, _ in w.sprites["cane"]]
+    keep = [(tuple(rig.root.location.xy), 0.9) for rig in S["friends"].values()] + [(tuple(LANDING_SPOT.xy), 1.0)] + [(c, 0.75) for c in cane]
+    ground = []
+    for d in np.arange(0.0, far[-1], fine):
+        x, y = at(d)
+        z = int(ground_at(x, y))
+        if not ground or ground[-1][1] != z:
+            ground.append([round(float(d), 3), z])
+        lost = w.get(int(math.floor(x)), int(math.floor(y)), z - 1) == b["water"]
+        for i in range(int(math.floor(x - 0.3)), int(math.floor(x + 0.3)) + 1):
+            for j in range(int(math.floor(y - 0.3)), int(math.floor(y + 0.3)) + 1):
+                if math.hypot(max(i - x, 0, x - i - 1), max(j - y, 0, y - j - 1)) <= 0.3:
+                    lost |= any(w.get(i, j, k) for k in range(int(ground_at(i + 0.5, j + 0.5)), z + 2))  # (something standing there)
+        lost |= any(math.hypot(x - c[0], y - c[1]) < r for c, r in keep)
+        if lost:
+            raise RuntimeError(f"the jockey's run is in the way of something at ({x:.2f}, {y:.2f})")
+    path = [[round(c, 3) for c in at(d)] for d in np.arange(0.0, far[-1] + step / 2, step)]
+    return {"path": path, "step": step, "ground": ground}
 
 
 def set_surface():
@@ -533,10 +815,14 @@ def set_surface():
     caption.location = V(0, 0, over + 8 * cell + 5 * 0.05)
     if HELP["rim"]:
         font.keyline("Landing_Caption_Rim", ["YOU CHOOSE THE NAME."], mats["rim"], cell=0.05, width=HELP["rim"] * 1.4).parent = caption
+    # On a soft dark card, as the line under the address is: it stands on the brightest of the sky.
+    card = scenery.scrim("Landing_Caption_Scrim", font.line_mask("YOU CHOOSE THE NAME.").shape[1] * 0.05, font.ROWS * 0.05, strength=0.72, feather=0.45)
+    card.parent = caption
+    card.location = (0, 3 * 0.05 - 0.02, font.ROWS * 0.05 / 2)
     pop(caption, shown + 0.07)
     # Under the address: to the right in the wide frame, where Steve's rod owns the air
     # to the left; centred and on two lines in the tall one.
-    pop(type_block("Landing_Editions", P(["DIFFERENT EDITIONS. SAME POND."], ["DIFFERENT EDITIONS.", "SAME POND."]), P(V(3.2, 0, -0.44), V(0, 0, -0.92)), "cream", cell=P(0.03, 0.036), depth=2, scrim=0.62, feather=0.5, parent=block), shown + 0.1)
+    pop(type_block("Landing_Editions", P(["DIFFERENT EDITIONS. SAME POND."], ["DIFFERENT EDITIONS.", "SAME POND."]), P(V(3.2, 0, -0.44), V(0, 0, -0.92)), "cream", cell=P(0.03, 0.036), depth=2, scrim=0.95, feather=0.6, parent=block), shown + 0.1)
 
     # Two friends fish the same pond: Steve on Java from the near bank, with a barrel for
     # his catch, and Alex on Bedrock from the far bank, who lets hers go.
@@ -546,7 +832,7 @@ def set_surface():
         ("Steve", "steve", False, (-4.3, 3.2), -58, (4, 0, 38), -72, "JAVA", (-6.6, 2.4), (-2.5, 3.5, ground_at(-3, 3) + 1.0), True, 0.0),
         ("Alex", "alex", True, (-8.2, 5.8), -3, (2, 0, 8), -46, "BEDROCK", (-8.6, 3.6), (-9.0, 2.7, POND_LEVEL), False, 4.8),  # she holds her rod low, clear of her name
     ):
-        rig = boxmodel.player(tag, skin, slim=slim)
+        rig = pumpkins(boxmodel.player(tag, skin, slim=slim))
         S["friends"][tag] = rig
         rig.place((x, y, ground_at(x, y)), yaw=yaw)
         rig.pose(body=(-4, 0, 0), head=head, arm_r=(arm, 0, 6), hand_r=(-24, 0, 0), arm_l=(-22, 0, 0), hand_l=(-26, 0, 0), leg_r=(-8, 0, 0), foot_r=(4, 0, 0), leg_l=(7, 0, 0), foot_l=(2, 0, 0))
@@ -557,11 +843,7 @@ def set_surface():
         rings = [scenery.ring(f"{tag}_Ring_{i}", ripple) for i in range(3)]
         S["fishers"].append(life.Fisher(rig, rod, tip, bobber, line, boxmodel.fish(f"{tag}_Fish"), rings, (*float_at, 0.0), away, POND_LEVEL, phase, SWELL, keeps, size=0.45))
         S.setdefault("fishing", []).append({"tag": tag, "tip": tip, "float": (*float_at, 0.0), "away": away, "keeps": keeps, "phase": phase, "size": 0.45})  # for the page, which plays the same loop
-        name_tag = font.text_object(f"Tag_{tag}", [label], b, mats["type"], "Type", palette="cream", cell=0.042, depth=2)
-        name_tag.location = (x + (0.0 if keeps else P(0.3, -0.5)), y, rig.root.location.z + (2.2 if keeps else P(3.5, 3.3)))  # hers stands clear above both rods, and the cane
-        name_tag.rotation_euler = rad(0, 0, P(0.0, 29.0))
-        pop(name_tag, shown + 0.05)
-        scrub(name_tag, "scale", STOMP, leaving)
+        # (Who is on which edition the page says in their nametags, over their heads.)
     # Butterflies over the meadow, each in its own livery.
     rows = ("kkkk..", "kaaakk", "kabaak", "kaawak", "kaaaak", ".kkaak", ".kaakk", ".kkkk.")
     liveries = (((1.0, 0.55, 0.10), (1.0, 0.80, 0.25)), ((1.0, 0.93, 0.45), (1.0, 1.0, 0.85)), ((0.45, 0.72, 1.0), (0.80, 0.92, 1.0)), ((1.0, 0.62, 0.78), (1.0, 0.86, 0.92)))
@@ -570,6 +852,27 @@ def set_surface():
         life.flier(f"Butterfly_{i}", wing, (0.27, 0.36), (x, y, ground_at(x, y) + lift), (1.3, 1.1, 0.45), speed=0.9 + 0.17 * i, beat=4.6 + 0.7 * i, seed=2.3 * i + 0.4, emit=0.5)
     rings = [scenery.ring(f"Leaper_Ring_{i}", ripple) for i in range(2)]
     S["fishers"].append(life.Jumper(boxmodel.fish("Leaper"), rings, (((-7.9, 2.0), (-7.3, 2.8)), ((-6.0, 1.3), (-6.8, 1.6))), POND_LEVEL, period=5.2, phase=2.0, height=SWELL))
+
+    # Now and then a chicken jockey runs across behind the pond: a baby zombie riding a
+    # chicken, as the game spawns one now and then. Only the page shows it, once in some
+    # visits (lib/landing/film/jockey.ts); here it is built, seated, and its run laid out.
+    # In each frame the run starts unseen behind the reeds, comes out behind Alex, passes
+    # behind Steve, and goes on until the frame has lost it: in the wide frame through the
+    # hollow behind the barrel and the pumpkin and up the bank, behind the tree; in the tall
+    # one along the terrace over them, off the frame. Its line keeps its heads under the
+    # nametags and the type. Then the stretch of it the lens sees, in blocks along it (from
+    # where Steve sees it come out of the reeds until it is gone): the page runs that in a
+    # few seconds.
+    corners, seen = P(
+        (((-12.4, 7.55), (-10.6, 7.75), (-9.9, 7.95), (-9.2, 8.3), (-6.6, 8.7), (-4.0, 9.4), (-1.0, 9.6), (3.0, 9.6), (6.5, 9.7), (8.5, 10.4), (9.7, 10.8)), (3.6, 20.2)),
+        (((-11.6, 7.45), (-10.2, 7.55), (-8.8, 8.6), (-6.5, 9.4), (-3.2, 9.6), (-0.6, 11.2), (0.8, 11.9)), (1.6, 12.6)),
+    )
+    S["jockey"] = dict(run_line(corners), seen=seen)
+    mount = boxmodel.chicken("Jockey")
+    boxmodel.seat(boxmodel.baby_zombie("Jockey_Rider"), mount)
+    (x0, y0), (x1, y1) = S["jockey"]["path"][:2]
+    mount.place((x0, y0, S["jockey"]["ground"][0][1]), yaw=math.degrees(math.atan2(x1 - x0, -(y1 - y0))))
+    hidden(mount.root)
 
     landing_key = look.sun("Landing_Key", (-0.38, -0.5, 0.78), energy=2.3, color=(1.0, 0.62, 0.42), angle_deg=6.0, volume=0.0)
     light_ramp(landing_key, [(0.66, 0.0), (0.86, 2.3), (1.56, 2.3), (1.74, 0.0)])
@@ -591,7 +894,8 @@ def set_dig():
     S["dig"] = anim.Track([(DIG0, 0.0), (1.95, 6.0), (2.12, 10.0), (2.33, 15.8), (2.47, 18.3), (BREAK, float(through))])
 
     for i, (lines, palettes, cell, (x, z)) in enumerate(bands()):
-        band = type_block(f"Band_{i}", lines, (x, -4 * cell, z), palettes, cell=cell, depth=4, scrim=0.42, feather=0.8)
+        # (Shallow: the camera comes down on it, and deep letters' tops would cover the strokes under them.)
+        band = type_block(f"Band_{i}", lines, (x, -1 * cell, z), palettes, cell=cell, depth=1, scrim=0.42, feather=0.8)
         if FRAME["tall"]:  # the tall frame turns away from each band before it is out of sight: it steps aside before the frame's edge would cut it
             gone = (2.04, 2.52)[i]
             scrub(band, "scale", gone, lambda s, gone=gone: (1.0 - smooth((s - gone) / 0.05),) * 3)
@@ -605,12 +909,29 @@ def set_dig():
     board.location, board.rotation_euler = P((7.0, -0.07, -10.9), (0.5, -0.07, -9.1)), rad(0, 6, 0)
     note = type_block("Dig_Sign_Text", ["BACK IN", "5 MINUTES"], (0, 0, 0), "ink", cell=0.022, depth=1, leading=3, parent=board)
     note.location = (0, -1 / 16 - 0.022, (0.75 - 19 * 0.022) / 2)
-    sock = ("................", "....wwwww.......", "....rrrrr.......", "....wwwww.......", "....rrrrr.......", "....wwwww.......", "....wwwww.......", "....wwwww.......",
-            "....wwwwww......", "....wwwwwwww....", "....wwwwwwwwww..", "....gwwwwwwwwww.", ".....gwwwwwwwww.", "......ggggggggg.", "................", "................")
-    ink = {".": (0, 0, 0, 0), "w": (0.93, 0.92, 0.88, 1), "r": (0.82, 0.16, 0.14, 1), "g": (0.62, 0.61, 0.6, 1)}
-    px = np.array([[ink[c] for c in row] for row in sock[::-1]], np.float32)
-    boxmodel.image_tiles("Dig_Sock", core.image_from_pixels("sock", px, core.EXPORT / "sock.png"), [[(-3.3, -0.02, -9.3), (-2.4, -0.02, -9.3), (-2.4, -0.02, -8.4), (-3.3, -0.02, -8.4)]])
+    sock("Dig_Sock", [(-3.3, -0.02, -9.3), (-2.4, -0.02, -9.3), (-2.4, -0.02, -8.4), (-3.3, -0.02, -8.4)])
     S["toys"] = {"fossil": V(8.4, 0.0, -6.6), "chest": V(cx + 1.0, 0.0, cz + 0.5), "sign": Vector(board.location) + V(0, 0.07, 0.4), "sock": V(-2.85, 0.0, -8.85)}
+    # Where it starts to dig, a sign on its post says the game's first rule, and it digs
+    # straight down beside it. Wide, it stands beside the hole on ground that stays, so it is
+    # still there at the top of the cut face as the camera goes down. The tall frame has no
+    # room there (the friends, the barrel and the pumpkin fill its middle distance): it
+    # stands nearer, in front of the hole on the slab, and goes down with its column. It is
+    # gone before the camera is home, where the world is whole again.
+    x, y = P((0.85, 1.5), (-1.3, -1.2))
+    rule = boxmodel.sign("Rule_Sign")
+    rule.location, rule.rotation_euler = (x, y, ground_at(x, max(y, 0.0))), rad(0, 0, P(0, 22.5))  # (the slab repeats the ground at the cut)
+    # On three lines: at a sign's size of type, STRAIGHT DOWN is wider than the board. (lib/landing/copy.ts says the same.)
+    words = type_block("Rule_Sign_Text", ["NEVER DIG", "STRAIGHT", "DOWN"], (0, 0, 0), "ink", cell=0.022, depth=1, leading=3, parent=rule)
+    words.location = (0, -1 / 16 - 0.022, 14 / 16 + (0.75 - 30 * 0.022) / 2)
+    (ox, oy, _), column = w.front[0], None
+    for piece in S["slab"] if y < 0 else ():
+        (i, j, _), (ni, nj, _) = piece["at"], piece["shape"]
+        if ox + i <= x < ox + i + ni and oy + j <= y < oy + j + nj:
+            column = piece["name"]
+            rule.parent = bpy.data.objects[column]  # (the glb leaves the slab out: the page puts the sign on its column again)
+            rule.matrix_parent_inverse = Matrix.Translation(piece["centre"]).inverted()
+    switch(rule, "scale", [(0.0, (1.0, 1.0, 1.0)), (HOME - 0.02, (0.0, 0.0, 0.0))])
+    S["rule"] = {"at": Vector(rule.location) + V(0, 0, 1.25), **({"slab": column} if column else {})}  # the middle of its board
 
     # What the pumpkin has not dug yet stays in place until it gets there.
     rng = np.random.default_rng(11)
@@ -656,6 +977,20 @@ def set_dig():
     light_ramp(daylight, [(1.54, 0.0), (1.72, 2600.0), (2.5, 2600.0), (2.8, 0.0)])
     haze = look.fog("Dig_Haze", (-34, -5, -32), (34, 7, 2), density=0.011, color=(1.0, 0.9, 0.8), anisotropy=0.4)
     ramp(haze.data.materials[0].node_tree.nodes["Volume Scatter"].inputs["Density"], "default_value", [(1.5, 0.0), (1.75, 0.011)])
+
+
+def sock(name, corners, other=False):
+    """The lost sock: its picture on a flat tile with these corners (the picture's lower
+    left first, then round it). The other one of the pair is the same picture turned
+    over: the other foot."""
+    image = bpy.data.images.get("sock")
+    if image is None:  # (drawn once, for both)
+        rows = ("................", "....wwwww.......", "....rrrrr.......", "....wwwww.......", "....rrrrr.......", "....wwwww.......", "....wwwww.......", "....wwwww.......",
+                "....wwwwww......", "....wwwwwwww....", "....wwwwwwwwww..", "....gwwwwwwwwww.", ".....gwwwwwwwww.", "......ggggggggg.", "................", "................")
+        ink = {".": (0, 0, 0, 0), "w": (0.93, 0.92, 0.88, 1), "r": (0.82, 0.16, 0.14, 1), "g": (0.62, 0.61, 0.6, 1)}
+        px = np.array([[ink[c] for c in row] for row in rows[::-1]], np.float32)
+        image = core.image_from_pixels("sock", px, core.EXPORT / "sock.png")
+    return boxmodel.image_tiles(name, image, [corners], [[(1, 0), (0, 0), (0, 1), (1, 1)]] if other else None)
 
 
 def dig_position(s):
@@ -759,7 +1094,7 @@ def set_cave():
     sleeps.append(lambda start, clock: after(moon.data, "energy", start, lambda dt: 150.0 * anim.clamp01((dt - 0.6) / 1.0), clock))
 
     # The two friends: they join once the lights are on, and leave before they go out.
-    steve = boxmodel.player("Cave_Steve", "steve")
+    steve = pumpkins(boxmodel.player("Cave_Steve", "steve"))
     steve.place(on_floor(*P((-2.5, 4.2), (-1.7, 5.4))), yaw=-66)  # (the tall frame is narrower: he works nearer the middle)
     steve.pose(body=(12, 0, 0), head=(2, 0, 50), arm_r=(-150, 0, 0), hand_r=(-28, 0, 0), arm_l=(34, 0, 0), hand_l=(-18, 0, 0), leg_r=(-30, 0, 0), foot_r=(26, 0, 0), leg_l=(22, 0, 0), foot_l=(8, 0, 0))
     boxmodel.hold(steve, boxmodel.item("Cave_Pickaxe", "item/iron_pickaxe.png"), grip=(-5, -5))
@@ -767,18 +1102,15 @@ def set_cave():
     live(steve.parts["arm_r"], "rotation_euler", lambda t: rad(*swing(t)))
     bow = anim.cycle(1.5, [(0.0, (12, 0, 0)), (0.28, (22, 0, 0)), (1.2, (12, 0, 0))])
     live(steve.parts["body"], "rotation_euler", lambda t: rad(*bow(t)))
-    alex = boxmodel.player("Cave_Alex", "alex", slim=True)
+    alex = pumpkins(boxmodel.player("Cave_Alex", "alex", slim=True))
     home = V(1.9, 4.6, floor_z(1.9, 4.6))
     alex.place(home, yaw=-24)
     alex.pose(body=(-6, 0, 0), head=(-12, 6, -16), arm_r=(0, 152, 0), hand_r=(0, 24, 0), arm_l=(0, -140, 0), hand_l=(0, -30, 0), leg_r=(-38, 0, 0), foot_r=(62, 0, 0), leg_l=(14, 0, 0), foot_l=(34, 0, 0))
     live(alex.root, "location", lambda t: tuple(home + V(0, 0, 0.42 * abs(math.sin(t * math.pi / 0.62)))))  # she cannot keep still
-    for rig, label, lift, joins, leaves in ((steve, "JAVA", 2.62, 1.0, 0.25), (alex, "BEDROCK", 2.75, 1.35, 0.55)):
-        tag = font.text_object(f"Cave_Tag_{label}", [label], b, mats["type"], "Type", palette="cream", cell=0.034, depth=2)
-        tag.location = (rig.root.location.x, rig.root.location.y, rig.root.location.z + lift)
-        tag.rotation_euler = rad(-6, 0, 0)
-        for obj, late in ((rig.root, 0.0), (tag, 0.12)):
-            wakes.append(lambda start, clock, obj=obj, at=joins + late: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._POP((dt - at) / 0.32)), clock))
-            sleeps.append(lambda start, clock, obj=obj, at=leaves: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._UNPOP((dt - at) / 0.22)), clock))
+    # (Who they are the page says in their nametags, which come and go with them.)
+    for rig, joins, leaves in ((steve, 1.0, 0.25), (alex, 1.35, 0.55)):
+        wakes.append(lambda start, clock, obj=rig.root, at=joins: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._POP((dt - at) / 0.32)), clock))
+        sleeps.append(lambda start, clock, obj=rig.root, at=leaves: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._UNPOP((dt - at) / 0.22)), clock))
 
     # Now and then a diamond flies from his pick into the chest behind him.
     gem_at = core.empty("Cave_Diamond_At", "Props")
@@ -809,12 +1141,13 @@ def set_cave():
         life.drip(f"Cave_Drip_{i}", (x, y, roof - 0.2), floor_z(x, y), period, 1.3 * i, drop, scenery.ring(f"Cave_Drip_Ring_{i}", ripple, thick=0.12))
         S.setdefault("drips", []).append((x, y, roof - 0.2, floor_z(x, y), period, 1.3 * i))
 
-    # One headline for each state, in the same place.
+    # One headline for each state, in the same place. (The tall frame's lines stand a
+    # little lower, clear of the low ceiling at their top left.)
     for key, lines, palettes, material, table_in, table_out, at_in, at_out in (
-        ("Awake", P(["SLEEPS WHEN YOU LEAVE.", "WAKES WHEN YOU JOIN."], ["SLEEPS WHEN", "YOU LEAVE.", "WAKES WHEN", "YOU JOIN."]), P(("cream", "gold"), ("cream", "cream", "gold", "gold")), "type", wakes, sleeps, 1.6, 0.5),
-        ("Asleep", P(["NOBODY HOME. IT SLEEPS.", "EVERY BLOCK SAVED."], ["NOBODY HOME.", "IT SLEEPS.", "EVERY BLOCK", "SAVED."]), P(("cream", "gold"), ("cream", "cream", "gold", "gold")), "type_dim", sleeps, rewakes, 1.7, 0.0),
+        ("Awake", P(["STOPS WHEN YOU LEAVE.", "STARTS WHEN YOU JOIN."], ["STOPS WHEN", "YOU LEAVE.", "STARTS WHEN", "YOU JOIN."]), P(("cream", "gold"), ("cream", "cream", "gold", "gold")), "type", wakes, sleeps, 1.6, 0.5),
+        ("Asleep", P(["NOBODY ON. SERVER OFF.", "NO PHANTOMS."], ["NOBODY ON.", "SERVER OFF.", "NO PHANTOMS."]), P(("cream", "gold"), ("cream", "cream", "gold")), "type_dim", sleeps, rewakes, 1.7, 0.0),
     ):
-        headline = type_block(f"Cave_{key}", lines, P((0.5, 6.5, -20.7), (1.1, 6.5, -20.4)), palettes, cell=P(0.065, 0.09), depth=4, leading=3, tilt=-8, material=material, scrim=0.5)
+        headline = type_block(f"Cave_{key}", lines, P((0.5, 6.5, -20.7), (1.1, 6.5, -20.85)), palettes, cell=P(0.065, 0.09), depth=4, leading=3, tilt=-8, material=material, scrim=0.5)
         hidden(headline)
         table_in.append(lambda start, clock, obj=headline, at=at_in: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._POP((dt - at) / 0.28)), clock))
         table_out.append(lambda start, clock, obj=headline, at=at_out: anim.TL.add(obj, "scale", start, lambda s, dt: tuple(Vector(one) * anim._UNPOP((dt - at) / 0.2)), clock))
@@ -994,97 +1327,221 @@ def set_ride():
 
 
 # -- the dungeon -----------------------------------------------------------------------
-ORES = ("CONSOLE", "LOGS", "PLAYERS", "SETTINGS", "ACTIVITY")  # redstone, coal, gold, lapis, copper
-ORE_LINES = (["Type a command.", "Things happen."], ["Read what happened", "while you weren't looking."], ["Friends in.", "Everyone else out."], ["Survival today.", "Creative tomorrow."], ["Who did what, and when."])
-SIGNS = (("/AI ASK", "GIVE EVERYONE", "NIGHT VISION"), ("/AI CODE HOME", "ADD A /HOME", "COMMAND"), ("/AI REVERT", "HOME"))
-ASKED = (("/ai ask give everyone night vision", "Done now."), ("/ai code home add a /home command", "Becomes a real command, no restart."), ("/ai revert home", "Oops, undone."))
-ORE_VIEW, SPAWNER_VIEW = (4.14, 4.31), (4.46, 4.78)  # the scroll over which the camera rests on each chamber
+
+
+# -- the homestead: the stage the features play on ---------------------------------
+# The yard and the house, in the world's own blocks: `x`, `y` are block ranges.
+YARD = {"x": (20, 24), "y": (13, 21), "gate": (22, 23)}  # fenced on the west, south and north; the house closes it on the east
+HOUSE = {"x": (25, 30), "y": (14, 20), "door": (16, 17), "window": 19}
+LECTERN = (23.8, 19.6)  # in the yard's far corner, by the house: clear of the gate's view
+# The features, each played while the camera rests on it: let in or kept out at the gate,
+# a plugin from the lectern's book, and the creeper's blast that the scroll takes back.
+BEATS = ((4.10, 4.27), (4.30, 4.46), (4.50, 4.74))
+REWIND = (4.53, 4.58, 4.625, 4.715)  # the creeper at the wall, the blast, time turns back, all of it back
+HEADS = (["FRIENDS IN.", "EVERYONE ELSE OUT."], ["ADD PLUGINS.", "OR WRITE YOUR OWN."], ["CREEPER? AW MAN.", "TURN BACK TIME."])
+
+
+def home_views(floor):
+    """Where the camera rests for each feature: (eye, aim) at its stop, by frame. The
+    camera's keys (camera_shots) and the headlines (set_dungeon) are both made from these."""
+    return (
+        (P(V(20.45, 20.55, floor + 3.4), V(20.65, 21.55, floor + 4.0)), V(21.4, 13.0, floor + 0.9)),
+        (P(V(19.6, 16.4, floor + 2.1), V(19.2, 15.5, floor + 2.35)), V(LECTERN[0] - 0.4, LECTERN[1] - 0.2, floor + 1.25)),
+        (P(V(19.3, 26.9, floor + 2.35), V(18.5, 27.9, floor + 2.85)), V(27.6, 19.4, floor + 1.7)),
+    )
+
+
+def head_place(eye, aim, dist, rise):
+    """A headline `dist` out along the view and `rise` (a share of the frame's half
+    height) up into it, turned to face the lens: always in frame, in front of the set."""
+    ahead = (aim - eye).normalized()
+    side = ahead.cross(V(0, 0, 1)).normalized()
+    up = side.cross(ahead).normalized()
+    lens = P(20.0, 17.0)
+    half = math.atan(12.0 / lens) if not FRAME["tall"] else math.atan(12.0 * 16 / 9 / lens)
+    at = eye + ahead * dist + up * (dist * math.tan(half) * rise)
+    to_eye = eye - at
+    return at, math.degrees(math.atan2(to_eye.x, -to_eye.y))
+
+
+def home_world():
+    """The house as blocks, every one its own piece (the creeper scatters them and the
+    backup lays them back): plank walls on log corners, a door and a window to the yard,
+    and a stepped roof, its middle in pieces of four. Its window's lit block waits at the
+    top of the box until night. In cells of the world, from (24, 13, floor)."""
+    b = S["b"]
+    (hx0, hx1), (hy0, hy1) = HOUSE["x"], HOUSE["y"]
+    ox, oy = hx0 - 1, hy0 - 1
+    nx, ny, nz = hx1 - hx0 + 3, hy1 - hy0 + 3, 8
+    g = np.zeros((nx, ny, nz), np.uint8)
+    pieces = []
+    door, win = HOUSE["door"], HOUSE["window"]
+    for x in range(hx0, hx1 + 1):
+        for y in range(hy0, hy1 + 1):
+            for z in range(3):
+                edge_x, edge_y = x in (hx0, hx1), y in (hy0, hy1)
+                if not (edge_x or edge_y):
+                    continue
+                if x == hx0 and y in door and z < 2:
+                    continue  # the door, open to the yard
+                block = "log" if edge_x and edge_y else "planks"
+                if (x == hx0 and y == win and z == 1) or (y == hy0 and x in (hx0 + 2, hx1 - 2) and z == 1):
+                    block = "lamp_off"  # the windows: dark by day
+                g[x - ox, y - oy, z] = b[block]
+                pieces.append({"name": f"Home_Block_{len(pieces):03d}", "at": (x - ox, y - oy, z), "shape": (1, 1, 1)})
+    # The roof: three steps, the eaves overhanging; the upper layers in pieces of two by two.
+    for k in range(3):
+        lo_x, hi_x, lo_y, hi_y = hx0 - 1 + k, hx1 + 1 - k, hy0 - 1 + k, hy1 + 1 - k
+        z = 3 + k
+        block = "spruce_log" if k == 2 else "planks"
+        for x in range(lo_x, hi_x + 1):
+            for y in range(lo_y, hi_y + 1):
+                g[x - ox, y - oy, z] = b[block]
+        step = 1 if k == 0 else 2
+        for x in range(lo_x, hi_x + 1, step):
+            for y in range(lo_y, hi_y + 1, step):
+                sx, sy = min(step, hi_x + 1 - x), min(step, hi_y + 1 - y)
+                pieces.append({"name": f"Home_Block_{len(pieces):03d}", "at": (x - ox, y - oy, z), "shape": (sx, sy, 1)})
+    lit = (0, 0, nz - 1)
+    g[lit] = b["lamp"]
+    pieces.append({"name": "Home_Window_Lit", "at": lit, "shape": (1, 1, 1)})
+    for piece in pieces:
+        piece["centre"] = tuple(o + a + s / 2 for o, a, s in zip((ox, oy, wld.SPOTS["dungeon"]["floor"]), piece["at"], piece["shape"]))
+    S["home_windows"] = [p["name"] for p, at in ((p, p["at"]) for p in pieces) if g[at] == b["lamp_off"]]
+    return g, pieces, (ox, oy, wld.SPOTS["dungeon"]["floor"])
+
+
+def plank_box(mesh, lo, size):
+    """A box of oak planks into `mesh` (pixels), its picture cut to the box's size."""
+    w, d, h = size
+    region = lambda a, b: (0, 0, min(a, 16), min(b, 16))  # noqa: E731
+    mesh.faces(lo, size, {boxmodel.PX: region(d, h), boxmodel.NX: region(d, h), boxmodel.PY: region(w, h), boxmodel.NY: region(w, h), boxmodel.PZ: region(w, d), boxmodel.NZ: region(w, d)})
+
+
+def set_fence(floor):
+    """The yard's fence: posts on the block lines with two rails between, as the game
+    builds one, and a gate of two leaves in the south side, each hung on its own post."""
+    mat = bpy.data.materials.get("Planks") or boxmodel.tex_material("Planks", "block/oak_planks.png", clip=False)
+    (x0, x1), (y0, y1), (g0, g1) = YARD["x"], YARD["y"], YARD["gate"]
+    posts = set()
+    runs = [((x0, y), (x0, y + 1)) for y in range(y0, y1)]  # the west side
+    runs += [((x, y0), (x + 1, y0)) for x in range(x0, x1 + 1) if not g0 <= x <= g1]  # the south side, but for the gate
+    runs += [((x, y1), (x + 1, y1)) for x in range(x0, x1 + 1)]  # the north side, to the house
+    mesh = boxmodel.BoxMesh(16, 16)
+    for (ax, ay), (bx, by) in runs:
+        posts.update({(ax, ay), (bx, by)})
+    for x, y in posts:
+        plank_box(mesh, (x * 16 + 6, y * 16 + 6, 0), (4, 4, 16))
+    for (ax, ay), (bx, by) in runs:
+        for z in (6, 12):
+            if ax == bx:
+                plank_box(mesh, (ax * 16 + 7, ay * 16 + 10, z), (2, 12, 3))
+            else:
+                plank_box(mesh, (ax * 16 + 10, ay * 16 + 7, z), (12, 2, 3))
+    fence = mesh.object("Home_Fence", mat, "Props")
+    fence.location = (0.0, 0.0, floor)
+    # The gate's two leaves, each from the middle of its post to the middle of the opening (a
+    # block each: the posts stand at g0 and g1 + 1); the page swings them.
+    for k, (hinge, sign) in enumerate(((g0, 1), (g1 + 1, -1))):
+        leaf = boxmodel.BoxMesh(16, 16)
+        for z in (5, 12):
+            plank_box(leaf, (0 if sign > 0 else -16, -1, z), (16, 2, 3))
+        for x in ((1, 13) if sign > 0 else (-14, -2)):
+            plank_box(leaf, (x, -1, 4), (2, 2, 12))
+        gate = leaf.object(f"Home_Gate_{k}", mat, "Props")
+        gate.location = (hinge + 0.5, y0 + 0.5, floor)
+    S["fence_posts"] = sorted(posts)
+    return sorted(posts)
 
 
 def set_dungeon():
-    """What stands in the dungeon. In the south bay, the ore wall with its labels and
-    the backups chest. In the north bay, the spawner under the three things you can
-    ask it, and the portal that waits unlit in the wall."""
+    """The homestead's cavern. Daylight falls through a shaft onto a grass floor, where a
+    house stands in a fenced yard beside a little field; a lectern in the yard holds the
+    plugin market's book. The friends come in from the tunnel to the south; a creeper
+    waits in the dark to the north. The portal waits unlit in the east wall."""
     b, mats = S["b"], S["mats"]
-    d, ow = wld.SPOTS["dungeon"], ore_wall()
-    (x0, x1), (y0, y1), floor, height = d["x"], d["y"], d["floor"], d["height"]  # (its lamps hang at this height, however high the room)
-    wall = x1 + 1.0  # the east wall's face
-    proud = float(x1)  # the face of the ores, which stand a block out from it
-    look.fog("Dungeon_Haze", (x0 - 1, y0 - 1, floor - 1), (x1 + 2, y1 + 2, floor + ow["height"] + 1), density=0.01, color=(1.0, 0.9, 0.8), anisotropy=0.4)
+    d = wld.SPOTS["dungeon"]
+    (x0, x1), (y0, y1), floor, height = d["x"], d["y"], d["floor"], d["height"]
+    wall = x1 + 1.0  # the east wall's face, where the portal is
+    look.fog("Dungeon_Haze", (x0 - 1, y0 - 1, floor - 1), (x1 + 2, y1 + 2, floor + height + 1), density=0.012, color=(1.0, 0.92, 0.8), anisotropy=0.55)
     lit = [(3.85, 0.0), (3.95, 1.0), (THROUGH, 1.0), (THROUGH + 0.05, 0.0)]
 
-    def lamp(name, at, energy, color=(1.0, 0.54, 0.18), radius=0.15, shadow=True, flame=None, breath=None):
-        """A light that is on while the dungeon can be seen. A flame wavers (`flame` is
-        its phase); an ore's glow breathes slowly."""
+    def lamp(name, at, energy, color=(1.0, 0.54, 0.18), radius=0.15, shadow=True, flame=None):
+        """A light that is on while the cavern can be seen; a flame wavers (`flame` is its phase)."""
         light = look.point(name, at, energy, color, radius=radius, shadow=shadow)
-        if flame is None and breath is None:
+        if flame is None:
             light_ramp(light, [(s, energy * k) for s, k in lit])
-            return
+            return light
         shown = anim.linear(lit)
-        waver = (lambda: flicker(anim.now(), flame)) if flame is not None else (lambda: 1.0 + 0.16 * math.sin(anim.now() * 1.3 + breath))
         switch(light, "hide_render", [(lit[0][0] - 1.0, True), (lit[0][0], False), (lit[-1][0], True)])
-        anim.TL.add(light.data, "energy", EVER, lambda s, dt: energy * shown(s) * waver(), "real")
+        anim.TL.add(light.data, "energy", EVER, lambda s, dt: energy * shown(s) * flicker(anim.now(), flame), "real")
+        return light
 
-    # South bay: the ore wall, read left to right as you face it.
-    ore_mid = (d["ores"][0] + d["ores"][-1]) / 2 + 1.0
-    tiles = ow["tiles"]
-    type_block("Dungeon_Headline", P(["YOUR SERVER. YOUR RULES."], ["YOUR SERVER.", "YOUR RULES."]), (wall - 4 * 0.075, ore_mid, floor + P(5.55, 9.5)), "gold", cell=0.075, depth=4, yaw=-90, scrim=0.45, feather=0.6)
-    for i, (label, (y, up)) in enumerate(zip(ORES, tiles)):
-        type_block(f"Dungeon_Ore_{i}", [label], (proud - 2 * 0.045, y + 1.0, floor + up - 0.54), "cream", cell=0.045, depth=2, yaw=-90)
-        lamp(f"Dungeon_OreLight_{i}", (proud - 1.3, y + 1.0, floor + up + 1.6), 55, (1.0, 0.8, 0.6), radius=0.3, shadow=False, breath=1.9 * i)
-    # The backups chest: on the floor under the row, or two side by side on their ledge as the sixth tile.
-    cy, cup, shelf = ow["chest"]
-    lids = []
-    for k, dy in enumerate((-0.5, 0.5) if shelf else (0.0,)):
-        chest, lid = boxmodel.chest(f"Dungeon_Chest_{k}", open_deg=-8)
-        chest.location = (wall - 0.55, cy + dy, floor + cup)
-        chest.rotation_euler = rad(0, 0, -90)
-        lids.append(lid)
-    if shelf:
-        type_block("Dungeon_Backups", ["BACKUPS"], (proud - 2 * 0.045, cy, floor + cup - 1 - 0.54), "cream", cell=0.045, depth=2, yaw=-90)
-    else:
-        type_block("Dungeon_Backups", ["BACKUPS"], (proud - 2 * 0.05, cy, floor + 1.0), "cream", cell=0.05, depth=2, yaw=-90)  # (low, clear of what the ores say)
-    # Torches at the foot of the wall: between each pair of ores in the row, or either side of the two columns.
-    for i, y in enumerate(P([y - 0.5 for y, _ in tiles[:-1]], [22.7, 15.3])):
-        torch = boxmodel.torch(f"Dungeon_Torch_{i}")
-        torch.location = (wall - 0.4, y, floor)
-        lamp(f"Dungeon_TorchLight_{i}", (wall - 0.7, y, floor + 0.9), 80, shadow=False, flame=2.3 * i)
+    # The daylight down the shaft (the page turns it to dusk, to night and back), and its bounce off the grass.
+    (sx0, sx1), (sy0, sy1) = d["shaft"]
+    shaft = V((sx0 + sx1 + 1) / 2, (sy0 + sy1 + 1) / 2, floor)
+    sky = look.area("Home_Sky", shaft + V(0, 0, height + 6), shaft, energy=3400, color=(1.0, 0.93, 0.8), size=4.5)
+    light_ramp(sky, [(s, 3400 * k) for s, k in lit])
+    lamp("Home_Bounce", shaft + V(-2.0, 1.0, 1.2), 140, (1.0, 0.85, 0.62), radius=2.0, shadow=False)
+    lamp("Home_Fill", (x0 + 4.0, (y0 + y1) / 2, floor + 6.0), 220, (0.62, 0.7, 1.0), radius=2.0, shadow=False)
+    dust_lo, dust_hi = (sx0 - 1.0, sy0 - 1.0, floor + 0.3), (sx1 + 2.0, sy1 + 2.0, floor + height + 4.0)
+    dust = scenery.leaves("Dungeon_Dust", scenery.fading_material("Dust", (1.0, 0.92, 0.7), strength=1.6), "FX", lo=dust_lo, hi=dust_hi, count=140, size=(0.01, 0.022), seed=17)
+    dust.color = (1.0, 1.0, 1.0, 0.6)
+    life.drift(dust, (0.03, 0.02, -0.05), dust_lo, dust_hi, sway=0.05)
+    # The tunnel the friends come in by: a torch at its mouth.
+    t0, t1 = d["tunnel"]
+    torch = boxmodel.torch("Dungeon_Torch_0")
+    torch.location = (t1 + 1.4, y0 + 0.4, floor)
+    lamp("Dungeon_TorchLight_0", (t1 + 1.1, y0 + 0.8, floor + 0.9), 90, shadow=False, flame=2.3)
 
-    # North bay: the spawner on a mossy block, under a wall of three signs.
-    board_w, board_h, gap = 3.0, 1.05, 0.1
-    sign_y = y1 - 0.5
-    for i, lines in enumerate(SIGNS):
-        board = boxmodel.sign(f"Sign_{i}", post=False)
-        board.location = (wall - 0.02, sign_y, floor + 1.75 + (2 - i) * (board_h + gap))
-        board.rotation_euler = rad(0, 0, -90)
-        board.scale = (board_w / 1.5, 1.0, board_h / 0.75)
-        rows = len(lines) * font.ROWS + (len(lines) - 1) * 3
-        cell = 0.031
-        type_block(f"Sign_{i}_Text", lines, (wall - 0.03 - 1 / 16 - cell, sign_y, floor + 1.75 + (2 - i) * (board_h + gap) + (board_h - rows * cell) / 2), "ink", cell=cell, depth=1, leading=3, yaw=-90)
-    cell = P(0.042, 0.06)
-    type_block("Spawner_Headline", P(["ASK THE SPAWNER ANYTHING."], ["ASK THE SPAWNER", "ANYTHING."]), (wall - 4 * cell, sign_y - 2.0, floor + P(5.62, 5.78)), "gold", cell=cell, depth=4, yaw=-90, scrim=0.45, feather=0.5)
-    sx, sy = wall - 2.5, sign_y
-    voxel.grid_object("Spawner_Stand", np.full((1, 1, 1), b["mossy_cobblestone"], np.uint8), b, mats["voxel"], "Props", origin=(sx - 0.5, sy - 0.5, floor))
-    boxmodel.cage("Spawner").location = (sx, sy, floor + 1.0)
-    flame = voxel.grid_object("Spawner_Core", np.full((1, 1, 1), b["jack_o_lantern"], np.uint8), b, mats["lamp"], "Props", scale=0.36, origin=(-0.18, -0.18, -0.18))
-    # Inside the cage the little lantern turns and bobs, as whatever a spawner holds does, and sparks rise round it.
-    live(flame, "location", lambda t: (sx, sy, floor + 1.46 + 0.035 * math.sin(t * 2.1)))
-    live(flame, "rotation_euler", lambda t: (0.0, 0.0, math.radians(-62.0) + t * 1.7))
-    lo, hi = (sx - 0.4, sy - 0.4, floor + 1.06), (sx + 0.4, sy + 0.4, floor + 1.94)
-    life.drift(scenery.leaves("Spawner_Sparks", mats["ember"], "FX", lo=lo, hi=hi, count=12, size=(0.02, 0.04), seed=29), (0.0, 0.0, 0.42), lo, hi, sway=0.08)
-    lamp("Spawner_Glow", (sx - 0.9, sy, floor + 1.7), 16, (1.0, 0.6, 0.2), shadow=False, flame=4.4)
-    lamp("Sign_Light", (wall - 2.2, sign_y - 0.2, floor + 4.4), 120, (1.0, 0.82, 0.62), radius=0.5, shadow=False)
-    type_block("Spawner_Small", ["OPERATORS ONLY."], (wall - 2 * 0.03, sign_y - 2.0, floor + P(5.24, 5.34)), "cream", cell=P(0.03, 0.036), depth=2, yaw=-90)
-    for i, (x, y) in enumerate(((wall - 0.4, y1 + 0.6), (x0 + 0.5, y0 + 0.5), (x0 + 0.5, y1 + 0.5), (x0 + 0.5, d["parting"][0] + 0.5))):
-        torch = boxmodel.torch(f"Dungeon_Torch_n{i}")
-        torch.location = (x, y, floor)
-        lamp(f"Dungeon_TorchLight_n{i}", (x - 0.3 if i == 0 else x + 0.3, y, floor + 0.9), 110, shadow=i > 0, flame=3.1 * i + 0.7)
-    for i, y in enumerate((ore_mid, sign_y - 2.0)):  # just enough to read each bay
-        lamp(f"Dungeon_Base_{i}", (x0 + 4.5, y, floor + height - 0.8), 170, (1.0, 0.74, 0.46), radius=0.8, shadow=False)
-    dust_lo, dust_hi = (x0 + 2.0, y0 + 0.5, floor + 0.3), (wall - 0.3, y1 + 0.5, floor + 5.6)
-    dust = scenery.leaves("Dungeon_Dust", scenery.fading_material("Dust", (1.0, 0.8, 0.5), strength=0.9), "FX", lo=dust_lo, hi=dust_hi, count=110, size=(0.008, 0.018), seed=17)
-    dust.color = (1.0, 1.0, 1.0, 0.45)
-    life.drift(dust, (0.05, 0.04, 0.04), dust_lo, dust_hi, sway=0.06)
+    # The house, as blocks the page builds (home_world): exported with the world.
+    # The yard: its fence and gate, the lantern a plugin hangs on each post, the lectern.
+    posts = set_fence(floor)
+    # On every other post of the west and north sides (the north one is what the market's
+    # view looks at), but none right by a resting camera, where it is a glaring block over the frame.
+    eyes = [eye for eye, _ in home_views(floor)]
+    clear = lambda x, y: all(math.hypot(x + 0.5 - eye.x, y + 0.5 - eye.y) > 2.6 for eye in eyes)
+    side = lambda x, y: x == YARD["x"][0] or y == YARD["y"][1]
+    hung = [p for p in posts if side(*p) and (p[0] + p[1]) % 2 == 0 and clear(*p)]
+    for k, (x, y) in enumerate(hung):
+        lantern = boxmodel.lantern(f"Home_Lantern_{k}")
+        lantern.location = (x + 0.5, y + 0.5, floor + 1.0)  # a post stands in the middle of its cell
+        hidden(lantern)
+        light = look.point(f"Home_LanternLight_{k}", (x + 0.5, y + 0.5, floor + 1.3), 45, (1.0, 0.66, 0.3), radius=0.1, shadow=False)
+        light.data.energy = 0.0
+    # The fireworks' bursts light the cave for a moment: the page moves these to each one.
+    for k in range(3):
+        look.point(f"Home_Burst_{k}", (YARD["x"][0], YARD["y"][1], floor + 4.0), 0.0, (1.0, 1.0, 1.0), radius=0.3, shadow=False)
+    lectern = boxmodel.lectern("Home_Lectern")
+    lectern.location = (LECTERN[0], LECTERN[1], floor)
+    lectern.rotation_euler = (0.0, 0.0, math.pi)  # its book to the north: Steve reads facing the camera
+    # The field: wheat, ripe, swaying.
+    (fx0, fx1), (fy0, fy1) = d["field"]
+    wheat = [(x, y, float(floor)) for x in range(fx0, fx1 + 1) for y in range(fy0, fy1 + 1)]
+    life.wind(boxmodel.cross_sprites("Home_Wheat", "block/wheat_stage7.png", wheat, col="World"), 0.12, rooted=True)
+    # Lights in the house, for the night: the window glows, and the room behind it.
+    look.point("Home_Window", (HOUSE["x"][0] + 1.2, HOUSE["window"] + 0.5, floor + 1.4), 0.0, (1.0, 0.7, 0.35), radius=0.4, shadow=False)
+    look.point("Home_Blast", (HOUSE["x"][1] - 1.0, HOUSE["y"][1] + 1.2, floor + 1.5), 0.0, (1.0, 0.86, 0.6), radius=1.0, shadow=False)
+
+    # Who lives here, and who comes by (in Steve's skin: Herobrine, whose eyes the page blanks): the page walks them.
+    tunnel = V((t0 + t1 + 1) / 2, y0 - 2.0, floor)
+    for name, skin, slim in (("Home_Steve", "steve", False), ("Home_Alex", "alex", True), ("Home_Stranger", "steve", False)):
+        rig = boxmodel.player(name, skin, slim=slim)
+        if name != "Home_Stranger":  # (the friends)
+            pumpkins(rig)
+        rig.place(tuple(tunnel), yaw=180)
+    creeper = boxmodel.creeper("Home_Creeper")
+    creeper.place((HOUSE["x"][1] - 1.5, y1 - 2.0, floor), yaw=180)
+
+    # What each feature says: up in the top of the frame where the camera rests on it, in front of the set.
+    for k, ((eye, aim), lines) in enumerate(zip(home_views(floor), HEADS)):
+        # Nearer the lens than anything in its view (the market's has the house's eaves, the gate's a glowstone close
+        # behind it), its letters sized to the distance so every headline reads the same size.
+        was, dist = P((5.2, 4.6, 5.6), (4.6, 4.2, 5.2))[k], P((3.6, 3.2, 5.6), (4.6, 3.0, 5.2))[k]
+        cell = P(0.05, (0.034, 0.03, 0.034)[k]) * dist / was
+        # (Lower in the wide frame for the first two: higher, their tops ran under the bar and off the frame.)
+        at, yaw = head_place(eye, aim, dist, P((0.3, 0.3, 0.46)[k], 0.6))
+        type_block(f"Home_Head_{k}", lines, at, ("cream", "gold"), cell=cell, depth=4, yaw=yaw, scrim=0.5, feather=0.6)
 
     # The portal in the east wall: dark until the pumpkin jumps into the frame.
     p0, p1 = d["portal"]
@@ -1096,102 +1553,8 @@ def set_dungeon():
     sparks = scenery.leaves("Dungeon_Sparks", mats["spark"], "FX", lo=tuple(gate + V(-5.5, -3, 0.4)), hi=tuple(gate + V(-0.5, 3, 5.5)), count=60, size=(0.025, 0.06), seed=9)
     show(sparks, PORTAL_LIT)
     S["gate"] = gate
-
-    # -- what the dungeon does while you look at it, in real time ------------------------
-    session = S["session"]
-    hint = scenery.fading_material("Hint", (1.0, 0.82, 0.3), strength=2.2)
-
-    def outline(name, at, size):
-        frame = scenery.frame_cube(name, 1.0, 0.035, hint, "FX")
-        frame.location, frame.scale, frame.visible_shadow = at, size, False
-        return frame
-
-    def rounds(first, each, count, chosen):
-        """Whose turn it is and since when: [(moment, which)]. Left alone, they take turns
-        of `each` seconds from `first`. What a visitor points at or clicks (`chosen`) has
-        its turn at once, and the round goes on from there."""
-        turns, moment, which = [], first, 0
-        for at, k in sorted(chosen) + [(session.duration, None)]:
-            while moment < at - 0.3:
-                turns.append((moment, which))
-                moment, which = moment + each, (which + 1) % count
-            if k is not None:
-                turns.append((at, k))
-                moment, which = at + each, (k + 1) % count
-        return turns
-
-    def turn_of(spans, which, each, view):
-        """How much `which` shows at scroll s and moment tau: it fades in for its turn and
-        out before the next, and only while the camera is on its chamber."""
-        def fn(s, tau):
-            if not view[0] <= s < view[1]:
-                return 0.0
-            live_ = [(moment, k) for moment, k in spans if moment <= tau]
-            if not live_ or live_[-1][1] != which:
-                return 0.0
-            age = tau - live_[-1][0]
-            return anim.clamp01(age / 0.15) * (1.0 - anim.clamp01((age - each + 0.25) / 0.2))
-
-        return fn
-
-    # The ore wall: each ore says what it is for, one after another; the chest opens for backups.
-    each = 2.3
-    # (title, lines, middle, size of its frame, where its lines hang from). An ore has its name
-    # under it already. In the row its lines hang under that name; in the grid, where the next
-    # tile (or the pumpkin) is right below, they lie across the lower half of the tile itself.
-    hang = P(-0.58, 1.35)  # from the tile's foot
-    topics = [(None, lines, V(proud, y + 1.0, floor + up + 1.0), (0.25, 2.2, 2.2), floor + up + hang) for lines, (y, up) in zip(ORE_LINES, tiles)]
-    backups = ["Creeper took the house?", "Ctrl+Z for the whole world."]
-    topics.append((None, backups, V(proud, cy, floor + cup), (0.25, 2.2, 2.2), floor + cup - 1 + hang) if shelf else ("Backups", backups, V(wall - 0.55, cy, floor + 0.5), (1.1, 1.1, 1.1), None))
-    pointed = [(session.at(f"tile_{k}"), k) for k in range(len(topics)) if session.at(f"tile_{k}") is not None]
-    spans = rounds(session.when(ORE_VIEW[0]), each, len(topics), pointed)
-    S.update(tile_pointed=pointed, tile_spots=[at for _, _, at, _, _ in topics])
-    for k, (title, lines, at, size, hangs) in enumerate(topics):
-        showing = turn_of(spans, k, each, ORE_VIEW)
-        frame = outline(f"Dungeon_Pick_{k}", at, size)
-        anim.TL.add(frame, "color", EVER, lambda s, dt, showing=showing: (1.0, 1.0, 1.0, 0.9 * showing(s, anim.now())), "real")
-        under = hangs is not None  # what a tile says hangs under its label; the chest on the floor has a tooltip beside it
-        S.setdefault("tips", []).append({"name": f"topic_{k}", "title": title, "lines": lines, "at": V(at.x, at.y, hangs) if under else at + V(0, -2.0, 0.3), "s": 4.22, "showing": showing, "under": under})
-        if k == len(topics) - 1:  # the chest opens for its turn
-            for lid in lids:
-                anim.TL.add(lid, "rotation_euler", EVER, lambda s, dt, showing=showing: (math.radians(lerp(-8.0, -64.0, showing(s, anim.now()))), 0.0, 0.0), "real")
-
-    # The spawner: the three things on the signs are asked in turn, and the room does them.
-    # Night vision lights the room; /home is written and the pumpkin uses it; revert takes it back.
-    each = 3.4
-    picked = [(session.at(f"sign_{k}"), k) for k in range(3) if session.at(f"sign_{k}") is not None]  # the visitor clicks a sign: that one is asked now
-    begun, leave = session.when(SPAWNER_VIEW[0]), session.when(SPAWNER_VIEW[1])
-    asked = [(moment, k) for moment, k in rounds(begun, each, 3, picked) if moment < leave - 1.0]
-    S.update(sign_picked=picked, sign_spots=[V(wall - 0.2, sign_y, floor + 1.75 + (2 - k) * (board_h + gap) + board_h / 2) for k in range(3)])
-    for k in range(3):
-        showing = turn_of(asked, k, each, SPAWNER_VIEW)
-        frame = outline(f"Sign_Pick_{k}", (wall - 0.2, sign_y, floor + 1.75 + (2 - k) * (board_h + gap) + board_h / 2), (0.3, board_w + 0.12, board_h + 0.1))
-        anim.TL.add(frame, "color", EVER, lambda s, dt, showing=showing: (1.0, 1.0, 1.0, 0.95 * showing(s, anim.now())), "real")
-    vision = look.area("Dungeon_NightVision", (x0 + 5.0, sign_y - 2.5, floor + height - 0.4), (wall - 2.0, sign_y - 2.5, floor + 1.0), energy=0.0, color=(0.72, 0.9, 1.0), size=9)
-    switch(vision, "hide_render", [(0.0, True), (4.3, False), (THROUGH, True)])
-    home_at = V(22.35, gate.y - P(1.5, 0.9), floor)  # by the portal's right post, where the camera sees the floor
-    home = boxmodel.sign("Home_Sign")
-    home.location, home.rotation_euler, home.scale = home_at, rad(0, 0, -72), (0.6,) * 3
-    word = type_block("Home_Sign_Text", ["/HOME"], (0, 0, 0), "ink", cell=0.05, depth=1, parent=home)
-    word.location = (0, -1 / 16 - 0.05, (14 + 6) / 16 - 4 * 0.05)
-    hidden(home)
-    trips, away = [], None
-    for moment, k in asked:
-        S.setdefault("says", []).append((moment + 0.15, "> " + ASKED[k][0], hud.WHITE))
-        S["says"].append((moment + 1.0, "[AI] " + ASKED[k][1], hud.GREEN))
-        if k == 0:
-            live(vision.data, "energy", lambda dt: 1250.0 * anim.clamp01(dt / 0.4) * (1.0 - anim.clamp01((dt - 1.9) / 0.5)), start=moment + 1.0)
-        elif k == 1:
-            pop(home, moment + 1.0, 0.3, base=(0.6,) * 3, clock="real")
-            S["says"].append((moment + 1.9, "<Kurbis> /home", hud.WHITE))
-            away = moment + 2.1
-        elif away is not None:
-            unpop(home, moment + 1.0, 0.25, base=(0.6,) * 3, clock="real")
-            trips.append((away, moment + 1.3))
-            away = None
-    if away is not None:
-        trips.append((away, None))
-    S["home_trips"], S["home_spot"] = trips, home_at + V(-0.75, 1.7, 0)  # beside its sign, not in front of it
+    S.update(tile_pointed=[], tile_spots=[], sign_picked=[], sign_spots=[])
+    S["home_spots"] = {"lectern": V(LECTERN[0], LECTERN[1], floor + 1.0), "tunnel": tunnel, "gate": V((YARD["gate"][0] + YARD["gate"][1] + 2) / 2, YARD["y"][0] + 0.5, floor), "blast": V(HOUSE["x"][1] - 1.0, HOUSE["y"][1] + 1.2, floor)}
 
 
 def portal_surface(name, foot, along=(1, 0, 0)):
@@ -1255,6 +1618,19 @@ def set_nether():
     live(walker.root, "location", lambda t: tuple(N(-34.0 + 1.1 * t, 78.0, 0.8 + 0.12 * abs(math.sin(t * 5.0)))))
     for key, sign in (("leg_r", 1.0), ("leg_l", -1.0)):
         live(walker.parts[key], "rotation_euler", lambda t, sign=sign: (math.radians(26.0 * sign * math.sin(t * 5.0)), 0.0, 0.0))
+
+    # The other one of the dig's lost sock, which said it was in the Nether: on the ground
+    # beside the second frame, small and easy to miss. It lies on the frame's right, away
+    # from where the pumpkin waits and leaps, and far under the type. It is turned so its
+    # leg runs across the frame: seen this low, a sock that points away is a smear.
+    x, y, turn = 2.4, 35.2, math.radians(70)
+    top = lambda x, y: next(z + 1 for z in range(ledge + 8, 0, -1) if grid.get(math.floor(x), math.floor(y), z))  # noqa: E731
+    across, along = 0.45 * Vector((math.cos(turn), math.sin(turn), 0)), 0.45 * Vector((-math.sin(turn), math.cos(turn), 0))
+    corners = [Vector((x, y, 0)) + i * across + j * along for i, j in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    ground = top(x, y)
+    assert all(top(c.x, c.y) == ground for c in corners), "the sock lies on the same ground all over"
+    sock("Nether_Sock", [tuple(N(c.x, c.y, ground + 0.02)) for c in corners], other=True)
+    S["nether_sock"] = N(x, y, ground)
 
     # The name field over the second frame, facing back along the bridge. Until a name is
     # typed it shows a placeholder; a name that is free lights the frame under it.
@@ -1401,22 +1777,18 @@ def cast():
     alight = rail_at(1e9) + seat
     d = wld.SPOTS["dungeon"]
     floor, gate = d["floor"], S["gate"]
-    wall_spot, opening, sign_spot = P(V(19.8, 15.6, floor), V(21.1, 19.0, floor)), V(14.4, d["parting"][0] + 0.4, floor), V(21.9, gate.y + 1.55, floor)  # (tall: under the middle of the wall)
-    facing = P(-75, -90)
-    a.hop(ARRIVE, 4.11, alight, wall_spot, 1.5, yaw=(90, facing), flips=1.0)
-    a.rest(4.11, wall_spot, yaw=facing)
-    a.hop(4.24, 4.31, wall_spot, opening, 1.6, yaw=(facing, -180), land=0.1)  # well ahead of the camera, through the opening
-    a.hop(4.31, 4.38, opening, sign_spot, 1.5, yaw=(-180, -100), flips=1.0)
-    a.rest(4.38, sign_spot, yaw=-100)
-    for go, back in S["home_trips"]:  # /home: gone in a blink, and there
-        spot = S["home_spot"]
-        a.act(go, go + 0.36, lambda u, spot=spot: pose(sign_spot if u < 0.5 else spot, -100, grow=abs(1.0 - 2.0 * u), calm=False))
-        a.act(go + 0.36, back if back is not None else 1e9, lambda u, spot=spot: pose(spot, -100, calm=True))
-        if back is not None:
-            a.act(back, back + 0.55, lambda u, spot=spot: pose(spot.lerp(sign_spot, smooth(u)) + V(0, 0, 4 * 0.9 * u * (1 - u)), -100, squash=1.0 + 0.12 * abs(math.cos(math.pi * u))))
+    # On the path, watching the gate; into the yard by the lectern; to the field's edge to watch the house.
+    path_spot, book_spot, watch_spot = V(18.7, 17.2, floor), V(22.6, 20.6, floor), V(22.7, 22.9, floor)
+    facing = (42, 50, 62)
+    a.hop(ARRIVE, 4.11, alight, path_spot, 1.5, yaw=(90, facing[0]), flips=1.0)
+    a.rest(4.11, path_spot, yaw=facing[0])
+    a.hop(4.27, 4.31, path_spot, book_spot, 1.7, yaw=(facing[0], facing[1]), land=0.1)  # over the fence
+    a.rest(4.31, book_spot, yaw=facing[1])
+    a.hop(4.47, 4.51, book_spot, watch_spot, 1.3, yaw=(facing[1], facing[2]), flips=1.0)
+    a.rest(4.51, watch_spot, yaw=facing[2])
     before, inside = gate + V(-2.3, 0.2, 0), gate + V(0, 0, 0.6)
     into_portal = (before, inside)
-    a.hop(4.77, 4.84, sign_spot, before, 0.9, yaw=(-100, 90))
+    a.hop(4.77, 4.84, watch_spot, before, 1.2, yaw=(facing[2], 90))
     a.hop(4.84, PORTAL_LIT, before, inside, 1.1, yaw=(90, 90), flips=1.0, land=0.0)  # into the frame, and it lights
     a.appear(-1.0, PORTAL_LIT + 0.004)
     for s, face in ((0.0, "asleep"), (WAKE_UP, "awake"), (FALL[0], "whee"), (FALL[1], "awake"), (DIG0, "whee"), (LAND, "awake"), (BOARD - 0.04, "whee"), (ARRIVE + 0.05, "awake"), (4.84, "whee")):
@@ -1453,7 +1825,7 @@ def cast():
     # The places of its journey, for the page, which plays the same moves.
     S["cast"] = {
         "fall_from": fall_from, "dig_start": dig_start, "hole": hole, "landing": landing, "mid": mid, "home": home, "seat": seat, "board": board, "alight": alight,
-        "wall_spot": wall_spot, "opening": opening, "sign_spot": sign_spot, "facing": facing, "before": into_portal[0], "inside": into_portal[1],
+        "path_spot": path_spot, "book_spot": book_spot, "watch_spot": watch_spot, "facing": list(facing), "before": into_portal[0], "inside": into_portal[1],
         "nether_spots": spots, "nether_inside": N(0.0, gate + 0.5, ledge + 0.7),
     }
 
@@ -1511,7 +1883,7 @@ def camera_shots():
         (2.70, V(-2.6, 1.0, -22.4)), (LAND, V(-2.2, 2.0, -23.8)), (2.95, V(-0.6, 4.0, -23.1)), (3.10, V(0.5, 5.5, -22.7)),
         (PART["cave"], cave_aim), (PART["cart"], cave_aim + V(0.1, 0, 0)),
     ]
-    lens = [(0.0, 28.0), (0.50, 28.0), (0.71, 22.0), (FALL[1], landing_lens), (STOMP, landing_lens), (1.78, dig_lens), (BREAK, dig_lens), (PART["cave"], 20.0), (ARRIVE - 0.05, 20.0), *P([(4.18, 18.0)], [(4.18, 23.0), (4.30, 23.0), (4.46, 18.0)]), (PORTAL_LIT, 18.0), (THROUGH, 16.0)]
+    lens = [(0.0, 28.0), (0.50, 28.0), (0.71, 22.0), (FALL[1], landing_lens), (STOMP, landing_lens), (1.78, dig_lens), (BREAK, dig_lens), (PART["cave"], 20.0), (ARRIVE - 0.05, 20.0), (4.12, P(19.0, 16.0)), (4.31, P(22.0, 19.0)), (4.51, P(18.0, 15.0)), (PORTAL_LIT, 18.0), (THROUGH, 16.0)]
     roll = [(0.0, 0.0), (1.90, 0.0), (1.99, -3.0), (2.10, 3.0), (2.22, 0.0)]
 
     # The cart: the camera chases it along its own, wider line (it cuts the turn), keeps
@@ -1532,19 +1904,19 @@ def camera_shots():
             target.append((s, rail_at(far + 1.4) + V(0, 0, 0.75)))
     roll += [(3.76, 0.0), (3.815, -11.0), (3.87, 0.0)]
 
-    # The dungeon: in on the ore wall, along the room past the column to the spawner's
-    # bay, then into the portal. The camera faces the east wall the whole way.
+    # The homestead: up over the yard to see the gate, down beside the lectern, low by
+    # the house for the blast (pulling out as time turns back), then round to the portal.
     d = wld.SPOTS["dungeon"]
-    floor, wall, gate = d["floor"], d["x"][1] + 1.0, S["gate"]
-    ore_mid = (d["ores"][0] + d["ores"][-1]) / 2 + 1.0
-    # Wide, it stands at head height before the row. Tall, it rises with the wall, which
-    # is twice as high, and stands a little further off from the spawner's bay.
-    wall_aim = V(wall, ore_mid, floor + P(2.75, 5.1))
-    bay_aim = V(wall, gate.y + 1.6, floor + P(2.85, 3.5))
-    eye += [(4.18, P(V(13.6, ore_mid - 0.35, floor + 2.4), V(13.4, ore_mid - 0.15, floor + 4.5))), (4.30, P(V(13.9, ore_mid + 0.25, floor + 2.4), V(13.6, ore_mid + 0.1, floor + 4.9))),
-            (4.46, P(V(16.3, gate.y + 1.4, floor + 2.1), V(15.2, gate.y + 1.5, floor + 3.0))), (PART["portal"], P(V(16.8, gate.y + 1.7, floor + 2.05), V(15.7, gate.y + 1.7, floor + 2.9))),
-            (4.92, V(17.6, gate.y + 0.3, floor + 1.8)), (5.10, V(gate.x - 3.2, gate.y, floor + 1.55)), (THROUGH, V(gate.x - 0.2, gate.y, floor + 1.5))]
-    target += [(ARRIVE, wall_aim), (4.18, wall_aim + V(0, -0.2, 0)), (4.30, wall_aim + V(0, 0.2, 0)), (4.46, bay_aim), (PART["portal"], bay_aim),
+    floor, gate = d["floor"], S["gate"]
+    (gate_eye, gate_aim), (book_eye, book_aim), (house_eye, house_aim) = home_views(floor)
+    drift = V(-0.15, 0.15, -0.05)  # the camera drifts while it rests: never quite still
+    eye += [(4.12, gate_eye - drift), (4.26, gate_eye + drift),
+            (4.31, book_eye - drift), (4.45, book_eye + drift),
+            (4.51, house_eye - drift), (REWIND[1], house_eye + drift),
+            (REWIND[3], P(V(17.6, 28.6, floor + 4.0), V(17.0, 29.4, floor + 4.4))), (PART["portal"], P(V(18.2, 28.8, floor + 3.6), V(17.6, 29.6, floor + 4.0))),
+            (4.92, V(28.0, gate.y - 0.6, floor + 1.8)), (5.10, V(gate.x - 3.2, gate.y, floor + 1.55)), (THROUGH, V(gate.x - 0.2, gate.y, floor + 1.5))]
+    target += [(ARRIVE, gate_aim), (4.12, gate_aim), (4.26, gate_aim + V(0.2, 0.3, 0)), (4.31, book_aim), (4.45, book_aim + V(0.1, 0, 0)), (4.51, house_aim), (REWIND[1], house_aim),
+               (REWIND[3], house_aim + V(0, -0.6, 0.6)), (PART["portal"], house_aim + V(1.0, 1.0, 0.4)),
                (4.92, gate + V(0, 0, 1.5)), (5.10, gate + V(1.0, 0, 1.5)), (THROUGH, gate + V(2.0, 0, 1.5))]
     shot_a = Shot(eye, target, roll=roll, lens=lens)
 
@@ -1557,10 +1929,52 @@ def camera_shots():
         (5.42, (0.2, row + 4.6, ledge + 2.0), (0.0, far_gate, ledge + 2.8)),
         (5.75, (0.5, row + 10.5, ledge + 2.4), aim),
         (6.05, (0.45, far_gate - back - 0.4, ledge + 2.5), aim),
-        (END, (0.4, far_gate - back, ledge + 2.5), aim),
+        (NAME_STOP, (0.4, far_gate - back, ledge + 2.5), aim),
+        # On, into the lit frame under the field: the swirl covers the way home.
+        (HOME, (0.0, far_gate - 0.6, ledge + 1.6), (0.0, far_gate + 6.0, ledge + 1.6)),
     )
-    shot_b = Shot([(s, N(*e)) for s, e, _ in path], [(s, N(*at)) for s, _, at in path], lens=[(THROUGH, 16.0), (5.75, 17.5), (END, 18.0)])
-    return [shot_a, shot_b]
+    shot_b = Shot([(s, N(*e)) for s, e, _ in path], [(s, N(*at)) for s, _, at in path], lens=[(THROUGH, 16.0), (5.75, 17.5), (NAME_STOP, 18.0), (HOME, 16.0)])
+
+    # C: home. Out of the swirl high over the meadow, down to the signs and the lectern,
+    # where it drifts to the end of the film. (The tall frame drifts back a little, to keep
+    # all three signs in it.)
+    e = S["ending"]
+    slide, turn = P((V(0.25, 0.15, 0.0), V(0.15, 0.0, 0.0)), (V(0.05, -0.1, 0.0), V(-0.05, 0.0, 0.0)))  # (the drift, and where it looks)
+    path = (
+        (HOME, e["sky"], e["sky_aim"]),
+        (6.55, e["eye"], e["aim"]),
+        (END, e["eye"] + slide, e["aim"] + turn),
+    )
+    shot_c = Shot([(s, at) for s, at, _ in path], [(s, at) for s, _, at in path], lens=[(HOME, 16.0), (6.55, P(20.0, 18.0)), (END, P(20.0, 18.0))])
+    return [shot_a, shot_b, shot_c]
+
+
+# -- home: the closing set ------------------------------------------------------------
+def set_ending():
+    """The way home: the valley again, made whole, where a row of signs says what the
+    service is and a lectern holds the book of questions (the page turns its pages).
+    Everything here is called Ending_ so the page shows it only once the camera is home."""
+    b, mats = S["b"], S["mats"]
+    # The hole the pumpkin dug, filled again: the world is whole at the end.
+    voxel.grid_object("Ending_Patch", np.concatenate([np.full((2, 2, 6), b["dirt"], np.uint8), np.full((2, 2, 1), b["grass"], np.uint8)], axis=2), b, mats["voxel"], "World", origin=(-2.0, 0.0, -6.0))
+    # Three signs on the flat of the meadow, two of the facts on each.
+    centre_x = 1.9
+    spots = [(centre_x + (k - 1) * 1.7, 2.0) for k in range(3)]
+    cell = 0.016
+    for k, (x, y) in enumerate(spots):
+        lines = SPECS[2 * k] + SPECS[2 * k + 1]
+        board = boxmodel.sign(f"Ending_Sign_{k}")
+        board.location = (x, y, ground_at(x, y))
+        rows = len(lines) * font.ROWS + (len(lines) - 1) * 2
+        type_block(f"Ending_Spec_{k}", lines, (x, y - 1 / 16 - cell, ground_at(x, y) + 14 / 16 + (0.75 - rows * cell) / 2), "ink", cell=cell, depth=1, leading=2)
+    lectern_at = V(centre_x, 4.0, 0.0)
+    lectern_at.z = ground_at(lectern_at.x, lectern_at.y)
+    boxmodel.lectern("Ending_Lectern").location = lectern_at
+    S["ending"] = {
+        "sky": V(centre_x, -1.5, P(8.0, 9.0)), "sky_aim": V(centre_x, 8.0, 2.5),
+        "eye": P(V(centre_x + 0.3, -2.7, 2.15), V(centre_x + 0.1, -2.75, 2.0)), "aim": V(centre_x + P(0.3, 0.15), 4.5, 1.6),
+        "spots": [V(x, y, ground_at(x, y) + 1.25) for x, y in spots], "lectern": lectern_at + V(0, 0, 1.0),
+    }
 
 
 # -- the interface and the visitor ---------------------------------------------------
@@ -1610,7 +2024,7 @@ def set_hud(shots):
             card = panel.card(f"tip_{tip['name']}", hud.tooltip(tip["title"], tip["lines"]), at=(spot[0] + (20 if right else -20), spot[1]), anchor=(1.0 if right else 0.0, 0.0), shown=False, inside=4)
         anim.TL.add(card, "color", EVER, lambda s, dt, showing=tip["showing"]: (1.0, 1.0, 1.0, showing(s, anim.now())), "real")
     for moment, line, colour in S.get("says", []):
-        panel.say(moment, line, colour, clock="real", stay=5.0, until=SPAWNER_VIEW[1] + 0.02)
+        panel.say(moment, line, colour, clock="real", stay=5.0, until=BEATS[2][1] + 0.02)
 
     keys, clicks = [], []
 
@@ -1709,13 +2123,6 @@ def set_hud(shots):
         for key, lines, t_in, t_out in (("awake", ["Pull it: everyone leaves,", "and the server sleeps."], hover + 0.25, off + 0.1), ("asleep", ["Pull it: someone joins,", "and the server wakes."], off + 2.2, (on or off + 6.0) + 0.1)):
             tip = panel.card(f"tip_lever_{key}", hud.tooltip("Lever", lines), at=P((on_lever[0] - 16, on_lever[1] + 26), (on_lever[0] + 24, on_lever[1] + 34)), anchor=(1.0, 0.0), shown=False, inside=4)  # between the headline and the block
             live(tip, "color", lambda dt, stay=t_out - t_in: (1.0, 1.0, 1.0, anim.clamp01(dt / 0.12) * (1.0 - anim.clamp01((dt - stay) / 0.15))), start=t_in)
-    # Dungeon: point at a tile of the ore wall (it says its piece), and click one of the
-    # spawner's signs (that one is asked).
-    for moment, k in S["tile_pointed"]:
-        go(moment, seen(S["tile_spots"][k] + V(0, -0.3, -0.2), 4.22), 0.6)
-    for moment, k in S["sign_picked"]:
-        go(moment, seen(S["sign_spots"][k] + V(0, -0.6, -0.1), 4.62), 0.7)
-        clicks.append(moment)
     # Nether: click the name field, type, and press Enter once the name is free.
     focus, enter = session.at("name_focus"), session.at("name_enter")
     if focus is not None:
@@ -1736,15 +2143,15 @@ def grade():
     """Everything that changes with the place rather than with an object: the sun,
     the sky's light, the covers, the lens wobble."""
     scene = S["scene"]
-    ramp(S["sun"].data, "energy", [(2.3, 7.0), (2.55, 0.0)])
-    switch(S["sun"], "hide_render", [(0.0, False), (2.56, True)])
+    ramp(S["sun"].data, "energy", [(2.3, 7.0), (2.55, 0.0), (HOME - 0.01, 0.0), (HOME, 7.0)])
+    switch(S["sun"], "hide_render", [(0.0, False), (2.56, True), (HOME, False)])
     sky = scene.world.node_tree.nodes["Background"].inputs["Strength"]
-    ramp(sky, "default_value", [(1.5, 1.0), (1.78, 0.55), (2.45, 0.55), (2.75, 0.1), (THROUGH - 0.01, 0.1), (THROUGH, 0.05)])
+    ramp(sky, "default_value", [(1.5, 1.0), (1.78, 0.55), (2.45, 0.55), (2.75, 0.1), (THROUGH - 0.01, 0.1), (THROUGH, 0.05), (HOME - 0.01, 0.05), (HOME, 1.0)])
 
     one, zero = (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)
     for cover, points in (
         (S["white"], [(WHITE[0], 0.0), (WHITE[1], 1.0), (WHITE[2], 1.0), (WHITE[3], 0.0)]),
-        (S["swirl"], [(5.13, 0.0), (5.22, 1.0), (5.30, 1.0), (5.46, 0.0)]),
+        (S["swirl"], [(SWIRL[0][0], 0.0), (SWIRL[0][1], 1.0), (SWIRL[0][2], 1.0), (SWIRL[0][3], 0.0), (SWIRL[1][0], 0.0), (SWIRL[1][1], 1.0), (SWIRL[1][2], 1.0), (SWIRL[1][3], 0.0)]),
     ):
         ramp(cover, "color", [(s, (1.0, 1.0, 1.0, alpha)) for s, alpha in points])
         switch(cover, "scale", [(0.0, zero), (points[0][0] - 0.01, one), (points[-1][0] + 0.01, zero)])
@@ -1831,6 +2238,7 @@ def stage(session="scroll", aspect="wide"):
     set_ride()
     set_dungeon()
     set_nether()
+    set_ending()
     cast()
     shots = camera_shots()
     grade()

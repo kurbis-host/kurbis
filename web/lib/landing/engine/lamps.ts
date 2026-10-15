@@ -33,6 +33,12 @@ export interface Lamp {
 
 export class Lamps {
   readonly byName = new Map<string, Lamp>();
+  /**
+   * How much of its light every lamp gives this frame, 0 to 1, over what each is set to:
+   * all of it, but while the film puts every light out at once (the blackout at the
+   * homestead's gate: film/homestead.ts). Whoever sets it sets it back.
+   */
+  level = 1;
   private readonly list: Lamp[] = [];
   private readonly where = new Vector3();
   private readonly scored: { lamp: Lamp; score: number; x: number; y: number; z: number }[] = [];
@@ -85,23 +91,25 @@ export class Lamps {
     let keys = 0;
     this.scored.length = 0;
     for (const key of globals.uKeyColor.value) key.set(0, 0, 0);
+    const level = Math.min(Math.max(this.level, 0), 1);
     for (const lamp of this.list) {
+      const energy = lamp.energy * level;
       if (lamp.kind === "sun") {
         if (lamp.name === "Sun") {
           globals.uSunDir.value.copy(lamp.toward);
-          globals.uSunColor.value.copy(lamp.color).multiplyScalar(lamp.energy / Math.PI);
-          globals.uSunHaze.value.copy(lamp.color).multiplyScalar(lamp.energy);
-        } else if (lamp.energy > 0 && keys < KEYS) {
+          globals.uSunColor.value.copy(lamp.color).multiplyScalar(energy / Math.PI);
+          globals.uSunHaze.value.copy(lamp.color).multiplyScalar(energy);
+        } else if (energy > 0 && keys < KEYS) {
           globals.uKeyDir.value[keys].copy(lamp.toward);
-          globals.uKeyColor.value[keys].set(lamp.color.r, lamp.color.g, lamp.color.b).multiplyScalar(lamp.energy / Math.PI);
+          globals.uKeyColor.value[keys].set(lamp.color.r, lamp.color.g, lamp.color.b).multiplyScalar(energy / Math.PI);
           keys += 1;
         }
         continue;
       }
-      if (lamp.energy <= 0) continue;
+      if (energy <= 0) continue;
       const where = this.where.copy(lamp.at);
       if (lamp.parent) lamp.parent.localToWorld(where);
-      const reach = lamp.energy * (lamp.kind === "area" ? AREA : POINT);
+      const reach = energy * (lamp.kind === "area" ? AREA : POINT);
       this.scored.push({ lamp, score: reach / (where.distanceToSquared(eye) + 16), x: where.x, y: where.y, z: where.z });
     }
     this.scored.sort((a, b) => b.score - a.score);
@@ -113,7 +121,7 @@ export class Lamps {
       }
       const { lamp } = entry;
       const area = lamp.kind === "area";
-      const reach = lamp.energy * (area ? AREA : POINT);
+      const reach = lamp.energy * level * (area ? AREA : POINT);
       const least = area ? Math.max((lamp.size * lamp.size) / 4, 0.25) : 0.09;
       globals.uLampAt.value[i].set(entry.x, entry.y, entry.z, least);
       globals.uLampColor.value[i].set(lamp.color.r * reach, lamp.color.g * reach, lamp.color.b * reach, area ? 1 : 0);

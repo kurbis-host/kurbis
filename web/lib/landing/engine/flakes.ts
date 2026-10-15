@@ -23,12 +23,15 @@ uniform float uSway;
 uniform vec3 uColor;
 uniform vec3 uGlow;
 uniform float uGrow;
+uniform float uNear;
 out vec3 vColor;
 out vec3 vWorld;
 void main() {
   vec3 centre = mod(aCentre - uLo + uVelocity * uTime, uSize) + uLo;
   float waver = sin(uTime * 1.7 + aPhase) * uSway;
-  vec3 world = (modelMatrix * vec4(centre + (aAcross * position.x + aUp * position.y) * uGrow + vec3(waver, waver * 0.6, 0.0), 1.0)).xyz;
+  // (A flake nearer the eye than uNear shrinks away, rather than fill the frame: rain all round the camera.)
+  float kept = uNear > 0.0 ? smoothstep(uNear, 2.0 * uNear, distance((modelMatrix * vec4(centre, 1.0)).xyz, cameraPosition)) : 1.0;
+  vec3 world = (modelMatrix * vec4(centre + (aAcross * position.x + aUp * position.y) * uGrow * kept + vec3(waver, waver * 0.6, 0.0), 1.0)).xyz;
   // A flake is lit as a scrap of paper is: from either side.
   vec3 normal = normalize(cross(aAcross, aUp));
   float day = daylightAt(world);
@@ -110,6 +113,7 @@ export function flakesMesh(globals: Globals, note: TypeNote, look: MaterialNote 
       uGlow: { value: glow },
       uTint: { value: alpha },
       uGrow: { value: 1 },
+      uNear: { value: 0 },
     },
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,

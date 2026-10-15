@@ -108,12 +108,18 @@ export interface Constants {
   SNAP_TILT: Vec3;
   LEVER: [number, number];
   NAMES: string[];
-  ORES: string[];
-  ORE_LINES: string[][];
-  SIGNS: string[][];
-  ASKED: [string, string][];
-  ORE_VIEW: [number, number];
-  SPAWNER_VIEW: [number, number];
+  /** The homestead's features, each [from, to] in screens; the blast and its undoing: at the wall, the blast, time turns back, all back. */
+  BEATS: [number, number][];
+  REWIND: [number, number, number, number];
+  HEADS: string[][];
+  YARD: { x: [number, number]; y: [number, number]; gate: [number, number] };
+  HOUSE: { x: [number, number]; y: [number, number]; door: [number, number]; window: number };
+  /** Where the camera rests on the Nether's name field; where it is home again, in the valley; the portal's two swirls. */
+  NAME_STOP: number;
+  HOME: number;
+  SWIRL: [number, number, number, number][];
+  /** The closing set's signs. */
+  SPECS: string[][];
 }
 
 export interface Spots {
@@ -121,7 +127,8 @@ export interface Spots {
   pond: { center: [number, number]; radius: [number, number] };
   cave: { center: Vec3; radius: Vec3; floor: number };
   rail: Vec3[];
-  dungeon: { x: [number, number]; y: [number, number]; floor: number; height: number; ores: number[]; parting: [number, number]; portal: [number, number] };
+  /** The homestead's cavern (the art still calls it the dungeon). */
+  dungeon: { x: [number, number]; y: [number, number]; floor: number; height: number; portal: [number, number]; shaft: [[number, number], [number, number]]; tunnel: [number, number]; field: [[number, number], [number, number]] };
   front: { x: [number, number]; depth: number; bottom: number };
 }
 
@@ -144,10 +151,11 @@ export interface CastPoints {
   seat: Vec3;
   board: Vec3;
   alight: Vec3;
-  wall_spot: Vec3;
-  opening: Vec3;
-  sign_spot: Vec3;
-  facing: number;
+  path_spot: Vec3;
+  book_spot: Vec3;
+  watch_spot: Vec3;
+  /** Which way it faces at each of its homestead spots. */
+  facing: [number, number, number];
   before: Vec3;
   inside: Vec3;
   nether_spots: Vec3[];
@@ -156,13 +164,20 @@ export interface CastPoints {
 
 /** Places and numbers the sets worked out while they were built. */
 export interface Points {
+  /** The closing set: where the camera comes and rests, the signs' boards, the lectern's book. */
+  ending: { sky: Vec3; sky_aim: Vec3; eye: Vec3; aim: Vec3; spots: Vec3[]; lectern: Vec3 };
   gate: Vec3;
-  home_spot: Vec3;
   lever_side: Vec3;
-  tile_spots: Vec3[];
-  sign_spots: Vec3[];
+  /** The homestead: where its lectern's book is, the tunnel the friends come by, its gate, and the creeper's blast. */
+  home_spots: { lectern: Vec3; tunnel: Vec3; gate: Vec3; blast: Vec3 };
+  /** The fence's posts, as [x, y] block corners. */
+  fence_posts: [number, number][];
   toys: Record<string, Vec3>;
+  /** The sign where the pumpkin starts to dig: the middle of its board, and the column of the slab it stands on, if it does (it goes down with it). */
+  rule: { at: Vec3; slab?: string };
   nether_click: Vec3;
+  /** The other one of the dig's lost sock, on the Nether's ground by the second frame: the middle of its tile, on the ground. */
+  nether_sock: Vec3;
   /** The dig as [x, z] steps, and the step at which it comes through the cave's roof. */
   steps: [number, number][];
   through: number;
@@ -174,6 +189,12 @@ export interface Points {
   fishing: { tag: string; tip: Vec3; float: Vec3; away: Vec3; keeps: boolean; phase: number; size: number }[];
   /** Drops from the cave's roof: x, y, where it falls from, the floor, seconds between drops, phase. */
   drips: [number, number, number, number, number, number][];
+  /**
+   * A chicken jockey's run behind the pond (film/jockey.ts): its line as [x, y] every `step`
+   * blocks along it, the ground's height under it wherever that changes ([blocks along it,
+   * height]), and the stretch of it the lens sees (blocks along it).
+   */
+  jockey: { path: [number, number][]; step: number; ground: [number, number][]; seen: [number, number] };
 }
 
 export interface TypeNote {
@@ -241,15 +262,14 @@ export interface LayoutData {
   fog: FogData[];
   points: Points;
   tracks: { dig: TrackData; ride: TrackData };
-  /** The dungeon's ore wall: the room's height, each tile as [south edge, feet up], the chest as [y, feet up, on a ledge]. */
-  ore_wall: { height: number; tiles: [number, number][]; chest: [number, number, boolean] };
   /** Facts on the cut face: [lines, palettes, cell, [centre x, bottom z]]. */
   bands: [string[], string[], number, [number, number]][];
 }
 
 export type { Pack, Records };
 
-async function pixelsOf(picture: Blob): Promise<ImageData> {
+/** A picture's pixels, top row first. */
+export async function pixelsOf(picture: Blob): Promise<ImageData> {
   const bitmap = await createImageBitmap(picture, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
   const canvas = document.createElement("canvas");
   canvas.width = bitmap.width;

@@ -123,6 +123,141 @@ def arrow():
     return px
 
 
+# Where the faces of the bed's two halves lie on its skin (entity/bed): the top, the end,
+# and the two long sides, each as the top left of its region.
+_BED = {"head": ((6, 6), (6, 0), (0, 6), (22, 6)), "foot": ((6, 28), (22, 22), (0, 28), (22, 28))}
+
+
+def bed(rel="entity/bed/red.png", size=16):
+    """A bed as the game's inventory shows it, `size` pixels square with row 0 at the
+    bottom. The game draws one from its block models (a mattress six pixels thick on four
+    legs, two blocks long) at the angle its items take in the interface (their `gui`
+    display: 30 degrees over, 340 round, moved 2 and 3 pixels, at 0.5325). The pack has no
+    picture of a bed, only its skin, so this is that drawing done here: each pixel is the
+    face nearest the eye at its centre, as the game draws it at the interface's own scale,
+    and the faces are lit as the game lights a block's (the top full, the ends 0.8, the
+    sides 0.6)."""
+    skin = core.pixels(rel)[::-1]  # (row 0 at the top, as the regions are counted)
+
+    def region(x, y, w, h, upright=False, mirror=False):
+        """A face's colours from the skin, by where on the face (u across, v up, 0..1). An
+        upright region is a long side: its columns go up the face (from the bottom on the
+        left, or the right if `mirror`), its rows along it."""
+        def colour(u, v):
+            if upright:
+                u, v = (1 - v if mirror else v), u
+            return skin[np.minimum(y + (v * h).astype(int), y + h - 1), np.minimum(x + (u * w).astype(int), x + w - 1)]
+        return colour
+
+    faces = []  # (corner, along u, along v, colours, light), in the model's pixels
+    for half, (top, end, west, east) in _BED.items():
+        z = 0 if half == "head" else 16
+        faces += [
+            ((0, 9, z), (16, 0, 0), (0, 0, 16), region(*top, 16, 16), 1.0),
+            ((0, 3, 0 if half == "head" else 32), (16, 0, 0), (0, 6, 0), region(*end, 16, 6), 0.8),
+            ((0, 3, z), (0, 0, 16), (0, 6, 0), region(*west, 6, 16, upright=True), 0.6),
+            ((16, 3, z), (0, 0, 16), (0, 6, 0), region(*east, 6, 16, upright=True, mirror=True), 0.6),
+        ]
+    leg = region(50, 3, 3, 3)
+    for x in (0, 13):
+        for z in (0, 29):
+            faces += [((x, 0, z + 3), (3, 0, 0), (0, 3, 0), leg, 0.8), ((x, 0, z), (3, 0, 0), (0, 3, 0), leg, 0.8), ((x, 0, z), (0, 0, 3), (0, 3, 0), leg, 0.6), ((x + 3, 0, z), (0, 0, 3), (0, 3, 0), leg, 0.6)]
+
+    over, round_ = math.radians(30), math.radians(340)
+    turn = np.array(((1, 0, 0), (0, math.cos(over), -math.sin(over)), (0, math.sin(over), math.cos(over)))) @ np.array(((math.cos(round_), 0, math.sin(round_)), (0, 1, 0), (-math.sin(round_), 0, math.cos(round_))))
+
+    def seen(p):
+        """A point of the model on the icon: (x, y from the top, nearness), in its pixels."""
+        q = turn @ ((np.asarray(p, float) / 16 - 0.5) * 0.5325) + np.array((2, 3, 0)) / 16
+        return np.array((8 + 16 * q[0], 8 - 16 * q[1], q[2])) * size / 16
+
+    across, down = np.meshgrid(np.arange(size) + 0.5, np.arange(size) + 0.5)
+    out = np.zeros((size, size, 4), np.float32)
+    near = np.full((size, size), -np.inf)
+    for corner, along_u, along_v, colour, light in faces:
+        o = seen(corner)
+        du, dv = seen(np.add(corner, along_u)) - o, seen(np.add(corner, along_v)) - o
+        flat = np.array(((du[0], dv[0]), (du[1], dv[1])))
+        if abs(np.linalg.det(flat)) < 1e-9:
+            continue  # (edge on; a face turned away is always behind one that is not)
+        u, v =np.einsum("ij,jkl->ikl", np.linalg.inv(flat), np.stack((across - o[0], down - o[1])))
+        depth = o[2] + u * du[2] + v * dv[2]
+        hit = (u >= 0) & (u < 1) & (v >= 0) & (v < 1) & (depth > near)
+        texel = colour(np.clip(u, 0, 1), np.clip(v, 0, 1))
+        hit &= texel[..., 3] > 0.5
+        out[hit] = np.concatenate((texel[..., :3] * light, np.ones(texel.shape[:2] + (1,))), axis=-1)[hit]
+        near[hit] = depth[hit]
+    return out[::-1].copy()
+
+
+def shield(rel="entity/shield/shield_base_nopattern.png", size=32):
+    """A shield as the game's inventory shows it, `size` pixels square with row 0 at the
+    bottom. The game draws it from its entity model (a plate 12 pixels wide, 22 high and
+    one thick, with a handle behind), turned upright and to face the eye, at the angle
+    its item takes in the interface (the `gui` display: 15 degrees over, 25 round, 5 of
+    roll, moved 2 and 3 pixels, at 0.65). Like the bed, the pack has only its skin, so this
+    is that drawing done here, each pixel the face nearest the eye at its centre. Unlike
+    the bed it is drawn at twice the interface's scale, as the game draws a model at the
+    screen's own pixels: at the interface's, the plate's stripes, a pixel each and
+    shrunk to two thirds, run together into bands. The faces are lit as the game lights
+    a block's (the face full, the top and bottom 0.8, the sides 0.6)."""
+    skin = core.pixels(rel)[::-1]  # (row 0 at the top, as the regions are counted)
+
+    def region(x, y, w, h):
+        """A face's colours from the skin, by where on the face (u across, v down, 0..1)."""
+        def colour(u, v):
+            return skin[np.minimum(y + (v * h).astype(int), y + h - 1), np.minimum(x + (u * w).astype(int), x + w - 1)]
+        return colour
+
+    def box(lo, extent, uv):
+        """A box of the model as the game lays its skin on one (from `uv`: the top and bottom
+        in the first row, the sides, face and back below), in the model's pixels (Y down)."""
+        (x0, y0, z0), (w, h, d), (u, v) = lo, extent, uv
+        x1, y1, z1 = x0 + w, y0 + h, z0 + d
+        return [  # (corner, along u, along v, colours, light)
+            ((x0, y0, z0), (w, 0, 0), (0, h, 0), region(u + d, v + d, w, h), 1.0),  # the face
+            ((x1, y0, z1), (-w, 0, 0), (0, h, 0), region(u + 2 * d + w, v + d, w, h), 1.0),  # the back
+            ((x0, y0, z1), (0, 0, -d), (0, h, 0), region(u, v + d, d, h), 0.6),
+            ((x1, y0, z0), (0, 0, d), (0, h, 0), region(u + d + w, v + d, d, h), 0.6),
+            ((x0, y0, z1), (w, 0, 0), (0, 0, -d), region(u + d, v, w, d), 0.8),  # the top
+            ((x0, y1, z1), (w, 0, 0), (0, 0, -d), region(u + d + w, v, w, d), 0.8),
+        ]
+
+    faces = box((-6, -11, -2), (12, 22, 1), (0, 0)) + box((-1, -3, -1), (2, 6, 6), (26, 0))
+
+    def turn(axis, degrees):
+        a = math.radians(degrees)
+        c, s = math.cos(a), math.sin(a)
+        return {"x": np.array(((1, 0, 0), (0, c, -s), (0, s, c))), "y": np.array(((c, 0, s), (0, 1, 0), (-s, 0, c))), "z": np.array(((c, -s, 0), (s, c, 0), (0, 0, 1)))}[axis]
+
+    shown = turn("x", 15) @ turn("y", -25) @ turn("z", -5)
+
+    def seen(p):
+        """A point of the model on the icon: (x, y from the top, nearness), in its pixels.
+        (The game stands the model up and turns its face to the eye, and takes half a block
+        off it as it does any item's, before the display moves it.)"""
+        q = shown @ ((np.array((p[0], -p[1], -p[2]), float) / 16 - 0.5) * 0.65) + np.array((2, 3, 0)) / 16
+        return np.array((8 + 16 * q[0], 8 - 16 * q[1], q[2])) * size / 16
+
+    across, down = np.meshgrid(np.arange(size) + 0.5, np.arange(size) + 0.5)
+    out = np.zeros((size, size, 4), np.float32)
+    near = np.full((size, size), -np.inf)
+    for corner, along_u, along_v, colour, light in faces:
+        o = seen(corner)
+        du, dv = seen(np.add(corner, along_u)) - o, seen(np.add(corner, along_v)) - o
+        flat = np.array(((du[0], dv[0]), (du[1], dv[1])))
+        if abs(np.linalg.det(flat)) < 1e-9:
+            continue  # (edge on)
+        u, v = np.einsum("ij,jkl->ikl", np.linalg.inv(flat), np.stack((across - o[0], down - o[1])))
+        depth = o[2] + u * du[2] + v * dv[2]
+        hit = (u >= 0) & (u < 1) & (v >= 0) & (v < 1) & (depth > near)
+        texel = colour(np.clip(u, 0, 1), np.clip(v, 0, 1))
+        hit &= texel[..., 3] > 0.5
+        out[hit] = np.concatenate((texel[..., :3] * light, np.ones(texel.shape[:2] + (1,))), axis=-1)[hit]
+        near[hit] = depth[hit]
+    return out[::-1].copy()
+
+
 # -- cards -----------------------------------------------------------------------
 def _material(name, image):
     mat = bpy.data.materials.new(f"Hud_{name}")

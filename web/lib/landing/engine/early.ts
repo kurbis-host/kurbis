@@ -47,7 +47,7 @@ export function begin(aspect: Aspect): Early {
   if (!early) {
     performance.mark("landing:asked"); // (these marks are for looking into how loading went)
     // The valley is what the first frame shows: it is asked for first, and built with a helper.
-    const valley = loadWorld("valley.grid.gz", aspect === "tall" ? "dungeon.tall.patch.gz" : undefined, { helped: spare() });
+    const valley = loadWorld("valley.grid.gz", undefined, { helped: spare() }) // (both frames' worlds are one now: no patch for the tall one);
     early = {
       valley,
       // The Nether is the film's last stop: it waits for the valley, and takes nothing from the first frame.

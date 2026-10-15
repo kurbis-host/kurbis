@@ -13,7 +13,9 @@ in float _sway;        // how far a point of a plant is from its root
 uniform float uTime;
 uniform float uCalm;
 uniform vec4 uMoves;   // wind: strength, rooted or loose; swell: the water's level, its height
+uniform vec2 uAtlas;   // for what is mapped onto the block atlas: its tiles across, and a tile's pixels across (0: not)
 out vec2 vUv;
+flat out vec2 vTile;   // the atlas tile a face shows
 out vec3 vWorld;
 out vec3 vNormal;
 void main() {
@@ -34,6 +36,7 @@ void main() {
   vWorld = world.xyz;
   vNormal = mat3(modelMatrix) * normal;
   vUv = vec2(uv.x, 1.0 - uv.y); // glTF counts v from the top; the pictures are loaded bottom row first, as the art has them
+  vTile = floor(vUv * uAtlas.x); // (every corner of a face lies just inside its tile)
   gl_Position = projectionMatrix * viewMatrix * world;
 }
 `;
@@ -50,13 +53,17 @@ uniform float uSelf;
 uniform float uTint;      // the object's own opacity (things that fade share a material)
 uniform float uStrip;     // frames in a picture that is a strip of them, one above the other (0: it is one picture)
 uniform float uTime;
+uniform vec2 uAtlas;
 in vec2 vUv;
+flat in vec2 vTile;
 in vec3 vWorld;
 in vec3 vNormal;
 
 void main() {
   vec4 base = uColor;
   vec2 uv = vUv;
+  // Only ever the face's own tile: seen small or edge on, a face's edge would sample the next one's pixels.
+  if (uAtlas.x > 0.0) uv = clamp(uv, (vTile + 0.5 / uAtlas.y) / uAtlas.x, (vTile + 1.0 - 0.5 / uAtlas.y) / uAtlas.x);
   if (uStrip > 0.0) uv.y = fract(uv.y - floor(uTime * 20.0) / uStrip); // played as the game plays it
   if (uFlags.x > 0.5) base *= texture(uMap, uv);
   if (base.a < uFlags.z) discard;
@@ -115,6 +122,8 @@ export interface Pictures {
   atlasEmit: Texture;
   /** Pictures by the name the notes use. */
   named: Map<string, Texture>;
+  /** The atlas's tiles across, and a tile's pixels across. */
+  grid: [number, number];
 }
 
 /** What the art said moves a thing by itself: wind in a plant, the swell under what floats. */
@@ -124,7 +133,7 @@ export interface Moves {
 }
 
 function shader(globals: Globals, extra: Record<string, IUniform>, fragmentShader: string, options: Partial<ShaderMaterial> = {}): ShaderMaterial {
-  return new ShaderMaterial({ uniforms: { uMoves: { value: [0, 0, 0, 0] }, uStrip: { value: 0 }, ...globals, ...extra }, vertexShader: VERTEX, fragmentShader, side: DoubleSide, ...options } as ConstructorParameters<typeof ShaderMaterial>[0]);
+  return new ShaderMaterial({ uniforms: { uMoves: { value: [0, 0, 0, 0] }, uStrip: { value: 0 }, uAtlas: { value: [0, 0] }, ...globals, ...extra }, vertexShader: VERTEX, fragmentShader, side: DoubleSide, ...options } as ConstructorParameters<typeof ShaderMaterial>[0]);
 }
 
 export function modelMaterial(globals: Globals, note: MaterialNote, pictures: Pictures, moves: Moves = {}): Material {
@@ -140,11 +149,12 @@ function build(globals: Globals, note: MaterialNote, pictures: Pictures): Materi
     return shader(globals, {
       uMap: { value: pictures.atlas },
       uGlowMap: { value: pictures.atlasEmit },
-      uColor: { value: [1, 1, 1, 1] },
+      uColor: { value: [1, 1, 1, note.alpha ?? 1] },
       uGlow: { value: [note.emit ?? 0, note.emit ?? 0, note.emit ?? 0] },
-      uFlags: { value: [1, 1, 0, 0] },
+      uFlags: { value: [1, 1, 0, note.dither ? 1 : 0] },
       uSelf: { value: note.glow ?? 0 },
       uTint: { value: 1 },
+      uAtlas: { value: pictures.grid },
     }, FRAGMENT);
   }
   if (note.kind === "flat") {

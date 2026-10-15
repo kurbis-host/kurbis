@@ -23,6 +23,7 @@ uniform vec4 uStops[STOPS];
 uniform vec3 uGlow;
 uniform vec4 uLobes;
 uniform float uStars;
+uniform float uStarsFrom;
 uniform float uStrength;
 uniform vec3 uDisc;
 in vec3 vDir;
@@ -46,7 +47,7 @@ void main() {
     vec3 p = dir * 130.0;
     vec3 cell = floor(p);
     float speck = step(distance(p, cell + hash3(cell)), 0.06);
-    color += vec3(1.0, 0.92, 0.82) * (speck * clamp((dir.z - 0.16) / 0.44, 0.0, 1.0) * uStars * 0.5);
+    color += vec3(1.0, 0.92, 0.82) * (speck * clamp((dir.z - uStarsFrom) / 0.44, 0.0, 1.0) * uStars * 0.5);
   }
   gl_FragColor = vec4(throughHaze(color * uStrength, dir, 1.0e5, 0.0), 1.0);
 }
@@ -63,6 +64,8 @@ export function makeSky(globals: Globals, note: SkyNote): Mesh {
       uGlow: { value: new Vector3(...note.glow) },
       uLobes: { value: new Vector4(note.glow_power, note.glow_gain, note.disc_power, note.disc) },
       uStars: { value: note.stars },
+      // How high over the horizon they begin to show (the night the chat can bring has them lower: film/weather.ts).
+      uStarsFrom: { value: 0.16 },
       // Where the disc is drawn: a little lower than the lamp that lights the land.
       uDisc: { value: new Vector3(...note.sun).normalize() },
       uStrength: { value: note.strength },

@@ -59,6 +59,7 @@ export class Actor {
   private readonly blinks: number[] = [1.7];
   private jumpAt = -Infinity;
   private jumpHeight = 0.75;
+  private jumpAnywhere = false;
   private acts: { t0: number; t1: number; fn: MoveFn }[] = [];
   /** A face worn over whatever the scroll says (asleep while the cave sleeps), or null. */
   mask: string | null = null;
@@ -131,11 +132,15 @@ export class Actor {
   }
 
   // live --------------------------------------------------------------------------------
-  /** It jumps on the spot (somebody clicked it), if it is at rest. */
-  jump(now: number, height = 0.75) {
+  /**
+   * It jumps on the spot (somebody clicked it), if it is at rest; or, `anywhere`, on top of
+   * whatever the scroll has it doing (a hop where it sits in the cart).
+   */
+  jump(now: number, height = 0.75, anywhere = false) {
     if (now - this.jumpAt < JUMP) return;
     this.jumpAt = now;
     this.jumpHeight = height;
+    this.jumpAnywhere = anywhere;
   }
 
   /**
@@ -198,19 +203,19 @@ export class Actor {
     if (p.calm) {
       squash *= 1 + BREATH[0] * Math.sin((2 * Math.PI * now) / BREATH[1]);
       if (face === "awake" && this.bodies.has("blink") && this.blinking(now)) face = "blink";
-      const u = (now - this.jumpAt) / JUMP;
-      if (u >= 0 && u < 1) {
-        if (u < 0.16) {
-          squash *= 1 - 0.26 * Math.sin((Math.PI * 0.5 * u) / 0.16);
-        } else if (u < 0.8) {
-          const v = (u - 0.16) / 0.64;
-          lift = 4 * this.jumpHeight * v * (1 - v);
-          squash *= 1 + 0.16 * Math.abs(Math.cos(Math.PI * v));
-          if (this.bodies.has("whee")) face = "whee";
-        } else {
-          const v = (u - 0.8) / 0.2;
-          squash *= 1 - 0.3 * (1 - v) * Math.cos(Math.PI * 0.5 * v);
-        }
+    }
+    const u = (now - this.jumpAt) / JUMP;
+    if ((p.calm || this.jumpAnywhere) && u >= 0 && u < 1) {
+      if (u < 0.16) {
+        squash *= 1 - 0.26 * Math.sin((Math.PI * 0.5 * u) / 0.16);
+      } else if (u < 0.8) {
+        const v = (u - 0.16) / 0.64;
+        lift = 4 * this.jumpHeight * v * (1 - v);
+        squash *= 1 + 0.16 * Math.abs(Math.cos(Math.PI * v));
+        if (this.bodies.has("whee")) face = "whee";
+      } else {
+        const v = (u - 0.8) / 0.2;
+        squash *= 1 - 0.3 * (1 - v) * Math.cos(Math.PI * 0.5 * v);
       }
     }
     const wide = 1 / Math.sqrt(Math.max(squash, 1e-3));

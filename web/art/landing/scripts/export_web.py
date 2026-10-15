@@ -5,6 +5,7 @@
 Writes web/public/landing/ (made from the texture pack while the page is a proof of
 concept), the parity fixtures under web/tests/unit/landing/fixtures/ (numbers and
 our own copy only), and the bundle's version, web/lib/landing/engine/version.ts.
+Also the few pictures of the pack the site's own HTML pages show, web/public/gui/.
 """
 
 import hashlib
@@ -25,7 +26,7 @@ import numpy as np  # noqa: E402
 
 import film  # noqa: E402
 from kurbis import blocks as blk  # noqa: E402
-from kurbis import core, export, sets, voxel  # noqa: E402
+from kurbis import core, export, hud, sets, voxel  # noqa: E402
 from kurbis import world as wld  # noqa: E402
 
 FIXTURES = core.ROOT.parents[1] / "tests" / "unit" / "landing" / "fixtures"
@@ -34,14 +35,26 @@ VALLEY_FLOOR = -12  # faces at or above this height are the valley proper (the s
 KEY_SUN = tuple(np.array((-0.47, -0.57, 0.67)) / np.linalg.norm((-0.47, -0.57, 0.67)))  # toward the key suns of the open-air stops, near enough
 # Constants of the film the page reads rather than repeats.
 CONSTANTS = (
-    "PART", "END", "WAKE_UP", "FALL", "STOMP", "DIG0", "BREAK", "LAND", "WAKE", "ARRIVAL_RATE", "BOARD", "ARRIVE", "PORTAL_LIT", "THROUGH", "WHITE",
+    "PART", "END", "WAKE_UP", "FALL", "STOMP", "DIG0", "BREAK", "LAND", "WAKE", "ARRIVAL_RATE", "BOARD", "ARRIVE", "PORTAL_LIT", "THROUGH", "WHITE", "NAME_STOP", "HOME", "SWIRL", "SPECS",
     "PACE", "POND_LEVEL", "SWELL", "SUN", "SUN_LIGHT", "HERO_EYE", "HERO_PUMPKIN", "LANDING_SPOT", "SLAB_RATE", "CAVE_PUMPKIN", "TORCHES", "LANTERNS",
-    "SNAPSHOT", "SNAP_TILT", "LEVER", "NAMES", "ORES", "ORE_LINES", "SIGNS", "ASKED", "ORE_VIEW", "SPAWNER_VIEW",
+    "SNAPSHOT", "SNAP_TILT", "LEVER", "NAMES", "BEATS", "REWIND", "HEADS", "YARD", "HOUSE",
 )
 # What the sets left in the film's shared state that is a place or a number.
-POINTS = ("gate", "home_spot", "lever_side", "tile_spots", "sign_spots", "toys", "nether_click", "nether_free", "through", "steps", "cave_folded", "rail", "cast", "fishing", "drips")
-# Pictures of the pack the interface shows: a toast's card and the icons on it.
-HUD = {"toast": "gui/sprites/toast/advancement.png", "grass": "block/grass_block_side.png", "dirt": "block/dirt.png", "cave": "block/diamond_ore.png", "deeper": "block/obsidian.png", "pearl": "item/ender_pearl.png"}
+POINTS = ("ending", "gate", "lever_side", "home_spots", "fence_posts", "toys", "rule", "nether_click", "nether_free", "nether_sock", "through", "steps", "cave_folded", "rail", "cast", "fishing", "drips", "jockey")
+# Pictures of the pack the interface shows: a toast's card and the icons on it. (The page
+# loads every key; "wood" is also the sides of the block a punched tree drops, and "boot"
+# and "boot_overlay" are the leather boot the friends fish up now and then, film/life.ts.
+# "bed", the cave asleep, and "shield", the stranger turned away at the gate, are drawn
+# here from the pack's skins for them, which have no pictures of their own: kurbis/hud.py.)
+HUD ={"toast": "gui/sprites/toast/advancement.png", "grass": "block/grass_block_side.png", "dirt": "block/dirt.png", "cave": "block/diamond_ore.png", "deeper": "block/obsidian.png", "pearl": "item/ender_pearl.png", "wood": "block/oak_log.png",
+      "boot": "item/leather_boots.png", "boot_overlay": "item/leather_boots_overlay.png", "bed": hud.bed, "minecart": "item/minecart.png", "shield": hud.shield,
+      "end": "block/end_stone.png"}  # "The End", as the credits come to rest (film/credits.ts)
+# Pictures of the pack the site's own HTML pages show, as files of their own beside the
+# bundle rather than in it (the bundle is written afresh and its pictures packed into one
+# file, which a plain page cannot read): the dirt the game's old menu screens are tiled
+# with, behind the page for an address with nothing at it (app/not-found.tsx).
+GUI = {"dirt": "block/dirt.png"}
+GUI_OUT = export.OUT.parent / "gui"
 
 
 def _dungeon_box():
@@ -99,7 +112,7 @@ def world_grids(S, aspect, report, reference, wide):
     front = _front(w.z0)
     floor = VALLEY_FLOOR - w.z0
     parts = _parts()
-    if aspect != "wide":
+    if aspect != "wide" and not np.array_equal(wide["grid"], w.grid):
         report["dungeon.tall"] = export.write_patch(export.OUT / "dungeon.tall.patch.gz", wide["grid"], w.grid, b, closed)
     day, lit, solid = export.levels(w.grid, b, sky=True, front=front)
     mine, shared, lit_faces = {}, hashlib.sha1(), []
@@ -129,6 +142,9 @@ def world_grids(S, aspect, report, reference, wide):
         report["valley"] = export.write_grid(export.OUT / "valley.grid.gz", w.grid, b, w.origin, parts, closed=closed, sky=True, front=[front(z) for z in range(w.grid.shape[2])], shadows=shadows)
         origin, slab = w.front
         report["slab"] = export.write_model(export.OUT / "slab.grid", slab, b, origin, "Voxel", S["slab"])
+        # The homestead's house: block by block, for the creeper to scatter.
+        cells, pieces, origin = film.home_world()
+        report["home"] = export.write_model(export.OUT / "home.grid", cells, b, origin, "Voxel", pieces)
     return shared.hexdigest()
 
 
@@ -154,9 +170,15 @@ def layout(S, shots, aspect):
         "fog": [dict(core.noted(obj), name=obj.name) for obj in scene.objects if core.noted(obj).get("kind") == "fog"],
         "points": export.plain({key: S[key] for key in POINTS if key in S and not isinstance(S[key], (bpy.types.ID,))}),
         "tracks": {"dig": export.track(S["dig"]), "ride": export.track(S["ride"])},
-        "ore_wall": export.plain(film.ore_wall()),
         "bands": export.plain(film.bands()),
     }
+
+
+def gui_pictures():
+    """The pack's pictures for the site's own pages (see `GUI`), each as it is."""
+    GUI_OUT.mkdir(exist_ok=True)
+    for key, rel in GUI.items():
+        shutil.copyfile(core.TEX / rel, GUI_OUT / f"{key}.png")
 
 
 def export_all():
@@ -201,14 +223,18 @@ def export_all():
     scene["textures"] = export.copy_textures(used)
     (out / "hud").mkdir(exist_ok=True)
     for key, rel in HUD.items():
-        shutil.copyfile(core.TEX / rel, out / "hud" / f"{key}.png")
+        if callable(rel):
+            core.image_from_pixels(f"hud_{key}", rel(), out / "hud" / f"{key}.png")
+        else:
+            shutil.copyfile(core.TEX / rel, out / "hud" / f"{key}.png")
     scene["hud"] = {key: f"hud/{key}.png" for key in HUD}
+    gui_pictures()
     scene["files"] = report
     scene["same_world"] = digests["wide"] == digests["tall"]
     if not scene["same_world"]:
         raise RuntimeError("the valley outside the dungeon differs between the frames: the page builds both from one grid")
     # Everything small the page reads whole (pictures, the slab's cells) goes out as one file.
-    small = [f for f in out.rglob("*") if f.is_file() and (f.suffix == ".png" or f.name == "slab.grid")]
+    small = [f for f in out.rglob("*") if f.is_file() and (f.suffix == ".png" or f.name in ("slab.grid", "home.grid"))]
     report["small"] = export.write_pack(out / "small.pack.gz", out, small)
     (out / "scene.json").write_text(json.dumps(scene, separators=(",", ":")))
     (FIXTURES / "world.json").write_text(json.dumps(reference, separators=(",", ":")))

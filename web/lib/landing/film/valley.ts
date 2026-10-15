@@ -8,21 +8,38 @@ import { lerp, seeded, smooth } from "../anim/easing";
 import { grow } from "../anim/timeline";
 import { vec, type Ctx } from "./context";
 
+const DEG = 180 / Math.PI;
+/**
+ * The sleeper as the page comes round to the sky (./ring.ts): how awake it is (asleep, an eye
+ * open, both) by the seconds since the scroll went into the lead-in, where the cover lifts on
+ * the sky (it wakes), and since the scroll came out of it onto the sky (it looks at us a while
+ * longer, and dozes off again).
+ */
+const WAKES: readonly (readonly [number, number])[] = [[0, 1], [0.35, 2]];
+const DOZES: readonly (readonly [number, number])[] = [[0, 2], [1.75, 1], [2.25, 0]];
+const FACES = [null, "peek", "awake"] as const;
+const awakeAt = (faces: readonly (readonly [number, number])[], t: number) => faces.reduce((face, [at, awake]) => (t >= at ? awake : face), faces[0][1]);
+
 export function setValley(ctx: Ctx) {
   const { tl, C, stage } = ctx;
   const eye = vec(C.HERO_EYE);
 
-  // The clouds drift with the wind.
+  // The clouds drift with the wind. When the page comes round, under the film's cover, they
+  // are back where they began: after a long visit the near one would be over the title.
   const clouds: [Object3D, Vector3][] = [];
-  for (const [name, cloud] of stage.nodes) if (name.startsWith("Cloud_") && name !== "Cloud_dive") clouds.push([cloud, cloud.position.clone()]);
+  for (const [name, cloud] of stage.nodes) if (name.startsWith("Cloud_") && !name.startsWith("Cloud_dive")) clouds.push([cloud, cloud.position.clone()]);
+  const blow = (time: number) => {
+    const since = time - Math.max(ctx.again, 0);
+    for (const [cloud, home] of clouds) cloud.position.set(home.x + 0.22 * since, home.y + 0.04 * since, home.z);
+  };
 
   // The hero: gone under the white-out, so nothing of it hangs over the landing.
   const title = ctx.node("Hero_Title");
   const cue = ctx.node("Hero_Cue");
   const hero = [title, ctx.node("Hero_Perch"), ctx.node("Hero_Caption"), cue];
-  // The layer the dive goes through. Once the pumpkin is down it is out of the designed
-  // frame; a taller screen would see its flat underside, so it goes.
-  const layer = ctx.node("Cloud_dive");
+  // The deck the dive goes through. Once the pumpkin is down it is out of the designed
+  // frame; a taller screen would see its flat undersides, so it goes.
+  const deck = [...stage.nodes.keys()].filter((name) => name.startsWith("Cloud_dive")).map((name) => ctx.node(name));
   const titleZ = title.position.z;
   const cueZ = cue.position.z;
 
@@ -32,14 +49,26 @@ export function setValley(ctx: Ctx) {
   const from = vec(ctx.pick([2.2, 18.4, 31.05], [1.9, 18.4, 31.4]));
   const to = vec(ctx.pick([4.6, 18.4, 32.2], [3.3, 18.4, 33.3]));
   const woken = tl.trigger(C.WAKE_UP - 0.01, 0.15);
+  let dozing = 1; // how far the Zs rise: not while it is awake for a moment
+  let woke: { at: number; out: number } | null = null; // into the lead-in, and out of it (Infinity while in it)
 
   tl.during(0, 1.2, ({ s, time, dt }) => {
-    for (const [cloud, home] of clouds) cloud.position.set(home.x + 0.22 * time, home.y + 0.04 * time, home.z);
+    blow(time);
     rain.visible = time >= rained && time - rained < 3.2;
     const asleep = s < C.WAKE_UP - 0.01;
-    pumpkin.mask = asleep && (watched || time - poked < 1.4) ? "peek" : null;
+    // The page has come round past the end of the credits: under the cover it opens an eye,
+    // then both, and as the cover lifts it looks at us; at the sky it looks a while longer, then
+    // dozes off again. Scrolled back up into the lead-in, it wakes as the cover comes over it.
+    if (ctx.lead > 0 && woke?.out !== Infinity) woke = { at: time, out: Infinity };
+    else if (ctx.lead <= 0 && woke?.out === Infinity) woke.out = time;
+    const again = woke ? FACES[Math.min(awakeAt(WAKES, Math.min(time, woke.out) - woke.at), awakeAt(DOZES, time - woke.out))] : null;
+    pumpkin.mask = asleep && again ? again : asleep && (watched || time - poked < 1.4) ? "peek" : null;
+    dozing += ((asleep && again ? 0 : 1) - dozing) * (1 - Math.exp(-dt / 0.25));
     let toward = 0;
-    if (asleep && watched && ctx.touch.pointer) {
+    if (asleep && again) {
+      // Straight at the camera, from where it rests.
+      toward = Math.atan2(stage.camera.position.x - sleeper.x, sleeper.y - stage.camera.position.y) * DEG - (pumpkin.root.rotation.z * DEG - pumpkin.glance);
+    } else if (asleep && watched && ctx.touch.pointer) {
       // It turns to where the pointer is, a little.
       onScreen.copy(sleeper).project(stage.camera);
       toward = Math.max(Math.min(0.45 * 480 * (ctx.touch.pointer.x - (onScreen.x * 0.5 + 0.5)), 40), -40);
@@ -48,13 +77,13 @@ export function setValley(ctx: Ctx) {
     pumpkin.glance = Math.abs(glance) > 0.01 ? glance : 0;
     const there = s < C.WHITE[1] + 0.01 ? 1 : 0;
     for (const thing of hero) grow(thing, there);
-    layer.visible = s < C.FALL[1] + 0.04;
+    for (const puff of deck) puff.visible = s < C.FALL[1] + 0.04;
     title.position.z = titleZ + 0.28 * Math.sin((time * 2 * Math.PI) / 6.5); // it floats
     cue.position.z = cueZ + 0.012 * Math.sin((time * 2 * Math.PI) / 1.1); // and the cue nudges downward
     const left = Math.max(1 - woken.t / 0.15, 0);
     zs.forEach((z, i) => {
       const u = (time / 2.7 + i / 3) % 1;
-      const size = ((0.5 * lerp(0.03, 0.066, u)) / cells[i]) * smooth(u / 0.12) * smooth((1 - u) / 0.18) * left * there;
+      const size = ((0.5 * lerp(0.03, 0.066, u)) / cells[i]) * smooth(u / 0.12) * smooth((1 - u) / 0.18) * left * there * dozing;
       z.visible = size > 1e-4;
       if (!z.visible) return;
       z.scale.setScalar(size);
@@ -125,13 +154,19 @@ export function setValley(ctx: Ctx) {
     });
     slab.rotation.order = "ZYX";
   }
-  tl.during(C.STOMP - 0.1, C.STOMP + 0.6, ({ s }) => {
+  // Home again at the end, the world is whole: the slab stands where it stood.
+  const whole = (s: number) => s >= C.HOME - 0.02;
+  tl.during(C.STOMP - 0.1, C.STOMP + 0.6, ({ s }) => lay(s));
+  tl.during(C.HOME - 0.05, C.END + 0.1, ({ s }) => lay(s));
+  const lay = (s: number) => {
     for (const { slab, home, delay, tip, twist, drift } of columns) {
-      const fallen = Math.max((s - C.STOMP) * C.SLAB_RATE - delay, 0);
+      const fallen = whole(s) ? 0 : Math.max((s - C.STOMP) * C.SLAB_RATE - delay, 0);
       slab.visible = fallen <= 1.55;
       if (!slab.visible) continue;
       slab.position.set(home.x, home.y - drift * fallen, home.z - 13 * fallen * fallen);
       slab.rotation.set(-tip * fallen, 0, twist * fallen);
     }
-  });
+  };
+  // And the clouds drift on.
+  tl.during(C.HOME - 0.05, C.END + 0.1, ({ time }) => blow(time));
 }

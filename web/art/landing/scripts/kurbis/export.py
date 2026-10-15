@@ -297,10 +297,11 @@ def _table(blocks):
     }
 
 
-def write_model(path, grid, blocks, origin, material, pieces):
+def write_model(path, grid, blocks, origin, material, pieces, place=None, scale=None):
     """A small thing made of blocks, for the page to mesh piece by piece as `voxel.quads`
     would (each piece a closed solid of its own): its cells, the material's name, and
-    each piece's name, box of cells and the place of its mesh's origin."""
+    each piece's name, box of cells and the place of its mesh's origin. A thing smaller
+    than the world's blocks has its own cells, a `place` in the world and a `scale`."""
     header = {
         "shape": [int(n) for n in grid.shape],
         "origin": [int(v) for v in origin],
@@ -308,6 +309,9 @@ def write_model(path, grid, blocks, origin, material, pieces):
         "material": material,
         "pieces": [{"name": p["name"], "at": [int(v) for v in p["at"]], "shape": [int(v) for v in p["shape"]], "centre": [float(v) for v in p["centre"]]} for p in pieces],
     }
+    if place is not None:
+        header["place"] = [float(v) for v in place]
+        header["scale"] = float(scale)
     return _packed(path, header, grid)
 
 

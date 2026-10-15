@@ -9,9 +9,11 @@
 
 import { Vector3, type Mesh, type Object3D, type ShaderMaterial } from "three";
 import { setPose, type MoveFn } from "../anim/actor";
-import { POP, UNPOP, clamp01, cycle, flicker, lerp, linear, smooth } from "../anim/easing";
+import { POP, UNPOP, clamp01, flicker, lerp, linear, smooth } from "../anim/easing";
 import { fade, grow } from "../anim/timeline";
 import { GREY, YELLOW, type Card } from "../engine/hud";
+import { COPY } from "../copy";
+import { Player, addPose, keyed, type Delta } from "../anim/player";
 import { vec, type Ctx } from "./context";
 
 /** One step of a sequence: put a thing where `dt` seconds into the sequence have it. */
@@ -23,10 +25,16 @@ interface Pull {
 }
 
 export interface Cave {
-  /** A hand on the lever: the cave goes to sleep, or wakes. False if it was not ready for one. */
+  /**
+   * A hand on the lever: the cave goes to sleep, or wakes. False if it was not ready for one
+   * (it is still doing what it was last asked), and the action bar says so, as the game does
+   * of a bed it will not let you sleep in.
+   */
   pull(time: number): boolean;
   /** Whether it is awake, or on its way there. */
   awake(): boolean;
+  /** When the lever was first pulled since the visitor came, or null if it has not been. */
+  pulledAt(): number | null;
   /** What the pumpkin makes of it: whether it sleeps, and how much of its candle burns. */
   readonly sleeper: { asleep: boolean; candle: number };
 }
@@ -37,6 +45,8 @@ const NEAR: [number, number] = [2.3, 4.2];
 /** Seconds a visitor rests at the lever without touching it before the pumpkin shows how, and how long it dozes. */
 const PATIENCE = 7;
 const DOZE = 3.8;
+/** The picture on the toast for going to sleep (a key of the art's HUD): the red bed. */
+const BED = "bed";
 
 export function setCave(ctx: Ctx): Cave {
   const { tl, C, stage, points } = ctx;
@@ -90,19 +100,44 @@ export function setCave(ctx: Ctx): Cave {
   // The two friends: they join once the lights are on, and leave before they go out.
   const steve = ctx.node("Cave_Steve");
   const alex = ctx.node("Cave_Alex");
-  const friends: [Object3D, Object3D, number, number][] = [[steve, ctx.node("Cave_Tag_JAVA"), 1.0, 0.25], [alex, ctx.node("Cave_Tag_BEDROCK"), 1.35, 0.55]];
-  for (const [rig, tag, joins, leaves] of friends) {
-    for (const [thing, late] of [[rig, 0], [tag, 0.12]] as const) {
-      wakes.push((dt) => grow(thing, POP((dt - joins - late) / 0.32)));
-      sleeps.push((dt) => grow(thing, UNPOP((dt - leaves) / 0.22)));
-    }
+  // Each with a nametag that comes and goes with them.
+  const friends = ([[steve, "Steve", 1.0, 0.25], [alex, "Alex", 1.35, 0.55]] as const).map(([rig, name, joins, leaves]) => ({ rig, name, joins, leaves, shown: 0, card: null as Card | null, cardFor: "" }));
+  for (const friend of friends) {
+    const { rig, joins, leaves } = friend;
+    hidden.push(() => void (friend.shown = 0));
+    wakes.push((dt) => {
+      grow(rig, POP((dt - joins) / 0.32));
+      friend.shown = POP((dt - joins - 0.12) / 0.32);
+    });
+    sleeps.push((dt) => {
+      grow(rig, UNPOP((dt - leaves) / 0.22));
+      friend.shown = UNPOP((dt - leaves) / 0.22);
+    });
   }
-  // He mines the diamonds, for ever; she cannot keep still.
-  const swing = cycle(1.5, [[0, [-150, 0, 0]], [0.28, [-58, 0, 0]], [0.5, [-70, 0, 0]], [1.2, [-150, 0, 0]]]);
-  const bow = cycle(1.5, [[0, [12, 0, 0]], [0.28, [22, 0, 0]], [1.2, [12, 0, 0]]]);
-  const arm = ctx.node("Cave_Steve_arm_r");
-  const body = ctx.node("Cave_Steve_body");
-  const alexHome = alex.position.clone();
+  // He mines the diamonds, for ever, with his whole body; she cannot keep still. (Both alive:
+  // lib/landing/anim/player.ts. The keys are changes from how the art stood them.)
+  const miner = new Player(stage, "Cave_Steve", false, 2);
+  const jumper = new Player(stage, "Cave_Alex", true, 3);
+  const MINE = 1.5;
+  const mining: [number, Delta][] = [
+    [0, {}], // the pick up over his shoulder
+    [0.16, { armR: [-14, 0, 0], body: [-4, 0, 0], elbowR: 14 }], // drawn back a little more
+    [0.3, { armR: [92, 0, 0], body: [12, 0, 4], elbowR: -6, head: [6, 0, 0], kneeR: 16, kneeL: 22, lift: -0.05 }], // the strike, his weight into it
+    [0.38, { armR: [86, 0, 0], body: [13, 0, 4], kneeR: 18, kneeL: 24, lift: -0.06 }], // the shock of it
+    [0.62, { armR: [70, 0, 0], body: [8, 0, 2], kneeR: 8, kneeL: 12, lift: -0.02 }],
+    [1.25, {}],
+    [MINE, {}],
+  ];
+  const JUMP = 1.24;
+  const jumping: [number, Delta][] = [
+    [0, { kneeR: 34, kneeL: 34, legR: [-18, 0, 0], legL: [-18, 0, 0], body: [10, 0, 0], armR: [0, -22, 0], armL: [0, 22, 0], lift: -0.12 }], // down
+    [0.16, { kneeR: -2, kneeL: -2, legR: [6, 0, 0], legL: [6, 0, 0], body: [-6, 0, 0], armR: [0, 14, 0], armL: [0, -14, 0], lift: 0.48, head: [-8, 0, 0] }], // up, arms flung
+    [0.42, { kneeR: 20, kneeL: 26, legR: [-14, 0, 0], legL: [-10, 0, 0], lift: 0.42, armR: [0, 6, 0], armL: [0, -6, 0] }], // knees tucked at the top
+    [0.62, { kneeR: 30, kneeL: 30, legR: [-16, 0, 0], legL: [-16, 0, 0], body: [8, 0, 0], lift: -0.1, armR: [0, -18, 0], armL: [0, 18, 0] }], // landing
+    [0.78, { kneeR: 12, kneeL: 12, body: [2, 0, 0], lift: -0.03 }],
+    [JUMP, { kneeR: 34, kneeL: 34, legR: [-18, 0, 0], legL: [-18, 0, 0], body: [10, 0, 0], armR: [0, -22, 0], armL: [0, 22, 0], lift: -0.12 }],
+  ];
+
   // Now and then a diamond flies from his pick into the chest behind him.
   const gemAt = ctx.node("Cave_Diamond_At");
   const gem = ctx.node("Cave_Diamond");
@@ -186,14 +221,21 @@ export function setCave(ctx: Ctx): Cave {
   // Who plays the sequences. Arriving wakes it, by the scroll; after that, whoever pulls
   // the lever. Only the last two matter: the one before gives what the last leaves alone.
   let pulls: Pull[] = [];
+  let firstPull: number | null = null;
+  let dreamt: Pull | null = null; // the last sleep the toast was sent for
   const sleeper = { asleep: false, candle: 1 };
   const flip = (time: number) => {
     const last = pulls[pulls.length - 1];
     const what = !last || last.what === "wake" ? "sleep" : "wake";
     pulls.push({ what, at: time });
     if (pulls.length > 2) pulls.shift();
-    // Its comings and goings, in chat.
-    const said: [number, string, typeof YELLOW][] = what === "wake" ? [[1.0, "Steve joined the game", YELLOW], [1.35, "Alex joined the game", YELLOW]] : [[0.25, "Steve left the game", YELLOW], [0.55, "Alex left the game", YELLOW], [folded + 0.15, "World saved.", GREY]];
+    firstPull ??= time;
+    // Its comings and goings, in chat, and the server's own word (by the visitor's name for it, once they have one).
+    const server = ctx.visitor ? `${ctx.visitor}${COPY.surface.host}` : COPY.cave.server;
+    const said: [number, string, typeof YELLOW][] =
+      what === "wake"
+        ? [[0.05, `${server} started`, GREY], [1.0, `${ctx.players.Steve} joined the game`, YELLOW], [1.35, `${ctx.players.Alex} joined the game`, YELLOW]]
+        : [[0.25, `${ctx.players.Steve} left the game`, YELLOW], [0.55, `${ctx.players.Alex} left the game`, YELLOW], [folded + 0.15, "World saved.", GREY], [folded + 0.5, `${server} ${COPY.cave.sleeps}`, GREY]];
     for (const [delay, text, color] of said) ctx.ui?.say(text, color, time + delay, { stay: 6, from: NEAR[0], until: 3.62 });
   };
 
@@ -248,6 +290,7 @@ export function setCave(ctx: Ctx): Cave {
     if (!near && (pulls.length || shown)) {
       // Out of sight it is as the scroll has it again.
       pulls = [];
+      firstPull = null;
       demo = null;
       shown = false;
       pumpkin.settle();
@@ -280,15 +323,22 @@ export function setCave(ctx: Ctx): Cave {
     sleeper.asleep = last ? (last.what === "sleep" ? since >= 1.2 : since < 0.15) : false;
     if (demo) sleeper.asleep = demo.done === 1 && since >= 1.2 && time < demo.on - 0.6; // it starts up before it knocks the lever back
     ctx.cast.pumpkin.mask = sleeper.asleep ? "asleep" : null;
+    // The moment it is asleep, the game's advancement for a bed: once a visit, whoever pulled the lever. (Gone with the cave's own toast.)
+    if (sleeper.asleep && last?.what === "sleep" && dreamt !== last) {
+      dreamt = last;
+      ctx.ui?.toast(COPY.toasts.events.dreams, BED, time, { from: C.WAKE + 0.03, until: 3.62 });
+    }
     sleeper.candle = last ? (last.what === "sleep" ? 1 - clamp01((since - 1) / 0.4) : clamp01(since / 0.3)) : 1;
 
     fade(hint, s >= 3.12 && s < 3.6 ? 0.18 + 0.4 * (0.5 + 0.5 * Math.sin((time * 2 * Math.PI) / 1.5)) : 0);
     if (!near) return;
-    swing(time, out);
-    arm.rotation.set(out[0] * RAD, out[1] * RAD, out[2] * RAD, "ZYX");
-    bow(time, out);
-    body.rotation.set(out[0] * RAD, out[1] * RAD, out[2] * RAD, "ZYX");
-    alex.position.z = alexHome.z + 0.42 * Math.abs(Math.sin((time * Math.PI) / 0.62));
+    addPose(miner.rest(), keyed(mining, time % MINE));
+    miner.look = struck; // his eyes on the rock
+    miner.face.mouth = time % MINE > 0.28 && time % MINE < 0.5 ? "open" : "closed";
+    miner.update(time, dt);
+    addPose(jumper.rest(), keyed(jumping, time % JUMP));
+    jumper.face.mouth = "smile";
+    jumper.update(time, dt);
     const flight = clamp01(((time % 4.5) - 0.3) / 0.75); // one in three swings, from the moment the pick lands
     const size = 0.36 * smooth(flight / 0.08) * (1 - smooth((flight - 0.82) / 0.18));
     gem.visible = size > 1e-3;
@@ -299,6 +349,22 @@ export function setCave(ctx: Ctx): Cave {
       gem.rotation.set(0, 0, time * 7);
     }
   });
+
+  // Click a friend while they are in and they say something (./speech.ts). Steve, who
+  // mines here, starts with the mines. Back after the server has slept (the last pull woke
+  // it), they say so first.
+  const talks = COPY.talk.cave;
+  const woke = () => {
+    const last = pulls[pulls.length - 1];
+    return last?.what === "wake" ? last.at : null;
+  };
+  for (const friend of friends) {
+    const { rig, name } = friend;
+    const here = () => friend.shown > 0.5;
+    const talk = ctx.speech.speaker({ rig: rig.name, seen: [3.12, 3.6], here, headline: [awakeLine, asleepLine], lines: talks[name], first: name === "Steve" ? talks.mines : undefined, after: [{ since: woke, lines: talks.woke[name] }] });
+    const middle = new Vector3();
+    ctx.touch.add({ name: `cave_${name}`, at: () => middle.copy(rig.position).add(new Vector3(0, 0, 1)), half: new Vector3(0.45, 0.45, 1.05), seen: [3.12, 3.6], here, click: talk });
+  }
 
   // Small things to find while it is awake: a torch that can be snuffed (it relights), the
   // chest (its lid lifts), and the diamonds Steve is after.
@@ -356,7 +422,11 @@ export function setCave(ctx: Ctx): Cave {
   const cave: Cave = {
     pull(time) {
       const last = pulls[pulls.length - 1];
-      if (tl.frame.s < C.WAKE + 0.2 || tl.frame.s >= NEAR[1] || (last && time - last.at < 2.2)) return false;
+      if (tl.frame.s < C.WAKE + 0.2 || tl.frame.s >= NEAR[1] || (last && time - last.at < 2.2)) {
+        // (Only the visitor's hand gets this: the pumpkin's turn at the lever does not come through here.)
+        ctx.ui?.actionBar(COPY.cave.busy, time, { from: NEAR[0], until: 3.62 });
+        return false;
+      }
       if (demo) {
         // The visitor takes over: the pumpkin leaves the lever to them.
         demo = null;
@@ -367,22 +437,57 @@ export function setCave(ctx: Ctx): Cave {
       return true;
     },
     awake: () => (pulls.length ? pulls[pulls.length - 1].what === "wake" : true),
+    pulledAt: () => firstPull,
     sleeper,
   };
   const says: Record<string, Card | null> = { awake: null, asleep: null };
+  const leverTip = () => {
+    if (!ctx.ui) return null;
+    says.awake ??= ctx.ui.draw.tooltip("Lever", COPY.cave.lever.awake);
+    says.asleep ??= ctx.ui.draw.tooltip("Lever", COPY.cave.lever.asleep);
+    return cave.awake() ? says.awake : says.asleep;
+  };
+  // A hand with no pointer to hover cannot find the lever's tooltip: at the stop, it shows by itself until the lever is pulled.
+  const touchOnly = typeof window !== "undefined" && window.matchMedia("(hover: none)").matches;
+  const hang = ctx.pick([-16, 26], [26, -70]);
+  const anchor = ctx.pick<[number, number]>([1, 0], [1, 1]);
+  const onScreen = new Vector3();
+  let offered = 0;
+  tl.during(3.1, 3.7, ({ s, dt }) => {
+    const ui = ctx.ui;
+    if (!ui) return;
+    const near = s >= NEAR[0] && s < NEAR[1];
+    // The nametags, over the friends' heads.
+    for (const friend of friends) {
+      if (!near || friend.shown <= 0.01) continue;
+      // (Drawn again if the friend's name changes: the visitor may take their place.)
+      if (friend.cardFor !== ctx.players[friend.name]) {
+        friend.cardFor = ctx.players[friend.name];
+        friend.card = ui.draw.nametag(friend.cardFor, "");
+      }
+      friend.rig.updateWorldMatrix(true, false);
+      onScreen.setFromMatrixPosition(friend.rig.matrixWorld).add(OVER_HEAD).project(stage.camera);
+      if (onScreen.z < 1 && friend.card) ui.tips.push({ card: friend.card, at: [(onScreen.x * 0.5 + 0.5) * ui.hud.width, (onScreen.y * 0.5 + 0.5) * ui.hud.height], anchor: [0.5, 0], alpha: friend.shown, of: friend.rig.name });
+    }
+    const wanted = touchOnly && s > 3.3 && s < 3.55 && firstPull === null && ctx.touch.hovered?.name !== "lever";
+    offered = wanted ? Math.min(offered + dt / 0.25, 1) : Math.max(offered - dt / 0.15, 0);
+    const card = offered > 0 ? leverTip() : null;
+    if (!card) return;
+    onScreen.copy(hint.position).project(stage.camera);
+    ui.tips.push({ card, at: [(onScreen.x * 0.5 + 0.5) * ui.hud.width + hang[0], (onScreen.y * 0.5 + 0.5) * ui.hud.height + hang[1]], anchor, alpha: offered });
+  });
   ctx.touch.add({
     name: "lever",
     at: hint.position.clone(),
     half: new Vector3(0.6, 0.6, 0.85),
     seen: [3.12, 3.6],
-    hang: { offset: ctx.pick([-16, 26], [24, 34]), anchor: [1, 0] }, // between the headline and the block
-    tip: () => {
-      if (!ctx.ui) return null;
-      says.awake ??= ctx.ui.draw.tooltip("Lever", ["Pull it: everyone leaves,", "and the server sleeps."]);
-      says.asleep ??= ctx.ui.draw.tooltip("Lever", ["Pull it: someone joins,", "and the server wakes."]);
-      return cave.awake() ? says.awake : says.asleep;
-    },
+    // Between the headline and the block; in the tall frame, whose headline sits right over it, below the block.
+    hang: { offset: ctx.pick([-16, 26], [26, -70]), anchor: ctx.pick([1, 0], [1, 1]) },
+    tip: () => leverTip(),
     click: (time) => void cave.pull(time),
   });
   return cave;
 }
+
+/** From a player's feet to just over their head. */
+const OVER_HEAD = new Vector3(0, 0, 2.3);

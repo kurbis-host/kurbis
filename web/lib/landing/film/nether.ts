@@ -4,12 +4,17 @@
  * the frame lights, and the pumpkin leaps through.
  */
 
-import { Mesh, Vector3, type BufferGeometry, type Material } from "three";
+import { Mesh, Vector3 } from "three";
 import { setPose } from "../anim/actor";
 import { POP, UNPOP, clamp01, lerp, smooth, wrap } from "../anim/easing";
 import { grow } from "../anim/timeline";
+import type { Palette } from "../engine/bundle";
 import type { Card } from "../engine/hud";
+import { COPY } from "../copy";
 import { vec, type Ctx } from "./context";
+import { REMOVED, REMOVED_FOR, SYSTEM, eggOf } from "./eggs";
+import { typedLine } from "./name-line";
+import { makeSplash, throb, touchSplash } from "./splash";
 
 const RAD = Math.PI / 180;
 /** Cells the name has room for before it is set smaller, and the host's width, as the art laid the line out. */
@@ -17,7 +22,7 @@ const NAME_CELLS = 58;
 const HOST_CELLS = 71;
 
 /** What the page has found out about the name that stands in the field. */
-export type Verdict = "free" | "taken" | "short" | "dash" | null;
+export type Verdict = "free" | "taken" | "mine" | "short" | "dash" | null;
 
 export interface NameField {
   /** Where the field is on the canvas, as shares of its width and height from the top left; null while it cannot be typed in. */
@@ -26,7 +31,7 @@ export interface NameField {
   /** The whole name as it now stands. */
   type(text: string, time: number): void;
   judge(verdict: Verdict, time: number): void;
-  /** Enter. True if the name was free: the pumpkin leaps, and the page may follow it. */
+  /** Step through. True if the name was free and the field is in sight: the pumpkin leaps, and the page may follow it. */
   enter(time: number): boolean;
 }
 
@@ -36,7 +41,6 @@ export function setNether(ctx: Ctx): NameField {
   const origin = vec(stage.data.nether.origin);
   const sIn = C.THROUGH - 0.03;
   const lights = lamps.named("Nether_Lamp_");
-  const face = stage.data.glyphs.block;
 
   // The name field over the second frame, facing back along the bridge.
   const field = ctx.node("Nether_Field");
@@ -57,36 +61,41 @@ export function setNether(ctx: Ctx): NameField {
   const walker = ctx.node("Strider");
   const legs = [ctx.node("Strider_leg_r"), ctx.node("Strider_leg_l")];
   walker.rotation.set(0, 0, 90 * RAD); // walking east
+  // The other one of the dig's lost sock lies by the second frame, for a visitor who
+  // remembers what that one said. It is small: the pointer finds it from a little way off.
+  const [sockTitle, sockLine] = COPY.nether.sock;
+  let sockTip: Card | null = null;
+  ctx.touch.add({
+    name: "nether_sock",
+    at: vec(ctx.points.nether_sock).add(new Vector3(0, 0, 0.1)),
+    half: new Vector3(0.8, 0.8, 0.35),
+    seen: [5.9, C.HOME - 0.05],
+    pick: true,
+    // Under it, on the bare deck: clear of the frame (lit or not) and of the field over it.
+    hang: { offset: [0, -18], anchor: [0.5, 1] },
+    tip: () => (sockTip ??= ctx.ui?.draw.tooltip(sockTitle, [sockLine]) ?? null),
+  });
 
   // -- the name, as it is typed -------------------------------------------------------------
   const cell = ctx.pick(0.06, 0.09);
   const left = -(ctx.pick(NAME_CELLS + 1 + HOST_CELLS, NAME_CELLS) / 2) * cell; // where the name begins
   const line = ctx.pick(0.72, 2.55); // the name's line, above the foot of the block
   const said = ctx.pick(0.042, 0.06); // the cell of what is said under it
-  const glyphs = new Map<string, BufferGeometry>();
-  let look: Material | null = null;
-  const letters: { mesh: Mesh; ch: string; born: number }[] = [];
-  let text = "";
+  const typed = typedLine(ctx, field, { palette: "cream", cell, depth: 4, day: 0, left, line, room: NAME_CELLS });
   let focused = false;
   let emptied = 0; // how far the placeholder has gone, 0..1
-  let verdict: Verdict = null;
+  let verdict: Verdict | "removed" = null;
   let judged = -Infinity;
+  let answered = -Infinity; // (when it first answered for the name as it stands)
   let cleared = -Infinity;
+  let held: { verdict: Verdict; at: number } | null = null; // what it found, while it says something else first
   let message: Mesh | null = null;
+  let shown: Mesh | null = null; // what answers for the name now: the message, or the splash
   let messageFor = "";
   let entered: number | null = null;
   let hint: Card | null = null;
 
-  const widthOf = (ch: string) => (face.glyphs[ch] ?? face.glyphs["?"])[0].length;
-  const letter = (ch: string) => {
-    const geometry = glyphs.get(ch);
-    if (geometry && look) return new Mesh(geometry, look);
-    const made = stage.makeType([ch], { palette: "cream", cell, depth: 4 });
-    look = made.material as Material;
-    glyphs.set(ch, made.geometry);
-    return made;
-  };
-  const say = (lines: string[], palette: string) => {
+  const say = (lines: string[], palette: string | Palette) => {
     if (message) {
       field.remove(message);
       message.geometry.dispose();
@@ -94,11 +103,39 @@ export function setNether(ctx: Ctx): NameField {
     message = stage.makeType(lines, { palette, cell: said, depth: 3 });
     field.add(message);
   };
-  const SAYS: Record<Exclude<Verdict, null>, (name: string) => [string[], string]> = {
-    free: (name) => [tall ? [`${name}.KURBIS.HOST`, "IS FREE."] : [`${name}.KURBIS.HOST IS FREE.`], "lime"],
-    taken: (name) => [tall ? [`${name}.KURBIS.HOST`, "IS TAKEN."] : [`${name}.KURBIS.HOST IS TAKEN.`], "ember"],
+  // (The name stands right above: the answer does not repeat it, so a long one never runs off the frame.)
+  const SAYS: Record<Exclude<Verdict, "free" | null> | "removed", (name: string) => [string[], string | Palette]> = {
+    taken: () => [["TAKEN. TRY ANOTHER."], "ember"],
+    mine: () => [["WELCOME BACK."], "lime"],
     short: () => [tall ? ["AT LEAST", "3 CHARACTERS."] : ["AT LEAST 3 CHARACTERS."], "ember"],
     dash: () => [tall ? ["NO DASH AT THE", "START OR END."] : ["NO DASH AT THE START OR END."], "ember"],
+    removed: () => [[REMOVED], SYSTEM],
+  };
+  // A free name gets the splash instead: on the host's lower right corner (3.9 along, in the wide frame), as the
+  // game's is on its logo's, just grazing its last letter (nearer the middle in the tall frame, to stay inside it).
+  const splash = makeSplash(stage, ctx.pick(0.03, 0.04), { words: COPY.splash.toUpperCase() }); // (in capitals, as it always was)
+  splash.position.set(ctx.pick(3.9, 0.6), -0.15, ctx.pick(0.66, 0.5));
+  field.add(splash);
+  // Pointed at, it says what is under the hood (./splash.ts): under it, where the frame below has room.
+  touchSplash(ctx, splash, { name: "nether_splash", seen: [6.0, C.HOME - 0.05], side: "under" });
+  /** Answer for the name as it stands (null: nothing is known of it yet). */
+  const tell = (next: Verdict | "removed", time: number) => {
+    const text = typed.text;
+    if (next === null) cleared = time;
+    else {
+      if (verdict === null) answered = time;
+      if (shown) grow(shown, 0); // (what it said first, if it said anything)
+      splash.visible = false;
+      if (next === "free") shown = splash;
+      else {
+        const [lines, palette] = SAYS[next](text);
+        say(lines, palette);
+        shown = message;
+      }
+      judged = time;
+      messageFor = text;
+    }
+    verdict = next;
   };
 
   // -- the pumpkin's last leap ----------------------------------------------------------------
@@ -110,45 +147,40 @@ export function setNether(ctx: Ctx): NameField {
   const corner = new Vector3();
 
   tl.during(sIn - 0.1, C.END, ({ s, time, dt }) => {
-    const there = s >= sIn;
+    const there = s >= sIn && s < C.HOME; // (home, the Nether is behind us)
     for (const lamp of lights) lamp.energy = there ? lamp.base : 0;
     for (const thing of stale) if (thing) thing.visible = false;
     card.visible = s >= 5.6;
     grow(headline, POP(popped.headline.t / 0.28));
     grow(host, POP(popped.host.t / 0.28));
     // Until a name is typed the field shows a placeholder.
-    emptied = focused || text ? Math.min(emptied + dt / 0.15, 1) : Math.max(emptied - dt / 0.15, 0);
+    emptied = focused || typed.text ? Math.min(emptied + dt / 0.15, 1) : Math.max(emptied - dt / 0.15, 0);
     grow(placeholder, POP(popped.name.t / 0.28) * UNPOP(emptied));
     grow(bar, POP(popped.name.t / 0.28));
     bar.scale.z *= focused ? 1.5 + 0.5 * Math.sin(time * 5) : 1; // it stirs while the field has the keyboard
 
     // The letters, each popping in as it is typed. A long name is set smaller, to fit.
-    let cells = 0;
-    for (const { ch } of letters) cells += widthOf(ch) + 1;
-    const fit = Math.min(NAME_CELLS / Math.max(cells - 1, 1), 1);
-    let x = 0;
-    for (const { mesh, ch, born } of letters) {
-      const w = widthOf(ch);
-      mesh.position.set(left + (x + w / 2) * cell * fit, 0, line);
-      mesh.scale.setScalar(fit * (1 + 0.2 * Math.sin(Math.PI * Math.min((time - born) / 0.12, 1))));
-      mesh.visible = popped.name.t > 0;
-      x += w + 1;
-    }
+    typed.lay(time, popped.name.t > 0);
 
     // What the page says about the name takes the caption's place.
+    if (held && time >= held.at) {
+      const { verdict: found, at } = held;
+      held = null;
+      tell(found, at); // (as of when it was due: a field out of sight then shows it as long said)
+    }
     const told = verdict !== null;
     const answer = told ? POP((time - judged - 0.05) / 0.28) : UNPOP((time - cleared) / 0.15);
-    if (message) grow(message, answer);
-    const captioned = told ? UNPOP((time - judged + 0.1) / 0.15) : POP((time - cleared - 0.1) / 0.28);
-    grow(caption, POP(popped.caption.t / 0.28) * (message ? captioned : 1));
+    if (shown) grow(shown, answer * (shown === splash ? throb(time) : 1));
+    const captioned = told ? UNPOP((time - answered + 0.1) / 0.15) : POP((time - cleared - 0.1) / 0.28);
+    grow(caption, POP(popped.caption.t / 0.28) * (shown ? captioned : 1));
 
     // A name that is free lights the frame under it.
-    const free = verdict === "free" ? time - judged : -1;
+    const free = verdict === "free" || verdict === "mine" ? time - judged : -1; // (their own world opens the frame too)
     grow(gate, free >= 0 ? POP((free - 0.25) / 0.3) : 0);
     sparks.visible = free >= 0.3;
     sparks.userData.grow = clamp01((free - 0.3) / 0.2);
     glows.forEach((lamp, i) => void (lamp.energy = free >= 0 ? [800, 260][i] * clamp01((free - 0.25) / 0.25) : 0));
-    if (ctx.ui && s > 6.0 && free >= 0 && entered === null) {
+    if (ctx.ui && s > 6.0 && s < C.HOME - 0.05 && free >= 0 && entered === null && ctx.ui.claimed === null) {
       // And the key to press shows, for a hand that has no keyboard.
       hint ??= ctx.ui.draw.button(null, "Enter");
       ctx.ui.extras.push({ card: hint, x: ctx.ui.hud.width / 2, y: 22, anchor: [0.5, 0], alpha: clamp01((free - 0.5) / 0.15), press: "enter" });
@@ -162,7 +194,7 @@ export function setNether(ctx: Ctx): NameField {
   const name: NameField = {
     box() {
       const { s } = tl.frame;
-      if (s < 6.0 || popped.name.t <= 0) return null;
+      if (s < 6.0 || s >= C.HOME - 0.05 || popped.name.t <= 0) return null;
       // The name's line: from where it begins to where the host does, projected.
       stage.camera.updateMatrixWorld();
       field.updateWorldMatrix(true, false);
@@ -174,32 +206,21 @@ export function setNether(ctx: Ctx): NameField {
       focused = on;
     },
     type(next, time) {
-      const upper = next.toUpperCase();
-      if (upper === text) return;
-      // Keep the letters that still stand; the new ones pop.
-      let same = 0;
-      while (same < text.length && same < upper.length && text[same] === upper[same]) same += 1;
-      for (const gone of letters.splice(same)) field.remove(gone.mesh);
-      [...upper.slice(same)].forEach((ch, i) => {
-        const mesh = letter(ch);
-        field.add(mesh);
-        letters.push({ mesh, ch, born: time + 0.02 * i });
-      });
-      text = upper;
+      typed.type(next, time);
     },
     judge(next, time) {
-      if (next === verdict && messageFor === text) return;
-      if (next === null) cleared = time;
-      else {
-        const [lines, palette] = SAYS[next](text);
-        say(lines, palette);
-        judged = time;
-        messageFor = text;
-      }
-      verdict = next;
+      const text = typed.text;
+      if (next === (held ? held.verdict : verdict) && messageFor === text) return;
+      held = null;
+      // Herobrine: it says "Removed." first (./eggs.ts), and what it found after.
+      if (next !== null && eggOf(text) === "removed") {
+        held = { verdict: next, at: time + REMOVED_FOR };
+        tell("removed", time);
+      } else tell(next, time);
     },
     enter(time) {
-      if (verdict !== "free" || entered !== null) return false;
+      // (Only where it can be seen: at the field, by the lit frame.)
+      if (verdict !== "free" || entered !== null || tl.frame.s < 6.0) return false;
       entered = time;
       // It leaps through the lit frame, and is gone.
       nether.act(time + 0.15, time + 0.8, (u, out) => {

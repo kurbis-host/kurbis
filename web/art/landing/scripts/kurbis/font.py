@@ -60,6 +60,7 @@ _G = {
     "-": ["....", "....", "....", "####", "####", "....", "....", "...."],
     "_": ["......", "......", "......", "......", "......", "......", "######", "######"],
     "/": ["...##", "...##", "..##.", "..##.", ".##..", ".##..", "##...", "##..."],
+    "%": ["###....##", "#.#...##.", "###..##..", "....##...", "...##....", "..##..###", ".##...#.#", "##....###"],  # rings: dots the size of "." read as punctuation
     "+": ["......", "..##..", "..##..", "######", "######", "..##..", "..##..", "......"],
     ">": ["##....", "###...", ".###..", "..###.", "..###.", ".###..", "###...", "##...."],
     "\u2193": ["..##..", "..##..", "..##..", "..##..", "######", ".####.", "..##..", "......"],  # down arrow
@@ -144,15 +145,32 @@ _PIXEL = (
     "7C 14 14 14 08|08 14 14 18 7C|7C 08 04 04 08|48 54 54 54 20|04 3F 44 40 20|3C 40 40 20 7C|1C 20 40 20 1C|3C 40 30 40 3C|"
     "44 28 10 28 44|0C 50 50 50 3C|44 64 54 4C 44|00 08 36 41 00|00 00 7F 00 00|00 41 36 08 00|08 04 08 10 08"
 )
-PIXEL_ROWS = 7
+# Seven rows down to the baseline, and one under it for the letters that hang below.
+PIXEL_ROWS = 8
+_DESCENDERS = {
+    "g": (".####", "#...#", "#...#", ".####", "....#", "####."),
+    "j": ("...#", "....", "...#", "...#", "...#", "...#", "#..#", ".##."),
+    "p": ("####.", "#...#", "#...#", "####.", "#....", "#...."),
+    "q": (".####", "#...#", "#...#", ".####", "....#", "....#"),
+    "y": ("#...#", "#...#", "#...#", ".####", "....#", "####."),
+    # As the game draws it: down through the line under the baseline, so it is not taken for an "l".
+    "|": ("#",) * PIXEL_ROWS,
+}
 
 
 def _pixel_glyphs():
     glyphs = {}
     for code, columns in enumerate(_PIXEL.split("|"), start=32):
-        grid = np.array([[(int(column, 16) >> row) & 1 for column in columns.split()] for row in range(PIXEL_ROWS)], bool)
+        grid = np.array([[(int(column, 16) >> row) & 1 for column in columns.split()] for row in range(7)], bool)
+        grid = np.vstack([grid, np.zeros((PIXEL_ROWS - 7, grid.shape[1]), bool)])
         used = np.flatnonzero(grid.any(axis=0))
         glyphs[chr(code)] = grid[:, used[0] : used[-1] + 1] if len(used) else np.zeros((PIXEL_ROWS, 3), bool)
+    for ch, rows in _DESCENDERS.items():
+        # Drawn from the bottom: a glyph shorter than the face starts lower down (lowercase starts at row 2).
+        drawn = np.array([[c == "#" for c in row] for row in rows], bool)
+        grid = np.zeros((PIXEL_ROWS, drawn.shape[1]), bool)
+        grid[PIXEL_ROWS - len(rows) :] = drawn
+        glyphs[ch] = grid
     return glyphs
 
 
@@ -160,7 +178,7 @@ PIXEL = _pixel_glyphs()
 
 
 def pixel_mask(text):
-    """One line in the small face: a mask seven rows high, row 0 at the top."""
+    """One line in the small face: a mask eight rows high (the last under the baseline), row 0 at the top."""
     parts = []
     for ch in text:
         parts.append(PIXEL.get(ch, PIXEL["?"]))

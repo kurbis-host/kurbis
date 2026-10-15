@@ -3,10 +3,8 @@
  * a name, and whether it is free.
  */
 
+import type { components } from "../api/generated/schemas";
 import { SUBDOMAIN, isSubdomain } from "../subdomain";
-
-/** Whether the page asks a server if a name is free, or makes the answer up. There is no endpoint yet. */
-export const MOCK = true;
 
 export const LONGEST = SUBDOMAIN.longest;
 
@@ -24,17 +22,11 @@ export function flawOf(name: string): Flaw {
   return name.length < SUBDOMAIN.shortest ? "short" : "dash";
 }
 
-const TAKEN = new Set(["steve", "lena", "bigfarm", "alex", "creeper", "admin", "minecraft", "kurbis", "play", "survival", "www", "api"]);
-
-/** Whether a (well-formed) name is free. Made up for now; the signature is what a real check would have. */
+/** Whether a (well-formed) name is free: the control plane is asked, with no session needed. */
 export async function isFree(name: string, signal?: AbortSignal): Promise<boolean> {
-  if (!MOCK) throw new Error("landing: there is no name check to ask yet");
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, 380);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(new DOMException("Aborted", "AbortError"));
-    });
-  });
-  return !TAKEN.has(name);
+  // Plain fetch, not the panel's API client: the landing page carries as little as it can.
+  const response = await fetch(`/api/v1/names/${encodeURIComponent(name)}`, { signal, headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`landing: the name check answered ${response.status}`);
+  const answer = (await response.json()) as components["schemas"]["NameAvailability"];
+  return answer.free;
 }

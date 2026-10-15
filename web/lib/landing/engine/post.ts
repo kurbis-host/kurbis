@@ -206,6 +206,12 @@ export class Post {
     white[2] = color.b;
   }
 
+  /** The cloud's colour, as it was last set. */
+  white(): Color {
+    const [r, g, b] = this.final.uniforms.uWhite.value as number[];
+    return new Color(r, g, b);
+  }
+
   /** The portal's picture, and how big one tile of it is on screen, in frame heights. */
   setSwirl(texture: Texture, tile: [number, number]) {
     this.final.uniforms.tSwirl.value = texture;

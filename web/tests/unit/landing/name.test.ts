@@ -1,6 +1,6 @@
 /** The name a visitor picks: what may be typed, what is wrong with it, whether it is free. */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { LONGEST, flawOf, isFree, typed } from "../../../lib/landing/name";
 
 describe("a server's name", () => {
@@ -18,12 +18,30 @@ describe("a server's name", () => {
     expect(flawOf("my-world-2")).toBeNull();
   });
 
-  it("answers whether a name is free, and can be called off", async () => {
+  it("asks the control plane whether a name is free, and can be called off", async () => {
+    const fetch = vi.fn((url: string, init?: RequestInit) =>
+      new Promise<Response>((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        const name = url.split("/").pop() ?? "";
+        setTimeout(() => resolve(Response.json({ name, free: name !== "steve" })), 5);
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
     await expect(isFree("pumpkinpatch")).resolves.toBe(true);
+    expect(fetch).toHaveBeenLastCalledWith("/api/v1/names/pumpkinpatch", expect.objectContaining({ headers: { accept: "application/json" } }));
     await expect(isFree("steve")).resolves.toBe(false);
     const abort = new AbortController();
     const asked = isFree("pumpkinpatch", abort.signal);
     abort.abort();
     await expect(asked).rejects.toThrow();
   });
+
+  it("does not make up an answer when the check fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("unavailable", { status: 503 }))));
+    await expect(isFree("pumpkinpatch")).rejects.toThrow("503");
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });

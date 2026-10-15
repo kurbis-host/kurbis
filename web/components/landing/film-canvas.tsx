@@ -6,6 +6,7 @@ import { aspectNow } from "../../lib/landing/engine/early";
 import { loadStage } from "../../lib/landing/engine/stage";
 import { workAt } from "../../lib/landing/engine/world";
 import { Film } from "../../lib/landing/film/film";
+import { FILM, Ring } from "../../lib/landing/film/ring";
 
 /** A pickaxe for the pointer, from the film's own picture of one: a data URL, or null without it. */
 async function pickaxe(source: Blob | null): Promise<string | null> {
@@ -55,6 +56,12 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
       return;
     }
     const context = gl;
+    // A visit begins at the sky. The page's top is the end of the credits, over the stretch where
+    // the page comes round onto the sky (../../lib/landing/film/ring.ts): so a page at its top, as it
+    // is opened (or as the router leaves it), is taken down to the sky. One the browser has put back
+    // where it was is left there.
+    const opening = new Ring(FILM);
+    if (window.scrollY < opening.top * window.innerHeight) window.scrollTo({ top: opening.page(0) * window.innerHeight, behavior: "instant" });
     workAt(worker);
     onState?.("loading");
     (async () => {
@@ -66,23 +73,49 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
         return;
       }
       const film = new Film(element, stage, overlay.current, context);
-      // (A window that is not laid out yet, a hidden one say, has no height: it is at the top.)
-      const screens = () => (window.innerHeight > 0 ? window.scrollY / window.innerHeight : 0);
-      const onScroll = () => film.setScroll(screens());
+      const { ring } = film;
+      // (A window that is not laid out yet, a hidden one say, has no height: it is at the sky.)
+      const screens = () => (window.innerHeight > 0 ? window.scrollY / window.innerHeight : ring.page(0));
+      // Where the scroll is on the ring. (The sky's place on the page is as near as a pixel can be: a pixel from it is the sky.)
+      const where = () => {
+        const s = ring.at(screens());
+        return Math.abs(s) * window.innerHeight < 1 ? 0 : s;
+      };
+      // A page in the copy of the tail over the ring, or of the lead-in under it, is moved to the
+      // same place in the ring proper, which looks the same: once its scroll has come to rest
+      // (moving it would stop a phone's momentum), or at once if it has reached the page's top or
+      // foot, and has nowhere left to go.
+      const home = () => {
+        const page = screens();
+        const to = ring.home(page);
+        if (to !== page) window.scrollTo({ top: to * window.innerHeight, behavior: "instant" });
+      };
+      const onScroll = () => {
+        if (window.scrollY <= 0 || window.scrollY >= document.documentElement.scrollHeight - window.innerHeight - 1) home();
+        film.setScroll(where());
+      };
+      const onRest = () => home();
       const onResize = () => film.resize();
       const onVisible = () => (document.hidden ? film.stop() : film.start());
-      film.setScroll(screens(), true);
+      home();
+      film.setScroll(where(), true);
       // A visitor who asked for less motion gets a film that stands at the stops.
       const still = window.matchMedia("(prefers-reduced-motion: reduce)");
       const onStill = () => void (film.calm = still.matches);
       onStill();
       still.addEventListener("change", onStill);
       film.onJump = (to) => {
-        window.scrollTo({ top: to * window.innerHeight, behavior: "instant" });
+        window.scrollTo({ top: ring.page(to) * window.innerHeight, behavior: "instant" });
         film.setScroll(to, true);
       };
       // The pointer: a hand over what can be touched, a pickaxe over what can be dug up.
       const pick = await pickaxe(stage.pack.has("tex/item_iron_pickaxe.png") ? stage.pack.picture("tex/item_iron_pickaxe.png") : null);
+      if (cancelled) {
+        // (Torn down while the pointer was made: this film never starts, or two would draw on one interface.)
+        still.removeEventListener("change", onStill);
+        film.dispose();
+        return;
+      }
       film.onCursor = (cursor) => {
         document.documentElement.style.cursor = cursor === "pick" && pick ? `url(${pick}) 25 6, pointer` : cursor === "" ? "" : "pointer";
       };
@@ -104,11 +137,106 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
         down = null;
       };
       const onLeave = () => film.pointer(null);
+      // Shift on its own is the game's key for getting out of a cart: the film's ride answers it.
+      const onKey = (event: KeyboardEvent) => {
+        if (event.key === "Shift" && !event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey) film.sneak();
+        // The keys for the ends of the page. Home goes to the sky, where a visit begins, rather than
+        // on up past it to where the page comes round (../../lib/landing/film/ring.ts). End goes to
+        // the end of the credits, where "The End" is, rather than on past it; pressed there, it goes
+        // on, round to the sky. (In a field they are the field's, unless the field's caret is at that
+        // end of it already: then they take the page.)
+        const field = event.target instanceof HTMLInputElement ? event.target : null;
+        const other = !field && event.target instanceof HTMLElement && (event.target.isContentEditable || /^(TEXTAREA|SELECT)$/.test(event.target.tagName));
+        if (other || event.defaultPrevented) return;
+        const behavior = film.calm ? "instant" : "smooth";
+        if ((event.key === "Home" || (event.key === "ArrowUp" && event.metaKey)) && !(field && field.selectionStart !== 0)) {
+          event.preventDefault();
+          window.scrollTo({ top: ring.page(0) * window.innerHeight, behavior });
+        } else if ((event.key === "End" || (event.key === "ArrowDown" && event.metaKey)) && !(field && field.selectionEnd !== field.value.length) && film.target < film.rolled - 0.01) {
+          event.preventDefault();
+          window.scrollTo({ top: Math.ceil(ring.page(film.rolled) * window.innerHeight), behavior }); // (not a pixel short of it)
+        }
+      };
+      // The game's own keys, which players press without thinking: F1 puts the interface away,
+      // F2 takes a screenshot, F3 shows the debug screen (on letting go, as the game does, unless
+      // B was pressed with it, for the hitboxes). What the browser would do with them (help,
+      // find) is not wanted here; every other key is left alone, and B without F3 is a "b" in a
+      // field. (A Mac's F-keys need fn, as in the game; a keyboard whose media keys send them is heard too.)
+      let f3: { combined: boolean } | null = null;
+      const onGameKey = (event: KeyboardEvent) => {
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        const key = [event.key, event.code].find((name) => /^F[1-3]$/.test(name)) ?? null;
+        if (event.type === "keyup") {
+          if (key !== "F3" || !f3) return;
+          event.preventDefault();
+          if (!f3.combined) film.debug.toggleScreen();
+          f3 = null;
+        } else if (key === "F3") {
+          event.preventDefault();
+          if (!event.repeat) f3 = { combined: false };
+        } else if (f3 && (event.code === "KeyB" || event.key.toLowerCase() === "b")) {
+          event.preventDefault();
+          if (event.repeat) return;
+          f3.combined = true;
+          film.debug.toggleHitboxes(film.time);
+        } else if (key === "F1" || key === "F2") {
+          event.preventDefault();
+          if (event.repeat) return;
+          if (key === "F1") film.toggleInterface();
+          else film.screenshot();
+        }
+      };
+      const onBlur = () => void (f3 = null); // (F3 let go of where the page cannot hear it)
+      // The game's chat (lib/landing/film/chat.ts): "/" opens it with the slash typed, as the game's
+      // "/" does, wherever the keyboard is but in a real text field, which keeps its slash. (The name
+      // field takes every letter typed on the page, so the game's T cannot open it; it never takes a
+      // "/".) While it is open, the keyboard is the chat's, heard before anything else on the page
+      // (the name field's typing-anywhere skips a key taken already): what is typed goes into its
+      // field, and Space, the arrows and the page keys do not scroll the page. The game's own F-keys
+      // are still the game's, and the browser's shortcuts the browser's. A hand without a keyboard
+      // never presses "/", and never sees it.
+      const texty = (element: Element | null) =>
+        (element instanceof HTMLInputElement && !/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/.test(element.type)) ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement ||
+        (element instanceof HTMLElement && element.isContentEditable);
+      const onChatKey = (event: KeyboardEvent) => {
+        if (event.isComposing) return;
+        const altGraph = event.getModifierState("AltGraph");
+        if (!film.chat.keyboard) {
+          if (event.key !== "/" || ((event.ctrlKey || event.altKey) && !altGraph) || event.metaKey || event.defaultPrevented || texty(document.activeElement)) return;
+          event.preventDefault();
+          if (document.activeElement instanceof HTMLElement) document.activeElement.blur(); // (a button the keyboard was on lets go)
+          film.chat.start("/", film.time);
+          return;
+        }
+        if (/^F\d{1,2}$/.test(event.key) || (f3 && (event.code === "KeyB" || event.key.toLowerCase() === "b"))) return;
+        if (!film.chat.key(event.key, { shift: event.shiftKey, alt: event.altKey, ctrl: event.ctrlKey, meta: event.metaKey, altGraph }, film.time)) return;
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      const onPaste = (event: ClipboardEvent) => {
+        if (!film.chat.open) return;
+        event.preventDefault();
+        film.chat.paste(event.clipboardData?.getData("text") ?? "", film.time);
+      };
+      // A real text field taken while the chat is open (clicked into) has the keyboard instead: the chat closes.
+      const onFocus = (event: FocusEvent) => {
+        if (film.chat.open && texty(event.target as Element | null)) film.chat.close();
+      };
       window.addEventListener("pointermove", at);
       window.addEventListener("pointerdown", onDown);
       window.addEventListener("pointerup", onUp);
       document.documentElement.addEventListener("pointerleave", onLeave);
+      window.addEventListener("keydown", onKey);
+      window.addEventListener("keydown", onGameKey);
+      window.addEventListener("keyup", onGameKey);
+      window.addEventListener("keydown", onChatKey, { capture: true });
+      window.addEventListener("paste", onPaste);
+      window.addEventListener("focusin", onFocus);
+      window.addEventListener("blur", onBlur);
       window.addEventListener("scroll", onScroll, { passive: true });
+      window.addEventListener("scrollend", onRest);
       window.addEventListener("resize", onResize);
       document.addEventListener("visibilitychange", onVisible);
       film.start();
@@ -123,15 +251,25 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
         window.removeEventListener("pointerdown", onDown);
         window.removeEventListener("pointerup", onUp);
         document.documentElement.removeEventListener("pointerleave", onLeave);
+        window.removeEventListener("keydown", onKey);
+        window.removeEventListener("keydown", onGameKey);
+        window.removeEventListener("keyup", onGameKey);
+        window.removeEventListener("keydown", onChatKey, { capture: true });
+        window.removeEventListener("paste", onPaste);
+        window.removeEventListener("focusin", onFocus);
+        window.removeEventListener("blur", onBlur);
         document.documentElement.style.cursor = "";
         window.removeEventListener("scroll", onScroll);
+        window.removeEventListener("scrollend", onRest);
         window.removeEventListener("resize", onResize);
         document.removeEventListener("visibilitychange", onVisible);
         film.dispose();
       };
     })().catch((error: unknown) => {
       console.error(error);
-      if (!cancelled) onState?.("failed");
+      if (cancelled) return;
+      onState?.("failed");
+      window.scrollTo({ top: 0, behavior: "instant" }); // (the page's own HTML, from its top: the film's had been taken down to the sky)
     });
     return () => {
       cancelled = true;

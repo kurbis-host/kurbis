@@ -31,7 +31,7 @@ var t=innerWidth<innerHeight,a=t?"tall":"wide",k=window.__kurbis={replies:[],fet
 var w=k.worker=new Worker(${JSON.stringify(worker)}),p;
 w.onmessage=function(e){k.replies.push(e.data)};w.onerror=function(){k.failed=true};
 if((navigator.hardwareConcurrency||2)>2){var h=k.helper=new Worker(${JSON.stringify(worker)}),c=new MessageChannel();h.postMessage({help:c.port2},[c.port2]);p=c.port1}
-k.grid=${u("valley.grid.gz")};k.patch=t?${u("dungeon.tall.patch.gz")}:void 0;
+k.grid=${u("valley.grid.gz")};k.patch=void 0;
 w.postMessage({id:0,grid:k.grid,patch:k.patch,port:p},p?[p]:[]);
 var f=["scene.json","layout."+a+".json","small.pack.gz","models."+a+".glb.gz"];
 for(var i=0;i<f.length;i++)k.fetched[f[i]]=fetch(${JSON.stringify(bundleUrl("@"))}.replace("@",f[i]));

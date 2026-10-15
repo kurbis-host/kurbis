@@ -11,7 +11,7 @@ import bpy
 import numpy as np
 
 from . import core
-from .blocks import NX, NY, NZ, PX, PY, PZ
+from .blocks import NX, NY, NZ, PX, PY, PZ, candle
 from mathutils import Matrix, Vector
 
 from .voxel import QUADS
@@ -181,6 +181,31 @@ def player(name, skin, slim=False, col="Characters"):
     return rig
 
 
+def pumpkin_faces(blocks):
+    """The atlas tiles of a pumpkin worn on the head (see `pumpkin`), front, side and top:
+    carved, and lit (a jack o'lantern, its candle shining). Ask before the atlas is baked."""
+    side, top = blocks.tex("pumpkin_side"), blocks.tex("pumpkin_top")
+    return {"carved": (blocks.tex("carved_pumpkin"), side, top), "lit": (blocks.tex("jack_o_lantern", emit=1.0, emit_mask=candle), side, top)}
+
+
+def pumpkin(rig, blocks, faces, material, col="Characters"):
+    """A pumpkin on a player's head, as the game draws the one a mob wears on Halloween:
+    the block at 10/16 (ten pixels a side), centred on the head, over its hat layer, and
+    turning with it. One for each of `faces` (see `pumpkin_faces`), `<rig>_pumpkin_<face>`."""
+    # From the head's pivot at the neck: the head is 8 pixels a side, 24 to 32 up.
+    verts = (np.asarray((-5, -5, 23), np.float32) + QUADS * 10.0 - np.asarray((0, 0, 24), np.float32)) * PX_M
+    worn = {}
+    for key, (front, side, top) in faces.items():
+        rects = blocks.atlas.rects[[side, side, side, front, top, top]]  # +X, -X, +Y (its back), -Y (its face), +Z, -Z
+        uvs = np.stack([rects[:, [0, 1]], rects[:, [2, 1]], rects[:, [2, 3]], rects[:, [0, 3]]], axis=1)
+        name = f"{rig.root.name}_pumpkin_{key}"
+        obj = core.link(bpy.data.objects.new(name, core.mesh_from_quads(name, verts, uvs)), col)
+        obj.data.materials.append(material)
+        obj.parent = rig.parts["head"]
+        worn[key] = obj
+    return worn
+
+
 def item(name, rel, col="Props", thickness=1.0):
     """A held item: every opaque pixel of a 16px sprite becomes a small cube."""
     px = core.pixels(rel)
@@ -219,6 +244,8 @@ def lantern(name, col="Props", lit=True):
 def chest(name, col="Props", open_deg=0.0):
     """Returns (base, lid). The lid hinges at the back edge."""
     mat = bpy.data.materials.get("Chest") or tex_material("Chest", "entity/chest/normal.png", clip=False)
+    # From December 24 to 26 every chest in the game is a present: the page swaps this in.
+    bpy.data.materials.get("ChestChristmas") or tex_material("ChestChristmas", "entity/chest/christmas.png", clip=False)
     base = BoxMesh().box((-7, -7, 0), (14, 14, 10), (0, 19), flipped=True).object(f"{name}_base", mat, col)
     lid_mesh = BoxMesh().box((-7, -7, 9), (14, 14, 5), (0, 0), flipped=True)
     lid_mesh.box((-1, -8, 7), (2, 1, 4), (0, 0), flipped=True)
@@ -394,6 +421,46 @@ def image_tiles(name, image, quads, uvs=None, col="Props", emit=0.0):
     return core.link(obj, col)
 
 
+def lectern(name, col="Props"):
+    """A lectern with its book open, a block tall, its origin at the foot and its book
+    toward -Y: a slab of a base, a post, and the sloped top."""
+    root = core.empty(name, col)
+
+    def part(key, rel, lo, size, pivot=(0, 0, 0)):
+        mat = bpy.data.materials.get(f"Lectern_{key}") or tex_material(f"Lectern_{key}", rel, clip=False)
+        mesh = BoxMesh(16, 16).faces(lo, size, {k: (0, 0, 16, 16) for k in (NX, PX, NY, PY, NZ, PZ)})
+        return mesh.object(f"{name}_{key}", mat, col, pivot, root)
+
+    part("base", "block/lectern_base.png", (-8, -8, 0), (16, 16, 2))
+    part("post", "block/lectern_front.png", (-4, -4, 2), (8, 8, 11))
+    top = part("top", "block/lectern_top.png", (-8, -7, 13), (16, 14, 3), pivot=(0, 0, 14))
+    top.rotation_euler = (math.radians(-22.5), 0.0, 0.0)  # sloped toward its reader
+    book = part("book", "item/book.png", (-6, -5, 16), (12, 10, 1), pivot=(0, 0, 14))
+    book.rotation_euler = top.rotation_euler
+    return root
+
+
+def creeper(name, col="Characters"):
+    """A creeper, facing -Y: a head on a tall body on four short legs, a little over 1.6
+    blocks tall. Returns a Rig with parts body, head, leg_fr, leg_fl, leg_br, leg_bl (the
+    legs swing from the hip)."""
+    mat = bpy.data.materials.get("Creeper") or tex_material("Creeper", "entity/creeper/creeper.png")
+    root = core.empty(name, col)
+    rig = Rig(root)
+    for key, parent, lo, size, uv, pivot in (
+        ("body", None, (-4, -2, 6), (8, 4, 12), (16, 16), (0, 0, 6)),
+        ("head", "body", (-4, -4, 18), (8, 8, 8), (0, 0), (0, 0, 18)),
+        ("leg_fr", None, (-4, -6, 0), (4, 4, 6), (0, 16), (-2, -4, 6)),
+        ("leg_fl", None, (0, -6, 0), (4, 4, 6), (0, 16), (2, -4, 6)),
+        ("leg_br", None, (-4, 2, 0), (4, 4, 6), (0, 16), (-2, 4, 6)),
+        ("leg_bl", None, (0, 2, 0), (4, 4, 6), (0, 16), (2, 4, 6)),
+    ):
+        holder = rig.parts[parent] if parent else root
+        rig.parts[key] = BoxMesh(64, 32).box(lo, size, uv).object(f"{name}_{key}", mat, col, pivot, holder, rig.pivots.get(parent, (0, 0, 0)))
+        rig.pivots[key] = pivot
+    return rig
+
+
 def strider(name, col="Characters"):
     """A strider: a body on two long legs, about two blocks tall, facing -Y. Returns a Rig
     with parts body, leg_r and leg_l (the legs swing from the hip)."""
@@ -408,3 +475,69 @@ def strider(name, col="Characters"):
         rig.parts[key] = BoxMesh(64, 128).box(lo, size, uv).object(f"{name}_{key}", mat, col, pivot, root)
         rig.pivots[key] = pivot
     return rig
+
+
+def chicken(name, col="Characters"):
+    """A chicken, as the game models it, facing -Y: a head with its beak and red wattle, a
+    body lying along its length, two wings and two legs, eleven pixels to its back and
+    fifteen to the top of its head. Its picture draws each leg as the game does, as a stick
+    down the back of the box and a foot under it (the rest is clear). Returns a Rig with
+    parts body, head, leg_r, leg_l, wing_r, wing_l: the legs swing from the hip, the wings
+    lift out from the shoulder (about Y)."""
+    mat = bpy.data.materials.get("Chicken") or tex_material("Chicken", "entity/chicken/chicken_temperate.png")
+    root = core.empty(name, col)
+    rig = Rig(root)
+    for key, boxes, pivot in (
+        ("body", (((-3, -3, 4), (6, 6, 8), (0, 9)),), (0, 0, 8)),  # upright as the picture lays it out; turned to lie along Y below
+        ("head", (((-2, -6, 9), (4, 3, 6), (0, 0)), ((-2, -8, 11), (4, 2, 2), (14, 0)), ((-1, -7, 9), (2, 2, 2), (14, 4))), (0, -4, 9)),  # and its beak and wattle
+        ("leg_r", (((-3, -2, 0), (3, 3, 5), (26, 0)),), (-2, 1, 5)),
+        ("leg_l", (((0, -2, 0), (3, 3, 5), (26, 0)),), (1, 1, 5)),
+        ("wing_r", (((-4, -3, 7), (1, 6, 4), (24, 13)),), (-4, 0, 11)),
+        ("wing_l", (((3, -3, 7), (1, 6, 4), (24, 13)),), (4, 0, 11)),
+    ):
+        mesh = BoxMesh(64, 32)
+        for lo, size, uv in boxes:
+            mesh.box(lo, size, uv)
+        rig.parts[key] = mesh.object(f"{name}_{key}", mat, col, pivot, root)
+        rig.pivots[key] = pivot
+    rig.parts["body"].rotation_euler = (math.radians(90), 0.0, 0.0)
+    return rig
+
+
+def baby_zombie(name, col="Characters"):
+    """A baby zombie, as the game models it since its babies got models of their own (26.1):
+    a head six pixels a side on a body and limbs half a grown zombie's, fifteen pixels tall,
+    facing -Y. Returns a Rig with parts body, head, arm_r, arm_l, leg_r, leg_l (the limbs
+    swing from shoulder and hip)."""
+    mat = bpy.data.materials.get("BabyZombie") or tex_material("BabyZombie", "entity/zombie/zombie_baby.png")
+    root = core.empty(name, col)
+    rig = Rig(root)
+    for key, lo, size, uv, pivot in (
+        ("body", (-2, -1, 4), (4, 2, 5), (16, 16), (0, 0, 6.5)),
+        ("head", (-3, -3, 9), (6, 6, 6), (3, 3), (0, 0, 8.75)),
+        ("arm_r", (-4, -1, 4), (2, 2, 5), (36, 16), (-3, 0, 8.5)),
+        ("arm_l", (2, -1, 4), (2, 2, 5), (28, 16), (3, 0, 8.5)),
+        ("leg_r", (-2, -1, 0), (2, 2, 4), (8, 16), (-1, 0, 4)),
+        ("leg_l", (0, -1, 0), (2, 2, 4), (0, 16), (1, 0, 4)),
+    ):
+        mesh = BoxMesh(64, 64).box(lo, size, uv)
+        if key == "head":
+            mesh.box((-3, -3, 8.9), (6, 6, 6), (35, 3), inflate=0.25)  # its hat layer
+        rig.parts[key] = mesh.object(f"{name}_{key}", mat, col, pivot, root)
+        rig.pivots[key] = pivot
+    return rig
+
+
+def seat(rider, mount, at=(0.0, 1.6, 8.2)):
+    """Sit a zombie on a mount as the game seats a rider: at the mount's passenger point
+    less the rider's own (for a baby zombie on a chicken, 0.7 - 3/16 blocks up and 0.1
+    back: `at`, in pixels from the mount's feet), so its legs rest on the mount's back.
+    Legs forward and a little apart, as anything riding sits; arms out in front, as a
+    zombie holds them. Turns are the game's order: about X, then up, then along."""
+    rider.root.parent = mount.root
+    rider.root.location = tuple(v * PX_M for v in at)
+    for key, turn in (("leg_r", (-81, 4.5, -18)), ("leg_l", (-81, -4.5, 18)), ("arm_r", (-80, 2.9, 5.7)), ("arm_l", (-80, -2.9, -5.7))):
+        part = rider.parts[key]
+        part.rotation_mode = "XZY"
+        part.rotation_euler = tuple(math.radians(a) for a in turn)
+    return rider

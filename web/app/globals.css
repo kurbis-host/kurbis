@@ -65,6 +65,12 @@
   color: #fff5dc; /* on the film's dark ground, whether or not the text is in sight */
 }
 
+/* While the film plays, the page's scroll goes round for ever (lib/landing/film/ring.ts): it has
+   no top or foot to bounce off, or to pull down to load the page again. */
+html:has(.landing:not([data-film="failed"])) {
+  overscroll-behavior-y: none;
+}
+
 /* While the film plays (or is on its way), the page's own text is for readers that do not
    see: it stays in the document, out of sight. Where the film cannot play, it is the page. */
 .landing:not([data-film="failed"]) .landing-text {
@@ -117,85 +123,160 @@
   background: linear-gradient(#2a1535 0%, #7a3a4d 48%, #ffb061 78%, #d9772c 100%);
 }
 
+/* Where the film cannot play, the page is its own HTML, in the game's interface (below). */
 .landing[data-film="failed"] {
-  background: var(--color-canvas);
-  color: var(--color-ink);
+  background: linear-gradient(#1b1020 0%, #2a1535 45%, #3d1f36 100%);
+  color: #ece6f2;
 }
 
 .landing[data-film="failed"] .landing-mirror {
   display: grid;
-  gap: 40px;
-  max-width: 680px;
+  gap: 20px;
+  max-width: 760px;
   margin: 0 auto;
-  padding: 72px 24px 96px;
+  padding: 48px 16px 96px;
   font-size: 18px;
   line-height: 1.6;
 }
 
-.landing[data-film="failed"] .landing-mirror h1 {
-  font-family: var(--font-display);
-  font-size: clamp(36px, 7vw, 56px);
-  font-weight: 850;
-  line-height: 1.05;
-  letter-spacing: -0.03em;
+.landing[data-film="failed"] .landing-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
-.landing[data-film="failed"] .landing-mirror h2 {
-  font-family: var(--font-display);
-  font-size: 28px;
-  font-weight: 800;
-  line-height: 1.15;
-  letter-spacing: -0.02em;
+.landing[data-film="failed"] .landing-mirror .landing-bar .landing-chip:last-child {
+  background: #33801f;
+  box-shadow: inset 2px 2px 0 #61b045, inset -2px -2px 0 #1c4f12;
 }
 
 .landing[data-film="failed"] .landing-mirror dt {
+  color: #fff;
   font-weight: 700;
+}
+
+.landing[data-film="failed"] .landing-mirror dd {
+  margin: 0;
+  color: #a8a8a8;
 }
 
 .landing[data-film="failed"] .landing-mirror dl > div {
-  margin-top: 10px;
-}
-
-.landing[data-film="failed"] .landing-mirror ul {
-  margin-top: 10px;
-  padding-left: 20px;
-  list-style: disc;
-}
-
-.landing[data-film="failed"] .landing-mirror a {
-  color: var(--color-pumpkin-dark);
-  font-weight: 700;
-}
-
-.landing[data-film="failed"] button.landing-chip,
-.landing-form button {
   margin-top: 12px;
-  border: 1px solid var(--color-earth-dark);
-  border-radius: var(--radius-sm);
-  background: var(--color-pumpkin);
-  padding: 10px 16px;
-  color: #2d1b11;
-  font-weight: 700;
+}
+
+.landing[data-film="failed"] .landing-mirror code {
+  color: #ffff55;
+}
+
+.landing[data-film="failed"] .landing-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  color: #a8a8a8;
+  font-size: 15px;
+}
+
+.landing[data-film="failed"] .landing-mirror .landing-footer .landing-chip {
+  display: inline;
+  min-height: 0;
+  border: 0;
+  background: none;
+  padding: 0;
+  box-shadow: none;
+  color: #55ffff;
+  font-weight: 400;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-shadow: none;
+}
+
+.landing[data-film="failed"] .landing-footer p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* The credits, as the film rolls them: the headings in the game's yellow, the story in white. */
+.landing[data-film="failed"] .landing-footer > div.landing-text {
+  flex-basis: 100%;
+  color: #ece6f2;
+  font-size: 17px;
+}
+
+.landing[data-film="failed"] .landing-footer h2 {
+  margin: 28px 0 6px;
+  color: #ffff55;
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.landing[data-film="failed"] .landing-footer div.landing-text p + p {
+  margin-top: 10px;
+}
+
+.landing[data-film="failed"] .landing-text > :first-child {
+  margin-top: 0;
 }
 
 .landing-form {
   display: grid;
-  gap: 8px;
-  max-width: 420px;
-  margin: 12px 0;
+  justify-items: start;
+  gap: 10px;
+  max-width: 460px;
+  margin: 16px 0 4px;
 }
 
+.landing-form label {
+  color: #fff;
+  font-weight: 700;
+}
+
+/* The claim card, where the film cannot draw it: the address, and the two ways on. */
+.landing[data-film="failed"] .landing-claim {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  border-top: 2px solid #280080;
+  padding-top: 16px;
+}
+
+.landing[data-film="failed"] .landing-claim p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.landing[data-film="failed"] .landing-claim strong {
+  color: #ffff55;
+}
+
+.landing[data-film="failed"] .landing-mirror .landing-claim .landing-chip:first-of-type {
+  background: #33801f;
+  box-shadow: inset 2px 2px 0 #61b045, inset -2px -2px 0 #1c4f12;
+}
+
+/* The game's text field: black, a grey edge that turns white while it is typed in. */
 .landing-input {
-  border: 1px solid var(--color-stone-dark);
-  border-radius: var(--radius-sm);
-  background: var(--color-paper);
-  padding: 10px 12px;
+  justify-self: stretch;
+  min-height: 48px;
+  border: 2px solid #a0a0a0;
+  background: #000;
+  padding: 8px 12px;
+  color: #fff;
   font-size: 18px;
+}
+
+.landing-input:focus {
+  border-color: #fff;
+  outline: none;
 }
 
 .landing-said {
   min-height: 1.6em;
-  color: var(--color-ink-soft);
+  color: #a8a8a8;
 }
 
 @keyframes pulse-status {
@@ -219,4 +300,211 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* -- the game's interface, as HTML ------------------------------------------------------ */
+/* The film draws its interface the way the game does (lib/landing/engine/hud.ts): the dark,
+   purple-edged panel of a tooltip, grey bevelled buttons, yellow titles. Plain pages that
+   belong with the landing page (the legal ones, and the page itself where the film cannot
+   play) wear the same. */
+.game-page {
+  min-height: 100svh;
+  background: linear-gradient(#1b1020 0%, #2a1535 55%, #3d1f36 100%);
+  color: #ece6f2;
+  padding: 20px 16px 72px;
+  font-size: 17px;
+  line-height: 1.6;
+}
+
+.game-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: 760px;
+  margin: 0 auto 24px;
+}
+
+.game-wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #fff5dc;
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.game-button,
+.landing[data-film="failed"] .landing-mirror .landing-chip,
+.landing-form button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  border: 2px solid #000;
+  background: #6b6b6b;
+  padding: 0 16px;
+  box-shadow: inset 2px 2px 0 #a8a8a8, inset -2px -2px 0 #4d4d4d;
+  color: #fff;
+  font-weight: 700;
+  text-decoration: none;
+  text-shadow: 2px 2px 0 #3f3f3f;
+}
+
+.game-button:hover,
+.landing[data-film="failed"] .landing-mirror .landing-chip:hover,
+.landing-form button:hover {
+  background: #7d7fa6;
+  box-shadow: inset 2px 2px 0 #b9bbe0, inset -2px -2px 0 #565879;
+}
+
+/* The keyboard's button is ringed in a colour that stands out on the game's dark grounds,
+   where the site's blue would not. */
+.game-button:focus-visible {
+  outline: 3px solid #ffcf5c;
+  outline-offset: 2px;
+}
+
+.game-panel,
+.landing[data-film="failed"] .landing-mirror > section {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  background: rgb(16 0 16 / 0.94);
+  padding: clamp(22px, 5vw, 44px);
+  box-shadow: inset 0 0 0 2px #100010, inset 0 0 0 4px #280080;
+  /* The tooltip's corners are cut, one pixel of the game's at a time. */
+  clip-path: polygon(2px 0, calc(100% - 2px) 0, 100% 2px, 100% calc(100% - 2px), calc(100% - 2px) 100%, 2px 100%, 0 calc(100% - 2px), 0 2px);
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) h1 {
+  margin: 0;
+  color: #ffff55;
+  font-family: var(--font-display);
+  font-size: clamp(32px, 6vw, 44px);
+  font-weight: 850;
+  line-height: 1.1;
+  text-shadow: 3px 3px 0 #3f3f15;
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) h2 {
+  margin: 36px 0 8px;
+  color: #fff;
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) p,
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) ul,
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) address {
+  margin: 0 0 12px;
+  font-style: normal;
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) ul {
+  padding-left: 22px;
+  list-style: square;
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) li + li {
+  margin-top: 6px;
+}
+
+:is(.game-panel, .landing[data-film="failed"] .landing-mirror > section) a {
+  color: #55ffff;
+  text-underline-offset: 3px;
+}
+
+.game-panel .game-quiet {
+  color: #a8a8a8;
+  font-size: 15px;
+}
+
+/* What the operator still has to fill in: impossible to miss. */
+.game-fill {
+  border-radius: 2px;
+  background: #ffff55;
+  padding: 0 4px;
+  color: #100010;
+  font-weight: 700;
+}
+
+/* -- the page that is not there --------------------------------------------------------- */
+/* An address with no page (app/not-found.tsx) gets the game's screen for a connection that
+   failed: its old menu background, and in the middle a grey title, the reason in white and
+   one button. It is measured in the interface's pixels (--gui), as the film's interface is
+   (lib/landing/engine/hud.ts): two CSS pixels each, a little less where the screen is
+   small. A pixel of the dirt is two of them, as the game draws it, and always a whole
+   number of CSS pixels, so it stays sharp. */
+.game-lost,
+:root:has(.game-lost) {
+  --gui: 2px;
+  /* Tinted as the game tints it: multiplied by #404040, a quarter of its light. */
+  background: url("/gui/dirt.png") 0 0 / calc(32 * var(--gui)) #404040;
+  background-blend-mode: multiply;
+  image-rendering: pixelated;
+}
+
+@media (max-width: 599px), (max-height: 599px) {
+  .game-lost,
+  :root:has(.game-lost) {
+    --gui: 1.5px;
+  }
+}
+
+/* The page's root wears the dirt as well, so it lies under all of the page and past its
+   ends, whatever share of the screen a phone's bars leave it. */
+:root:has(.game-lost) body {
+  background: none;
+}
+
+.game-lost {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100svh;
+  padding: 32px 16px;
+  color: #fff;
+  font-size: 19px;
+  line-height: 1.45;
+  text-align: center;
+  text-shadow: 2px 2px 0 #3f3f3f; /* the game's: the letters' colour at a quarter of its light */
+}
+
+.game-lost h1 {
+  margin: 0 0 calc(8 * var(--gui));
+  color: #aaa;
+  font-family: var(--font-display);
+  font-size: clamp(30px, 7vw, 40px);
+  font-weight: 800;
+  line-height: 1.15;
+  text-shadow: 3px 3px 0 #2a2a2a;
+}
+
+.game-lost p {
+  max-width: 34em;
+  margin: 0;
+}
+
+.game-lost .game-lost-code {
+  margin-top: 6px;
+  color: #a8a8a8;
+  font-size: 15px;
+  text-shadow: 2px 2px 0 #2a2a2a;
+}
+
+/* The game's screens have their buttons 200 of its pixels across. */
+.game-lost .game-button {
+  box-sizing: border-box;
+  justify-content: center;
+  width: min(calc(200 * var(--gui)), 100%);
+  margin-top: calc(14 * var(--gui));
 }

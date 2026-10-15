@@ -2,7 +2,7 @@
 
 Source art for the scroll-driven landing page (`web/app/(marketing)/page.tsx`; its code is in `web/lib/landing/` and `web/components/landing/`). The look follows the Minecraft trailer references: hard-edged voxels, flat trailer-style textures, golden-hour light, haze, bloom, and chunky extruded type that lives in the world.
 
-The page is one continuous take from the sky to the Nether, about six screens of scroll. Scroll drives the camera and the story; life and reactions run in real time on top.
+The page is one continuous take from the sky through the Nether and home again, 6.8 screens of scroll; then the credits roll, and the page begins again (8.4 screens in all). Scroll drives the camera and the story; life and reactions run in real time on top.
 
 | Path | Purpose |
 | --- | --- |
@@ -23,14 +23,14 @@ The page is one continuous take from the sky to the Nether, about six screens of
 
 - `blocks.py`: texture atlas (colour + emission), block registry, the shared voxel material.
 - `voxel.py`: numpy mesher. A 3D id grid becomes culled, atlas-mapped quads.
-- `world.py`: the valley, cut open at `y = 0`: the short dig on the cut face, the cave the cut face opens, the cart tunnel behind it, the dungeon, and the slab of ground that hides the cut until the slice.
+- `world.py`: the valley, cut open at `y = 0`: the short dig on the cut face, the cave the cut face opens, the cart tunnel behind it, the homestead's cavern (still `dungeon` in `SPOTS`), and the slab of ground that hides the cut until the slice.
 - `sets.py`: the Nether, its own grid placed far from the valley.
 - `anim.py`: the timeline. See "Two clocks" below.
 - `life.py`: what moves by itself. Wind, water swell and drifting flakes are geometry-node modifiers on the scene clock (previs only; the browser does them as shaders). Fishing and leaping fish are keyed loops.
-- `hud.py`: the Minecraft-style interface, drawn on cards fixed in front of the lens in interface pixels (480 across): chat lines, toasts, tooltips, buttons, and the previs pointer.
-- `font.py`: "Kurbis Block", our own voxel display face, for copy in the world; and a small five-by-seven pixel face with lower case, for the interface.
+- `hud.py`: the Minecraft-style interface, drawn on cards fixed in front of the lens in interface pixels (480 across): chat lines, toasts, tooltips, buttons, and the previs pointer. Also the red bed as the game's inventory draws it (`bed`), the browser's toast icon for the cave falling asleep, and the shield (`shield`, at twice the interface's scale, as the game draws a model), the icon for turning Herobrine away at the homestead's gate: the pack has no picture of either.
+- `font.py`: "Kurbis Block", our own voxel display face, for copy in the world (with a "%" for the splash); and a small five-by-seven pixel face with lower case, for the interface, whose g, j, p, q and y hang a row below the line.
 - `mascot.py`: the pumpkin and its faces (our own pixel art).
-- `boxmodel.py`: box-UV models: players (rigid parts with elbow and knee pivots), held items, torch, lantern, chest, cart, lever, sign, rails, fish, plant sprites.
+- `boxmodel.py`: box-UV models: players (rigid parts with elbow and knee pivots), held items, a pumpkin to wear on the head (`pumpkin`: carved, or lit), torch, lantern, lectern, chest, cart, lever, sign, rails, fish, plant sprites, and mobs as the game models them (creeper, strider, chicken, baby zombie, and `seat` for a rider).
 - `scenery.py`: clouds, drifting leaves, rain, ripple rings, the snapshot block, the scrim behind type.
 - `look.py`: sky, lights, haze, camera, full-frame covers, compositor (bloom, vignette, lens wobble), render settings.
 - `export.py`: what the browser gets: the worlds as grids of blocks with the suns' shadows on them, small models as a glb, and what the toolkit noted about each thing (`core.note`). It also holds the meshing and light baking the page repeats (`faces`, `levels`, `light`): the reference the page's own is tested against.
@@ -44,7 +44,7 @@ Every animated value is a function of the scroll position and of real time. `ani
 | Kind | Driven by | Helpers | Used for |
 | --- | --- | --- | --- |
 | Scrubbed | scroll position | `ramp`, `switch`, `show`, `scrub`, `light_ramp`, `Shot`, `Actor` moves | the camera, the pumpkin's journey, mood lights, the falling slab |
-| Triggered | starts at a scroll position (or at a moment), then plays in real time | `pop`, `unpop`, `after`, `light_window` | type popping in, the lever's sequences, what the spawner does |
+| Triggered | starts at a scroll position (or at a moment), then plays in real time | `pop`, `unpop`, `after`, `light_window` | type popping in, the lever's sequences, what the homestead's gate and plugins do |
 | Live | real time | `live`, `cycle`, an `Actor` at rest (breathing, blinks, glances, a jump when clicked), `life.Fisher` | life at the stops, reactions to the visitor |
 
 A sequence written in seconds can also be played by the scroll: the clock `("scrub", rate)` begins at a scroll position and counts `rate` seconds per screen. The cave uses this: the same waking sequence is scrubbed when the pumpkin arrives (so it is done before the stop, however fast the page is scrolled) and triggered when the lever is pulled.
@@ -55,16 +55,26 @@ Scroll maps onto the timeline linearly: no snapping, no sticky zones. A stop is 
 
 | Scroll | Part | Camera | What happens | Alive, and to touch |
 | --- | --- | --- | --- | --- |
-| 0.00 | **Sky** (stop) | Slow drift toward the pumpkin's cloud | The pumpkin sleeps on its cloud over the valley | Zs rise, clouds and leaves drift, the title floats. Hover the sleeper: it opens an eye and follows. Click it: it jumps. Click a cloud: rain |
+| 0.00 | **Sky** (stop) | Slow drift toward the pumpkin's cloud | The pumpkin sleeps on its cloud over the valley | Zs rise, clouds and leaves drift, the title floats. Hover the sleeper: it opens an eye and follows. Click it: it jumps. Click a cloud: rain. Type a free name: the title screen's splash, "NOW WITH 100% MORE PUMPKIN!" (and so at the Nether's field). Stay a long while and someone like Steve, with blank shining eyes, stands far below at the treeline looking up; point at him and he is gone, once a visit |
 | 0.25 | Dive | Sinks with the falling pumpkin, upright, through a cloud that whites out the frame | It wakes, shuffles off the cloud and falls to the meadow | |
-| 1.15 | **Surface** (stop) | Low, behind the landing spot; slow slide | The address and two friends on different editions at one pond | Wind in everything that grows, swell on the pond, both friends fishing, a fish leaping, the name retyping, chat. Click the pond, a friend, the tree, the pumpkin |
-| 1.45 | Slice and dig | Pulls back and drops as the ground in front breaks away, then sinks along the cut face | It stomps, the slab falls, it digs down, a jog, and down past two bands of facts | Blocks crack ahead of it. A fossil, a chest, an old sign and a lost sock say what they are |
+| 1.15 | **Surface** (stop) | Low, behind the landing spot; slow slide | The address and two friends on different editions at one pond. Where the pumpkin will dig, a sign says the game's first rule: never dig straight down | Wind in everything that grows, swell on the pond, both friends fishing, a fish leaping, the name retyping, chat (down to the friend asking if it is their own SMP now). Now and then a friend fishes up a boot, and says so. In one visit in four, after a few seconds' rest, a chicken jockey runs by behind the pond and Steve shouts it. Click the pond, a friend (they say a line of their own, in a bubble), the tree (punched, it drops a log, and "Getting Wood"), the pumpkin, the jockey; point at the sign |
+| 1.45 | Slice and dig | Pulls back and drops as the ground in front breaks away, then sinks along the cut face | It stomps beside the sign, the slab falls (in the tall frame the sign stands on it, and goes too), it digs straight down, a jog, and down past two bands of facts | Blocks crack ahead of it. A fossil, a chest, an old sign and a lost sock say what they are |
 | 2.75 | Cave arrival | Down with it into the dark cave, then in through the open front | It reaches the glowing snapshot block: the world unfolds, torches fire, friends join | Scrubbed: complete by the stop |
-| 3.25 | **Cave** (stop) | Slow slide past the lever | Sleeps when you leave, wakes when you join | Torches flicker, Steve mines, Alex hops. **Pull the lever**: friends leave, torches die, the pumpkin sleeps, the world is saved as one block; pull again and it is back. Left alone, the pumpkin goes and does it itself |
-| 3.55 | Cart | Chases the cart north, round a banked turn and down a slope | It hops into the cart and rides to the dungeon | |
-| 4.05 | **Dungeon** (stop) | In on the ore wall, then along the room past the parting wall to the spawner | Ore wall and backups chest; the spawner under its three signs | Ores take turns saying what they are for; the chest opens. The spawner's three requests are asked in turn and the room does them: night vision, `/home` (the pumpkin uses it), revert |
+| 3.25 | **Cave** (stop) | Slow slide past the lever | Sleeps when you leave, wakes when you join | Torches flicker, Steve mines, Alex hops. **Pull the lever**: friends leave, torches die, the pumpkin sleeps, the world is saved as one block, the headline says there are no phantoms either, and "Sweet Dreams"; pull again and it is back (too soon, and the action bar says the game's "You may not rest now; there are monsters nearby"). Left alone, the pumpkin goes and does it itself |
+| 3.55 | Cart | Chases the cart north, round a banked turn and down a slope | It hops into the cart and rides to the homestead | The action bar says "Press Left Shift to Dismount" (Shift: the pumpkin tries); in the tunnel, "On A Rail" |
+| 4.05 | **Homestead** (stop) | Rests on the yard three times, one view for each feature | A cavern where daylight falls down a shaft onto a house in a fenced yard. Three features in turn: friends in, everyone else out; plugins; turn back time | The friends come in and the gate shuts on a stranger: Herobrine. Left alone, he is turned away ("Not Today, Thank You"); click him and he is let in, every light goes out but his eyes, and he leaves the game. The lectern's book installs plugins that change the yard (lanterns, fireflies, fireworks) as dusk falls. At night a creeper blows the house up (the chat says so, as the game prints a death), and scrolling on turns time back, block by block, the backup's year counting down to 2011 |
 | 4.75 | Portal | Push into the frame; the swirl fills the screen and the lens wobbles | It jumps into the frame and the portal lights | |
-| 5.55 | **Nether** (stop) | Out and forward along the bridge to the second frame | The name field over an unlit portal: the end of the page | Embers rise, the lava breathes, a strider walks. Type a name: it is free, the frame lights; Enter, and the pumpkin leaps through |
+| 5.55 | **Nether** (stop) | Out and forward along the bridge to the second frame | The name field over an unlit portal | Embers rise, the lava breathes, a strider walks. Type a name: it is free, the frame lights; Enter, and the pumpkin leaps through. The dig's lost sock has its other one here, on the deck by the frame: point at it |
+| 6.25 | **Home** (stop) | Through the second frame, back over the meadow, and down to the signs and the lectern, where it drifts to the end of the film | The valley made whole: the visitor's address over it, signs saying what the service is, and the questions people ask in the lectern's book | The book turns its pages; its arrows (or a click on the lectern) turn them by hand |
+| 6.80 | Credits (the browser's) | Home's last view, gone dark | The page's own story rolls up the dark, as the game's credits do after the End, moved by the scroll | Its links can be followed: Pumpkin's places, then the page's own (Kurbis on GitHub, and the legal pages). Where it rests, "The End" arrives as an advancement: "Or the beginning?". Scrolled on, the page begins again under the film's cover, in the sky, where the pumpkin opens its eyes for a moment |
+
+Anywhere on the page (the browser's alone):
+
+- Names that do in either name field what they do in the game (`film/eggs.ts`): dinnerbone and grumm stand the name, and the visitor in a friend's place, on their heads; jeb runs the letters through the wool colours; herobrine is "Removed." first; creeper's letters hiss, blow up and come back.
+- The days the game marks, by the visitor's calendar (`film/dates.ts`): on Halloween the friends wear pumpkins (lit in the dark) and the title has the game's "OOoooOOOoooo! Spooky!"; from 24 to 26 December every chest is a present.
+- The game's keys: F1 puts the interface away, F2 saves a screenshot named as the game names one, F3 is the debug screen and F3+B its hitboxes (which also show what can be clicked). "/" opens the chat: `/help`, `/time set day|night`, `/weather clear|rain`, `/stop`, `/kill` (the death screen) and `/seed` do what they do in the game (`film/chat.ts`, `commands.ts`, `weather.ts`).
+- What the visitor makes happen is told as the game tells it: a toast (`film/toasts.ts`), or the action bar for what the game would refuse (`ui.actionBar`). Nametags, speech bubbles and tooltips keep under the bar along the top; a nametag whose head goes up under it is not drawn, as the frame would cut it.
+- An address with nothing at it gets the game's "Connection Lost" screen (`web/app/not-found.tsx`).
 
 Rules that keep it one take:
 
@@ -72,7 +82,7 @@ Rules that keep it one take:
 - Nothing is a timed cut or a simulation, so it holds when scrubbed slowly or backwards. Where the camera travels through something that moves (the falling slab), that motion is scrubbed too, so the camera can never catch up with it.
 - Only moves, turns, scales, show/hide and light levels are animated, because those carry over to the browser.
 
-Status: previs 2. Every stop is alive and has its main interaction, in two frames: `build(session, "wide")` and `build(session, "tall")` (9:16; `P(wide, tall)` in `film.py` picks each layout, and tall blends are saved as `film_<session>_tall.blend`). The tall frame re-breaks the type, restages the surface on a diagonal, and lays the dungeon's ore wall out two across and three up in a higher room, so the dungeon is the one piece of world that differs by aspect. Clips in `renders/previs2/`: `scroll.mp4` (the scroll alone, about 14 s), `visit.mp4` (a whole visit with a rest and the visitor's hand at every stop, about 71 s), `visit_tall.mp4` (the same visit in the tall frame), and per-stop clips `idle.mp4`, `play.mp4`, `cave.mp4`, `cave_demo.mp4`.
+Status: previs 2. Every stop is alive and has its main interaction, in two frames: `build(session, "wide")` and `build(session, "tall")` (9:16; `P(wide, tall)` in `film.py` picks each layout, and tall blends are saved as `film_<session>_tall.blend`). The tall frame re-breaks the type and restages the surface on a diagonal; the world itself is the same in both frames. Clips in `renders/previs2/`: `scroll.mp4` (the scroll alone, about 14 s), `visit.mp4` (a whole visit with a rest and the visitor's hand at every stop, about 71 s), `visit_tall.mp4` (the same visit in the tall frame), and per-stop clips `idle.mp4`, `play.mp4`, `cave.mp4`, `cave_demo.mp4`.
 
 The audit also measures contrast (`scripts/audit_run.py` runs it headless at full size). Gold type on the sunset measures about 1.6:1 against the sky. The hero title and the address carry a thin dark rim (`font.keyline`, switched by `HELP` in `film.py`), which separates the letters from the glow but does not change that figure: whether it is enough is still open.
 
@@ -100,12 +110,13 @@ This stages the `visit` session in both frames (nothing is baked) and writes:
 
 | Where | What |
 | --- | --- |
-| `web/public/landing/valley.grid.gz`, `nether.grid.gz` | The worlds as grids of blocks, one byte a cell: the valley with what lies under it and the dungeon (6.7 million cells in 97 KB), and the Nether (1.1 million in 39 KB). After the valley's cells come the two suns' shadows on its faces (124 KB more). See "What the page builds itself" |
-| `web/public/landing/dungeon.tall.patch.gz` | The tall frame's dungeon, as the box of cells in which its world differs from the wide frame's: laid into the valley's grid before it is built |
+| `web/public/landing/valley.grid.gz`, `nether.grid.gz` | The worlds as grids of blocks, one byte a cell: the valley with what lies under it and the homestead's cavern (6.7 million cells in 97 KB), and the Nether (1.1 million in 39 KB). After the valley's cells come the two suns' shadows on its faces (124 KB more). See "What the page builds itself" |
+| `web/public/landing/dungeon.tall.patch.gz` | Only if the tall frame's world ever differs from the wide frame's: the box of cells that differ, laid into the valley's grid before it is built. Both frames share one world now, so none is written |
 | `web/public/landing/small.pack.gz` | Every small file as one: the pictures from the pack (`tex/`, `hud/`, the two atlases) and the slab's blocks (`slab.grid`; the page meshes its pieces itself) |
 | `web/public/landing/models.<frame>.glb.gz` | Everything else small, with names and parents, without pictures: the page gives each material its texture by the material's name |
 | `web/public/landing/scene.json`, `layout.<frame>.json` | The sky, palettes, glyphs and the film's constants; and per frame the camera's shots, the type (as text and place: the page builds the letters), lamps, haze boxes and places the sets worked out |
 | `web/lib/landing/engine/version.ts` | The bundle's version: a hash over all of its files. The page asks for every file by it (`?v=...`), and `next.config.ts` lets a browser keep what is asked for that way for good |
+| `web/public/gui/dirt.png` | Not the film's: a picture of the pack the site's own HTML shows, as a plain file beside the bundle (`GUI` in `export_web.py`). The pack's `block/dirt.png`, which the 404 page (`web/app/not-found.tsx`) tiles and darkens as the game's old menu background |
 | `web/tests/unit/landing/fixtures/reference.<frame>.json` | The camera and the pumpkin sampled every 0.02 screens, and what the type says. Numbers and our own copy only, so it is committed: `parity.test.ts` holds the page's timeline to it, `copy.test.ts` the page's text |
 | `web/tests/unit/landing/fixtures/world.json` | A digest of every part of the world as built here: its faces and every byte of their light. `world.test.ts` holds the page's building to it |
 

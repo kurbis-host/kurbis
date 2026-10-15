@@ -54,10 +54,9 @@ describe("the world, built in the page", () => {
     for (const [name, want] of Object.entries(reference.wide)) expect(digest(parts.get(name)), name).toEqual(want);
   }, 120000);
 
-  it("builds the tall frame's world from the same grid, with its dungeon laid in", () => {
-    const parts = build(patched(valley, readPatch(unpacked("dungeon.tall.patch.gz"))));
+  it("builds the tall frame's world from the same grid: the two frames share one world", () => {
+    const parts = build(valley);
     for (const [name, want] of Object.entries(reference.tall)) expect(digest(parts.get(name)), name).toEqual(want);
-    expect(reference.tall.dungeon).not.toEqual(reference.wide.dungeon);
   }, 120000);
 
   it("comes to the same with a helper, and when the helper lets it down", async () => {

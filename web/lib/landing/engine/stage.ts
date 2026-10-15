@@ -5,10 +5,10 @@
 
 import { Color, Group, Mesh, Object3D, PerspectiveCamera, Scene, Vector3, type Material, type ShaderMaterial, type Texture } from "three";
 import { Shot } from "../anim/shot";
-import { readModel } from "../world/grid";
+import { readModel, type BlockModel } from "../world/grid";
 import type { Took } from "../world/load";
 import { pieceGeometry } from "./blockmodel";
-import { loadPicture, loadTiles, readModels, type Aspect, type FogData, type LayoutData, type NodeData, type Pack, type Records, type SceneData } from "./bundle";
+import { loadPicture, loadTiles, readModels, type Aspect, type FogData, type LayoutData, type NodeData, type Pack, type Palette, type Records, type SceneData } from "./bundle";
 import { take } from "./early";
 import { flakesMesh } from "./flakes";
 import { Lamps } from "./lamps";
@@ -48,7 +48,11 @@ export interface Stage {
    * face as one mesh, its origin at the bottom centre of its front. The caller places it
    * and disposes of its geometry when done.
    */
-  makeType(lines: readonly string[], options: { palette?: string; cell: number; depth: number; material?: string; day?: number; leading?: number }): Mesh;
+  makeType(lines: readonly string[], options: { palette?: string | Palette; cell: number; depth: number; material?: string; day?: number; leading?: number; tracking?: number }): Mesh;
+  /** The dark rim that goes round such type (`width` in cells), to sit just behind it. */
+  makeRim(lines: readonly string[], options: { cell: number; width: number; day?: number; leading?: number }): Mesh;
+  /** What such type is drawn with (`day`: how much daylight reaches it), for type laid out by the caller. */
+  typeLook(material: string, day: number): ShaderMaterial;
   /** Resolves when the parts under the valley and beyond the portal are in too. */
   rest: Promise<void>;
   dispose(): void;
@@ -146,7 +150,7 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
 
   // Pictures the small models need, then the models themselves.
   const named = new Map<string, Texture>();
-  const pictures: Pictures = { atlas, atlasEmit, named };
+  const pictures: Pictures = { atlas, atlasEmit, named, grid: [data.atlas.across, data.atlas.tile] };
   const loadNamed = Promise.all(
     Object.entries(data.textures).map(async ([key, file]) => {
       const picture = await loadPicture(pack.picture(`tex/${file}`));
@@ -156,6 +160,7 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
   );
   const [gltf, world] = await Promise.all([models, valley, loadNamed]);
   const slab = readModel(pack.bytes("slab.grid").slice().buffer);
+  const home = pack.has("home.grid") ? readModel(pack.bytes("home.grid").slice().buffer) : null;
   // One grid holds the valley, what lies under it and the dungeon: all of it is there at once.
   for (const [part, look] of [["valley.terrain", "terrain"], ["valley.leaves", "leaves"], ["valley.water", "water"], ["under.terrain", "terrain"], ["under.water", "water"]]) {
     addRecords(part, world.parts.get(part), look);
@@ -189,24 +194,34 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
   scene.add(gltf);
 
   // The slab in front of the cut face comes as cells, and is built here: by far the
-  // largest thing the models would otherwise carry.
-  const slabNote = data.materials[slab.material];
-  if (slabNote) {
-    let material = materials.get(slab.material);
+  // largest thing the models would otherwise carry. So does the homestead's house, which
+  // comes apart block by block.
+  const build = (model: BlockModel, name: string) => {
+    const note = data.materials[model.material];
+    if (!note) return;
+    let material = materials.get(model.material);
     if (!material) {
-      material = modelMaterial(globals, slabNote, pictures);
-      material.name = slab.material;
-      materials.set(slab.material, material);
+      material = modelMaterial(globals, note, pictures);
+      material.name = model.material;
+      materials.set(model.material, material);
       disposables.push(material);
     }
-    for (const piece of slab.pieces) {
-      const mesh = new Mesh(pieceGeometry(slab, piece, data.atlas.across, data.atlas.tile), material);
+    const holder = new Group();
+    holder.name = name;
+    if (model.place) holder.position.set(...model.place);
+    holder.scale.setScalar(model.scale ?? 1);
+    for (const piece of model.pieces) {
+      const mesh = new Mesh(pieceGeometry(model, piece, data.atlas.across, data.atlas.tile), material);
       mesh.name = piece.name;
       mesh.position.set(piece.centre[0], piece.centre[1], piece.centre[2]);
-      gltf.add(mesh);
+      holder.add(mesh);
       nodes.set(piece.name, mesh);
     }
-  }
+    gltf.add(holder);
+    nodes.set(name, holder);
+  };
+  build(slab, "Slab");
+  if (home) build(home, "Home");
 
   // What is built here rather than loaded: type, its rims and scrims, and the flakes.
   const face = data.glyphs.block;
@@ -288,9 +303,13 @@ export async function loadStage(aspect: Aspect): Promise<Stage> {
     pictures,
     pack,
     took,
-    makeType(lines, { palette = "cream", cell, depth, material = "Type", day = 0, leading = 3 }) {
-      return new Mesh(typeGeometry(textMask(face, lines, { leading }), data.palettes[palette], cell, depth), typeLook(material, day));
+    makeType(lines, { palette = "cream", cell, depth, material = "Type", day = 0, leading = 3, tracking }) {
+      return new Mesh(typeGeometry(textMask(face, lines, { leading, tracking }), typeof palette === "string" ? data.palettes[palette] : palette, cell, depth), typeLook(material, day));
     },
+    makeRim(lines, { cell, width, day = 0, leading = 3 }) {
+      return new Mesh(rimGeometry(textMask(face, lines, { leading }), cell, width, rim), typeLook("Rim", day));
+    },
+    typeLook,
     rest,
     dispose() {
       disposed = true;

@@ -6,8 +6,15 @@ import { Track } from "../anim/track";
 import type { Constants, Points } from "../engine/bundle";
 import type { Stage } from "../engine/stage";
 import type { Cast } from "./cast";
+import type { Cave } from "./cave";
+import type { Chat } from "./chat";
+import type { Card } from "../engine/hud";
 import type { Interface } from "./interface";
+import { Speech } from "./speech";
 import type { Touch } from "./touch";
+
+/** The two friends in the film; the visitor may take one's place (./visitor.ts). */
+export type Friend = "Steve" | "Alex";
 
 export interface Ctx {
   stage: Stage;
@@ -29,6 +36,30 @@ export interface Ctx {
   cast: Cast;
   /** The visitor's hand. */
   touch: Touch;
+  /** What the friends say when clicked, over their heads. */
+  speech: Speech;
+  /** The cave, once it is set (the interface's chat follows its lever). */
+  cave: Cave | null;
+  /** The game's chat, once it is set ("/" opens it): the interface draws its field. */
+  chat: Chat | null;
+  /** The visitor's own name, once they have picked a free one: the film calls their server by it. */
+  visitor: string | null;
+  /** What each friend goes by: their own name, or the visitor's, whose skin they wear. */
+  players: Record<Friend, string>;
+  /** Which friend wears the visitor's skin, if one does. */
+  wearer: Friend | null;
+  /** Their head, from that skin, for the interface (16 interface pixels square). */
+  face: Card | null;
+  /** The visitor is back, with a server of their own already. */
+  home: boolean;
+  /** Follow a link drawn in the world (a sign at the end of the page): the page goes there. */
+  go(href: string): void;
+  /** Open somebody else's page, from a link in the credits: in a tab of its own. */
+  open(href: string): void;
+  /** The moment the page last came round (./ring.ts), from the end of the credits to the sky or back, under the film's cover; -Infinity until it has. */
+  again: number;
+  /** How far before the sky the scroll is, in the lead-in where the cover lifts on it (./ring.ts): screens, 0 while it is not. The film stands at the sky all through it. */
+  lead: number;
 }
 
 export function vec(v: readonly number[]): Vector3 {
@@ -62,6 +93,18 @@ export function makeContext(stage: Stage, tl: Timeline, touch: Touch, makeCast: 
     pick: (wide, tall) => (stage.tall ? tall : wide),
     ui: null,
     touch,
+    speech: new Speech(stage.camera, stage.nodes),
+    cave: null,
+    chat: null,
+    visitor: null,
+    players: { Steve: "Steve", Alex: "Alex" },
+    wearer: null,
+    face: null,
+    home: false,
+    go: () => {},
+    open: () => {},
+    again: -Infinity,
+    lead: 0,
     cast: null as unknown as Cast,
   };
   ctx.cast = makeCast(ctx);

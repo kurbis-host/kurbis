@@ -89,6 +89,9 @@ export interface BlockModel {
   material: string;
   /** Each piece: its name, the box of cells it is, and where its mesh's own origin stands in the world. */
   pieces: { name: string; at: [number, number, number]; shape: [number, number, number]; centre: [number, number, number] }[];
+  /** A thing smaller than the world's blocks: where its cell (0, 0, 0) stands in the world, and how big a cell is. */
+  place?: [number, number, number];
+  scale?: number;
   cells: Uint8Array;
 }
 

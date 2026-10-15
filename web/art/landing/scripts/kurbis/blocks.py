@@ -61,10 +61,11 @@ def solid(rgb, alpha=1.0):
 
 
 class Blocks:
-    """Block ids start at 1; 0 is air."""
+    """Block ids start at 1; 0 is air. `atlas`: another registry's, to draw from the same
+    pictures without joining its grids (the hero's cloud: see film.py)."""
 
-    def __init__(self):
-        self.atlas = Atlas()
+    def __init__(self, atlas=None):
+        self.atlas = atlas or Atlas()
         self.names = ["air"]
         self.tiles = [[0] * 6]
         self.opaque = [False]
@@ -137,10 +138,16 @@ def bright(px):
     return px[..., :3].max(-1) > 0.75
 
 
-def voxel_material(name, atlas, emit_strength=4.0, self_illum=0.0, roughness=0.9):
+def candle(px):
+    """Mask for a jack o'lantern's face: the candle's yellow, not the orange rind round it."""
+    return px[..., 1] > 0.7
+
+
+def voxel_material(name, atlas, emit_strength=4.0, self_illum=0.0, roughness=0.9, alpha=1.0):
     """Closest-filtered atlas, emission from the emit atlas, optional self-illumination.
 
-    `self_illum` adds base colour to emission so type stays graphic in dark shots.
+    `self_illum` adds base colour to emission so type stays graphic in dark shots. Below 1,
+    `alpha` makes it see-through, drawn as a screen door (as the far clouds are).
     """
     color_img, emit_img = atlas.images
     mat = bpy.data.materials.new(name)
@@ -177,6 +184,10 @@ def voxel_material(name, atlas, emit_strength=4.0, self_illum=0.0, roughness=0.9
     bsdf.inputs["Emission Strength"].default_value = 1.0
     nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
     core.note(mat, kind="voxel", emit=emit_strength, glow=self_illum)
+    if alpha < 1.0:
+        bsdf.inputs["Alpha"].default_value = alpha
+        mat.surface_render_method = "DITHERED"
+        core.note(mat, alpha=alpha, dither=True)
     return mat
 
 
@@ -285,6 +296,7 @@ def build_registry():
     b.cube("cherry_log", side=t("cherry_log"), top=t("cherry_log_top"), bottom=t("cherry_log_top"))
     b.cube("water", all=b.flat((0.16, 0.42, 0.86)), opaque=False, group="water")
     b.cube("cloud", all=b.flat((1.0, 0.93, 0.90)), opaque=False, group="cloud")
+    b.cube("farmland", top=t("farmland_moist"), side=t("dirt"), bottom=t("dirt"))
     for name, pal in TYPE_PALETTES.items():
         b.cube(
             f"type_{name}",

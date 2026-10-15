@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { POP, UNPOP, cycle, linear } from "../../../lib/landing/anim/easing";
 import { Timeline } from "../../../lib/landing/anim/timeline";
 import { Track } from "../../../lib/landing/anim/track";
-import { Round } from "../../../lib/landing/film/dungeon";
+import { Round } from "../../../lib/landing/anim/round";
 
 describe("the timeline", () => {
   it("runs a triggered piece in real time once the scroll has passed its start", () => {
@@ -58,6 +58,20 @@ describe("the timeline", () => {
     tl.update(3.5, 0.048, 0.016); // leaving: it puts its things away
     tl.update(4, 0.064, 0.016);
     expect(seen).toEqual([0, 2.5, 3.5]);
+  });
+
+  it("runs every part once where the scroll jumps to, so a part left past its end puts its things as that place has them", () => {
+    const tl = new Timeline();
+    // A sign that is gone at the end of the page, as the pond's is once the camera is home.
+    let sign = true;
+    tl.during(6.7, 6.9, ({ s }) => void (sign = s < 6.78));
+    tl.update(1.3, 0, 0.016);
+    for (const s of [6.75, 6.8, 7.5]) tl.update(s, 0.1, 0.016);
+    expect(sign).toBe(false);
+    // Round to the sky, past the end: the scroll never passed the sign's stretch on the way.
+    tl.settle(0);
+    tl.update(0, 0.2, 0.016);
+    expect(sign).toBe(true);
   });
 });
 

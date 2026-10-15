@@ -27,10 +27,11 @@ SPOTS = {
     # The cart track from the cave to the dungeon: corners of the rail's centre line. It
     # runs north out of the cave, turns east, drops five blocks and runs in through the door.
     "rail": ((0.5, 6.5, -25.0), (0.5, 17.5, -25.0), (4.0, 17.5, -25.0), (9.0, 17.5, -30.0), (16.5, 17.5, -30.0)),
-    # The dungeon's interior cells and its floor. Everything to look at is on the east
-    # wall, in two chambers: the ores to the south, where the track comes in, and the
-    # portal frame to the north. A wall parts them, open at its west end.
-    "dungeon": {"x": (12, 22), "y": (11, 34), "floor": -30, "height": 7, "ores": (24, 21, 18, 15, 12), "parting": (27, 17), "portal": (29, 30)},
+    # The homestead's cavern: its interior cells, its floor and how high its dome is.
+    # Daylight falls into it through a shaft in the roof onto a grass floor, where a house
+    # stands in a fenced yard. Friends come in by a tunnel in the south wall; the portal
+    # frame is in the east wall, to the north.
+    "dungeon": {"x": (12, 34), "y": (11, 36), "floor": -30, "height": 12, "portal": (30, 31), "shaft": ((23, 27), (15, 19)), "tunnel": (21, 23), "field": ((23, 26), (25, 28))},
     # Ground in front of the cut face. It makes the meadow whole until the slice.
     "front": {"x": (-30, 30), "depth": 14, "bottom": -11},
 }
@@ -320,38 +321,59 @@ class World:
             carve([(cx, y, cz) for cx in (x - 1, x) for y in (0, 1) for cz in (z, z + 1)], (float(x), 1.0, float(z)))
 
     def _dungeon(self):
-        """A cobblestone room, part moss, closed all round but for the door the track
-        comes in by. Five kinds of ore stand out from the east wall, an obsidian frame
-        is set in it further north, and a patch of bedrock shows through the floor.
-        Each ore is two blocks square: `ores` gives its south edge and, if it does not
-        stand in the usual row, how far above the floor (y, up). `ledge` is a shelf of
-        planks the same width, for a chest to stand on among them."""
+        """The homestead's cavern: a dome of stone with lumpy walls, highest in the middle,
+        a shaft in its roof to the daylight far above, grass on the floor where that light
+        falls and stone and gravel elsewhere. A tunnel in the south wall, the portal frame
+        in the east wall."""
         d = self.dungeon
         (x0, x1), (y0, y1), floor, height = d["x"], d["y"], d["floor"], d["height"]
-        top = floor + height - 1
-        lo, hi = (x0 - 1, y0 - 1, floor - 2), (x1 + 3, y1 + 2, top + 2)  # thin toward the cave, so it never shows there
-        self.box((lo[0], hi[0]), (lo[1], hi[1]), (lo[2], hi[2]), "cobblestone")
-        self.box((x0, x1), (y0, y1), (floor, top), 0)
-        row, end = d["parting"]
-        self.box((end, x1), (row, row), (floor, top), "cobblestone")
-        self.box((x0, x1), (row, row), (top, top), "cobblestone")  # and a beam over the opening
+        lo, hi = (x0 - 3, y0 - 3, floor - 2), (x1 + 3, y1 + 3, floor + height + 9)
+        self.box((lo[0], hi[0]), (lo[1], hi[1]), (lo[2], hi[2]), "stone")
         shell = self.grid[lo[0] - self.x0 : hi[0] + 1 - self.x0, lo[1] : hi[1] + 1, lo[2] - self.z0 : hi[2] + 1 - self.z0]
         X, Y, Z = np.meshgrid(*(np.arange(n, dtype=np.float64) for n in shell.shape), indexing="ij")
-        patchy = noise3(X, Y, Z, 3.5, 602)
-        shell[(shell == self.b["cobblestone"]) & (_hash(X, Y, Z, 601) < 0.16 + 0.6 * (patchy > 0.56))] = self.b["mossy_cobblestone"]
-        ores = ("redstone_ore", "coal_ore", "gold_ore", "lapis_ore", "copper_ore")  # read left to right, facing east
-        for at, ore in zip(d["ores"], ores):
-            y, up = at if isinstance(at, tuple) else (at, 3)
-            self.box((x1, x1), (y, y + 1), (floor + up, floor + up + 1), ore)
-        if d.get("ledge"):
-            y, up = d["ledge"]
-            self.box((x1, x1), (y, y + 1), (floor + up, floor + up), "planks")
+        wx, wy, wz = X + lo[0] + 0.5, Y + lo[1] + 0.5, Z + lo[2] + 0.5
+        # The room: a flattened dome over the floor's box, its walls pushed in and out by noise.
+        cx, cy = (x0 + x1 + 1) / 2, (y0 + y1 + 1) / 2
+        rx, ry = (x1 + 1 - x0) / 2, (y1 + 1 - y0) / 2
+        across = np.sqrt(((wx - cx) / rx) ** 4 + ((wy - cy) / ry) ** 4) ** 0.5  # a rounded box: 1 at its walls
+        lump = (noise3(wx, wy, wz, 4.5, 611) - 0.5) * 0.34
+        roof = floor + height * np.sqrt(np.clip(1 - across**2.2, 0, 1)) + (noise3(wx, wy, wz, 3.0, 612) - 0.5) * 2.2
+        air = (across + lump < 1.0) & (wz > floor) & (wz < roof)
+        # The shaft: straight up through the roof to the daylight.
+        (sx0, sx1), (sy0, sy1) = d["shaft"]
+        air |= (wx > sx0) & (wx < sx1 + 1) & (wy > sy0) & (wy < sy1 + 1) & (wz > floor) & (wz < floor + height + 8)
+        # The tunnel friends come in by, from the south.
+        t0, t1 = d["tunnel"]
+        air |= (wx > t0) & (wx < t1 + 1) & (wy > y0 - 4) & (wy < y0 + 2) & (wz > floor) & (wz < floor + 3)
+        shell[air] = 0
+        # What the walls are made of: stone, with andesite, tuff and moss in patches.
+        solid = shell != 0
+        kind = noise3(wx, wy, wz, 5.0, 613)
+        shell[solid & (kind > 0.62)] = self.b["andesite"]
+        shell[solid & (kind < 0.3)] = self.b["tuff"]
+        shell[solid & (noise3(wx, wy, wz, 3.2, 614) > 0.7)] = self.b["mossy_cobblestone"]
+        shell[solid & (_hash(X, Y, Z, 615) < 0.012)] = self.b["glowstone"]  # a few glints in the dark
+        # The floor: grass in the shaft's light (spreading in a soft patch), dirt under it; gravel paths elsewhere.
+        top = floor - 1 - lo[2]
+        fx, fy = wx[:, :, 0], wy[:, :, 0]
+        sun = np.sqrt(((fx - (sx0 + sx1 + 1) / 2) / 9.5) ** 2 + ((fy - (sy0 + sy1 + 1) / 2) / 10.5) ** 2) + (noise2(fx, fy, 3.0, 616) - 0.5) * 0.5
+        floor_cells = shell[:, :, top]
+        grass = (sun < 1.0)
+        floor_cells[grass] = self.b["grass"]
+        shell[:, :, top - 1][grass] = self.b["dirt"]
+        floor_cells[~grass & (noise2(fx, fy, 2.4, 617) > 0.62)] = self.b["gravel"]
+        # The field beside the yard: tilled.
+        (fx0, fx1), (fy0, fy1) = d["field"]
+        floor_cells[(fx > fx0) & (fx < fx1 + 1) & (fy > fy0) & (fy < fy1 + 1)] = self.b["farmland"]
+        shell[:, :, top] = floor_cells
+        # The portal frame, set into the east wall.
         p0, p1 = d["portal"]
-        self.box((x1 + 1, x1 + 1), (p0 - 1, p1 + 1), (floor - 1, floor + 3), "obsidian")
-        self.box((x1 + 1, x1 + 1), (p0, p1), (floor, floor + 2), 0)  # the wall shows through it until it lights
-        self.set(x1 + 1, p0 - 1, floor + 3, "crying_obsidian")
-        self.set(x1 + 1, p1 + 1, floor + 1, "crying_obsidian")
-        self.box((x0 + 1, x0 + 2), (y0 + 1, y0 + 2), (floor - 1, floor - 1), "bedrock")
+        px = x1 + 1
+        self.box((px, px + 1), (p0 - 1, p1 + 1), (floor - 1, floor + 3), "obsidian")
+        self.box((px, px + 1), (p0, p1), (floor, floor + 2), 0)
+        self.box((x1 - 1, px - 1), (p0 - 2, p1 + 2), (floor, floor + 4), 0)  # a bay before it, so it stands clear of the wall's lumps
+        self.set(px, p0 - 1, floor + 3, "crying_obsidian")
+        self.set(px, p1 + 1, floor + 1, "crying_obsidian")
 
     def _rail(self):
         """The cart tunnel: three wide and three high along the track, a block taller on
@@ -464,21 +486,26 @@ class World:
         cur = self.grid[sel]
         self.grid[sel] = np.where(cur == 0, self.b[leaf], cur)
 
-    def tree(self, x, y, leaf, trunk=None, radius=None, thick=1):
-        """Round, chunky canopy on a dark trunk: the trailer tree."""
+    def tree(self, x, y, leaf, trunk=None, radius=None, thick=1, place=True):
+        """Round, chunky canopy on a dark trunk: the trailer tree. With `place` off it only
+        makes its random draws, so the trees after it come out as they would have."""
         z = self.top(x, y) + 1
         radius = radius or float(self.rng.uniform(2.3, 4.3))
         trunk = trunk or int(3 + radius * 1.2 + self.rng.integers(0, 3))
+        offsets = [(self.rng.uniform(-0.7, 0.7, 2) * radius).astype(int) for _ in range(2)]
+        if not place:
+            return
         self.box((x, x + thick - 1), (y, y + thick - 1), (z, z + trunk), "log")
         top = z + trunk
         self._blob(x, y, top, radius, radius * 0.82, leaf)
-        for _ in range(2):
-            ox, oy = (self.rng.uniform(-0.7, 0.7, 2) * radius).astype(int)
+        for ox, oy in offsets:
             self._blob(x + ox, y + oy, top - int(radius * 0.35), radius * 0.68, radius * 0.6, leaf)
 
-    def spruce(self, x, y):
+    def spruce(self, x, y, place=True):
         z = self.top(x, y) + 1
         trunk = int(self.rng.integers(8, 14))
+        if not place:
+            return
         self.box((x, x), (y, y), (z, z + trunk), "spruce_log")
         layers = trunk - 1
         for k in range(layers):
@@ -508,10 +535,13 @@ class World:
                     continue
                 if self.get(x, y, top) != self.b["grass"]:
                     continue
+                # The low sun stands behind this stretch of the ridge, seen from the landing: a tree
+                # there turns black in its glare, a hole in the middle of the shot.
+                place = not (abs(x + 5) <= 5 and 32 <= y <= 70)
                 if self.rng.random() < (0.1 + max(top - 8, 0) * 0.03):
-                    self.spruce(x, y)
+                    self.spruce(x, y, place=place)
                 else:
-                    self.tree(x, y, autumn[int(self.rng.integers(len(autumn)))])
+                    self.tree(x, y, autumn[int(self.rng.integers(len(autumn)))], place=place)
 
     def _pumpkins(self):
         # Decoration only, kept clear of the cast and of the address on the ridge.

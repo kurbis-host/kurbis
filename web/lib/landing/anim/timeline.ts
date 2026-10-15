@@ -68,7 +68,9 @@ export class Timeline {
   /**
    * Run `fn` on every frame whose scroll position lies in s0..s1, and once more as the
    * scroll leaves, so it can put its things away. (Give the stretch over which its
-   * things can be seen or heard of, generously.)
+   * things can be seen or heard of, generously.) And once on a frame the scroll jumped
+   * to, wherever that is (the page's first is one): the scroll did not pass its things on
+   * the way, so it puts them where that place has them.
    */
   during(s0: number, s1: number, fn: (frame: Frame) => void) {
     this.parts.push({ s0, s1, fn, ran: false });
@@ -100,17 +102,10 @@ export class Timeline {
     for (const trigger of this.triggers) trigger.step(s, dt);
     for (const part of this.parts) {
       const inside = s >= part.s0 && s <= part.s1;
-      if (inside || part.ran) part.fn(frame);
+      if (inside || part.ran || frame.jumped) part.fn(frame);
       part.ran = inside;
     }
-    // A part that has never run still owes its things their opening state.
-    if (!this.opened) {
-      this.opened = true;
-      for (const part of this.parts) if (!part.ran) part.fn(frame);
-    }
   }
-
-  private opened = false;
 }
 
 // -- things ------------------------------------------------------------------------

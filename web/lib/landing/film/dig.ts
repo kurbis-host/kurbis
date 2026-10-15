@@ -1,21 +1,17 @@
 /**
  * The cut face: the facts beside the dig, the blocks the pumpkin has yet to dig, their
- * cracks, and the crumbs it throws.
+ * cracks, and the crumbs it throws. And the sign where it starts.
  */
 
 import { Vector3 } from "three";
 import { lerp, seeded, smooth } from "../anim/easing";
 import { grow } from "../anim/timeline";
 import type { Card } from "../engine/hud";
+import { COPY } from "../copy";
 import { vec, type Ctx } from "./context";
 
-/** Things buried in the cut face, to find on the way down: what each says when the pointer finds it. */
-const TOYS: [string, string, string][] = [
-  ["fossil", "Fossil", "Older than your last world."],
-  ["chest", "Chest", "Someone's coal. Finders keepers."],
-  ["sign", "Old sign", "It says: Back in 5 minutes."],
-  ["sock", "Lost sock", "The other one is in the Nether."],
-];
+/** Things buried in the cut face, to find on the way down (as the art names them): what each says when the pointer finds it. */
+const TOYS: [string, string, string][] = (["fossil", "chest", "sign", "sock"] as const).map((key, i) => [key, ...COPY.dig.finds[i]]);
 
 export function setDig(ctx: Ctx) {
   const { tl, C, points, dig, tall } = ctx;
@@ -61,6 +57,25 @@ export function setDig(ctx: Ctx) {
     });
   }
 
+  // The sign where it starts to dig, which says the game's first rule: to read at the pond.
+  // Where it stands on the slab (the tall frame), it goes down with its column. It is gone
+  // before the camera is home, where the world is whole again.
+  const rule = ctx.node("Rule_Sign");
+  if (points.rule.slab) ctx.node(points.rule.slab).attach(rule);
+  const [heading, said] = COPY.dig.rule.find;
+  let told: Card | null = null;
+  ctx.touch.add({
+    name: "rule",
+    at: vec(points.rule.at),
+    half: ctx.pick(new Vector3(0.8, 0.15, 0.45), new Vector3(0.75, 0.4, 0.45)), // (the tall frame's is turned toward the lens)
+    seen: [1.05, C.STOMP - 0.06],
+    pick: true,
+    // Clear of the board, where it says the same: over it (wide), or under it, in the grass (tall).
+    hang: ctx.pick({ offset: [0, 36], anchor: [0.5, 0] }, { offset: [0, -36], anchor: [0.5, 1] }),
+    tip: () => (told ??= ctx.ui?.draw.tooltip(heading, [said]) ?? null),
+  });
+  tl.during(C.HOME - 0.05, C.END + 0.1, ({ s }) => void (rule.visible = s < C.HOME - 0.02));
+
   tl.during(C.STOMP - 0.1, C.LAND + 0.3, ({ s }) => {
     if (tall) bands.forEach((band, i) => grow(band, 1 - smooth((s - gone[i]) / 0.05)));
     const far = dig.value(s);
@@ -70,11 +85,13 @@ export function setDig(ctx: Ctx) {
       cracks.visible = s >= begun && s < when - 0.004;
       cracks.userData.tint = Math.min(Math.max(far - (i - 1), 0), 0.999);
     }
-    // Each crumb flies for the step that threw it last.
+    // Each crumb flies for the step that threw it last; and only while the dig is in its stretch
+    // (one still being taken back as the scroll leaves it, upward, is not left hanging at the pond).
     for (const crumb of crumbs) crumb.visible = false;
+    const digging = s >= C.STOMP - 0.1 && s <= C.LAND + 0.3;
     for (const { crumb, clock, from, fling, spin } of throws) {
       const t = clock.t;
-      if (t <= 0) continue;
+      if (t <= 0 || !digging) continue;
       const thing = crumbs[crumb];
       const size = Math.max(1 - t / 0.42, 0);
       thing.visible = size > 1e-3;

@@ -53,9 +53,9 @@ export function makeCast(parts: CastParts): Cast {
   const seat = vec(place.seat);
   const board = vec(place.board);
   const alight = vec(place.alight);
-  const wallSpot = vec(place.wall_spot);
-  const opening = vec(place.opening);
-  const signSpot = vec(place.sign_spot);
+  const pathSpot = vec(place.path_spot);
+  const bookSpot = vec(place.book_spot);
+  const watchSpot = vec(place.watch_spot);
   const before = vec(place.before);
   const inside = vec(place.inside);
   const { facing } = place;
@@ -91,7 +91,7 @@ export function makeCast(parts: CastParts): Cast {
   a.hop(2.93, C.WAKE, mid, home, 1.3, { yaw: [20, 370], land: 0.12 });
   a.rest(C.WAKE, home, 10);
 
-  // Into the cart, through the tunnel, and out in front of the ore wall.
+  // Into the cart, through the tunnel, and out in the homestead.
   a.hop(3.57, C.BOARD, home, board, 1.5, { yaw: [10, 180], flips: 1, land: 0.1 });
   const heading = new Vector3();
   a.move(C.BOARD, C.ARRIVE, (u, out) => {
@@ -100,12 +100,14 @@ export function makeCast(parts: CastParts): Cast {
     setPose(out, railAt(points, far, out.pos).add(seat), Math.atan2(heading.x, -heading.y) * DEG);
     out.tilt[0] = Math.asin(Math.max(Math.min(-heading.z, 1), -1)) * DEG;
   });
-  a.hop(C.ARRIVE, 4.11, alight, wallSpot, 1.5, { yaw: [90, facing], flips: 1 });
-  a.rest(4.11, wallSpot, facing);
-  a.hop(4.24, 4.31, wallSpot, opening, 1.6, { yaw: [facing, -180], land: 0.1 }); // well ahead of the camera, through the opening
-  a.hop(4.31, 4.38, opening, signSpot, 1.5, { yaw: [-180, -100], flips: 1 });
-  a.rest(4.38, signSpot, -100);
-  a.hop(4.77, 4.84, signSpot, before, 0.9, { yaw: [-100, 90] });
+  // On the path, watching the gate; into the yard by the lectern; to the field's edge to watch the house.
+  a.hop(C.ARRIVE, 4.11, alight, pathSpot, 1.5, { yaw: [90, facing[0]], flips: 1 });
+  a.rest(4.11, pathSpot, facing[0]);
+  a.hop(4.27, 4.31, pathSpot, bookSpot, 1.7, { yaw: [facing[0], facing[1]], land: 0.1 }); // over the fence
+  a.rest(4.31, bookSpot, facing[1]);
+  a.hop(4.47, 4.51, bookSpot, watchSpot, 1.3, { yaw: [facing[1], facing[2]], flips: 1 });
+  a.rest(4.51, watchSpot, facing[2]);
+  a.hop(4.77, 4.84, watchSpot, before, 1.2, { yaw: [facing[2], 90] });
   a.hop(4.84, C.PORTAL_LIT, before, inside, 1.1, { yaw: [90, 90], flips: 1, land: 0 }); // into the frame, and it lights
   a.appear(-1, C.PORTAL_LIT + 0.004);
   a.face(0, "asleep").face(C.WAKE_UP, "awake").face(fall0, "whee").face(fall1, "awake").face(C.DIG0, "whee").face(C.LAND, "awake");
@@ -127,11 +129,13 @@ export function makeCast(parts: CastParts): Cast {
   return {
     pumpkin: a,
     nether: n,
+    // (Low: the candle stands just in front of the face, and stronger it washes the pumpkin flat
+    // and the carved face out of it. The face's own glow does the rest.)
     candle: linear([
-      [C.WAKE_UP, 0], [C.WAKE_UP + 0.01, 16], [fall1, 16], [fall1 + 0.02, 40], [C.STOMP, 40], [1.66, 70], [C.BREAK, 70], [C.BREAK + 0.02, 150],
-      [C.WAKE, 150], [C.WAKE + 0.1, 34], [3.57, 34], [C.BOARD, 110], [C.ARRIVE, 110], [4.12, 30], [C.PORTAL_LIT, 30], [C.PORTAL_LIT + 0.01, 0],
+      [C.WAKE_UP, 0], [C.WAKE_UP + 0.01, 4], [fall1, 4], [fall1 + 0.02, 10], [C.STOMP, 10], [1.66, 18], [C.BREAK, 18], [C.BREAK + 0.02, 38],
+      [C.WAKE, 38], [C.WAKE + 0.1, 9], [3.57, 9], [C.BOARD, 28], [C.ARRIVE, 28], [4.12, 8], [C.PORTAL_LIT, 8], [C.PORTAL_LIT + 0.01, 0],
     ]),
     back: linear([[3.58, 0], [C.BOARD, 16], [C.ARRIVE, 16], [C.ARRIVE + 0.06, 0]]),
-    netherCandle: linear([[C.THROUGH - 0.03, 0], [C.THROUGH - 0.02, 26]]),
+    netherCandle: linear([[C.THROUGH - 0.03, 0], [C.THROUGH - 0.02, 7]]),
   };
 }
