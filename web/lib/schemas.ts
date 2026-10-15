@@ -18,6 +18,7 @@ export const setupSchema = z.object({
   simulation_distance: z.number().int().min(2).max(32),
   hardcore: z.boolean(),
   whitelist: z.boolean(),
+  whitelist_by_members: z.boolean(),
   tab_stats: z.boolean(),
 });
 export type SetupValues = z.infer<typeof setupSchema>;

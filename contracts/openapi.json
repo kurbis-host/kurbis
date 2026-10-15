@@ -6904,6 +6904,740 @@
           }
         ]
       }
+    },
+    "/api/v1/servers/{server_id}/whitelist/in-game": {
+      "post": {
+        "description": "Plugin only: add a player from in game, recording which player added them. Operators always may; players on the whitelist may while whitelist_by_members is on.",
+        "operationId": "addWhitelistEntryInGame",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InGameWhitelistMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whitelist"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/whitelist/requests": {
+      "post": {
+        "description": "Plugin only: report a player the whitelist turned away, so the panel can list them.",
+        "operationId": "reportWhitelistJoinRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinRequestReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whitelist"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "serverCapabilityBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/whitelist/requests/{player_id}": {
+      "delete": {
+        "description": "Forget a join request without letting the player in.",
+        "operationId": "dismissWhitelistJoinRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "player_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whitelist"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/let-in": {
+      "post": {
+        "description": "Add a player the whitelist turned away in the last day.",
+        "operationId": "letInWhitelistJoinRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "player_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whitelist"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/claim": {
+      "post": {
+        "description": "Owner only, while the owner has no linked Minecraft account: mark a join request as the owner's own player, who goes on the whitelist and becomes an operator. The Minecraft account is not linked for sign-in.",
+        "operationId": "claimWhitelistJoinRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "player_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whitelist"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          },
+          {
+            "serverGrantCookie": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -7866,7 +8600,8 @@
               "simulation_distance": 8,
               "tab_stats": false,
               "view_distance": 12,
-              "whitelist": false
+              "whitelist": true,
+              "whitelist_by_members": true
             }
           },
           "subdomain": {
@@ -7916,6 +8651,128 @@
           "Creative",
           "Adventure",
           "Spectator"
+        ]
+      },
+      "InGamePlayer": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "player_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "player_id",
+          "name"
+        ]
+      },
+      "InGameWhitelistMutation": {
+        "type": "object",
+        "properties": {
+          "added_by": {
+            "description": "The player in game who adds them. An operator always may; a player on\n the whitelist may while the server's `whitelist_by_members` setting is on.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InGamePlayer"
+              }
+            ]
+          },
+          "name": {
+            "description": "The player to add, as Pumpkin named them.",
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "player_id": {
+            "description": "The UUID Pumpkin reported when it turned this player away. A Bedrock\n player who has never been on the server cannot be resolved by name, so\n the runtime that saw them vouches for it, as it does for the player\n roster. Without it the name is resolved like a panel addition.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "default": null
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "added_by"
+        ]
+      },
+      "JoinRequest": {
+        "description": "A player the whitelist turned away in the last day.",
+        "type": "object",
+        "properties": {
+          "attempts": {
+            "description": "How often they tried, as the server reported it (at most once a minute).",
+            "type": "integer",
+            "format": "int32"
+          },
+          "first_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "name": {
+            "type": "string"
+          },
+          "player_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "player_id",
+          "name",
+          "attempts",
+          "first_attempt_at",
+          "last_attempt_at"
+        ]
+      },
+      "JoinRequestPath": {
+        "type": "object",
+        "properties": {
+          "player_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "server_id",
+          "player_id"
+        ]
+      },
+      "JoinRequestReport": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "player_id": {
+            "description": "The UUID Pumpkin gave the player it turned away.",
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "player_id",
+          "name"
         ]
       },
       "LimitQuery": {
@@ -9301,7 +10158,12 @@
           },
           "whitelist": {
             "type": "boolean",
-            "default": false
+            "default": true
+          },
+          "whitelist_by_members": {
+            "description": "Players on the whitelist may let in someone the whitelist just turned\n away. Operators always can.",
+            "type": "boolean",
+            "default": true
           }
         },
         "additionalProperties": false
@@ -9373,6 +10235,13 @@
             "minimum": 0
           },
           "whitelist": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": null
+          },
+          "whitelist_by_members": {
             "type": [
               "boolean",
               "null"
@@ -9527,20 +10396,38 @@
               "$ref": "#/components/schemas/WhitelistEntry"
             }
           },
+          "owner_has_minecraft_account": {
+            "description": "Whether the owner's account has a linked Minecraft account, which is\n always on the whitelist and an operator. Without one the owner can\n mark a join request as their own.",
+            "type": "boolean"
+          },
+          "requests": {
+            "description": "Players turned away in the last day, most recent first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JoinRequest"
+            }
+          },
           "revision": {
             "type": "integer",
             "format": "int64"
           },
           "synchronized": {
             "type": "boolean"
+          },
+          "whitelist_by_members": {
+            "description": "Whether players on the whitelist may let in someone it turned away.",
+            "type": "boolean"
           }
         },
         "required": [
           "enabled",
+          "whitelist_by_members",
+          "owner_has_minecraft_account",
           "revision",
           "applied_revision",
           "synchronized",
-          "entries"
+          "entries",
+          "requests"
         ]
       },
       "WhitelistDeleteQuery": {
@@ -9559,6 +10446,17 @@
       "WhitelistEntry": {
         "type": "object",
         "properties": {
+          "added_by": {
+            "description": "Who put the player on the whitelist: the owner's account name for\n additions in the panel, the player's name for additions in game.\n Unknown for a login-link session and for entries older than this field.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "added_in_game": {
+            "description": "Whether the player was added from inside the game.",
+            "type": "boolean"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -9578,6 +10476,7 @@
         "required": [
           "player_id",
           "name",
+          "added_in_game",
           "created_at",
           "updated_at"
         ]

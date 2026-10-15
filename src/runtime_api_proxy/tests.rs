@@ -71,6 +71,14 @@ fn normal_scope_allows_only_server_capability_routes() {
             Method::DELETE,
             format!("/api/v1/servers/{expected}/whitelist"),
         ),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/whitelist/in-game"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/servers/{expected}/whitelist/requests"),
+        ),
         (Method::POST, format!("/api/v1/servers/{expected}/commands")),
         (Method::POST, "/api/v1/server/login-links".to_owned()),
         (Method::GET, format!("/api/v1/servers/{expected}/ai")),
@@ -184,6 +192,32 @@ fn normal_scope_denies_sibling_account_and_worker_routes() {
                 Uuid::new_v4(),
                 Uuid::new_v4()
             ),
+        ),
+        // Join requests are answered in the panel, never by the server.
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/whitelist/requests/{}/let-in",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/servers/{expected}/whitelist/requests/{}/claim",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::DELETE,
+            format!(
+                "/api/v1/servers/{expected}/whitelist/requests/{}",
+                Uuid::new_v4()
+            ),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/servers/{expected}/whitelist/requests"),
         ),
     ] {
         assert!(

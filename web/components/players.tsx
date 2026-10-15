@@ -2,14 +2,16 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Crown, LoaderCircle, Plus, Shield, ShieldCheck, Trash2, UsersRound, UserRoundCheck } from "lucide-react";
+import { Check, Crown, LoaderCircle, Plus, Shield, ShieldCheck, Trash2, UserRoundPlus, UsersRound, UserRoundCheck, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { errorMessage } from "../lib/api/client";
+import { formatRelative } from "../lib/format";
 import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { queryKeys } from "../lib/query";
+import { useNow } from "../lib/use-now";
 import type { OperatorEntry, OperatorRoster } from "../lib/player-roster";
 import { playerMutationSchema, type PlayerMutationValues } from "../lib/schemas";
 import {
@@ -26,6 +28,7 @@ type PlayerPresence = components["schemas"]["PlayerPresence"];
 type Server = components["schemas"]["Server"];
 type WhitelistEntry = components["schemas"]["WhitelistEntry"];
 type WhitelistState = components["schemas"]["Whitelist"];
+type JoinRequest = components["schemas"]["JoinRequest"];
 type MutationTarget = { name: string };
 
 const listItem =
@@ -102,6 +105,16 @@ function hasIdentity(entry: { player_id?: string | null; name: string }, player:
     || entry.name.localeCompare(player.name, undefined, { sensitivity: "accent" }) === 0;
 }
 
+function joinAttempts(request: JoinRequest, now: number) {
+  const when = `Tried to join ${formatRelative(request.last_attempt_at, now)}`;
+  return request.attempts > 1 ? `${when} · ${request.attempts} tries` : when;
+}
+
+function addedBy(entry: WhitelistEntry) {
+  if (!entry.added_by) return "";
+  return ` · added by ${entry.added_by}${entry.added_in_game ? " in game" : ""}`;
+}
+
 function isProtectedOperator(entry: OperatorEntry) {
   return entry.is_owner;
 }
@@ -115,12 +128,15 @@ export function Players({
   initialServer,
   initialPlayers,
   initialWhitelist,
+  renderedAt = Date.now(),
 }: {
   initialServer: Server;
   initialPlayers: PlayerPresence[];
   initialWhitelist: WhitelistState;
+  renderedAt?: number;
 }) {
   const queryClient = useQueryClient();
+  const now = useNow(renderedAt);
   const serverId = initialServer.id;
   const [requestError, setRequestError] = useState<string | null>(null);
   const { data: server = initialServer } = useQuery({
@@ -166,6 +182,28 @@ export function Players({
     onSuccess: setWhitelist,
     onError: (error) => setRequestError(errorMessage(error)),
   });
+  const letIn = useMutation({
+    mutationFn: (request: JoinRequest) => browserApi.letInJoinRequest(serverId, request.player_id),
+    onMutate: () => setRequestError(null),
+    onSuccess: setWhitelist,
+    onError: (error) => setRequestError(errorMessage(error)),
+  });
+  const claim = useMutation({
+    mutationFn: (request: JoinRequest) => browserApi.claimJoinRequest(serverId, request.player_id),
+    onMutate: () => setRequestError(null),
+    onSuccess: (next) => {
+      setWhitelist(next);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.operators(serverId) });
+    },
+    onError: (error) => setRequestError(errorMessage(error)),
+  });
+  const dismiss = useMutation({
+    mutationFn: (request: JoinRequest) => browserApi.dismissJoinRequest(serverId, request.player_id),
+    onMutate: () => setRequestError(null),
+    onSuccess: setWhitelist,
+    onError: (error) => setRequestError(errorMessage(error)),
+  });
+  const answering = letIn.isPending || claim.isPending || dismiss.isPending;
   const addOperator = useMutation({
     mutationFn: (target: MutationTarget) => browserApi.addOperatorEntry(serverId, target),
     onMutate: () => setRequestError(null),
@@ -271,6 +309,48 @@ export function Players({
         </Surface>
 
         <div className="grid gap-[18px]">
+          {whitelist.requests.length ? (
+            <Surface className="p-6">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="m-0 font-display text-[21px] leading-[1.2] font-[800]">Asked to join</h2>
+                  <p className="mt-1.5 mb-0 text-xs text-ink-soft">
+                    {whitelist.owner_has_minecraft_account
+                      ? "Players the whitelist turned away in the last day."
+                      : "Players the whitelist turned away in the last day. If one of them is you, choose That's me: that player is let in and made an operator."}
+                  </p>
+                </div>
+                <Count>{whitelist.requests.length}</Count>
+              </div>
+              <ul className="mt-[18px] mb-0 list-none p-0">
+                {whitelist.requests.map((request) => (
+                  <li className={listItem} key={request.player_id}>
+                    <Face><UserRoundPlus size={17} /></Face>
+                    <div className="min-w-0">
+                      <strong className="block truncate text-[13px]">{request.name}</strong>
+                      <span className="mt-[3px] block text-[11px] text-ink-soft">{joinAttempts(request, now)}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button className={quietAction} type="button" disabled={answering} onClick={() => letIn.mutate(request)}>
+                        {letIn.isPending && letIn.variables?.player_id === request.player_id ? <LoaderCircle className="animate-spin" size={12} /> : <Check size={12} />}
+                        Let in
+                      </button>
+                      {whitelist.owner_has_minecraft_account ? null : (
+                        <button className={quietAction} type="button" disabled={answering} onClick={() => claim.mutate(request)}>
+                          {claim.isPending && claim.variables?.player_id === request.player_id ? <LoaderCircle className="animate-spin" size={12} /> : <Crown size={12} />}
+                          That&apos;s me
+                        </button>
+                      )}
+                      <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#ece5d6] text-ink-soft disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Dismiss ${request.name}'s request`} disabled={answering} onClick={() => dismiss.mutate(request)}>
+                        <X size={15} />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </Surface>
+          ) : null}
+
           <Surface className="p-6">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -287,7 +367,7 @@ export function Players({
                     <Face><UserRoundCheck size={17} /></Face>
                     <div className="min-w-0">
                       <strong className="block truncate text-[13px]">{entry.name}</strong>
-                      <span className="mt-[3px] block text-[11px] text-ink-soft">{players.some((player) => hasIdentity(entry, player)) ? "Online now" : "Saved access"}</span>
+                      <span className="mt-[3px] block text-[11px] text-ink-soft">{players.some((player) => hasIdentity(entry, player)) ? "Online now" : "Saved access"}{addedBy(entry)}</span>
                     </div>
                     <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${entry.name} from whitelist`} disabled={removeWhitelist.isPending} onClick={() => removeWhitelist.mutate(entry)}>
                       {removeWhitelist.isPending && removeWhitelist.variables?.name === entry.name ? <LoaderCircle className="animate-spin" size={15} /> : <Trash2 size={15} />}

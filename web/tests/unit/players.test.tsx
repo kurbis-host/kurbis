@@ -20,6 +20,9 @@ const player: PlayerPresence = {
 };
 const emptyWhitelist: WhitelistState = {
   enabled: true,
+  whitelist_by_members: true,
+  owner_has_minecraft_account: true,
+  requests: [],
   revision: 0,
   applied_revision: 0,
   synchronized: true,
@@ -93,11 +96,11 @@ function operatorsResponse(entries: OperatorRoster["entries"]): OperatorRoster {
   };
 }
 
-function whitelistEntry(id: string, name: string) {
-  return { player_id: id, name, created_at: createdAt, updated_at: createdAt };
+function whitelistEntry(id: string, name: string, extra: Partial<WhitelistState["entries"][number]> = {}) {
+  return { player_id: id, name, added_by: null, added_in_game: false, created_at: createdAt, updated_at: createdAt, ...extra };
 }
 function operatorEntry(id: string, name: string, extra: Partial<OperatorRoster["entries"][number]> = {}) {
-  return { ...whitelistEntry(id, name), is_owner: false, ...extra };
+  return { player_id: id, name, created_at: createdAt, updated_at: createdAt, is_owner: false, ...extra };
 }
 
 afterEach(() => {
@@ -177,6 +180,64 @@ describe("player and access management", () => {
     expect(screen.getByText("Owner", { selector: "span" })).toBeVisible();
     expect(screen.getByText("Locked")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Remove Alex as operator" })).not.toBeInTheDocument();
+  });
+
+  it("lists join requests and lets the owner answer them", async () => {
+    const steve = "00000000-0000-4000-8000-000000000201";
+    const recently = new Date(Date.now() - 3 * 60_000).toISOString();
+    const pending: WhitelistState = {
+      ...emptyWhitelist,
+      owner_has_minecraft_account: false,
+      requests: [{ player_id: steve, name: "Steve", attempts: 2, first_attempt_at: recently, last_attempt_at: recently }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = await requestFrom(input, init);
+      const url = new URL(request.url, "http://localhost");
+      if (url.pathname.endsWith(`/whitelist/requests/${steve}/let-in`) && request.method === "POST") {
+        return Response.json(whitelistResponse([whitelistEntry(steve, "Steve", { added_by: "Owner" })]), { status: 201 });
+      }
+      if (url.pathname.endsWith("/whitelist") && request.method === "GET") {
+        return Response.json(whitelistResponse([whitelistEntry(steve, "Steve", { added_by: "Owner" })]));
+      }
+      throw new Error(`unexpected request ${request.method} ${url.pathname}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    setup({ whitelist: pending });
+    const user = userEvent.setup();
+
+    expect(screen.getByRole("heading", { name: "Asked to join" })).toBeVisible();
+    expect(screen.getByText(/Tried to join 3 minutes ago · 2 tries/)).toBeVisible();
+    expect(screen.getByRole("button", { name: /That's me/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dismiss Steve's request" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /Let in/ }));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Asked to join" })).not.toBeInTheDocument());
+    expect(screen.getByText("Saved access · added by Owner")).toBeVisible();
+  });
+
+  it("offers That's me only while the owner has no linked Minecraft account", () => {
+    const recently = new Date().toISOString();
+    setup({
+      whitelist: {
+        ...emptyWhitelist,
+        requests: [{ player_id: "00000000-0000-4000-8000-000000000202", name: "Alex2", attempts: 1, first_attempt_at: recently, last_attempt_at: recently }],
+      },
+    });
+    expect(screen.getByRole("button", { name: /Let in/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /That's me/ })).not.toBeInTheDocument();
+  });
+
+  it("says who added a whitelist entry and whether it was in game", () => {
+    setup({
+      whitelist: whitelistResponse([
+        whitelistEntry("00000000-0000-4000-8000-000000000101", "Steve", { added_by: "Alex", added_in_game: true }),
+        whitelistEntry("00000000-0000-4000-8000-000000000102", "Notch", { added_by: "Owner" }),
+        whitelistEntry("00000000-0000-4000-8000-000000000103", "Herobrine"),
+      ]),
+    });
+    expect(screen.getByText("Saved access · added by Alex in game")).toBeVisible();
+    expect(screen.getByText("Saved access · added by Owner")).toBeVisible();
+    expect(screen.getAllByText("Saved access", { exact: true }).length).toBeGreaterThan(0);
   });
 
   it("removes unprotected whitelist and operator entries by player name", async () => {

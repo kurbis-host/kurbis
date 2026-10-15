@@ -28,7 +28,8 @@ const defaults: SetupValues = {
   view_distance: 12,
   simulation_distance: 8,
   hardcore: false,
-  whitelist: false,
+  whitelist: true,
+  whitelist_by_members: true,
   tab_stats: false,
 };
 
@@ -62,6 +63,7 @@ export function Setup() {
         simulation_distance: values.simulation_distance,
         hardcore: values.hardcore,
         whitelist: values.whitelist,
+        whitelist_by_members: values.whitelist_by_members,
         tab_stats: values.tab_stats,
       };
       const server = await browserApi.createServer({ subdomain: values.subdomain, settings });
@@ -235,6 +237,18 @@ export function Setup() {
                   <SwitchField
                     label="Whitelist"
                     description="Only explicitly allowed players may join."
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                )}
+              />
+              <Controller
+                control={control}
+                name="whitelist_by_members"
+                render={({ field }) => (
+                  <SwitchField
+                    label="Members can let players in"
+                    description="Players on the whitelist can add someone it turned away, from in game. Operators always can."
                     checked={field.value}
                     onCheckedChange={field.onChange}
                   />

@@ -175,7 +175,7 @@ pub(crate) fn adjust_setting(key: &str, direction: i8) -> Result<()> {
                 .context("distance setting was not numeric")? as i16;
             Value::Number(current.saturating_add(direction as i16).clamp(2, 32).into())
         }
-        "hardcore" | "whitelist" | "tab_stats" => {
+        "hardcore" | "whitelist" | "whitelist_by_members" | "tab_stats" => {
             Value::Bool(!settings.get(key).and_then(Value::as_bool).unwrap_or(false))
         }
         _ => anyhow::bail!("invalid settings key"),
@@ -217,7 +217,11 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<()> {
         {
             Ok(())
         }
-        "hardcore" | "whitelist" | "tab_stats" if value.as_bool().is_some() => Ok(()),
+        "hardcore" | "whitelist" | "whitelist_by_members" | "tab_stats"
+            if value.as_bool().is_some() =>
+        {
+            Ok(())
+        }
         _ => anyhow::bail!("invalid settings key or value"),
     }
 }
@@ -235,10 +239,38 @@ pub(crate) fn create_login_link() -> Result<String> {
         .context("login link response omitted its URL")
 }
 
-pub(crate) fn add_whitelist_entry(name: &str) -> Result<()> {
+/// Add a player to the whitelist. With `added_by`, the player in game who
+/// adds them, the API checks that player may and records them; `player_id`
+/// is then the UUID Pumpkin reported for someone it turned away. Without it
+/// (the server console) the name is resolved like a panel addition.
+pub(crate) fn add_whitelist_entry(
+    name: &str,
+    player_id: Option<uuid::Uuid>,
+    added_by: Option<(uuid::Uuid, &str)>,
+) -> Result<()> {
+    let Some((adder_id, adder_name)) = added_by else {
+        post(
+            &server_path("/whitelist")?,
+            &serde_json::json!({"name": name}),
+        )?;
+        return Ok(());
+    };
+    let mut body = serde_json::json!({
+        "name": name,
+        "added_by": {"player_id": adder_id, "name": adder_name},
+    });
+    if let Some(player_id) = player_id {
+        body["player_id"] = Value::String(player_id.to_string());
+    }
+    post(&server_path("/whitelist/in-game")?, &body)?;
+    Ok(())
+}
+
+/// Tell the panel the whitelist turned this player away.
+pub(crate) fn report_join_request(player_id: uuid::Uuid, name: &str) -> Result<()> {
     post(
-        &server_path("/whitelist")?,
-        &serde_json::json!({"name": name}),
+        &server_path("/whitelist/requests")?,
+        &serde_json::json!({"player_id": player_id, "name": name}),
     )?;
     Ok(())
 }

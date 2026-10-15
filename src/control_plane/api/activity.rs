@@ -82,6 +82,7 @@ pub(super) struct LimitQuery {
 pub(super) struct EventRow {
     pub(super) id: i64,
     pub(super) event_type: String,
+    pub(super) detail: Option<String>,
     pub(super) created_at: DateTime<Utc>,
 }
 
@@ -94,7 +95,7 @@ pub(super) async fn activity(
     let server_id = path.server_id;
     let server = require_server_access(&state, &headers, server_id).await?;
     let rows = sqlx::query_as::<_, EventRow>(
-        "SELECT id, event_type, created_at
+        "SELECT id, event_type, detail, created_at
          FROM server_events
          WHERE server_id = $1
          ORDER BY id DESC LIMIT $2",
@@ -124,7 +125,7 @@ pub(super) async fn activity(
                 id: row.id,
                 kind,
                 summary,
-                detail: None,
+                detail: row.detail,
                 status: None,
                 created_at: row.created_at,
             })

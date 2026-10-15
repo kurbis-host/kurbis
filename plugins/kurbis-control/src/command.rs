@@ -11,7 +11,7 @@ use pumpkin_plugin_api::{
 use serde_json::Value;
 
 use crate::{
-    actions, api, chat,
+    actions, api, chat, join_requests,
     menu::{self, View},
     stats,
 };
@@ -151,7 +151,15 @@ impl CommandHandler for Handler {
                 "set" => update_setting(&sender, &server, &args)?,
                 "whitelist_add" => {
                     let name = arg(&args, "name")?;
-                    api::add_whitelist_entry(&name)?;
+                    let player = sender.as_player();
+                    let adder = player
+                        .as_ref()
+                        .map(|player| (join_requests::player_uuid(player), player.get_name()));
+                    api::add_whitelist_entry(
+                        &name,
+                        None,
+                        adder.as_ref().map(|(id, name)| (*id, name.as_str())),
+                    )?;
                     say(&sender, &format!("Added {name} to the whitelist."));
                     if let Some(player) = sender.as_player() {
                         let _ = menu::open(&player, View::Whitelist(0));
@@ -224,7 +232,9 @@ fn update_setting(sender: &CommandSender, server: &Server, args: &ConsumedArgs) 
             Value::String(raw)
         }
         "view_distance" | "simulation_distance" => Value::Number(raw.parse::<u8>()?.into()),
-        "hardcore" | "whitelist" | "tab_stats" => Value::Bool(raw.parse::<bool>()?),
+        "hardcore" | "whitelist" | "whitelist_by_members" | "tab_stats" => {
+            Value::Bool(raw.parse::<bool>()?)
+        }
         _ => bail!("invalid settings key or value"),
     };
     api::update_setting(&key, value)?;

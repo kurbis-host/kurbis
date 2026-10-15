@@ -173,6 +173,43 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
             "player mutation must not trust caller UUIDs for {path}"
         );
     }
+    // In-game additions carry a runtime-reported UUID, so only the server's
+    // own capability may make them.
+    let in_game = &paths["/api/v1/servers/{server_id}/whitelist/in-game"]["post"];
+    assert_eq!(
+        in_game["security"],
+        serde_json::json!([{"serverCapabilityBearer": []}]),
+        "in-game whitelist additions are for the server's plugin only"
+    );
+    assert_eq!(
+        paths["/api/v1/servers/{server_id}/whitelist/requests"]["post"]["security"],
+        serde_json::json!([{"serverCapabilityBearer": []}]),
+        "only the server's plugin reports join requests"
+    );
+    for (path, method) in [
+        (
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}",
+            "delete",
+        ),
+        (
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/let-in",
+            "post",
+        ),
+        (
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/claim",
+            "post",
+        ),
+    ] {
+        for requirement in paths[path][method]["security"].as_array().unwrap() {
+            assert!(
+                !requirement
+                    .as_object()
+                    .unwrap()
+                    .contains_key("serverCapabilityBearer"),
+                "{method} {path} answers a join request and is for the panel only"
+            );
+        }
+    }
     for removed in [
         "/api/v1/servers/{server_id}/actions",
         "/api/v1/servers/{server_id}/reset",
@@ -489,6 +526,7 @@ fn settings_patch_preserves_unspecified_values() {
             "simulation_distance": 8,
             "hardcore": false,
             "whitelist": true,
+            "whitelist_by_members": true,
             "tab_stats": true
         })
     );
