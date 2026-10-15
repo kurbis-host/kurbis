@@ -53,7 +53,7 @@ Use transactions, row locks, advisory locks where useful, and explicit generatio
 Public API/panel supports:
 
 - Google/Discord OAuth login and explicit provider linking.
-- Automatic account registration and first-server creation from verified online Minecraft Java/Bedrock identities; one-use browser redemption links remain available for linking a Minecraft identity to an existing browser account.
+- Automatic account registration and first-server creation from verified online Minecraft Java/Bedrock identities. Joining a free address is the only way to claim a server name; a browser sign-in claims nothing. The lobby gives an owner without a Google or Discord sign-in a one-use account link that links the Minecraft identity (and its server) to the browser account that opens it.
 - Account identity listing, browser-session listing/revocation, preserved-world/default-world selection, and logout.
 - Create/delete one server for a new account; preserve all worlds when identities merge.
 - Select/change an available subdomain while stopped.
@@ -186,7 +186,7 @@ Test the complete lifecycle rather than isolated smoke tests:
 - Worker heartbeat loss makes its routes unavailable and does not start a second copy until the previous placement is proven inactive.
 - 2 GiB memory and 5 GiB storage quotas are enforced under real container load.
 - Unknown/invalid subdomains, failed restores, corrupt snapshots, object-store outage, full workers, and Pumpkin startup failure produce deterministic states and recoverable retries.
-- Browser E2E tests cover OAuth, server creation, address selection, lifecycle controls, queue state, logs, and deletion.
+- Browser E2E tests cover OAuth, claiming a name by joining it and linking it through the lobby's account link, address selection, lifecycle controls, queue state, logs, and deletion.
 - Identity tests cover automatic Minecraft account registration and first-server creation from verified online identities, concurrent first admissions, normalized verified-email linking, suspended-account merges, preservation of all server-linked history, and default-world selection. Schema tests bootstrap a fresh database and do not require historical migration compatibility.
 - Browser security tests cover OAuth provider linking, signed-in and signed-out Minecraft redemption, one-use/15-minute tokens, cross-origin rejection, forged or offline identity rejection, persistent sessions, revocation, and logout.
 - Per-server API tests verify every server route checks active account ownership, including events, logs, exports, players, whitelist, snapshots, and lifecycle mutations.

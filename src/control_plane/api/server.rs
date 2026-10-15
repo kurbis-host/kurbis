@@ -4,7 +4,7 @@ use axum::{Json, extract::State, http::StatusCode};
 use futures::future::try_join_all;
 use garde::Validate;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -14,8 +14,7 @@ use crate::model::{
 };
 
 use super::actor::{
-    ApiAccountHeaders, ApiAccountOrServerGrantHeaders, ApiJson, ApiPath, ApiServerHeaders,
-    ServerIdPath,
+    ApiAccountOrServerGrantHeaders, ApiJson, ApiPath, ApiServerHeaders, ServerIdPath,
 };
 use super::internal::{require_active_user, require_server_access};
 use super::types::{
@@ -161,74 +160,43 @@ pub(super) async fn list_servers(
     Ok(Json(views))
 }
 
-#[derive(Debug, Deserialize, JsonSchema, Validate)]
-#[serde(deny_unknown_fields)]
-#[garde(allow_unvalidated)]
-pub(super) struct CreateServerRequest {
-    #[garde(length(min = 3, max = 32))]
-    subdomain: String,
-    #[garde(skip)]
-    #[serde(default)]
-    settings: ServerSettings,
+/// Whether a server name can still be claimed. Names are claimed only by
+/// joining their address in Minecraft, so this reserves nothing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ServerAddress {
+    pub subdomain: String,
+    pub address: String,
+    pub available: bool,
 }
 
-pub(super) async fn create_server_for_user(
-    state: &AppState,
-    owner_id: Uuid,
-    subdomain: &str,
-    settings: ServerSettings,
-) -> Result<ServerRecord, ApiError> {
-    if !validate_subdomain(subdomain) {
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SubdomainPath {
+    subdomain: String,
+}
+
+/// Public, like the gateway's status ping that already says whether an
+/// address is waiting to be created.
+pub(super) async fn server_address(
+    State(state): State<Arc<AppState>>,
+    ApiPath(path): ApiPath<SubdomainPath>,
+) -> Result<Json<ServerAddress>, ApiError> {
+    if !validate_subdomain(&path.subdomain) {
         return Err(ApiError::with_code(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_subdomain",
             "invalid subdomain",
         ));
     }
-    settings.validate()?;
-    let mut tx = state.pool.begin().await?;
-    let account_status: Option<String> =
-        sqlx::query_scalar("SELECT account_status FROM users WHERE id = $1 FOR UPDATE")
-            .bind(owner_id)
-            .fetch_optional(&mut *tx)
+    let taken: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM servers WHERE subdomain = $1)")
+            .bind(&path.subdomain)
+            .fetch_one(&state.pool)
             .await?;
-    if account_status.as_deref() != Some("active") {
-        return Err(ApiError::with_code(
-            StatusCode::FORBIDDEN,
-            "account_suspended",
-            "account is suspended",
-        ));
-    }
-    let has_server: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM servers WHERE owner_id = $1)")
-            .bind(owner_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if has_server {
-        return Err(ApiError::with_code(
-            StatusCode::CONFLICT,
-            "account_has_server",
-            "this account already has a hosted world",
-        ));
-    }
-    let server = insert_server_record(&mut tx, owner_id, subdomain, settings.into_stored())
-        .await
-        .map_err(|error| {
-            mutation_error(error, "account already has a server or subdomain is taken")
-        })?;
-    tx.commit().await?;
-    Ok(server)
-}
-
-pub(super) async fn create_server(
-    State(state): State<Arc<AppState>>,
-    headers: ApiAccountHeaders,
-    ApiJson(input): ApiJson<CreateServerRequest>,
-) -> Result<(StatusCode, Json<Server>), ApiError> {
-    let user = require_active_user(&state, &headers).await?;
-    let server = create_server_for_user(&state, user.id, &input.subdomain, input.settings).await?;
-    let view = server_view(&state.pool, server, &state.config.root_domain).await?;
-    Ok((StatusCode::CREATED, Json(view)))
+    Ok(Json(ServerAddress {
+        address: format!("{}.{}", path.subdomain, state.config.root_domain),
+        subdomain: path.subdomain,
+        available: !taken,
+    }))
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Validate)]

@@ -398,57 +398,11 @@ async fn current_placement_capability_and_redeemed_session_share_server_scope() 
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let (owner_id, owner_token) = user_session(&pool, "active").await;
-    let (other_owner_id, other_owner_token) = user_session(&pool, "active").await;
+    let (other_owner_id, _) = user_session(&pool, "active").await;
     let app = router(state(pool.clone()));
 
-    let suffix = Uuid::new_v4().simple().to_string();
-    let created = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/api/v1/servers",
-            Some(&owner_token),
-            Some(json!({
-                "subdomain": format!("scope-{}", &suffix[..12]),
-                "settings": {
-                    "motd": "Scoped API",
-                    "difficulty": "Normal",
-                    "gamemode": "Survival",
-                    "view_distance": 12,
-                    "simulation_distance": 8,
-                    "hardcore": false,
-                    "whitelist": true
-                }
-            })),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::CREATED);
-    let server_id = Uuid::parse_str(json_body(created).await["id"].as_str().unwrap()).unwrap();
-    let other_created = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/api/v1/servers",
-            Some(&other_owner_token),
-            Some(json!({
-                "subdomain": format!("other-{}", &suffix[..12]),
-                "settings": {
-                    "motd": "Other server",
-                    "difficulty": "Normal",
-                    "gamemode": "Survival",
-                    "view_distance": 12,
-                    "simulation_distance": 8,
-                    "hardcore": false,
-                    "whitelist": true
-                }
-            })),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(other_created.status(), StatusCode::CREATED);
-    let other_server_id =
-        Uuid::parse_str(json_body(other_created).await["id"].as_str().unwrap()).unwrap();
+    let server_id = create_test_server(&pool, owner_id, "scope").await;
+    let other_server_id = create_test_server(&pool, other_owner_id, "other").await;
 
     let mut worker_id = Uuid::new_v4();
     let original_worker_id = worker_id;

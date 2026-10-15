@@ -303,21 +303,6 @@ export interface components {
         };
         /** @enum {string} */
         ConsoleCommandStatus: "queued" | "running" | "succeeded" | "failed" | "cancelled";
-        CreateServerRequest: {
-            /** @default {
-             *       "difficulty": "Normal",
-             *       "gamemode": "Survival",
-             *       "hardcore": false,
-             *       "motd": "Hosted by Kurbis",
-             *       "simulation_distance": 8,
-             *       "tab_stats": false,
-             *       "view_distance": 12,
-             *       "whitelist": true,
-             *       "whitelist_by_members": true
-             *     } */
-            settings: components["schemas"]["ServerSettings"];
-            subdomain: string;
-        };
         /** @enum {string} */
         DesiredState: "running" | "stopped" | "deleted";
         /** @enum {string} */
@@ -599,6 +584,13 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /** @description Whether a server name can still be claimed. Names are claimed only by
+         *      joining their address in Minecraft, so this reserves nothing. */
+        ServerAddress: {
+            address: string;
+            available: boolean;
+            subdomain: string;
+        };
         ServerAiJobPath: {
             /** Format: uuid */
             job_id: string;
@@ -834,6 +826,8 @@ export interface components {
         };
         Session: {
             limits: components["schemas"]["ServiceLimits"];
+            /** @description Every server address is `<name>.<server_domain>`. */
+            server_domain: string;
             user: components["schemas"]["SessionUser"];
         };
         SessionUser: {
@@ -854,6 +848,9 @@ export interface components {
         };
         /** @enum {string} */
         SnapshotReason: "periodic" | "shutdown" | "manual" | "restore" | "reset" | "export";
+        SubdomainPath: {
+            subdomain: string;
+        };
         UpdateServerRequest: {
             settings?: components["schemas"]["ServerSettingsPatch"] | null;
             subdomain?: string | null;

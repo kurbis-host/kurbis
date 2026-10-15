@@ -16,11 +16,11 @@ type ServerScopedSession = components["schemas"]["ServerScopedSession"];
 export function ServerList({
   servers,
   sessions,
-  canCreateServer,
+  canClaimServer,
 }: {
   servers: Server[];
   sessions: ServerScopedSession[];
-  canCreateServer: boolean;
+  canClaimServer: boolean;
 }) {
   const { data: currentServers = servers } = useQuery({
     queryKey: queryKeys.servers,
@@ -39,7 +39,7 @@ export function ServerList({
       <PageHeader
         title="Servers"
         description="Choose a world you own or have been granted access to."
-        actions={canCreateServer ? <Link className="inline-flex min-h-11 items-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] no-underline" href="/app/setup">Create a world</Link> : null}
+        actions={canClaimServer ? <Link className="inline-flex min-h-11 items-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] no-underline" href="/app/setup">Claim a server</Link> : null}
       />
       {currentServers.length ? (
         <ul aria-label="Accessible servers" className="m-0 grid list-none gap-3 p-0">
@@ -70,7 +70,7 @@ export function ServerList({
       ) : (
         <Surface className="p-6">
           <p className="m-0 text-ink-soft">No hosted worlds or shared server access yet.</p>
-          {canCreateServer ? <Link className="mt-4 inline-flex min-h-11 items-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] no-underline" href="/app/setup">Create a world</Link> : null}
+          {canClaimServer ? <Link className="mt-4 inline-flex min-h-11 items-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] no-underline" href="/app/setup">Claim a server</Link> : null}
         </Surface>
       )}
     </>

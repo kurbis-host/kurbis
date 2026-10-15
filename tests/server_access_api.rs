@@ -507,7 +507,6 @@ async fn assert_account_apis_denied(
     server_id: Uuid,
     label: &str,
 ) {
-    let suffix = Uuid::new_v4().simple().to_string();
     let cases = [
         (Method::GET, "/api/v1/session".to_owned(), None),
         (Method::GET, "/api/v1/account".to_owned(), None),
@@ -520,22 +519,6 @@ async fn assert_account_apis_denied(
             Method::DELETE,
             format!("/api/v1/account/sessions/{}", Uuid::new_v4()),
             None,
-        ),
-        (
-            Method::POST,
-            "/api/v1/servers".to_owned(),
-            Some(json!({
-                "subdomain": format!("acc-{}", &suffix[..12]),
-                "settings": {
-                    "motd":"Unauthorized",
-                    "difficulty":"Normal",
-                    "gamemode":"Survival",
-                    "view_distance":12,
-                    "simulation_distance":8,
-                    "hardcore":false,
-                    "whitelist":false
-                }
-            })),
         ),
     ];
     for (method, path, body) in cases {

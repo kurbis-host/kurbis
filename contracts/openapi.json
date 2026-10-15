@@ -1644,25 +1644,29 @@
             "serverGrantCookie": []
           }
         ]
-      },
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateServerRequest"
-              }
-            }
-          },
-          "required": true
-        },
+      }
+    },
+    "/api/v1/server-addresses/{subdomain}": {
+      "get": {
+        "description": "Whether a server name is still free. A name is claimed by joining its address in Minecraft.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subdomain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "style": "simple"
+          }
+        ],
         "responses": {
-          "201": {
-            "description": "",
+          "200": {
+            "description": "Whether a server name can still be claimed. Names are claimed only by\n joining their address in Minecraft, so this reserves nothing.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Server"
+                  "$ref": "#/components/schemas/ServerAddress"
                 }
               }
             }
@@ -1767,12 +1771,7 @@
               }
             }
           }
-        },
-        "security": [
-          {
-            "accountSessionCookie": []
-          }
-        ]
+        }
       }
     },
     "/api/v1/server/login-links": {
@@ -8583,38 +8582,6 @@
           "cancelled"
         ]
       },
-      "CreateServerRequest": {
-        "type": "object",
-        "properties": {
-          "settings": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ServerSettings"
-              }
-            ],
-            "default": {
-              "difficulty": "Normal",
-              "gamemode": "Survival",
-              "hardcore": false,
-              "motd": "Hosted by Kurbis",
-              "simulation_distance": 8,
-              "tab_stats": false,
-              "view_distance": 12,
-              "whitelist": true,
-              "whitelist_by_members": true
-            }
-          },
-          "subdomain": {
-            "type": "string",
-            "maxLength": 32,
-            "minLength": 3
-          }
-        },
-        "additionalProperties": false,
-        "required": [
-          "subdomain"
-        ]
-      },
       "DesiredState": {
         "type": "string",
         "enum": [
@@ -9511,6 +9478,26 @@
           "updated_at"
         ]
       },
+      "ServerAddress": {
+        "description": "Whether a server name can still be claimed. Names are claimed only by\n joining their address in Minecraft, so this reserves nothing.",
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "subdomain": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subdomain",
+          "address",
+          "available"
+        ]
+      },
       "ServerAiJobPath": {
         "type": "object",
         "properties": {
@@ -10286,13 +10273,18 @@
           "limits": {
             "$ref": "#/components/schemas/ServiceLimits"
           },
+          "server_domain": {
+            "description": "Every server address is `<name>.<server_domain>`.",
+            "type": "string"
+          },
           "user": {
             "$ref": "#/components/schemas/SessionUser"
           }
         },
         "required": [
           "user",
-          "limits"
+          "limits",
+          "server_domain"
         ]
       },
       "SessionUser": {
@@ -10356,6 +10348,17 @@
           "restore",
           "reset",
           "export"
+        ]
+      },
+      "SubdomainPath": {
+        "type": "object",
+        "properties": {
+          "subdomain": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subdomain"
         ]
       },
       "UpdateServerRequest": {

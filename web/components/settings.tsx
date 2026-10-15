@@ -12,6 +12,7 @@ import { browserApi } from "../lib/api/operations";
 import { lifecycle, lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
 import { settingsFormSchema, type SettingsFormValues } from "../lib/schemas";
+import { typedSubdomain } from "../lib/subdomain";
 import {
   Button,
   ConfirmDialog,
@@ -163,9 +164,7 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
                   aria-label="Address"
                   {...register("subdomain", {
                     onChange: (event) => {
-                      event.target.value = event.target.value
-                        .toLowerCase()
-                        .replace(/[^a-z0-9-]/g, "");
+                      event.target.value = typedSubdomain(event.target.value);
                     },
                   })}
                 />

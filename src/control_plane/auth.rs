@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    Json,
     body::Body,
     extract::State,
     http::{HeaderMap, Request, StatusCode, header},
@@ -18,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{config::OAuthProvider, pumpkin_control::VerifiedMinecraftIdentity};
+use crate::config::OAuthProvider;
 
 use super::{
     api::{ApiAccountHeaders, ApiError, ApiJson, ApiPath, ApiQuery, AppState, OAuthProviderPath},
@@ -54,19 +53,6 @@ struct TokenResponse {
 struct OAuthState {
     intent: String,
     user_id: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MinecraftLinkRequest {
-    identity: VerifiedMinecraftIdentity,
-    minecraft_player_id: Uuid,
-    display_name: String,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct MinecraftLinkResponse {
-    url: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Validate)]
@@ -323,46 +309,45 @@ pub async fn callback(
     Ok(response.into())
 }
 
-pub async fn create_minecraft_link(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<MinecraftLinkRequest>,
-) -> Result<Json<MinecraftLinkResponse>, ApiError> {
-    let MinecraftLinkRequest {
-        identity,
-        minecraft_player_id,
-        display_name,
-    } = request;
-    let key = identity::minecraft_identity_key(&identity, minecraft_player_id)
-        .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
-    if !identity::valid_minecraft_display_name(&display_name) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "verified Minecraft profile is invalid",
-        ));
-    }
-
+/// Mint the one-use link the lobby gives a verified player who owns the
+/// server they joined. Opened in a browser signed in to Kurbis, it links the
+/// player (and the server their join created) to that account; opened
+/// anywhere else, it signs in to the player's own account. Minting replaces
+/// the player's earlier link, so reconnecting never piles up live tokens.
+pub(super) async fn create_minecraft_login_link(
+    pool: &PgPool,
+    public_base_url: &str,
+    key: &identity::MinecraftIdentityKey,
+    minecraft_player_id: Uuid,
+    display_name: &str,
+) -> Result<String, sqlx::Error> {
     let token = random_token();
-    sqlx::query("DELETE FROM minecraft_login_tokens WHERE expires_at <= now()")
-        .execute(&state.pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM minecraft_login_tokens
+         WHERE expires_at <= now() OR (provider = $1 AND subject = $2)",
+    )
+    .bind(key.provider)
+    .bind(&key.subject)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO minecraft_login_tokens(token_hash, provider, subject, minecraft_player_id, display_name, expires_at)
          VALUES($1, $2, $3, $4, $5, now() + make_interval(mins => $6))",
     )
     .bind(token_hash(&token))
     .bind(key.provider)
-    .bind(key.subject)
+    .bind(&key.subject)
     .bind(minecraft_player_id)
-    .bind(display_name.trim())
+    .bind(display_name)
     .bind(MINECRAFT_TOKEN_MINUTES as i32)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(Json(MinecraftLinkResponse {
-        url: format!(
-            "{}/auth/minecraft#token={token}",
-            state.config.public_base_url.trim_end_matches('/')
-        ),
-    }))
+    tx.commit().await?;
+    Ok(format!(
+        "{}/auth/minecraft#token={token}",
+        public_base_url.trim_end_matches('/')
+    ))
 }
 
 pub(super) async fn redeem_minecraft(
@@ -605,11 +590,6 @@ pub(super) fn same_origin(headers: &HeaderMap, public_base_url: &str) -> bool {
 
 fn map_identity_error(error: IdentityError) -> ApiError {
     match error {
-        IdentityError::AlreadyLinked => ApiError::with_code(
-            StatusCode::CONFLICT,
-            "identity_already_linked",
-            "that provider identity belongs to another account",
-        ),
         IdentityError::AccountMissing => ApiError::with_code(
             StatusCode::CONFLICT,
             "account_changed",
