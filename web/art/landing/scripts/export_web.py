@@ -2,9 +2,9 @@
 
     Blender -b --factory-startup -P scripts/export_web.py
 
-Writes web/public/landing/ (made from the texture pack while the page is a proof of
-concept), the parity fixtures under web/tests/unit/landing/fixtures/ (numbers and
-our own copy only), and the bundle's version, web/lib/landing/engine/version.ts.
+Writes web/public/landing/ (with our own textures: see paint_textures.py), the parity
+fixtures under web/tests/unit/landing/fixtures/ (numbers and our own copy only), and
+the bundle's version, web/lib/landing/engine/version.ts.
 """
 
 import hashlib
@@ -40,7 +40,7 @@ CONSTANTS = (
 )
 # What the sets left in the film's shared state that is a place or a number.
 POINTS = ("gate", "home_spot", "lever_side", "tile_spots", "sign_spots", "toys", "nether_click", "nether_free", "through", "steps", "cave_folded", "rail", "cast", "fishing", "drips")
-# Pictures of the pack the interface shows: a toast's card and the icons on it.
+# Pictures the interface shows: a toast's card and the icons on it.
 HUD = {"toast": "gui/sprites/toast/advancement.png", "grass": "block/grass_block_side.png", "dirt": "block/dirt.png", "cave": "block/diamond_ore.png", "deeper": "block/obsidian.png", "pearl": "item/ender_pearl.png"}
 
 

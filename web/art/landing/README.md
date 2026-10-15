@@ -16,7 +16,9 @@ The page is one continuous take from the sky to the Nether, about six screens of
 | `scripts/web_frames.mjs`, `scripts/compare_web.py` | Capture the page's frames at given scroll positions, and lay them beside the previs's. |
 | `scripts/gate0.py` | The earlier look-dev stills (superseded). Uses `kurbis/world_stills.py`. |
 | `scripts/kurbis/` | The toolkit (see below). |
-| `ref/` | Reference material and the third-party texture pack. Git-ignored. |
+| `scripts/paint_textures.py`, `scripts/paint/` | Paints our own textures into `textures/` (see "Textures"). Plain Python, no Blender. |
+| `textures/` | The textures, as painted. Committed. |
+| `ref/` | Reference material (the trailer, the third-party "Trailers Vision" pack the look was first tried with). Git-ignored. |
 | `blend/`, `export/`, `renders/` | Generated. Git-ignored. |
 
 ## Toolkit (`scripts/kurbis`)
@@ -102,7 +104,7 @@ This stages the `visit` session in both frames (nothing is baked) and writes:
 | --- | --- |
 | `web/public/landing/valley.grid.gz`, `nether.grid.gz` | The worlds as grids of blocks, one byte a cell: the valley with what lies under it and the dungeon (6.7 million cells in 97 KB), and the Nether (1.1 million in 39 KB). After the valley's cells come the two suns' shadows on its faces (124 KB more). See "What the page builds itself" |
 | `web/public/landing/dungeon.tall.patch.gz` | The tall frame's dungeon, as the box of cells in which its world differs from the wide frame's: laid into the valley's grid before it is built |
-| `web/public/landing/small.pack.gz` | Every small file as one: the pictures from the pack (`tex/`, `hud/`, the two atlases) and the slab's blocks (`slab.grid`; the page meshes its pieces itself) |
+| `web/public/landing/small.pack.gz` | Every small file as one: our pictures (`tex/`, `hud/`, the two atlases) and the slab's blocks (`slab.grid`; the page meshes its pieces itself) |
 | `web/public/landing/models.<frame>.glb.gz` | Everything else small, with names and parents, without pictures: the page gives each material its texture by the material's name |
 | `web/public/landing/scene.json`, `layout.<frame>.json` | The sky, palettes, glyphs and the film's constants; and per frame the camera's shots, the type (as text and place: the page builds the letters), lamps, haze boxes and places the sets worked out |
 | `web/lib/landing/engine/version.ts` | The bundle's version: a hash over all of its files. The page asks for every file by it (`?v=...`), and `next.config.ts` lets a browser keep what is asked for that way for good |
@@ -111,7 +113,7 @@ This stages the `visit` session in both frames (nothing is baked) and writes:
 
 The files named `.gz` are written through gzip once, at level 9, and sent as they are: a rule in `web/next.config.ts` has the server say so (`Content-Encoding: gzip`), and the browser unpacks them on the way in. The page reads plain bytes and unpacks nothing. Neither the server nor Cloudflare in front of it would pack such bytes by itself (both go by content type, and pack text), and what is packed per request comes out larger: 110 to 118 KB for the valley's cells, against 97. Whatever serves the bundle must send that header: without it the film cannot read its files, and the page is its HTML.
 
-`web/public/landing/` is committed, so the page plays wherever it is deployed. It is made from the pack: see "Rules". Where the bundle is missing or cannot load, the page is its own HTML: the same copy in reading order, a real lever button and a real name field (`web/components/landing/mirror.tsx`). That is also what a browser without WebGL2 gets, and what screen readers and search engines read while the film plays.
+`web/public/landing/` is committed, so the page plays wherever it is deployed. Where the bundle is missing or cannot load, the page is its own HTML: the same copy in reading order, a real lever button and a real name field (`web/components/landing/mirror.tsx`). That is also what a browser without WebGL2 gets, and what screen readers and search engines read while the film plays.
 
 ### What the page builds itself
 
@@ -165,10 +167,28 @@ Where the browser differs from the previs on purpose: light is baked per block c
 
 ## Rules
 
-- **Textures and skins are a stand-in.** The POC reads the "Trailers Vision" pack from `ref/pack`, including its Steve and Alex skins. The pack itself stays out of the repository. The bundle exported from it (`web/public/landing/`) is committed and deployed as a proof of concept, by the owner's decision of 2026-10-12; our own textures and characters replace it once the look is approved.
+- **Textures and skins are our own** (see "Textures"). Nothing of the third-party pack in `ref/` reaches the bundle or the repository.
 - **Copy is in-world.** Text is voxel type in the scene, not DOM. The page still needs a hidden text mirror for screen readers and search, and a real `<input>` behind the name claim.
 - **Tone mapping is Standard.** AgX washes the palette out. The three.js side should use no tone mapping or Neutral to match.
 - **Export contract.** Named nodes, rigid parts under pivots, one atlas material per group. What the page must know about a thing beyond its geometry is said with `core.note` and exported with it.
+
+## Textures
+
+Every picture the page draws is painted in code by `scripts/paint_textures.py` (its painters are in `scripts/paint/`) and lands in `textures/`, under the path the toolkit asks for it by (`block/dirt.png`, `entity/chest/normal.png`, ...: `core.TEX`). The script paints exactly what the page uses (`USED`): the blocks its worlds show, the pictures its models and interface name, and the cracks of digging. A block added to `blocks.build_registry`, or a picture named by a model, needs a painter there; the export stops on any texture that is missing.
+
+Each texture keeps the game's own design (its shapes, layout and colours: a pickaxe's two-armed head, the lamp's diamonds, a pair of boots, the toast's grey-bordered card), redrawn by hand in the trailer look of the references and of the "Trailers Vision" pack the POC was made with: flat tones, two or three a material, big shapes, a lit edge on top and to the left and a seam below and to the right. Nothing is traced or derived from either set of pixels. Block tiles repeat without a seam (patterns are cells on a torus). Hand-drawn pictures are text maps, a character a pixel; every random choice is seeded, so a run paints the same pixels.
+
+Conventions the toolkit relies on:
+
+- The grass top, oak leaves, short grass and lily pads are grey: the toolkit tints them (the grass top by the grass side's top-left pixel).
+- Where a block glows only in its coloured pixels (ores, crying obsidian, gilded blackstone, magma, the furnace: `blocks.saturated`), the rock around them is kept near grey.
+- Models cut fixed rects out of their pictures: the torch and the lever's stick are columns 7 and 8 from row 6 down, the lantern's parts sit at the top left, and boxes (chest, cart, sign, strider, salmon, players) use the game's box unwrap.
+- `_e` pictures are what glows (torch, lantern, cave vines); the portal is 32 frames one above the other.
+
+```bash
+python3 scripts/paint_textures.py renders/textures.png    # the sheet is optional
+$B -b --factory-startup -P scripts/export_web.py
+```
 
 ## Blender 5.2 notes
 

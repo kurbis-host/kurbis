@@ -72,7 +72,7 @@ class Blocks:
 
     # -- tiles -------------------------------------------------------------
     def tex(self, name, tint=None, emit=0.0, emit_mask=None, folder="block"):
-        """Atlas tile from a pack texture. `emit_mask(px) -> bool array` limits the glow."""
+        """Atlas tile from one of our textures (core.TEX). `emit_mask(px) -> bool array` limits the glow."""
         key = (name, tint, emit, emit_mask.__name__ if emit_mask else None)
         if key in self.atlas.index:
             return self.atlas.index[key]
@@ -216,6 +216,8 @@ TYPE_PALETTES = {
 
 
 def build_registry():
+    """Every block the film places. Their pictures are our own (scripts/paint_textures.py
+    paints exactly these): add a block here and it needs a painter there."""
     b = Blocks()
     t = b.tex
 
@@ -234,7 +236,6 @@ def build_registry():
     b.cube("deepslate", all=t("deepslate"), top=t("deepslate_top"), bottom=t("deepslate_top"))
     b.cube("bedrock", all=t("bedrock"))
     b.cube("sand", all=t("sand"))
-    b.cube("snow", all=t("snow"))
     # Far mountains: flat tiles, because a 16px pattern turns to static at 200 m.
     b.cube("rock", all=b.flat((0.20, 0.17, 0.21)))
     b.cube("rock_dark", all=b.flat((0.13, 0.11, 0.15)))
@@ -244,24 +245,15 @@ def build_registry():
     b.cube("planks", all=t("oak_planks"))
     b.cube("obsidian", all=t("obsidian"))
     b.cube("crying_obsidian", all=t("crying_obsidian", emit=0.5, emit_mask=saturated))
-    b.cube("stone_bricks", all=t("stone_bricks"))
-    b.cube("mossy_stone_bricks", all=t("mossy_stone_bricks"))
-    b.cube("cracked_stone_bricks", all=t("cracked_stone_bricks"))
-    b.cube("chiseled_stone_bricks", all=t("chiseled_stone_bricks"))
     b.cube("blackstone", side=t("blackstone"), top=t("blackstone_top"), bottom=t("blackstone_top"))
     b.cube("polished_blackstone_bricks", all=t("polished_blackstone_bricks"))
     b.cube("gilded_blackstone", all=t("gilded_blackstone", emit=0.25, emit_mask=saturated))
-    b.cube("deepslate_bricks", all=t("deepslate_bricks"))
     b.cube("nether_bricks", all=t("nether_bricks"))
     b.cube("netherrack", all=t("netherrack"))
     b.cube("magma", all=t("magma", emit=0.7, emit_mask=saturated))
-    b.cube("gold_block", all=t("gold_block"))
     b.cube("lamp", all=t("redstone_lamp_on", emit=1.0))
     b.cube("lamp_off", all=t("redstone_lamp"))
     b.cube("basalt", side=t("basalt_side"), top=t("basalt_top"), bottom=t("basalt_top"))
-    b.cube("froglight", side=t("ochre_froglight_side", emit=1.0), top=t("ochre_froglight_top", emit=1.0), bottom=t("ochre_froglight_top", emit=1.0))
-    b.cube("command_block", side=t("command_block_side"), front=t("command_block_front", emit=0.35, emit_mask=saturated), top=t("command_block_back"), bottom=t("command_block_back"))
-    b.cube("smithing_table", side=t("smithing_table_side"), front=t("smithing_table_front"), top=t("smithing_table_top"), bottom=t("smithing_table_bottom"))
     b.cube("bone", side=t("bone_block_side"), top=t("bone_block_top"), bottom=t("bone_block_top"))
     b.cube("crafting_table", side=t("crafting_table_side"), front=t("crafting_table_front"), top=t("crafting_table_top"), bottom=t("oak_planks"))
     b.cube("furnace", side=t("furnace_side"), front=t("furnace_front_on", emit=1.0, emit_mask=saturated), top=t("furnace_top"), bottom=t("furnace_top"))
@@ -282,7 +274,6 @@ def build_registry():
         b.cube(name, all=t("oak_leaves", tint=tint), opaque=False, group="leaves")
     b.cube("leaves_blossom", all=t("flowering_azalea_leaves"), opaque=False, group="leaves")
     b.cube("leaves_cherry", all=t("cherry_leaves"), opaque=False, group="leaves")
-    b.cube("cherry_log", side=t("cherry_log"), top=t("cherry_log_top"), bottom=t("cherry_log_top"))
     b.cube("water", all=b.flat((0.16, 0.42, 0.86)), opaque=False, group="water")
     b.cube("cloud", all=b.flat((1.0, 0.93, 0.90)), opaque=False, group="cloud")
     for name, pal in TYPE_PALETTES.items():

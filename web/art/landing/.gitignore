@@ -1,6 +1,6 @@
 *.blend1
 *.blend2
-# POC uses third-party pack textures: keep every derived binary out of git.
+# Reference material, including a third-party texture pack: never committed.
 ref/
 blend/
 export/

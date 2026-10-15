@@ -8,8 +8,8 @@ import numpy as np
 from mathutils import Euler, Matrix
 
 ROOT = Path(__file__).resolve().parents[2]
-# POC only: third-party trailer-style pack. Replaced by our own textures before shipping.
-TEX = ROOT / "ref" / "pack" / "assets" / "minecraft" / "textures"
+# Our own textures, painted by scripts/paint_textures.py (see scripts/paint/).
+TEX = ROOT / "textures"
 EXPORT = ROOT / "export"
 RENDERS = ROOT / "renders"
 BLEND = ROOT / "blend"

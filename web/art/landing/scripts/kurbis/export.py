@@ -17,11 +17,10 @@ behaviour:
   scene     what both shapes share: sky, palettes, glyphs, constants.
   reference camera and pumpkin sampled along the scroll, for the page's parity tests.
 
-Everything lands in web/public/landing, textures of the pack included (while the page
-is a proof of concept). What is not text is written through gzip, once and as hard as
-gzip packs (`_gzip`): the server sends those files as they are and says so
-(`Content-Encoding`, see web/next.config.ts), and the browser unpacks them on the way
-in. A server would not pack such bytes by itself, nor does the CDN in front of it.
+Everything lands in web/public/landing, our textures included. What is not text is
+written through gzip, once and as hard as gzip packs (`_gzip`): the server sends those
+files as they are and says so (`Content-Encoding`, see web/next.config.ts), and the
+browser unpacks them on the way in. A server would not pack such bytes by itself, nor does the CDN in front of it.
 """
 
 import gzip
@@ -465,7 +464,7 @@ def plain(value):
 
 
 def copy_textures(used):
-    """The pictures the materials name, side by side under tex/: pack textures by their
+    """The pictures the materials name, side by side under tex/: our textures by their
     own path with the slashes flattened, pictures made in code by their name."""
     out = OUT / "tex"
     out.mkdir(parents=True, exist_ok=True)
