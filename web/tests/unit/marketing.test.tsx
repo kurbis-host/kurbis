@@ -54,7 +54,7 @@ describe("standalone marketing pages", () => {
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Your world is waiting below");
     expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "You choose the name.",
-      "Cost: nothing.",
+      "One server each.",
       "Stops when you leave. Starts when you join.",
       "Friends in. Everyone else out.",
       "Add plugins. Or write your own.",
@@ -66,8 +66,8 @@ describe("standalone marketing pages", () => {
       "Built on Pumpkin",
       "The community",
     ]);
-    expect(screen.getByText("No card. No ads.")).toBeInTheDocument();
-    expect(screen.getByText("2 GB RAM. 5 GB world. One server each.")).toBeInTheDocument();
+    expect(screen.getByText("2 GB RAM. 5 GB world.")).toBeInTheDocument();
+    expect(screen.getByText("Bigger servers are paid. They pay for yours.")).toBeInTheDocument();
     // The film's bar, as links: first in the page, as the bar is first in the frame.
     const bar = screen.getByRole("navigation", { name: "Kurbis" });
     expect(within(bar).getAllByRole("link").map((link) => [link.textContent, link.getAttribute("href")])).toEqual([
@@ -125,7 +125,7 @@ describe("standalone marketing pages", () => {
     // Enter holds the name in the claim card: copy it into the game, or sign in.
     expect(push).not.toHaveBeenCalled();
     const card = screen.getByRole("region", { name: "pumpkin-patch.kurbis.host" });
-    expect(card).toHaveTextContent("It's free. Join it in Minecraft and it's yours the moment you arrive.");
+    expect(card).toHaveTextContent("Join it in Minecraft and it's yours the moment you arrive. No card needed.");
     // Kept, so the claim page can offer it after signing in.
     expect(localStorage.getItem("kurbis.name")).toBe("pumpkin-patch");
     await user.click(within(card).getByRole("button", { name: "Copy address" }));
