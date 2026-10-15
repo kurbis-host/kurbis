@@ -44,6 +44,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         5_i64 * 1024 * 1024 * 1024
     );
     assert_eq!(session["limits"]["idle_seconds"], 300);
+    assert_eq!(session["root_domain"], "mc.example.test");
 
     let empty = app
         .clone()

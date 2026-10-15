@@ -56,6 +56,7 @@ export const session: Session = {
     idle_seconds: 300,
     player_limit: null,
   },
+  root_domain: "kurbis.host",
 };
 
 export const finishedAiJob: AiJob = {

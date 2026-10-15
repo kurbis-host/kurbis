@@ -50,6 +50,7 @@ mod exports;
 mod github_webhook;
 mod internal;
 mod logs;
+mod names;
 mod openapi;
 mod operators;
 mod player_resolution;
@@ -59,6 +60,7 @@ mod runtime_stats;
 mod server;
 mod server_access;
 mod session;
+mod skins;
 mod snapshots;
 mod types;
 mod whitelist;
@@ -410,6 +412,33 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .api_route(
             "/auth/logout",
             api_post_with(auth::logout, |operation| operation.response::<204, ()>()),
+        )
+        .api_route(
+            "/api/v1/names/{name}",
+            api_get_with(names::name_availability, |operation| {
+                operation.description("Whether a server address is free to take. Needs no session.")
+            }),
+        )
+        .api_route(
+            "/api/v1/skins/{name}",
+            api_get_with(skins::player_skin, |operation| {
+                operation
+                    .description("The skin of the Java player with this name, as a PNG, for the landing page. Needs no session; the x-skin-model header says classic or slim.")
+                    .response_with::<200, Vec<u8>, _>(|mut response| {
+                        let response = {
+                            let inner = response.inner();
+                            let body = inner
+                                .content
+                                .shift_remove("application/octet-stream")
+                                .or_else(|| inner.content.shift_remove("application/json"));
+                            if let Some(body) = body {
+                                inner.content.insert("image/png".to_owned(), body);
+                            }
+                            response
+                        };
+                        response.description("The skin's PNG, 64 by 64 (or 64 by 32, the old layout).")
+                    })
+            }),
         )
         .api_route("/api/v1/session", api_get(session::session))
         .api_route("/api/v1/account", api_get(account::account))

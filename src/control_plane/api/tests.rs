@@ -544,6 +544,72 @@ async fn suspended_session_is_visible_but_control_plane_access_is_forbidden() {
 }
 
 #[tokio::test]
+async fn name_availability_needs_no_session_and_counts_every_server_row() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (owner, _) = create_user_session(&pool, "active").await;
+    let server_id = create_server(&pool, owner).await;
+    let taken: String = sqlx::query_scalar("SELECT subdomain FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let app = router(test_state(pool.clone()));
+    let ask = |name: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/names/{name}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        }
+    };
+
+    let free = format!("free-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let (status, body) = ask(free.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({ "name": free, "free": true }));
+
+    let (status, body) = ask(taken.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["free"], false);
+
+    // A server on its way out still holds its name until its row is gone.
+    sqlx::query("UPDATE servers SET desired_state = 'deleted' WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ask(taken.clone()).await.1["free"], false);
+    sqlx::query("DELETE FROM servers WHERE id = $1")
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ask(taken).await.1["free"], true);
+
+    for invalid in ["ab", "-dash", "dash-", "UPPER", "under_score"] {
+        let (status, body) = ask(invalid.to_owned()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(body["code"], "invalid_subdomain");
+    }
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn server_read_is_scoped_to_the_authenticated_owner() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;

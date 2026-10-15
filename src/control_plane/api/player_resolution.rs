@@ -111,10 +111,10 @@ pub(super) async fn resolve_player_name(
     resolve_java_profile(&state.http, MOJANG_PROFILE_BASE_URL, name).await
 }
 
-const MOJANG_PROFILE_BASE_URL: &str = "https://api.mojang.com/users/profiles/minecraft";
+pub(super) const MOJANG_PROFILE_BASE_URL: &str = "https://api.mojang.com/users/profiles/minecraft";
 const MAX_MOJANG_PROFILE_BYTES: usize = 4 * 1024;
 
-async fn resolve_java_profile(
+pub(super) async fn resolve_java_profile(
     http: &reqwest::Client,
     profile_base_url: &str,
     name: &str,
@@ -200,7 +200,7 @@ fn invalid_mojang_response() -> ApiError {
     )
 }
 
-fn is_java_profile_name(name: &str) -> bool {
+pub(super) fn is_java_profile_name(name: &str) -> bool {
     let length = name.chars().count();
     (3..=16).contains(&length)
         && name

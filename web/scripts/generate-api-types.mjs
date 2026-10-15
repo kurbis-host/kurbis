@@ -26,6 +26,8 @@ const surfaces = {
   auth: (path) => path.startsWith("/auth/"),
   account: (path) => path === "/api/v1/session" || path === "/api/v1/account" || path.startsWith("/api/v1/account/"),
   servers: (path) => path === "/api/v1/servers"
+    || path === "/api/v1/names/{name}"
+    || path === "/api/v1/skins/{name}"
     || path === "/api/v1/server/login-links"
     || path.startsWith("/api/v1/server/sessions/")
     || path === "/api/v1/server/sessions"

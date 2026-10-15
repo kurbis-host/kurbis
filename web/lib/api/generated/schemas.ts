@@ -392,6 +392,14 @@ export interface components {
         MinecraftRedeemRequest: {
             token: string;
         };
+        /** @description Whether a server address is still free to take, asked before anyone has an account. */
+        NameAvailability: {
+            free: boolean;
+            name: string;
+        };
+        NamePath: {
+            name: string;
+        };
         OAuthCallback: {
             code?: string | null;
             error?: string | null;
@@ -775,6 +783,8 @@ export interface components {
         };
         Session: {
             limits: components["schemas"]["ServiceLimits"];
+            /** @description The domain every server's address ends in: `<subdomain>.<root_domain>`. */
+            root_domain: string;
             user: components["schemas"]["SessionUser"];
         };
         SessionUser: {
@@ -783,6 +793,9 @@ export interface components {
             email?: string | null;
             /** Format: uuid */
             id: string;
+        };
+        SkinPath: {
+            name: string;
         };
         Snapshot: {
             /** Format: date-time */
