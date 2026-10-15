@@ -55,7 +55,7 @@ python3 tools/verify_worker_runtime.py --bin-dir target/debug \
   --protocol-dir tools/protocol --output output/runtime/native-lifecycle
 ```
 
-This harness uses an explicit offline identity fixture only for its disposable servers. It verifies the managed plugin load, OP-only login command, same-server link redemption, replay and origin checks, account/cross-server isolation, and expired-session rejection. It also verifies that unverified players receive no account login link. Results are written to result.json; check passed and individual checks. Native success cannot establish Docker hard-quota enforcement.
+This harness uses an explicit offline identity fixture only for its disposable servers. It verifies the managed plugin load, OP-only login command, same-server link redemption, replay and origin checks, account/cross-server isolation, and expired-session rejection. It also verifies that unverified players receive no account login link. Results are written to result.json; check passed and individual checks. Native success cannot establish Docker hard-quota enforcement. See PROGRESS.md for executed results and outstanding plan requirements.
 
 ## Measure a server start
 
