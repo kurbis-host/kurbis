@@ -126,6 +126,10 @@ services:
     environment:
       PUMPKIN_HOST_CONTROL_SOCKET: /run/kurbis-gateway/host-control.sock
       PUMPKIN_HOST_CONTROL_TOKEN: ${PUMPKIN_GATEWAY_CONTROL_TOKEN}
+      # Bedrock clients reach the lobby only through the gateway, so its
+      # NetherNet answer must name the gateway's public address, not its own.
+      PUMPKIN_NETHERNET_EXTERNAL_IP: ${BEDROCK_PUBLIC_IP}
+      PUMPKIN_NETHERNET_EXTERNAL_PORT: ${BEDROCK_PORT}
     volumes:
       - waiting-control:/run/kurbis-gateway
     restart: unless-stopped
