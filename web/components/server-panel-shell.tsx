@@ -107,7 +107,7 @@ export function ServerPanelShell({
   const nav = [
     ...(server
       ? serverNav.map(({ suffix, label, Icon }) => ({ href: `${root}${suffix}`, label, Icon }))
-      : [{ href: "/app/setup", label: "Setup", Icon: WandSparkles }]),
+      : [{ href: "/app/setup", label: "Claim server", Icon: WandSparkles }]),
     ...(!scoped ? [{ href: "/app/account", label: "Account", Icon: CircleUserRound }] : []),
   ];
 

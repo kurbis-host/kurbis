@@ -3,5 +3,5 @@ import { getAccount, getServerSessions, getServers } from "../../../../lib/api/s
 
 export default async function ServersPage() {
   const [servers, sessions, account] = await Promise.all([getServers(), getServerSessions(), getAccount()]);
-  return <ServerList servers={servers} sessions={sessions} canCreateServer={account.worlds.length === 0} />;
+  return <ServerList servers={servers} sessions={sessions} canClaimServer={account.worlds.length === 0} />;
 }

@@ -5,6 +5,7 @@ import { Pool } from 'pg';
 import AxeBuilder from '@axe-core/playwright';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { accountLink, claimByJoining, joinServer, linkToSignedInAccount } from './minecraft';
 
 const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
 const api = process.env.BROWSER_API_URL ?? 'http://127.0.0.1:18080';
@@ -81,22 +82,6 @@ async function command(request: APIRequestContext, name: string, data?: unknown)
   expect(response.ok(), await response.text()).toBeTruthy();
   return response;
 }
-type MinecraftIdentity = { kind: 'java'; uuid: string } | { kind: 'bedrock'; xuid: string };
-function minecraftPlayerId(identity: MinecraftIdentity) {
-  if (identity.kind === 'java') return identity.uuid;
-  return BigInt(identity.xuid).toString(16).padStart(32, '0').replace(
-    /^(........)(....)(....)(....)(............)$/,
-    '$1-$2-$3-$4-$5',
-  );
-}
-async function issueMinecraftLink(request: APIRequestContext, identity: MinecraftIdentity) {
-  const response = await request.post(`${api}/internal/minecraft-login-links`, {
-    headers: { authorization: 'Bearer browser-internal-token' },
-    data: { identity, minecraft_player_id: minecraftPlayerId(identity), display_name: 'Minecraft Player' },
-  });
-  expect(response.status(), await response.text()).toBe(200);
-  return (await response.json()).url as string;
-}
 async function login(page: Page, name = 'Browser Player', provider = 'Google') {
   await page.goto('/login');
   await page.getByRole('link', { name: `Continue with ${provider}` }).click();
@@ -106,7 +91,7 @@ async function login(page: Page, name = 'Browser Player', provider = 'Google') {
   }).toBe(name);
   await expect(page).toHaveURL(/\/app(?:\/setup|\/servers)$/);
   if (new URL(page.url()).pathname === '/app/servers') {
-    await page.getByRole('link', { name: 'Create a world' }).first().click();
+    await page.getByRole('link', { name: 'Claim a server' }).first().click();
     await expect(page).toHaveURL(/\/app\/setup$/);
   }
   await expect(page.getByPlaceholder('friends-world')).toBeVisible();
@@ -126,9 +111,9 @@ function workerLeaseId(token: string) {
   const hex = Buffer.from(blake3(Buffer.from(token)).slice(0, 16)).toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-async function startWorldOnline(page: Page, request: APIRequestContext, worldName: string) {
+async function startWorldOnline(page: Page, request: APIRequestContext, worldName: string, ownerName?: string) {
   await login(page);
-  await create(page, worldName);
+  await create(page, worldName, ownerName);
   const id = await serverId(page);
   const capacity = await command(request, 'capacity', { available: true });
   expect(capacity.status()).toBe(204);
@@ -148,11 +133,9 @@ async function startWorldOnline(page: Page, request: APIRequestContext, worldNam
   );
   return id;
 }
-async function create(page: Page, name: string) {
-  await page.getByPlaceholder('friends-world').fill(name);
-  await page.getByRole('button', { name: /Create sleeping world/ }).click();
+async function create(page: Page, name: string, ownerName?: string) {
+  await claimByJoining(page, name, ownerName);
   await state(page, 'Sleeping');
-  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
 }
 async function browserApi(page: Page, path: string, method = 'GET', data?: unknown) {
   const cookie = (await page.context().cookies()).map(({ name, value }) => `${name}=${value}`).join('; ');
@@ -453,7 +436,7 @@ test('world and full reset preserve their distinct settings, whitelist, and reco
   expect(server?.subdomain).toBe('reset-world');
   expect(server?.settings).toMatchObject({
     motd: 'Hosted by Kurbis',
-    whitelist: false,
+    whitelist: true,
     difficulty: 'Normal',
     gamemode: 'Survival',
   });
@@ -591,8 +574,9 @@ test('OAuth browser binding, state replay, ownership and invalid configuration a
   await attacker.close();
   await login(page);
   await create(page, 'validation-world');
-  const duplicate = await browserApi(page, '/api/v1/servers', 'POST', { subdomain: 'another-world' });
-  expect(duplicate.status).toBe(409);
+  // A signed-in browser cannot claim a name: only joining it in Minecraft can.
+  const browserClaim = await browserApi(page, '/api/v1/servers', 'POST', { subdomain: 'another-world' });
+  expect(browserClaim.status).toBe(405);
   for (const input of [{ subdomain: '../bad' }, { settings: { difficulty: 'Impossible' } }, { settings: { view_distance: 33 } }, { settings: { plugins: ['unrestricted'] } }]) {
     const response = await browserApi(page, await serverApiPath(page), 'PATCH', input);
     expect(response.status, `invalid settings ${JSON.stringify(input)}: ${response.text}`).toBe(422);
@@ -643,11 +627,11 @@ test('Google and Discord keep provider identities separate and both establish se
 
 test('Minecraft fragment links redeem once through the same-origin browser page', async ({ page, browser, request }) => {
   const identity = { kind: 'java' as const, uuid: randomUUID() };
-  const link = await issueMinecraftLink(request, identity);
+  const link = accountLink(await joinServer(request, 'fragment-world', identity)).href;
   const redemption = page.waitForRequest(request =>
     new URL(request.url()).pathname === '/auth/minecraft/redeem' && request.method() === 'POST'
   );
-  const appLoaded = page.waitForURL(/\/app\/servers$/, { waitUntil: 'load' });
+  const appLoaded = page.waitForURL(/\/manage\/[0-9a-f-]+$/, { waitUntil: 'load' });
   await page.goto(link);
   await redemption;
   await appLoaded;
@@ -678,18 +662,19 @@ test('signed-in Minecraft redemption attaches to the browser account without rep
   await login(page);
   await create(page, 'minecraft-owner-world');
   const identity = { kind: 'bedrock' as const, xuid: '2533274790395904' };
-  const link = await issueMinecraftLink(request, identity);
-  await page.goto(link);
-  await expect(page).toHaveURL(/\/app\/servers$/);
+  await linkToSignedInAccount(page, accountLink(await joinServer(request, 'bedrock-joined-world', identity)), 'Browser Player');
+  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
   expect(new URL(page.url()).hash).toBe('');
   expect((await current(page)).subdomain).toBe('minecraft-owner-world');
 
   const owner = await pool.query(
-    "SELECT i.user_id, s.id AS server_id, s.is_default FROM identities i JOIN servers s ON s.owner_id=i.user_id WHERE i.provider='minecraft_bedrock' AND i.subject=$1",
+    "SELECT s.subdomain, s.is_default FROM identities i JOIN servers s ON s.owner_id=i.user_id WHERE i.provider='minecraft_bedrock' AND i.subject=$1 ORDER BY s.subdomain",
     [identity.xuid],
   );
-  expect(owner.rows).toHaveLength(1);
-  expect(owner.rows[0]).toMatchObject({ server_id: expect.any(String), is_default: true });
+  expect(owner.rows).toEqual([
+    { subdomain: 'bedrock-joined-world', is_default: false },
+    { subdomain: 'minecraft-owner-world', is_default: true },
+  ]);
   await page.goto('/app/account');
   await expect(page.getByText('Minecraft Bedrock Edition', { exact: true })).toBeVisible();
 });
@@ -715,7 +700,9 @@ test('separate OAuth accounts cannot read or mutate each other and address confl
   expect(await current(otherPage)).toBeNull();
   expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}`, 'PATCH', { subdomain: 'owned-world' })).status).toBe(404);
   expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}/actions`, 'POST', { action: 'start' })).status).toBe(404);
-  expect((await browserApi(otherPage, '/api/v1/servers', 'POST', { subdomain: 'owned-world' })).status).toBe(409);
+  // Joining a taken address is a visit, not a claim.
+  const visit = await joinServer(otherPage.request, 'owned-world');
+  expect(visit).toMatchObject({ created: false, owner: false, account_link: null, target: { server_id: ownedServerId } });
   await create(otherPage, 'other-world');
   expect((await browserApi(otherPage, `/api/v1/servers/${ownedServerId}`, 'PATCH', { subdomain: 'owned-world' })).status).toBe(404);
   expect((await current(page)).subdomain).toBe('owned-world');
@@ -862,15 +849,9 @@ test('online console commands are deduplicated, fenced to a runtime generation, 
 
 test('Players page manages independent whitelist and protected operator rosters without exposing IDs', async ({ page, request }) => {
   test.setTimeout(120000);
-  const id = await startWorldOnline(page, request, 'managed-player-world');
-  const owner = await pool.query('SELECT owner_id FROM servers WHERE id = $1', [id]);
-  const ownerProfileId = randomUUID();
+  // The owner claimed the world by joining it as BrowserOwner.
+  const id = await startWorldOnline(page, request, 'managed-player-world', 'BrowserOwner');
   const playerId = '8667ba71-b85a-4004-af54-457a9734eed7';
-  await pool.query(
-    `INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
-     VALUES($1, $2, 'minecraft_java', $3, 'BrowserOwner', $4)`,
-    [randomUUID(), owner.rows[0].owner_id, ownerProfileId, ownerProfileId],
-  );
   await pool.query(
     `INSERT INTO server_players(server_id, player_id, name, edition)
      VALUES($1, $2, 'BrowserHelper', 'java')

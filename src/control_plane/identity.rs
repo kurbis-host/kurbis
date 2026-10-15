@@ -67,8 +67,6 @@ fn valid_xuid(xuid: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum IdentityError {
-    #[error("identity is already linked to another account")]
-    AlreadyLinked,
     #[error("account no longer exists")]
     AccountMissing,
     #[error(transparent)]
@@ -109,9 +107,16 @@ pub async fn link_oauth_identity(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((owner_id,)) = existing {
-        if link_to.is_some_and(|account_id| account_id != owner_id) {
-            return Err(IdentityError::AlreadyLinked);
-        }
+        // Linking a sign-in that already belongs to another account proves
+        // control of both, so the accounts become one, as when a signed-in
+        // browser redeems a Minecraft link.
+        let owner_id = match link_to {
+            Some(account_id) if account_id != owner_id => {
+                merge_accounts(&mut tx, account_id, owner_id).await?;
+                account_id
+            }
+            _ => owner_id,
+        };
         update_oauth_identity(
             &mut tx,
             provider,

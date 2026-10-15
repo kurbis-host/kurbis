@@ -8,9 +8,8 @@ export const subdomainSchema = z
   .max(SUBDOMAIN.longest, `Use at most ${SUBDOMAIN.longest} characters.`)
   .regex(SUBDOMAIN.pattern, "Use lowercase letters, numbers, or dashes; do not start or end with a dash.");
 
-export const setupSchema = z.object({
+export const settingsFormSchema = z.object({
   subdomain: subdomainSchema,
-  preset: z.enum(["survival", "creative"]),
   motd: z.string().max(120, "Keep the MOTD under 120 characters."),
   difficulty: z.enum(["Peaceful", "Easy", "Normal", "Hard"]),
   gamemode: z.enum(["Survival", "Creative", "Adventure", "Spectator"]),
@@ -21,9 +20,6 @@ export const setupSchema = z.object({
   whitelist_by_members: z.boolean(),
   tab_stats: z.boolean(),
 });
-export type SetupValues = z.infer<typeof setupSchema>;
-
-export const settingsFormSchema = setupSchema.omit({ preset: true });
 export type SettingsFormValues = z.infer<typeof settingsFormSchema>;
 
 const playerNameSchema = z

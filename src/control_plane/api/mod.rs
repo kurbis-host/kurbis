@@ -39,6 +39,7 @@ use super::{
 mod account;
 mod activity;
 mod actor;
+mod admission;
 mod ai;
 mod ci;
 mod ci_runtime_public;
@@ -435,12 +436,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                 operation.response::<204, ()>()
             }),
         )
+        .api_route("/api/v1/servers", api_get(server::list_servers))
         .api_route(
-            "/api/v1/servers",
-            api_get(server::list_servers).post_with(
-                server::create_server,
-                |operation| operation.response::<201, Json<Server>>(),
-            ),
+            "/api/v1/server-addresses/{subdomain}",
+            api_get_with(server::server_address, |operation| {
+                operation.description(
+                    "Whether a server name is still free. A name is claimed by joining its address in Minecraft.",
+                )
+            }),
         )
         .api_route(
             "/api/v1/server/login-links",
@@ -686,7 +689,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/bedrock-signal/ci/{hostname}",
             get(internal::ci_bedrock_signal_target),
         )
-        .route("/internal/admission", post(internal::admit))
+        .route("/internal/admission", post(admission::admit))
         .route("/webhooks/github", post(github_webhook::ingest))
         .route("/internal/ci/previews/{preview_id}", get(ci_runtime_public::status).patch(ci_runtime_public::update_settings))
         .route("/internal/ci/previews/{preview_id}/players", get(ci_runtime_public::players))
@@ -694,10 +697,6 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/ci/previews/status/{hostname}", get(ci::status))
         .route("/public/ci/previews/{hostname}", get(ci::public_status))
         .route("/internal/ci/previews/admit", post(ci::admit))
-        .route(
-            "/internal/minecraft-login-links",
-            post(internal::mint_minecraft_link),
-        )
         .route(
             "/internal/worker/server-capabilities",
             post(server_access::ensure_server_capability),

@@ -164,7 +164,7 @@ export function Account({
           <div className="mt-[18px] rounded-[10px] bg-[#dfe7d2] p-4 text-[13px] leading-normal text-[#4a593e]">
             {server
               ? "Your hosted world keeps its address and backups when you link another sign-in method."
-              : "This account has no hosted world yet. Setup creates one sleeping world."}
+              : "This account has no hosted world yet. Join a free address in Minecraft to claim one."}
           </div>
         </Surface>
       </div>

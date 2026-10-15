@@ -433,24 +433,37 @@ fn json_request(
     request.body(Body::from(body.to_string())).unwrap()
 }
 
-async fn mint_minecraft_link(app: &axum::Router, identity: Value) -> Value {
+/// Join `subdomain` as the verified player and return the account link the
+/// lobby hands an owner who has no web sign-in yet.
+async fn join_for_account_link(app: &axum::Router, identity: Value, subdomain: &str) -> String {
     let minecraft_player_id = test_profile_id(&identity);
     let response = app
         .clone()
-        .oneshot(
-            Request::post("/internal/minecraft-login-links")
-                .header(header::AUTHORIZATION, "Bearer test-internal-token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({"identity":identity,"minecraft_player_id":minecraft_player_id,"display_name":"Minecraft Player"})
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(admission_request(
+            Some("Bearer test-internal-token"),
+            serde_json::json!({
+                "hostname": format!("{subdomain}.mc.example"),
+                "identity": identity,
+                "minecraft_player_id": minecraft_player_id,
+                "display_name": "Minecraft Player",
+            }),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap()
+    let admission: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(admission["owner"], true);
+    admission["account_link"].as_str().unwrap().to_owned()
+}
+
+fn admission_request(authorization: Option<&str>, body: Value) -> Request<Body> {
+    let mut request =
+        Request::post("/internal/admission").header(header::CONTENT_TYPE, "application/json");
+    if let Some(authorization) = authorization {
+        request = request.header(header::AUTHORIZATION, authorization);
+    }
+    request.body(Body::from(body.to_string())).unwrap()
 }
 
 fn test_profile_id(identity: &Value) -> Uuid {
@@ -465,8 +478,8 @@ fn test_profile_id(identity: &Value) -> Uuid {
     Uuid::from_u128(numeric.max(1))
 }
 
-fn minecraft_token(link: &Value) -> String {
-    let url = reqwest::Url::parse(link["url"].as_str().unwrap()).unwrap();
+fn minecraft_token(link: &str) -> String {
+    let url = reqwest::Url::parse(link).unwrap();
     assert_eq!(url.scheme(), "https");
     assert_eq!(url.path(), "/auth/minecraft");
     url.fragment()
@@ -667,49 +680,43 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
     let state = test_state(pool.clone());
     let app = router(state);
     let java_uuid = Uuid::new_v4();
-    let link = mint_minecraft_link(&app, serde_json::json!({"kind":"java","uuid":java_uuid})).await;
+    let java_world = format!("java-{}", &java_uuid.simple().to_string()[..12]);
+    let link = join_for_account_link(
+        &app,
+        serde_json::json!({"kind":"java","uuid":java_uuid}),
+        &java_world,
+    )
+    .await;
     let token = minecraft_token(&link);
     let token_hash = blake3::hash(token.as_bytes()).as_bytes().to_vec();
     let forged_uuid = Uuid::new_v4();
 
     let forged = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/internal/minecraft-login-links")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "identity":{"kind":"java","uuid":forged_uuid},
-                        "minecraft_player_id":forged_uuid,
-                        "display_name":"Forged Player"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(admission_request(
+            None,
+            serde_json::json!({
+                "hostname":"forged-world.mc.example",
+                "identity":{"kind":"java","uuid":forged_uuid},
+                "minecraft_player_id":forged_uuid,
+                "display_name":"Forged Player"
+            }),
+        ))
         .await
         .unwrap();
     assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
     for invalid_xuid in ["0", "abc", "000", "123456789012345678901"] {
         let invalid = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/internal/minecraft-login-links")
-                    .header(header::AUTHORIZATION, "Bearer test-internal-token")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "identity":{"kind":"bedrock","xuid":invalid_xuid},
-                            "display_name":"Bedrock Player"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
+            .oneshot(admission_request(
+                Some("Bearer test-internal-token"),
+                serde_json::json!({
+                    "hostname":"invalid-world.mc.example",
+                    "identity":{"kind":"bedrock","xuid":invalid_xuid},
+                    "minecraft_player_id":Uuid::new_v4(),
+                    "display_name":"Bedrock Player"
+                }),
+            ))
             .await
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -802,9 +809,11 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
         .unwrap();
     assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
 
-    let expired_link = mint_minecraft_link(
+    let bedrock_xuid = "2533274790395904";
+    let expired_link = join_for_account_link(
         &app,
-        serde_json::json!({"kind":"bedrock","xuid":"2533274790395904"}),
+        serde_json::json!({"kind":"bedrock","xuid":bedrock_xuid}),
+        &format!("bedrock-{}", &Uuid::new_v4().simple().to_string()[..12]),
     )
     .await;
     let expired_token = minecraft_token(&expired_link);
@@ -828,17 +837,24 @@ async fn minecraft_login_tokens_are_private_one_use_origin_bound_and_expiring() 
         .await
         .unwrap();
     assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
-    let expired_identity_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM identities
-         WHERE provider = 'minecraft_bedrock' AND subject = '2533274790395904'",
+    let bedrock_user: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM identities
+         WHERE provider = 'minecraft_bedrock' AND subject = $1",
     )
+    .bind(bedrock_xuid)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(expired_identity_count, 0);
+    let expired_sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE user_id=$1")
+            .bind(bedrock_user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(expired_sessions, 0);
 
-    sqlx::query("DELETE FROM users WHERE id=$1")
-        .bind(user_id)
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind([user_id, bedrock_user].as_slice())
         .execute(&pool)
         .await
         .unwrap();
@@ -875,9 +891,15 @@ async fn signed_in_minecraft_redemption_merges_the_browser_account_and_all_world
         .await
         .unwrap();
     let app = router(test_state(pool.clone()));
-    let link = mint_minecraft_link(
+    let minecraft_world: String = sqlx::query_scalar("SELECT subdomain FROM servers WHERE id=$1")
+        .bind(minecraft_server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let link = join_for_account_link(
         &app,
         serde_json::json!({"kind":"bedrock","xuid":bedrock_xuid}),
+        &minecraft_world,
     )
     .await;
     let redeemed = app
