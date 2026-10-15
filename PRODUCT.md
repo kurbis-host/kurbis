@@ -20,7 +20,7 @@ _Inferred from `web/PLAN.md`._ The distinctive mechanism is wake-on-connect Mine
 
 ## Operating Context
 
-_Inferred from `web/PLAN.md`._ Users enter through OAuth, create one server, share its Java/Bedrock address, and manage lifecycle, online console commands, logs, settings, current players, independent whitelist and managed-operator lists, backups, restore operations, activity, and account state from a responsive browser UI.
+_Inferred from `web/PLAN.md`._ Users enter through OAuth or by joining a free address in Minecraft; a server name is claimed only by that first join, which creates the server and hands the player a link that ties it to their web account. Owners share its Java/Bedrock address, and manage lifecycle, online console commands, logs, settings, current players, independent whitelist and managed-operator lists, backups, restore operations, activity, and account state from a responsive browser UI.
 
 ## Capabilities and Constraints
 

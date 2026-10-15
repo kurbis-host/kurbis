@@ -33,8 +33,14 @@ pub struct AdmissionRequest {
 pub struct AdmissionResponse {
     pub target: RouteTarget,
     pub private_message: Option<String>,
+    /// One-use link for an owner who has not linked Google or Discord yet. It
+    /// signs in to the player's account, or links the player and their server
+    /// to the account already signed in to the browser that opens it. The
+    /// lobby shows it as clickable chat text as soon as the player arrives.
+    #[serde(default)]
+    pub account_link: Option<String>,
     /// Panel login link for an owner whose server failed to start. The lobby
-    /// shows `private_link_label` as clickable chat text that opens it.
+    /// shows it as clickable chat text after saying what happened.
     #[serde(default)]
     pub private_link: Option<String>,
     pub created: bool,

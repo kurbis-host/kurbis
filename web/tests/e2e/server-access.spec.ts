@@ -3,6 +3,7 @@ import { blake3 } from "@noble/hashes/blake3";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import { Pool } from "pg";
+import { claimByJoining } from "./minecraft";
 
 const api = process.env.BROWSER_API_URL ?? "http://127.0.0.1:18080";
 const fixture = process.env.BROWSER_FIXTURE_URL ?? "http://127.0.0.1:18081";
@@ -15,7 +16,7 @@ function workerLeaseId(token: string) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-async function loginAndCreateServer(page: Page) {
+async function loginAndClaimServer(page: Page) {
   await page.goto("/login");
   await page.getByRole("link", { name: "Continue with Google" }).click();
   await expect.poll(async () => page.evaluate(async () => {
@@ -23,18 +24,7 @@ async function loginAndCreateServer(page: Page) {
     return response.ok ? (await response.json()).user.display_name : null;
   })).toBe("Browser Player");
   await expect(page).toHaveURL(/\/app(?:\/setup|\/servers)$/);
-  if (!page.url().endsWith("/app/setup")) {
-    await page.getByRole("link", { name: "Create a world" }).first().click();
-    await expect(page).toHaveURL(/\/app\/setup$/);
-  }
-  await page.getByPlaceholder("friends-world").fill("server-access-world");
-  await page.getByRole("button", { name: /Create sleeping world/ }).click();
-  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
-  return page.evaluate(async () => {
-    const response = await fetch("/api/v1/servers");
-    const servers = await response.json();
-    return servers[0].id as string;
-  });
+  return claimByJoining(page, "server-access-world");
 }
 
 async function mintCurrentPlacementLink(request: APIRequestContext, serverId: string) {
@@ -161,7 +151,7 @@ test.beforeEach(async ({ request }) => {
 test.afterAll(async () => { await pool.end(); });
 
 test("account and multiple scoped grants share the selector with independent revocation", async ({ page, request }) => {
-  const accountServerId = await loginAndCreateServer(page);
+  const accountServerId = await loginAndClaimServer(page);
   const accountGrant = await mintCurrentPlacementLink(request, accountServerId);
   const first = await createScopedWorldLink(request, "scoped-shared-one", 10);
   const second = await createScopedWorldLink(request, "scoped-shared-two", 20);
@@ -323,7 +313,7 @@ test("account and multiple scoped grants share the selector with independent rev
 });
 
 test("scoped-only users can revoke individual grants from a mobile server panel", async ({ page, request }) => {
-  await loginAndCreateServer(page);
+  await loginAndClaimServer(page);
   const capacity = await request.post(`${fixture}/fixture/capacity`, { data: { available: true } });
   expect(capacity.ok(), await capacity.text()).toBeTruthy();
   const first = await createScopedWorldLink(request, "mobile-revoke-one", 40);
@@ -359,7 +349,7 @@ test("scoped-only users can revoke individual grants from a mobile server panel"
 
 test("server login link opens a scoped panel and keeps account routes private", async ({ page, request, browser }) => {
   test.setTimeout(60000);
-  const serverId = await loginAndCreateServer(page);
+  const serverId = await loginAndClaimServer(page);
   const link = await mintCurrentPlacementLink(request, serverId);
 
   // The account owner who generated the link is signed out before redeeming it.
@@ -388,7 +378,7 @@ test("server login link opens a scoped panel and keeps account routes private", 
   for (const width of [1440, 820, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
     await expect(navigation).toBeVisible();
-    await expect(navigation.getByRole("link")).toHaveCount(6);
+    await expect(navigation.getByRole("link")).toHaveCount(7);
     await expect(page.getByText("Server only • no Kurbis account")).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
     const navMetrics = await navigation.evaluate((element) => ({
@@ -516,7 +506,7 @@ test("malformed and expired server login links explain how to recover", async ({
   expect((await page.context().cookies()).some((cookie) => cookie.name === "kurbis_server_session")).toBe(false);
 
   const owner = await browser.newPage();
-  const serverId = await loginAndCreateServer(owner);
+  const serverId = await loginAndClaimServer(owner);
   const link = await mintCurrentPlacementLink(request, serverId);
   await expireLatestLoginLink(serverId);
 
@@ -553,7 +543,7 @@ test("server login keeps a retry action for temporary redemption failures", asyn
 });
 
 test("server sessions are fenced when the owning account is suspended", async ({ page, request }) => {
-  const serverId = await loginAndCreateServer(page);
+  const serverId = await loginAndClaimServer(page);
   const link = await mintCurrentPlacementLink(request, serverId);
   await pool.query("DELETE FROM sessions");
   await page.context().clearCookies();
@@ -571,7 +561,7 @@ test("server sessions are fenced when the owning account is suspended", async ({
 });
 
 test("server-only deletion reports completion and fences the old session", async ({ page, request }) => {
-  const serverId = await loginAndCreateServer(page);
+  const serverId = await loginAndClaimServer(page);
   const link = await mintCurrentPlacementLink(request, serverId);
   await pool.query("DELETE FROM sessions");
   await page.context().clearCookies();

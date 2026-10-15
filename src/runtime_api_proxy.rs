@@ -1244,6 +1244,7 @@ pub(crate) fn route_allowed(scope: Scope, method: &Method, path: &str, expected_
                 Some(["whitelist"]) => {
                     matches!(*method, Method::GET | Method::POST | Method::DELETE)
                 }
+                Some(["whitelist", "in-game" | "requests"]) => *method == Method::POST,
                 Some(["commands"] | ["ai", "jobs" | "sync"]) => *method == Method::POST,
                 Some(["plugins"]) => *method == Method::GET,
                 Some(["plugins", "market"]) => matches!(*method, Method::GET | Method::POST),

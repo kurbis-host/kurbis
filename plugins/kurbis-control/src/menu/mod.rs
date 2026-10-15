@@ -257,8 +257,15 @@ impl TextInputTarget {
         let done = match self {
             Self::Motd => api::update_setting("motd", Value::String(text.to_owned()))
                 .map(|()| Some("Updated server setting motd.".to_owned())),
-            Self::WhitelistAdd(_) => api::add_whitelist_entry(text)
-                .map(|()| Some(format!("Added {text} to the whitelist."))),
+            Self::WhitelistAdd(_) => api::add_whitelist_entry(
+                text,
+                None,
+                Some((
+                    crate::join_requests::player_uuid(player),
+                    &player.get_name(),
+                )),
+            )
+            .map(|()| Some(format!("Added {text} to the whitelist."))),
             Self::AiPrompt { new_conversation } => {
                 crate::ai::ask(player, text, *new_conversation).map(|()| None)
             }
@@ -736,15 +743,19 @@ fn activate(player: &Player, server: &Server, action: Action) -> Result<()> {
             }
             tell(
                 player,
-                if key == "whitelist" {
-                    "Whitelist setting saved; live server synchronization is queued."
-                } else {
-                    "Setting saved. Runtime configuration changes apply after the next server start."
+                match key {
+                    "whitelist" => {
+                        "Whitelist setting saved; live server synchronization is queued."
+                    }
+                    "whitelist_by_members" => "Saved. This applies right away.",
+                    _ => {
+                        "Setting saved. Runtime configuration changes apply after the next server start."
+                    }
                 },
             );
             open(
                 player,
-                if key == "whitelist" {
+                if matches!(key, "whitelist" | "whitelist_by_members") {
                     View::Whitelist(0)
                 } else {
                     View::Settings

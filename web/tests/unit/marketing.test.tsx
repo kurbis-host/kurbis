@@ -16,6 +16,14 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push }),
 }));
 
+/** The control plane's answer to whether a name is free (`GET /api/v1/server-addresses/{subdomain}`). */
+function addresses(taken: (name: string) => boolean = () => false) {
+  return vi.fn((url: string) => {
+    const subdomain = url.split("/").pop() ?? "";
+    return Promise.resolve(Response.json({ subdomain, address: `${subdomain}.kurbis.host`, available: !taken(subdomain) }));
+  });
+}
+
 beforeEach(() => {
   // A browser without WebGL (jsdom has no canvas at all): the film cannot play, and the page must not need it.
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
@@ -96,10 +104,7 @@ describe("standalone marketing pages", () => {
 
   it("checks a typed name with the control plane, holds it in a claim card, and goes on to sign in", async () => {
     // The only request the page makes: whether the name is free.
-    const fetch = vi.fn((url: string) => {
-      const name = url.split("/").pop() ?? "";
-      return Promise.resolve(Response.json({ name, free: name !== "steve" }));
-    });
+    const fetch = addresses((name) => name === "steve");
     vi.stubGlobal("fetch", fetch);
     const user = userEvent.setup();
     render(<LandingPage />);
@@ -121,7 +126,7 @@ describe("standalone marketing pages", () => {
     expect(push).not.toHaveBeenCalled();
     const card = screen.getByRole("region", { name: "pumpkin-patch.kurbis.host" });
     expect(card).toHaveTextContent("It's free. Join it in Minecraft and it's yours the moment you arrive.");
-    // Kept for the tab, so setup can offer it after signing in.
+    // Kept, so the claim page can offer it after signing in.
     expect(localStorage.getItem("kurbis.name")).toBe("pumpkin-patch");
     await user.click(within(card).getByRole("button", { name: "Copy address" }));
     expect(await navigator.clipboard.readText()).toBe("pumpkin-patch.kurbis.host");
@@ -129,11 +134,11 @@ describe("standalone marketing pages", () => {
     expect(within(card).getByRole("status")).toHaveTextContent("Copied. In Minecraft: Multiplayer > Add Server, paste, and join.");
     await user.click(within(card).getByRole("button", { name: "Or sign in" }));
     expect(push).toHaveBeenCalledWith("/login");
-    expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/v1/names/steve", "/api/v1/names/pumpkin-patch"]);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/v1/server-addresses/steve", "/api/v1/server-addresses/pumpkin-patch"]);
   });
 
   it("closes the claim card, from its button or with Escape", async () => {
-    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(Response.json({ name: url.split("/").pop(), free: true }))));
+    vi.stubGlobal("fetch", addresses());
     const user = userEvent.setup();
     render(<LandingPage />);
     const [field] = screen.getAllByRole("textbox", { name: /Pick a name for your server/ });
@@ -150,7 +155,7 @@ describe("standalone marketing pages", () => {
   });
 
   it("takes a free name when the field is left, without Enter, and keeps a closed card closed", async () => {
-    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(Response.json({ name: url.split("/").pop(), free: true }))));
+    vi.stubGlobal("fetch", addresses());
     const user = userEvent.setup();
     render(<LandingPage />);
     const [field] = screen.getAllByRole("textbox", { name: /Pick a name for your server/ });
@@ -172,7 +177,7 @@ describe("standalone marketing pages", () => {
 
   it("has the name from an earlier visit in its fields again", async () => {
     localStorage.setItem("kurbis.name", "pumpkin-patch");
-    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(Response.json({ name: url.split("/").pop(), free: true }))));
+    vi.stubGlobal("fetch", addresses());
     render(<LandingPage />);
     const fields = screen.getAllByRole("textbox", { name: /Pick a name for your server/ });
     await waitFor(() => expect(fields[0]).toHaveValue("pumpkin-patch"));
@@ -180,11 +185,7 @@ describe("standalone marketing pages", () => {
   });
 
   it("keeps the open card on the name as it stands: checking, free, taken", async () => {
-    const taken = new Set(["steve"]);
-    vi.stubGlobal("fetch", vi.fn((url: string) => {
-      const name = url.split("/").pop() ?? "";
-      return Promise.resolve(Response.json({ name, free: !taken.has(name) }));
-    }));
+    vi.stubGlobal("fetch", addresses((name) => name === "steve"));
     const user = userEvent.setup();
     render(<LandingPage />);
     const [field] = screen.getAllByRole("textbox", { name: /Pick a name for your server/ });
@@ -211,7 +212,7 @@ describe("standalone marketing pages", () => {
   it("welcomes a visitor back to the server they made, with a way to its panel", async () => {
     localStorage.setItem("kurbis.name", "pumpkin-patch");
     // The name they claimed is taken now: by them.
-    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(Response.json({ name: url.split("/").pop(), free: false }))));
+    vi.stubGlobal("fetch", addresses(() => true));
     const user = userEvent.setup();
     render(<LandingPage />);
     const card = await screen.findByRole("region", { name: "pumpkin-patch.kurbis.host" }, { timeout: 3000 });

@@ -44,7 +44,6 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         5_i64 * 1024 * 1024 * 1024
     );
     assert_eq!(session["limits"]["idle_seconds"], 300);
-    assert_eq!(session["root_domain"], "mc.example.test");
 
     let empty = app
         .clone()
@@ -53,43 +52,58 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     assert_eq!(json_body(empty).await, json!([]));
 
+    assert_eq!(session["server_domain"], "mc.example.test");
+
+    // Signing in claims nothing: the name stays free until the owner joins it.
     let subdomain = format!("api-{}", &owner_id.simple().to_string()[..12]);
-    let created = app
+    let address = |expected_available: bool| {
+        let app = app.clone();
+        let uri = format!("/api/v1/server-addresses/{subdomain}");
+        let subdomain = subdomain.clone();
+        async move {
+            let response = app
+                .oneshot(request(Method::GET, &uri, None, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                json_body(response).await,
+                json!({
+                    "subdomain": subdomain,
+                    "address": format!("{subdomain}.mc.example.test"),
+                    "available": expected_available,
+                })
+            );
+        }
+    };
+    address(true).await;
+    let invalid_address = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/api/v1/server-addresses/-bad",
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_address.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let removed_create = app
         .clone()
         .oneshot(request(
             Method::POST,
             "/api/v1/servers",
             Some(&token),
-            Some(json!({
-                "subdomain": subdomain,
-                "settings": {
-                    "motd": "API integration",
-                    "difficulty": "Normal",
-                    "gamemode": "Survival",
-                    "view_distance": 12,
-                    "simulation_distance": 8,
-                    "hardcore": false,
-                    "whitelist": true
-                }
-            })),
+            Some(json!({"subdomain": subdomain})),
         ))
         .await
         .unwrap();
-    assert_eq!(created.status(), StatusCode::CREATED);
-    let created = json_body(created).await;
-    let server_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
-    assert_eq!(created["observed_state"], "sleeping");
-    assert_eq!(created["is_default"], true);
-    assert_eq!(
-        created["java_address"],
-        format!("{subdomain}.mc.example.test")
-    );
-    assert_eq!(created["storage_limit_bytes"], 5_i64 * 1024 * 1024 * 1024);
+    assert_eq!(removed_create.status(), StatusCode::METHOD_NOT_ALLOWED);
 
     let owner_profile_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
-         VALUES($1, $2, 'minecraft_java', $3, 'WorldOwner', $4)",
+         VALUES($1, $2, 'minecraft_java', $3, 'Admission Player', $4)",
     )
     .bind(Uuid::new_v4())
     .bind(owner_id)
@@ -98,6 +112,39 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
     .execute(&pool)
     .await
     .unwrap();
+    let joined = app
+        .clone()
+        .oneshot(internal_admission_request(
+            &format!("{subdomain}.mc.example.test"),
+            Some(json!({"kind":"java", "uuid":owner_profile_id})),
+            Some(owner_profile_id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), StatusCode::OK);
+    let joined = json_body(joined).await;
+    assert_eq!(joined["created"], true);
+    address(false).await;
+    let server_id = Uuid::parse_str(joined["target"]["server_id"].as_str().unwrap()).unwrap();
+    let created = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("/api/v1/servers/{server_id}"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    assert_eq!(created["observed_state"], "sleeping");
+    assert_eq!(created["is_default"], true);
+    assert_eq!(
+        created["java_address"],
+        format!("{subdomain}.mc.example.test")
+    );
+    assert_eq!(created["storage_limit_bytes"], 5_i64 * 1024 * 1024 * 1024);
 
     let isolated = app
         .clone()
@@ -330,9 +377,9 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     let whitelist = json_body(whitelist).await;
     assert_eq!(whitelist["enabled"], true);
-    assert_eq!(whitelist["revision"], 1);
+    assert_eq!(whitelist["revision"], 0);
     assert_eq!(whitelist["applied_revision"], 0);
-    assert_eq!(whitelist["synchronized"], false);
+    assert_eq!(whitelist["synchronized"], true);
 
     let added = app
         .clone()
@@ -346,7 +393,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     assert_eq!(added.status(), StatusCode::CREATED);
     let added = json_body(added).await;
-    assert_eq!(added["revision"], 2);
+    assert_eq!(added["revision"], 1);
     assert_eq!(added["applied_revision"], 0);
     assert_eq!(added["synchronized"], false);
     assert_eq!(added["entries"][0]["player_id"], player_id.to_string());
@@ -358,14 +405,14 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .await
         .unwrap();
     let initial_operators = json_body(initial_operators).await;
-    assert_eq!(initial_operators["revision"], 2);
+    assert_eq!(initial_operators["revision"], 1);
     assert_eq!(initial_operators["applied_revision"], 0);
     assert_eq!(initial_operators["synchronized"], false);
     assert_eq!(
         initial_operators["entries"][0]["player_id"],
         owner_profile_id.to_string()
     );
-    assert_eq!(initial_operators["entries"][0]["name"], "WorldOwner");
+    assert_eq!(initial_operators["entries"][0]["name"], "Admission Player");
     assert_eq!(initial_operators["entries"][0]["is_owner"], true);
 
     let owner_mutation = app
@@ -374,7 +421,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
             Method::POST,
             &operators_uri,
             Some(&token),
-            Some(json!({"name":"WorldOwner"})),
+            Some(json!({"name":"Admission Player"})),
         ))
         .await
         .unwrap();
@@ -408,11 +455,12 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     assert_eq!(added_operator.status(), StatusCode::CREATED);
     let added_operator = json_body(added_operator).await;
-    assert_eq!(added_operator["revision"], 3);
+    // Entries sort by name: the owner, "Admission Player", comes first.
+    assert_eq!(added_operator["revision"], 2);
     assert_eq!(added_operator["applied_revision"], 0);
     assert_eq!(added_operator["synchronized"], false);
     assert_eq!(
-        added_operator["entries"][0]["player_id"],
+        added_operator["entries"][1]["player_id"],
         player_id.to_string()
     );
 
@@ -434,7 +482,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     assert_eq!(readded_offline_bedrock.status(), StatusCode::CREATED);
     assert_eq!(
-        json_body(readded_offline_bedrock).await["entries"][0]["player_id"],
+        json_body(readded_offline_bedrock).await["entries"][1]["player_id"],
         player_id.to_string()
     );
 
@@ -450,7 +498,7 @@ async fn versioned_api_covers_panel_resources_and_lifecycle_boundaries() {
         .unwrap();
     assert_eq!(removed_operator.status(), StatusCode::OK);
     let removed_operator = json_body(removed_operator).await;
-    assert_eq!(removed_operator["revision"], 4);
+    assert_eq!(removed_operator["revision"], 3);
     assert_eq!(removed_operator["entries"].as_array().unwrap().len(), 1);
     assert_eq!(removed_operator["entries"][0]["is_owner"], true);
 

@@ -39,6 +39,7 @@ use super::{
 mod account;
 mod activity;
 mod actor;
+mod admission;
 mod ai;
 mod ci;
 mod ci_runtime_public;
@@ -50,7 +51,6 @@ mod exports;
 mod github_webhook;
 mod internal;
 mod logs;
-mod names;
 mod openapi;
 mod operators;
 mod player_resolution;
@@ -414,12 +414,6 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             api_post_with(auth::logout, |operation| operation.response::<204, ()>()),
         )
         .api_route(
-            "/api/v1/names/{name}",
-            api_get_with(names::name_availability, |operation| {
-                operation.description("Whether a server address is free to take. Needs no session.")
-            }),
-        )
-        .api_route(
             "/api/v1/skins/{name}",
             api_get_with(skins::player_skin, |operation| {
                 operation
@@ -464,12 +458,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                 operation.response::<204, ()>()
             }),
         )
+        .api_route("/api/v1/servers", api_get(server::list_servers))
         .api_route(
-            "/api/v1/servers",
-            api_get(server::list_servers).post_with(
-                server::create_server,
-                |operation| operation.response::<201, Json<Server>>(),
-            ),
+            "/api/v1/server-addresses/{subdomain}",
+            api_get_with(server::server_address, |operation| {
+                operation.description(
+                    "Whether a server name is still free. A name is claimed by joining its address in Minecraft.",
+                )
+            }),
         )
         .api_route(
             "/api/v1/server/login-links",
@@ -660,6 +656,49 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                 })
                 .delete(whitelist::remove_whitelist_entry),
         )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/in-game",
+            api_post_with(whitelist::add_whitelist_entry_in_game, |operation| {
+                operation
+                    .id("addWhitelistEntryInGame")
+                    .description("Plugin only: add a player from in game, recording which player added them. Operators always may; players on the whitelist may while whitelist_by_members is on.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests",
+            api_post_with(whitelist::report_join_request, |operation| {
+                operation
+                    .id("reportWhitelistJoinRequest")
+                    .description("Plugin only: report a player the whitelist turned away, so the panel can list them.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}",
+            api_delete_with(whitelist::dismiss_join_request, |operation| {
+                operation
+                    .id("dismissWhitelistJoinRequest")
+                    .description("Forget a join request without letting the player in.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/let-in",
+            api_post_with(whitelist::let_in_join_request, |operation| {
+                operation
+                    .id("letInWhitelistJoinRequest")
+                    .description("Add a player the whitelist turned away in the last day.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/claim",
+            api_post_with(whitelist::claim_join_request, |operation| {
+                operation
+                    .id("claimWhitelistJoinRequest")
+                    .description("Owner only, while the owner has no linked Minecraft account: mark a join request as the owner's own player, who goes on the whitelist and becomes an operator. The Minecraft account is not linked for sign-in.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
         .route(
             "/internal/bedrock-signal/{server_id}",
             get(internal::bedrock_signal_target),
@@ -672,7 +711,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/bedrock-signal/ci/{hostname}",
             get(internal::ci_bedrock_signal_target),
         )
-        .route("/internal/admission", post(internal::admit))
+        .route("/internal/admission", post(admission::admit))
         .route("/webhooks/github", post(github_webhook::ingest))
         .route("/internal/ci/previews/{preview_id}", get(ci_runtime_public::status).patch(ci_runtime_public::update_settings))
         .route("/internal/ci/previews/{preview_id}/players", get(ci_runtime_public::players))
@@ -680,10 +719,6 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/ci/previews/status/{hostname}", get(ci::status))
         .route("/public/ci/previews/{hostname}", get(ci::public_status))
         .route("/internal/ci/previews/admit", post(ci::admit))
-        .route(
-            "/internal/minecraft-login-links",
-            post(internal::mint_minecraft_link),
-        )
         .route(
             "/internal/worker/server-capabilities",
             post(server_access::ensure_server_capability),

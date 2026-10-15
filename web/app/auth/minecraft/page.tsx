@@ -5,7 +5,7 @@ import { ArrowLeft, Gamepad2 } from "lucide-react";
 import { ApiError, errorMessage } from "../../../lib/api/client";
 import { browserApi } from "../../../lib/api/operations";
 
-type PageState = "reading" | "redeeming" | "error";
+type PageState = "reading" | "confirming" | "redeeming" | "error";
 
 export default function MinecraftLoginPage() {
   const started = useRef(false);
@@ -13,6 +13,7 @@ export default function MinecraftLoginPage() {
   const [token, setToken] = useState<string | null>(null);
   const [state, setState] = useState<PageState>("reading");
   const [message, setMessage] = useState("Checking your Minecraft sign-in link…");
+  const [account, setAccount] = useState<string | null>(null);
 
   useEffect(() => {
     if (started.current) return;
@@ -27,8 +28,26 @@ export default function MinecraftLoginPage() {
       return;
     }
     setToken(loginToken);
-    void redeem(loginToken);
+    void start(loginToken);
   }, []);
+
+  /**
+   * Signed out, the link signs in to the player's own account. Signed in, it merges the
+   * player and their server into this account, so that is never done without asking:
+   * a link someone else sent must not attach their player to this account.
+   */
+  async function start(loginToken: string) {
+    const session = await browserApi.getSession().catch(() => null);
+    if (!session) {
+      await redeem(loginToken);
+      return;
+    }
+    setAccount(session.user.display_name);
+    setState("confirming");
+    setMessage(
+      `This link adds a Minecraft player and their server to the Kurbis account you are signed in to (${session.user.display_name}). Only continue if it came from your own Minecraft chat.`,
+    );
+  }
 
   async function redeem(loginToken: string) {
     if (inFlight.current) return;
@@ -37,7 +56,7 @@ export default function MinecraftLoginPage() {
     setMessage("Signing in to Kurbis…");
     try {
       await browserApi.redeemMinecraft(loginToken);
-      window.location.replace("/app");
+      window.location.replace("/app/setup");
     } catch (error) {
       setState("error");
       setMessage(error instanceof ApiError && error.status === 400
@@ -67,6 +86,14 @@ export default function MinecraftLoginPage() {
           {message}
         </p>
         <div className="mt-7 flex flex-wrap gap-3">
+          {state === "confirming" && token ? (
+            <button
+              className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] shadow-[0_5px_0_var(--color-pumpkin-dark),var(--shadow-low)] hover:bg-[#eb7a2d] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#315d3a]"
+              onClick={() => void redeem(token)}
+            >
+              Link to {account}
+            </button>
+          ) : null}
           {state === "error" && token ? (
             <button
               className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-sm bg-pumpkin px-4 font-[760] text-[#25170f] shadow-[0_5px_0_var(--color-pumpkin-dark),var(--shadow-low)] hover:bg-[#eb7a2d] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#315d3a]"

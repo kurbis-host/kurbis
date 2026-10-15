@@ -303,20 +303,6 @@ export interface components {
         };
         /** @enum {string} */
         ConsoleCommandStatus: "queued" | "running" | "succeeded" | "failed" | "cancelled";
-        CreateServerRequest: {
-            /** @default {
-             *       "difficulty": "Normal",
-             *       "gamemode": "Survival",
-             *       "hardcore": false,
-             *       "motd": "Hosted by Kurbis",
-             *       "simulation_distance": 8,
-             *       "tab_stats": false,
-             *       "view_distance": 12,
-             *       "whitelist": false
-             *     } */
-            settings: components["schemas"]["ServerSettings"];
-            subdomain: string;
-        };
         /** @enum {string} */
         DesiredState: "running" | "stopped" | "deleted";
         /** @enum {string} */
@@ -327,6 +313,56 @@ export interface components {
         };
         /** @enum {string} */
         GameMode: "Survival" | "Creative" | "Adventure" | "Spectator";
+        InGamePlayer: {
+            name: string;
+            /** Format: uuid */
+            player_id: string;
+        };
+        InGameWhitelistMutation: {
+            /** @description The player in game who adds them. An operator always may; a player on
+             *      the whitelist may while the server's `whitelist_by_members` setting is on. */
+            added_by: components["schemas"]["InGamePlayer"];
+            /** @description The player to add, as Pumpkin named them. */
+            name: string;
+            /**
+             * Format: uuid
+             * @description The UUID Pumpkin reported when it turned this player away. A Bedrock
+             *      player who has never been on the server cannot be resolved by name, so
+             *      the runtime that saw them vouches for it, as it does for the player
+             *      roster. Without it the name is resolved like a panel addition.
+             * @default null
+             */
+            player_id: string | null;
+        };
+        /** @description A player the whitelist turned away in the last day. */
+        JoinRequest: {
+            /**
+             * Format: int32
+             * @description How often they tried, as the server reported it (at most once a minute).
+             */
+            attempts: number;
+            /** Format: date-time */
+            first_attempt_at: string;
+            /** Format: date-time */
+            last_attempt_at: string;
+            name: string;
+            /** Format: uuid */
+            player_id: string;
+        };
+        JoinRequestPath: {
+            /** Format: uuid */
+            player_id: string;
+            /** Format: uuid */
+            server_id: string;
+        };
+        JoinRequestReport: {
+            name: string;
+            /**
+             * Format: uuid
+             * @description The UUID Pumpkin gave the player it turned away.
+             */
+            player_id: string;
+        };
         LimitQuery: {
             /** Format: int64 */
             limit?: number | null;
@@ -391,14 +427,6 @@ export interface components {
         };
         MinecraftRedeemRequest: {
             token: string;
-        };
-        /** @description Whether a server address is still free to take, asked before anyone has an account. */
-        NameAvailability: {
-            free: boolean;
-            name: string;
-        };
-        NamePath: {
-            name: string;
         };
         OAuthCallback: {
             code?: string | null;
@@ -555,6 +583,13 @@ export interface components {
             subdomain: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        /** @description Whether a server name can still be claimed. Names are claimed only by
+         *      joining their address in Minecraft, so this reserves nothing. */
+        ServerAddress: {
+            address: string;
+            available: boolean;
+            subdomain: string;
         };
         ServerAiJobPath: {
             /** Format: uuid */
@@ -744,8 +779,14 @@ export interface components {
              * @default 12
              */
             view_distance: number;
-            /** @default false */
+            /** @default true */
             whitelist: boolean;
+            /**
+             * @description Players on the whitelist may let in someone the whitelist just turned
+             *      away. Operators always can.
+             * @default true
+             */
+            whitelist_by_members: boolean;
         };
         ServerSettingsPatch: {
             /** @default null */
@@ -770,6 +811,8 @@ export interface components {
             view_distance: number | null;
             /** @default null */
             whitelist: boolean | null;
+            /** @default null */
+            whitelist_by_members: boolean | null;
         };
         ServiceLimits: {
             /** Format: int64 */
@@ -783,8 +826,8 @@ export interface components {
         };
         Session: {
             limits: components["schemas"]["ServiceLimits"];
-            /** @description The domain every server's address ends in: `<subdomain>.<root_domain>`. */
-            root_domain: string;
+            /** @description Every server address is `<name>.<server_domain>`. */
+            server_domain: string;
             user: components["schemas"]["SessionUser"];
         };
         SessionUser: {
@@ -808,6 +851,9 @@ export interface components {
         };
         /** @enum {string} */
         SnapshotReason: "periodic" | "shutdown" | "manual" | "restore" | "reset" | "export";
+        SubdomainPath: {
+            subdomain: string;
+        };
         UpdateServerRequest: {
             settings?: components["schemas"]["ServerSettingsPatch"] | null;
             subdomain?: string | null;
@@ -817,15 +863,29 @@ export interface components {
             applied_revision: number;
             enabled: boolean;
             entries: components["schemas"]["WhitelistEntry"][];
+            /** @description Whether the owner's account has a linked Minecraft account, which is
+             *      always on the whitelist and an operator. Without one the owner can
+             *      mark a join request as their own. */
+            owner_has_minecraft_account: boolean;
+            /** @description Players turned away in the last day, most recent first. */
+            requests: components["schemas"]["JoinRequest"][];
             /** Format: int64 */
             revision: number;
             synchronized: boolean;
+            /** @description Whether players on the whitelist may let in someone it turned away. */
+            whitelist_by_members: boolean;
         };
         WhitelistDeleteQuery: {
             /** Format: uuid */
             player_id: string;
         };
         WhitelistEntry: {
+            /** @description Who put the player on the whitelist: the owner's account name for
+             *      additions in the panel, the player's name for additions in game.
+             *      Unknown for a login-link session and for entries older than this field. */
+            added_by?: string | null;
+            /** @description Whether the player was added from inside the game. */
+            added_in_game: boolean;
             /** Format: date-time */
             created_at: string;
             name: string;

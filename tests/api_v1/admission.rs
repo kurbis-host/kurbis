@@ -128,7 +128,7 @@ async fn first_verified_bedrock_join_registers_its_xuid_and_creates_one_server()
 }
 
 #[tokio::test]
-async fn authenticated_admission_serializes_creation_redirects_and_keeps_existing_host_access() {
+async fn linked_admission_serializes_creation_redirects_and_keeps_existing_host_access() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let identity_id = Uuid::new_v4();
@@ -290,70 +290,6 @@ async fn authenticated_admission_serializes_creation_redirects_and_keeps_existin
         .unwrap();
     assert_eq!(bedrock.status(), StatusCode::OK);
 
-    let (mixed_owner, mixed_token) = user_session(&pool, "active").await;
-    let mixed_java_uuid = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
-         VALUES($1, $2, 'minecraft_java', $3, 'Mixed Race Java', $4)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(mixed_owner)
-    .bind(mixed_java_uuid.to_string())
-    .bind(mixed_java_uuid)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let mixed_identity = json!({"kind":"java", "uuid":mixed_java_uuid});
-    let requests = (0..8).map(|index| {
-        let app = app.clone();
-        let token = mixed_token.clone();
-        let identity = mixed_identity.clone();
-        async move {
-            let subdomain = format!(
-                "mixed-{}-{}",
-                index,
-                &Uuid::new_v4().simple().to_string()[..8]
-            );
-            if index % 2 == 0 {
-                app.oneshot(request(
-                    Method::POST,
-                    "/api/v1/servers",
-                    Some(&token),
-                    Some(json!({"subdomain":subdomain})),
-                ))
-                .await
-                .unwrap()
-            } else {
-                app.oneshot(internal_admission_request(
-                    &format!("{subdomain}.mc.example.test"),
-                    Some(identity),
-                    Some(mixed_java_uuid),
-                ))
-                .await
-                .unwrap()
-            }
-        }
-    });
-    for response in join_all(requests).await {
-        assert!(
-            matches!(
-                response.status(),
-                StatusCode::CREATED | StatusCode::CONFLICT | StatusCode::OK
-            ),
-            "mixed web/admission request returned {}",
-            response.status()
-        );
-    }
-    let (mixed_server_count, mixed_default_count): (i64, i64) = sqlx::query_as(
-        "SELECT count(*), count(*) FILTER (WHERE is_default)
-         FROM servers WHERE owner_id = $1",
-    )
-    .bind(mixed_owner)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!((mixed_server_count, mixed_default_count), (1, 1));
-
     let (suspended_owner, _) = user_session(&pool, "suspended").await;
     let suspended_uuid = Uuid::new_v4();
     sqlx::query(
@@ -389,7 +325,7 @@ async fn authenticated_admission_serializes_creation_redirects_and_keeps_existin
     assert_eq!(suspended_server_count, 0);
 
     sqlx::query("DELETE FROM users WHERE id = ANY($1)")
-        .bind([owner_id, bedrock_owner, mixed_owner, suspended_owner].as_slice())
+        .bind([owner_id, bedrock_owner, suspended_owner].as_slice())
         .execute(&pool)
         .await
         .unwrap();
@@ -477,4 +413,194 @@ async fn owner_of_a_failed_server_gets_a_panel_login_link_at_admission() {
     assert_eq!(owner["owner"], true);
     assert!(owner["private_link"].is_null());
     assert_eq!(login_tokens().await, 1);
+}
+
+fn redeem_request(token: &str, session: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/minecraft/redeem")
+        .header(header::ORIGIN, "https://panel.example.test")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session) = session {
+        builder = builder.header(header::COOKIE, format!("kurbis_session={session}"));
+    }
+    builder
+        .body(Body::from(json!({ "token": token }).to_string()))
+        .unwrap()
+}
+
+fn link_token(admission: &Value) -> String {
+    let link = admission["account_link"].as_str().unwrap();
+    let (base, token) = link.split_once("#token=").unwrap();
+    assert_eq!(base, "https://panel.example.test/auth/minecraft");
+    token.to_owned()
+}
+
+#[tokio::test]
+async fn joining_after_a_web_sign_in_claims_the_name_and_links_both_accounts() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let app = router(state(pool.clone()));
+    // A Google sign-in creates an account and nothing else.
+    let (web_owner, web_token) = user_session(&pool, "active").await;
+    let subdomain = format!("claim-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let hostname = format!("{subdomain}.mc.example.test");
+    let java_uuid = Uuid::new_v4();
+    let join = || {
+        let app = app.clone();
+        let hostname = hostname.clone();
+        async move {
+            let response = app
+                .oneshot(internal_admission_request(
+                    &hostname,
+                    Some(json!({"kind":"java", "uuid":java_uuid})),
+                    Some(java_uuid),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        }
+    };
+
+    // The first join creates the server under the player's own account and
+    // hands them the one-use link that joins it to the web account.
+    let first = join().await;
+    assert_eq!(first["created"], true);
+    assert_eq!(first["owner"], true);
+    assert!(first["private_link"].is_null());
+    let server_id = Uuid::parse_str(first["target"]["server_id"].as_str().unwrap()).unwrap();
+    let player_account: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(player_account, web_owner);
+
+    // Rejoining replaces the link instead of adding another live one.
+    let stale = link_token(&first);
+    let second = join().await;
+    assert_eq!(second["created"], false);
+    let token = link_token(&second);
+    assert_ne!(token, stale);
+    let live_links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM minecraft_login_tokens WHERE provider = 'minecraft_java' AND subject = $1",
+    )
+    .bind(java_uuid.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_links, 1);
+    let replaced = app
+        .clone()
+        .oneshot(redeem_request(&stale, Some(&web_token)))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::UNAUTHORIZED);
+
+    // Opening the link where the web account is signed in makes them one.
+    let redeemed = app
+        .clone()
+        .oneshot(redeem_request(&token, Some(&web_token)))
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, web_owner);
+    let player_identity_owner: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM identities WHERE provider = 'minecraft_java' AND subject = $1",
+    )
+    .bind(java_uuid.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(player_identity_owner, web_owner);
+    let player_account_left: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+            .bind(player_account)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!player_account_left);
+
+    // Linked, the owner signs in on the web and gets no more account links.
+    let linked = join().await;
+    assert_eq!(linked["owner"], true);
+    assert!(linked["account_link"].is_null());
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(web_owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_account_link_signs_a_minecraft_only_owner_in_and_guests_get_none() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let app = router(state(pool.clone()));
+    let subdomain = format!("solo-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let hostname = format!("{subdomain}.mc.example.test");
+    let join = |uuid: Uuid| {
+        let app = app.clone();
+        let hostname = hostname.clone();
+        async move {
+            let response = app
+                .oneshot(internal_admission_request(
+                    &hostname,
+                    Some(json!({"kind":"java", "uuid":uuid})),
+                    Some(uuid),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        }
+    };
+    let owner_uuid = Uuid::new_v4();
+    let owner = join(owner_uuid).await;
+    assert_eq!(owner["created"], true);
+    let guest_uuid = Uuid::new_v4();
+    let guest = join(guest_uuid).await;
+    assert_eq!(guest["owner"], false);
+    assert!(guest["account_link"].is_null());
+
+    let redeemed = app
+        .clone()
+        .oneshot(redeem_request(&link_token(&owner), None))
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+    let cookie = redeemed
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| value.strip_prefix("kurbis_session="))
+        .and_then(|value| value.split(';').next())
+        .unwrap()
+        .to_owned();
+    let servers = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/v1/servers", Some(&cookie), None))
+        .await
+        .unwrap();
+    assert_eq!(servers.status(), StatusCode::OK);
+    let servers = json_body(servers).await;
+    assert_eq!(servers.as_array().unwrap().len(), 1);
+    assert_eq!(servers[0]["subdomain"], subdomain);
+
+    sqlx::query(
+        "DELETE FROM users WHERE id IN (SELECT user_id FROM identities
+         WHERE provider = 'minecraft_java' AND subject = ANY($1))",
+    )
+    .bind([owner_uuid.to_string(), guest_uuid.to_string()].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
 }

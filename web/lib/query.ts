@@ -2,6 +2,7 @@ export const queryKeys = {
   session: ["session"] as const,
   account: ["account"] as const,
   servers: ["servers"] as const,
+  serverAddress: (subdomain: string) => ["server-addresses", subdomain] as const,
   serverSessions: ["server-sessions"] as const,
   server: (serverId: string) => ["servers", serverId] as const,
   activity: (serverId: string) => ["servers", serverId, "activity"] as const,

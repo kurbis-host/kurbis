@@ -17,7 +17,8 @@ The web panel in `web/` provides the user interface for managing hosted servers.
 ## Features
 
 - Verified online Minecraft Java and Bedrock identities automatically register or resume an account on join.
-- The first valid address creates that account’s server; each account has one server, and account merges preserve all existing worlds.
+- Server names are claimed only by joining them: the first verified player to join a free address creates that account’s server. Signing in with Google or Discord claims nothing; the web panel shows which names are free and says to join one. Each account has one server, and account merges preserve all existing worlds.
+- An owner who has not linked Google or Discord gets a one-use account link in the lobby chat. Opened in a browser signed in to Kurbis, it links the Minecraft player and their server to that account; opened anywhere else, it signs in to the player’s own account. Linking Google or Discord from that account later merges the two accounts the same way.
 - Java 26.3 hostname routing, sleeping-server wake, waiting sessions, and native backend transfer, exercised with a real protocol client.
 - Wake-on-join for sleeping servers.
 - Automatic sleep after inactivity.

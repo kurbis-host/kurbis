@@ -472,6 +472,13 @@ async fn first_verified_java_and_bedrock_join_wake_and_transfer_without_reconnec
                 !state.chat_messages.is_empty(),
                 "gateway lifecycle status should request a chat copy"
             );
+            assert!(
+                state.links.iter().any(|(label, url, _)| {
+                    label.contains("link this server") && url.contains("/auth/minecraft#token=")
+                }),
+                "the first join hands its owner the account link: {:?}",
+                state.links
+            );
         }
 
         let operation = claim_operation(&pool, worker_id)
@@ -598,9 +605,9 @@ async fn failed_start_keeps_the_owner_in_the_lobby_with_a_login_link_until_the_j
         .await
         .unwrap();
     routes.invalidate_all().await;
-    // The first-join player owns the server and has no panel access yet.
-    // Instead of being disconnected they stay in the lobby and are handed a
-    // panel login link for the failure.
+    // The first-join player owns the server and has no web sign-in yet.
+    // Instead of being disconnected they stay in the lobby and are handed
+    // their account link, which opens the panel, for the failure.
     wait_for_control_event(
         &control_state,
         |state| {
@@ -617,8 +624,8 @@ async fn failed_start_keeps_the_owner_in_the_lobby_with_a_login_link_until_the_j
         &control_state,
         |state| {
             state.links.iter().any(|(label, url, earlier)| {
-                label.starts_with("Click here")
-                    && url.contains("/auth/server#token=")
+                label.contains("see what went wrong")
+                    && url.contains("/auth/minecraft#token=")
                     && *earlier > 0
             })
         },

@@ -33,13 +33,28 @@ export function apiOperations(client: Client<paths>) {
     removeWhitelistEntry: (serverId: string, playerId: string) => apiRequest(client.DELETE("/api/v1/servers/{server_id}/whitelist", {
       params: { path: { server_id: serverId }, query: { player_id: playerId } },
     })),
+    /** Join requests carry the UUID the server reported; the panel only answers them. */
+    letInJoinRequest: (serverId: string, playerId: string) =>
+      apiRequest(client.POST("/api/v1/servers/{server_id}/whitelist/requests/{player_id}/let-in", {
+        params: { path: { server_id: serverId, player_id: playerId } },
+      })),
+    claimJoinRequest: (serverId: string, playerId: string) =>
+      apiRequest(client.POST("/api/v1/servers/{server_id}/whitelist/requests/{player_id}/claim", {
+        params: { path: { server_id: serverId, player_id: playerId } },
+      })),
+    dismissJoinRequest: (serverId: string, playerId: string) =>
+      apiRequest(client.DELETE("/api/v1/servers/{server_id}/whitelist/requests/{player_id}", {
+        params: { path: { server_id: serverId, player_id: playerId } },
+      })),
     getOperators: (serverId: string) => apiRequest(client.GET("/api/v1/servers/{server_id}/operators", serverParams(serverId))),
     addOperatorEntry: (serverId: string, body: components["schemas"]["OperatorMutation"]) =>
       apiRequest(client.POST("/api/v1/servers/{server_id}/operators", { ...serverParams(serverId), body })),
     removeOperatorEntry: (serverId: string, playerId: string) => apiRequest(client.DELETE("/api/v1/servers/{server_id}/operators", {
       params: { path: { server_id: serverId }, query: { player_id: playerId } },
     })),
-    createServer: (body: components["schemas"]["CreateServerRequest"]) => apiRequest(client.POST("/api/v1/servers", { body })),
+    getServerAddress: (subdomain: string) => apiRequest(client.GET("/api/v1/server-addresses/{subdomain}", {
+      params: { path: { subdomain } },
+    })),
     updateServer: (serverId: string, body: components["schemas"]["UpdateServerRequest"]) => apiRequest(client.PATCH("/api/v1/servers/{server_id}", { ...serverParams(serverId), body })),
     command: (serverId: string, body: components["schemas"]["ServerCommandRequest"]) => apiRequest(client.POST("/api/v1/servers/{server_id}/commands", { ...serverParams(serverId), body })),
     sendConsoleCommand: async (serverId: string, commandText: string, requestId = globalThis.crypto.randomUUID()): Promise<void> => {

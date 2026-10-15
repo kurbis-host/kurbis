@@ -29,6 +29,7 @@ export const server: Server = {
     simulation_distance: 8,
     hardcore: false,
     whitelist: false,
+    whitelist_by_members: true,
     tab_stats: false,
   },
   storage_bytes: 512 * 1024 * 1024,
@@ -56,7 +57,7 @@ export const session: Session = {
     idle_seconds: 300,
     player_limit: null,
   },
-  root_domain: "kurbis.host",
+  server_domain: "kurbis.host",
 };
 
 export const finishedAiJob: AiJob = {

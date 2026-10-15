@@ -60,6 +60,20 @@ pub(super) async fn shut_down_runtime(runtime: &mut impl RuntimeShutdown) -> Res
     Ok(RuntimeExit::Killed)
 }
 
+/// Kill a running Pumpkin that began shutting down without being asked, for
+/// example after a crash. It can no longer release a held barrier, which a
+/// leaving player waits for, so it may never exit. Returns whether it did.
+pub(super) async fn kill_if_shutting_down(runtime: &mut impl RuntimeShutdown) -> Result<bool> {
+    if runtime.host_control_listening().await? {
+        return Ok(false);
+    }
+    runtime
+        .kill()
+        .await
+        .context("kill CI Pumpkin that is shutting down by itself")?;
+    Ok(true)
+}
+
 /// Recover the two-part quiescence protocol after a worker crashes. The
 /// generation marker is removed by the release future only after the app-level
 /// barrier acknowledges, so either failure leaves recovery retryable.
@@ -365,6 +379,33 @@ mod tests {
 
         assert_eq!(exit, RuntimeExit::Killed);
         assert_eq!(pumpkin.events, vec!["released", "shutdown", "killed"]);
+    }
+
+    #[tokio::test]
+    async fn a_running_preview_that_stopped_listening_is_killed() {
+        let mut pumpkin = FakePumpkin {
+            listening: false,
+            barrier_held: true,
+            player_online: true,
+            shutting_down: true,
+            ..FakePumpkin::running()
+        };
+
+        assert!(kill_if_shutting_down(&mut pumpkin).await.unwrap());
+        assert_eq!(pumpkin.events, vec!["killed"]);
+        assert!(!pumpkin.running);
+    }
+
+    #[tokio::test]
+    async fn a_running_preview_that_still_listens_is_left_alone() {
+        let mut pumpkin = FakePumpkin {
+            barrier_held: true,
+            ..FakePumpkin::running()
+        };
+
+        assert!(!kill_if_shutting_down(&mut pumpkin).await.unwrap());
+        assert!(pumpkin.events.is_empty());
+        assert!(pumpkin.running);
     }
 
     #[tokio::test]

@@ -171,7 +171,7 @@ pub(super) async fn next_event_row(
     cursor: i64,
 ) -> Result<Option<EventRow>, sqlx::Error> {
     sqlx::query_as::<_, EventRow>(
-        "SELECT e.id, e.event_type, e.created_at
+        "SELECT e.id, e.event_type, e.detail, e.created_at
          FROM server_events e
          WHERE e.server_id = $1 AND e.id > $2
          ORDER BY e.id ASC LIMIT 1",

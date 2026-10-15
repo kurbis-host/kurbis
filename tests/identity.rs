@@ -557,3 +557,80 @@ async fn oldest_world_becomes_default_when_the_browser_account_has_none() {
 
     cleanup(&pool, &[browser_user, source_user]).await;
 }
+
+#[tokio::test]
+async fn linking_a_web_sign_in_owned_by_another_account_merges_that_account() {
+    let pool = test_pool().await;
+    let suffix = Uuid::new_v4();
+    // The player joined first: their Minecraft account owns the server.
+    let java_uuid = Uuid::new_v4();
+    let player_user = attach_minecraft_identity(
+        &pool,
+        "minecraft_java",
+        &java_uuid.to_string(),
+        java_uuid,
+        "Java Player",
+        None,
+    )
+    .await
+    .unwrap();
+    let server_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)")
+        .bind(server_id)
+        .bind(player_user)
+        .bind(format!("joined-{}", &suffix.simple().to_string()[..8]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Their Google sign-in already made a separate, empty account.
+    let google_subject = format!("google-first-{suffix}");
+    let google_user = link_oauth_identity(
+        &pool,
+        "google",
+        &google_subject,
+        None,
+        false,
+        "Google Player",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(google_user, player_user);
+
+    // Linking Google from the player's session proves both are theirs.
+    let linked = link_oauth_identity(
+        &pool,
+        "google",
+        &google_subject,
+        None,
+        false,
+        "Google Player",
+        Some(player_user),
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked, player_user);
+    let google_owner: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM identities WHERE provider = 'google' AND subject = $1",
+    )
+    .bind(&google_subject)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(google_owner, player_user);
+    let server_owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(server_owner, player_user);
+    let google_account_left: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+            .bind(google_user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!google_account_left);
+
+    cleanup(&pool, &[player_user]).await;
+}

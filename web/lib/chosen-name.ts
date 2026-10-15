@@ -1,6 +1,6 @@
 /**
  * The name a visitor picked on the landing page, kept in their browser for good: the
- * setup page offers it after sign-in, and the landing page has it in its fields again on
+ * claim page offers it after sign-in, and the landing page has it in its fields again on
  * their next visit. Storage can be refused (a private window, blocked site data); then the
  * name is simply not kept.
  */

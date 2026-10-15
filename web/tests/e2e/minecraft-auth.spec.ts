@@ -1,35 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { Pool } from 'pg';
+import { accountLink, joinServer, linkToSignedInAccount, minecraftPlayerId } from './minecraft';
 
-const api = process.env.BROWSER_API_URL ?? 'http://127.0.0.1:18080';
 const fixture = process.env.BROWSER_FIXTURE_URL ?? 'http://127.0.0.1:18081';
 const panel = process.env.BROWSER_PANEL_URL ?? 'http://127.0.0.1:18082';
 const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
-
-async function mintLoginLink(
-  request: APIRequestContext,
-  identity: { kind: 'java'; uuid: string } | { kind: 'bedrock'; xuid: string },
-  displayName: string,
-) {
-  const minecraftPlayerId = identity.kind === 'java'
-    ? identity.uuid
-    : BigInt(identity.xuid).toString(16).padStart(32, '0').replace(
-      /^(........)(....)(....)(....)(............)$/,
-      '$1-$2-$3-$4-$5',
-    );
-  const response = await request.post(`${api}/internal/minecraft-login-links`, {
-    headers: { authorization: 'Bearer browser-internal-token' },
-    data: { identity, minecraft_player_id: minecraftPlayerId, display_name: displayName },
-  });
-  expect(response.status(), await response.text()).toBe(200);
-  const { url } = await response.json() as { url: string };
-  const loginUrl = new URL(url);
-  expect(loginUrl.origin).toBe(panel);
-  expect(loginUrl.pathname).toBe('/auth/minecraft');
-  expect(loginUrl.search).toBe('');
-  return loginUrl;
-}
 
 async function recordRedemptionRequest(page: Page) {
   await page.addInitScript(() => {
@@ -55,16 +31,20 @@ test.beforeEach(async ({ request }) => {
 });
 test.afterAll(async () => { await pool.end(); });
 
-test('Minecraft browser links clear the fragment, redeem same-origin, and attach to signed-in accounts', async ({ page, request }) => {
+test('the first join claims its name and its link signs in, then links later joins to the same account', async ({ page, request }) => {
   test.setTimeout(60000);
-  const javaLink = await mintLoginLink(
+  // A Java player claims a name by joining it; the lobby hands them their account link.
+  const java = await joinServer(
     request,
+    'minecraft-auth-world',
     { kind: 'java', uuid: randomUUID() },
     'Java Browser Player',
   );
+  expect(java.created).toBe(true);
+  const javaLink = accountLink(java);
   await recordRedemptionRequest(page);
   await page.goto(`${javaLink.pathname}${javaLink.hash}`);
-  await expect(page).toHaveURL(/\/app(?:\/setup|\/servers)$/);
+  await expect(page).toHaveURL(new RegExp(`/manage/${java.target.server_id}$`));
   await expect.poll(async () => page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
     return response.ok ? (await response.json()).user.display_name : null;
@@ -77,23 +57,12 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
   ));
   expect(initialRequest).toEqual({ fragmentAtRequest: '', origin: panel, method: 'POST' });
 
-  if (new URL(page.url()).pathname === '/app/servers') {
-    await page.getByRole('link', { name: 'Create a world' }).first().click();
-    await expect(page).toHaveURL(/\/app\/setup$/);
-  }
-  await page.getByPlaceholder('friends-world').fill('minecraft-auth-world');
-  await page.getByRole('button', { name: /Create sleeping world/ }).click();
-  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
-
   const originalSession = await page.evaluate(async () => {
     const response = await fetch('/api/v1/session');
     return response.json();
   });
   const bedrockXuid = '2533274790395904';
-  const bedrockProfile = BigInt(bedrockXuid).toString(16).padStart(32, '0').replace(
-    /^(........)(....)(....)(....)(............)$/,
-    '$1-$2-$3-$4-$5',
-  );
+  const bedrockProfile = minecraftPlayerId({ kind: 'bedrock', xuid: bedrockXuid });
   const sourceUser = randomUUID();
   const sourceWorld = 'merged-bedrock-world';
   await pool.query(
@@ -108,13 +77,17 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     'INSERT INTO servers(id, owner_id, subdomain) VALUES($1, $2, $3)',
     [randomUUID(), sourceUser, sourceWorld],
   );
-  const bedrockLink = await mintLoginLink(
+  // The Bedrock player already owns a world on their own account. Joining it hands
+  // them their account link; opening it here joins that account to this one.
+  const bedrock = await joinServer(
     request,
+    sourceWorld,
     { kind: 'bedrock', xuid: bedrockXuid },
     'Bedrock Browser Player',
   );
-  await page.goto(`${bedrockLink.pathname}${bedrockLink.hash}`);
-  await expect(page).toHaveURL(/\/app\/servers$/);
+  expect(bedrock.created).toBe(false);
+  await linkToSignedInAccount(page, accountLink(bedrock), 'Java Browser Player');
+  await expect(page).toHaveURL(/\/manage\/[0-9a-f-]+$/);
   await page.goto('/app/account');
   await expect(page.getByRole('heading', { name: 'Linked identities' })).toBeVisible();
   await expect(page.getByText('Minecraft Java Edition', { exact: true })).toBeVisible();
@@ -140,4 +113,29 @@ test('Minecraft browser links clear the fragment, redeem same-origin, and attach
     .toBe(cookie?.value);
   const sourceStillExists = await pool.query('SELECT 1 FROM users WHERE id = $1', [sourceUser]);
   expect(sourceStillExists.rowCount).toBe(0);
+});
+
+test('a web sign-in claims nothing: joining the name claims it and the link joins both accounts', async ({ page, context }) => {
+  await page.goto('/login');
+  await page.getByRole('link', { name: 'Continue with Google' }).click();
+  // A new account has nothing to list yet, so it goes straight to the claim page.
+  await expect(page).toHaveURL(/\/app\/setup$/);
+  await page.getByRole('textbox', { name: 'Server name' }).fill('joined-claim-world');
+  await expect(page.getByText('joined-claim-world.mc.example.test is free. Join it in Minecraft to claim it.')).toBeVisible();
+  const claimedBySignIn = await pool.query("SELECT count(*) FROM servers WHERE subdomain = 'joined-claim-world'");
+  expect(claimedBySignIn.rows[0].count).toBe('0');
+
+  // The join creates the server; the link from chat, opened in this browser, links it.
+  const join = await joinServer(page.request, 'joined-claim-world');
+  expect(join.created).toBe(true);
+  const chatLink = await context.newPage();
+  await linkToSignedInAccount(chatLink, accountLink(join), 'Browser Player');
+  await expect(chatLink).toHaveURL(new RegExp(`/manage/${join.target.server_id}$`));
+  // The claim page that was waiting opens the panel by itself.
+  await expect(page).toHaveURL(new RegExp(`/manage/${join.target.server_id}$`), { timeout: 15000 });
+  const owner = await pool.query(
+    "SELECT i.provider FROM servers s JOIN identities i ON i.user_id = s.owner_id WHERE s.id = $1 ORDER BY i.provider",
+    [join.target.server_id],
+  );
+  expect(owner.rows.map((row) => row.provider)).toEqual(['google', 'minecraft_java']);
 });

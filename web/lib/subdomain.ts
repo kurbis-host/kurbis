@@ -15,3 +15,8 @@ export const SUBDOMAIN = {
 export function isSubdomain(name: string): boolean {
   return name.length >= SUBDOMAIN.shortest && name.length <= SUBDOMAIN.longest && SUBDOMAIN.pattern.test(name);
 }
+
+/** A name as it may be typed: lowercase letters, digits and dashes, and no longer than allowed. */
+export function typedSubdomain(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, SUBDOMAIN.longest);
+}

@@ -569,10 +569,32 @@ pub(super) fn render_whitelist(
         Some(Action::Prompt(TextInputTarget::WhitelistAdd(page))),
     );
 
+    // Slot 8: whether players on the whitelist may let others in
+    button(
+        inv,
+        actions,
+        8,
+        "oak_door",
+        if data["whitelist_by_members"] == true {
+            "Members can let players in: §aOn"
+        } else {
+            "Members can let players in: §cOff"
+        },
+        "Players on the whitelist can let in someone\nit turned away with /letin. Operators always can.\nClick to toggle",
+        Some(Action::ToggleSetting {
+            key: "whitelist_by_members",
+        }),
+    );
+
     // Render whitelisted players on content slots
     for (index, entry) in page_entries(entries, page).enumerate() {
         let name = value(entry, &["name"]);
         let player_id = value(entry, &["player_id"]);
+        let added_by = match (entry["added_by"].as_str(), entry["added_in_game"] == true) {
+            (Some(adder), true) => format!("Added by {adder} in game\n"),
+            (Some(adder), false) => format!("Added by {adder} in the panel\n"),
+            (None, _) => String::new(),
+        };
         let slot = content_slot(index);
         button(
             inv,
@@ -580,7 +602,7 @@ pub(super) fn render_whitelist(
             slot,
             "player_head",
             &name,
-            &format!("UUID: {player_id}\n§cClick to remove"),
+            &format!("{added_by}UUID: {player_id}\n§cClick to remove"),
             Some(Action::Open(View::ConfirmRemoveWhitelist {
                 name: name.clone(),
                 player_id,

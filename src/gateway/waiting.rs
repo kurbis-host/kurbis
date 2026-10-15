@@ -178,13 +178,31 @@ async fn handle_player(
                 {
                     tracing::warn!(player_id = %player.id, ?error, "failed to deliver private server redirect notice");
                 }
+                let failed = admission.target.state == ObservedState::Failed;
+                if !failed
+                    && let Some(url) = admission.account_link.as_deref()
+                    && let Err(error) = control
+                        .link(
+                            &config.waiting_control_socket,
+                            player.id,
+                            ACCOUNT_LINK_LABEL,
+                            url,
+                        )
+                        .await
+                {
+                    tracing::warn!(player_id = %player.id, ?error, "failed to deliver account link");
+                }
                 state.admission_hostname = Some(format!(
                     "{}.{}",
                     admission.target.subdomain, config.root_domain
                 ));
                 state.owner = admission.owner;
-                state.pending_login_link = admission.private_link;
-                state.admitted_while_failed = admission.target.state == ObservedState::Failed;
+                // A failed server's owner gets whichever link opens its panel
+                // after the notice that says what happened.
+                state.pending_login_link = admission
+                    .private_link
+                    .or(admission.account_link.filter(|_| failed));
+                state.admitted_while_failed = failed;
                 state.admission_target = Some(admission.target);
                 state.admission_complete = true;
             }
@@ -312,6 +330,8 @@ async fn send_notice_once(
     }
     Ok(())
 }
+
+const ACCOUNT_LINK_LABEL: &str = "Click here to open your server panel. Open it where you are signed in to Kurbis to link this server to that account (valid for 15 minutes).";
 
 const LOGIN_LINK_LABEL: &str =
     "Click here to open your server panel and see what went wrong (valid for 15 minutes).";
@@ -776,6 +796,7 @@ mod tests {
                                 bedrock_port: None,
                             },
                             private_message: None,
+                            account_link: None,
                             private_link: None,
                             created: true,
                             owner: true,

@@ -22,13 +22,13 @@ describe("a server's name", () => {
     const fetch = vi.fn((url: string, init?: RequestInit) =>
       new Promise<Response>((resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
-        const name = url.split("/").pop() ?? "";
-        setTimeout(() => resolve(Response.json({ name, free: name !== "steve" })), 5);
+        const subdomain = url.split("/").pop() ?? "";
+        setTimeout(() => resolve(Response.json({ subdomain, address: `${subdomain}.kurbis.host`, available: subdomain !== "steve" })), 5);
       }),
     );
     vi.stubGlobal("fetch", fetch);
     await expect(isFree("pumpkinpatch")).resolves.toBe(true);
-    expect(fetch).toHaveBeenLastCalledWith("/api/v1/names/pumpkinpatch", expect.objectContaining({ headers: { accept: "application/json" } }));
+    expect(fetch).toHaveBeenLastCalledWith("/api/v1/server-addresses/pumpkinpatch", expect.objectContaining({ headers: { accept: "application/json" } }));
     await expect(isFree("steve")).resolves.toBe(false);
     const abort = new AbortController();
     const asked = isFree("pumpkinpatch", abort.signal);

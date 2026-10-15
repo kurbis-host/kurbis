@@ -36,8 +36,8 @@ impl TryFrom<&str> for AccountStatus {
 pub struct Session {
     pub user: SessionUser,
     pub limits: ServiceLimits,
-    /// The domain every server's address ends in: `<subdomain>.<root_domain>`.
-    pub root_domain: String,
+    /// Every server address is `<name>.<server_domain>`.
+    pub server_domain: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -74,6 +74,6 @@ pub(super) async fn session(
             idle_seconds: DEFAULT_IDLE_SECONDS,
             player_limit: None,
         },
-        root_domain: state.config.root_domain.clone(),
+        server_domain: state.config.root_domain.clone(),
     }))
 }
