@@ -1,4 +1,4 @@
-/** The legal pages: there, linked to each other, and plain about what is still to fill in. */
+/** The legal pages: there, linked to each other, and with nothing left to fill in. */
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,13 +15,12 @@ describe("legal pages", () => {
     expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "Provider",
       "Contact",
-      "VAT ID",
       "Responsible for the content",
       "Consumer dispute resolution",
     ]);
     expect(screen.getByRole("link", { name: "privacy policy" })).toHaveAttribute("href", "/privacy");
     expect(screen.getByRole("link", { name: "Back to the world" })).toHaveAttribute("href", "/");
-    expect(screen.getByText(/not an official Minecraft product/)).toBeInTheDocument();
+    expect(screen.getByText(/not an official Minecraft or PumpkinMC product/)).toBeInTheDocument();
   });
 
   it("says what is stored, why, and for how long", () => {
@@ -42,11 +41,14 @@ describe("legal pages", () => {
     expect(screen.getByRole("link", { name: "Impressum" })).toHaveAttribute("href", "/impressum");
   });
 
-  it("marks what the operator still has to fill in", () => {
-    render(<PrivacyPage />);
-    const fills = document.querySelectorAll("mark.game-fill");
-    expect(fills.length).toBeGreaterThan(0);
-    for (const fill of fills) expect(fill.textContent).toMatch(/^\[\[.+\]\]$/);
+  it("leaves nothing for the operator to fill in", () => {
+    for (const Page of [ImpressumPage, PrivacyPage]) {
+      const { container, unmount } = render(<Page />);
+      expect(container.querySelectorAll("mark.game-fill")).toHaveLength(0);
+      // (A placeholder written as plain capitals, like "HOSTING PROVIDER", would slip past the marks.)
+      expect(container.textContent).not.toMatch(/\b[A-Z]{3,}(?: [A-Z]{3,})+\b/);
+      unmount();
+    }
   });
 
   it("is linked from where people sign in", () => {

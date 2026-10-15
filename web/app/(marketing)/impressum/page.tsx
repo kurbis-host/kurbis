@@ -21,11 +21,7 @@ export default function ImpressumPage() {
 			</address>
 
 			<h2>Contact</h2>
-			<p>
-				Email: info@kurbis.host
-				<br />
-				Phone: PHONE NUMBER, OR A CONTACT FORM THAT ANSWERS QUICKLY
-			</p>
+			<p>Email: info@kurbis.host</p>
 
 			<h2>Responsible for the content</h2>
 			<p>Under § 18 (2) MStV: Samuel Scheit, at the address above.</p>

@@ -21,8 +21,9 @@ export default function PrivacyPage() {
 			<h2>Visiting the website</h2>
 			<p>
 				To send you this website, our servers process your IP address, the time of the request and what your browser tells them
-				about itself (Art. 6 (1) (f) GDPR: we cannot deliver the page otherwise). The site runs at HOSTING PROVIDER, COUNTRY.
-				Technical logs are deleted after LOG RETENTION.
+				about itself (Art. 6 (1) (f) GDPR: we cannot deliver the page otherwise). The site runs on a server rented from Contabo
+				GmbH, Germany, in its data centre in Lauterbourg, France. Each part of the service keeps at most its newest 30 MB of
+				technical logs; older entries are overwritten.
 			</p>
 			<p>
 				There are no analytics, no ads and no tracking cookies. The landing page and its 3D world come from our own server; nothing
