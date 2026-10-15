@@ -18,6 +18,18 @@ from run_bounded_build import (
 )
 
 
+def wait_for_child_pid(pid_file: Path, timeout: float = 10) -> int:
+    """The PID the build subprocess wrote, once it has. A busy host can take
+    seconds to start Python, and the file exists before its contents do."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return int(pid_file.read_text())
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.02)
+    raise AssertionError("guard never started its build subprocess")
+
+
 class BuildMemoryGuardTests(unittest.TestCase):
     def test_concurrency_config_defaults_and_rejects_invalid_environment_values(self):
         self.assertEqual(parse_concurrency(None), 2)
@@ -136,11 +148,7 @@ update(-1)
                 "import os,pathlib,time; pathlib.Path(os.environ['CHILD_PID']).write_text(str(os.getpid())); time.sleep(60)",
             ]
             wrapper = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            deadline = time.monotonic() + 3
-            while not pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(pid_file.exists(), "guard never started its build subprocess")
-            child_pid = int(pid_file.read_text())
+            child_pid = wait_for_child_pid(pid_file)
             wrapper.kill()
             wrapper.wait(timeout=3)
             try:
@@ -191,7 +199,8 @@ update(-1)
                 "import os,pathlib,time; pathlib.Path(os.environ['CHILD_PID']).write_text(str(os.getpid())); time.sleep(60)",
             ]
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.2)
+            # Terminate only once the build subprocess is running, or there is no child for the signal to reach.
+            child_pid = wait_for_child_pid(pid_file)
             process.terminate()
             process.wait(timeout=3)
             result = run_build(
@@ -203,7 +212,6 @@ update(-1)
                 memory_probe=lambda: (8 * GIB, 7 * GIB),
             )
             self.assertEqual(result, 0)
-            child_pid = int(pid_file.read_text())
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 try:
