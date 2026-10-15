@@ -4,9 +4,11 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRight } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { useEffect } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { errorMessage } from "../lib/api/client";
 import { browserApi } from "../lib/api/operations";
+import { chosenName } from "../lib/chosen-name";
 import { queryKeys } from "../lib/query";
 import { setupSchema, type SetupValues } from "../lib/schemas";
 import {
@@ -35,7 +37,7 @@ const defaults: SetupValues = {
 const presetCard =
   "block min-h-[126px] rounded-xl bg-[#eee6d5] p-[18px] shadow-[inset_0_0_0_1px_#c9c0ad] transition-[transform,box-shadow,background-color] duration-150 peer-checked:bg-[#dfe8d0] peer-checked:shadow-[inset_0_0_0_2px_var(--color-grass),0_8px_18px_rgba(78,99,54,0.10)] peer-focus-visible:outline-3 peer-focus-visible:outline-offset-3 peer-focus-visible:outline-focus";
 
-export function Setup() {
+export function Setup({ domain }: { /** What every address ends in. */ domain: string }) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const form = useForm<SetupValues>({
@@ -51,6 +53,12 @@ export function Setup() {
     formState: { errors, isSubmitting },
   } = form;
   const preset = watch("preset");
+
+  // A name picked on the landing page before signing in is offered here.
+  useEffect(() => {
+    const name = chosenName();
+    if (name && !form.getValues("subdomain")) setValue("subdomain", name, { shouldDirty: true });
+  }, [form, setValue]);
 
   const submit = handleSubmit(async (values) => {
     try {
@@ -125,7 +133,7 @@ export function Setup() {
                     })}
                   />
                   <span className="flex min-h-11 items-center rounded-r-sm border border-l-0 border-[#bdb5a4] bg-[#e6dfd0] px-3 text-xs text-ink-soft max-sm:max-w-[132px] max-sm:overflow-hidden max-sm:text-ellipsis">
-                    .your-domain
+                    .{domain}
                   </span>
                 </div>
               </Field>
