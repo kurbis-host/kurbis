@@ -631,6 +631,49 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                 })
                 .delete(whitelist::remove_whitelist_entry),
         )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/in-game",
+            api_post_with(whitelist::add_whitelist_entry_in_game, |operation| {
+                operation
+                    .id("addWhitelistEntryInGame")
+                    .description("Plugin only: add a player from in game, recording which player added them. Operators always may; players on the whitelist may while whitelist_by_members is on.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests",
+            api_post_with(whitelist::report_join_request, |operation| {
+                operation
+                    .id("reportWhitelistJoinRequest")
+                    .description("Plugin only: report a player the whitelist turned away, so the panel can list them.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}",
+            api_delete_with(whitelist::dismiss_join_request, |operation| {
+                operation
+                    .id("dismissWhitelistJoinRequest")
+                    .description("Forget a join request without letting the player in.")
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/let-in",
+            api_post_with(whitelist::let_in_join_request, |operation| {
+                operation
+                    .id("letInWhitelistJoinRequest")
+                    .description("Add a player the whitelist turned away in the last day.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
+        .api_route(
+            "/api/v1/servers/{server_id}/whitelist/requests/{player_id}/claim",
+            api_post_with(whitelist::claim_join_request, |operation| {
+                operation
+                    .id("claimWhitelistJoinRequest")
+                    .description("Owner only, while the owner has no linked Minecraft account: mark a join request as the owner's own player, who goes on the whitelist and becomes an operator. The Minecraft account is not linked for sign-in.")
+                    .response::<201, Json<Whitelist>>()
+            }),
+        )
         .route(
             "/internal/bedrock-signal/{server_id}",
             get(internal::bedrock_signal_target),

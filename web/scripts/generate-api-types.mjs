@@ -38,8 +38,12 @@ const surfaces = {
     && !path.startsWith("/api/v1/servers/{server_id}/plugins/")
     && path !== "/api/v1/servers/{server_id}/commands"
     && path !== "/api/v1/servers/{server_id}/runtime-stats"
+    && path !== "/api/v1/servers/{server_id}/whitelist"
+    && !path.startsWith("/api/v1/servers/{server_id}/whitelist/")
     && path !== "/api/v1/servers/{server_id}/console/commands"
     && path !== "/api/v1/servers/{server_id}/console/commands/{command_id}",
+  "server-whitelist": (path) => path === "/api/v1/servers/{server_id}/whitelist"
+    || path.startsWith("/api/v1/servers/{server_id}/whitelist/"),
   "server-stats": (path) => path === "/api/v1/servers/{server_id}/runtime-stats",
   "server-console": (path) => path === "/api/v1/servers/{server_id}/console/commands"
     || path === "/api/v1/servers/{server_id}/console/commands/{command_id}",

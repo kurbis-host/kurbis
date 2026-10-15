@@ -35,6 +35,7 @@ export function serverToSettingsValues(server: Server): SettingsFormValues {
     simulation_distance: server.settings.simulation_distance,
     hardcore: server.settings.hardcore,
     whitelist: server.settings.whitelist,
+    whitelist_by_members: server.settings.whitelist_by_members,
     tab_stats: server.settings.tab_stats,
   };
 }
@@ -262,6 +263,19 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
                   <SwitchField
                     label="Whitelist"
                     description="Only players on the whitelist may join."
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    disabled={disabled}
+                  />
+                )}
+              />
+              <Controller
+                control={control}
+                name="whitelist_by_members"
+                render={({ field }) => (
+                  <SwitchField
+                    label="Members can let players in"
+                    description="When someone not on the whitelist tries to join, players on it are told in chat and can add them. Operators always can. Who added whom shows in the whitelist and activity."
                     checked={field.value}
                     onCheckedChange={field.onChange}
                     disabled={disabled}

@@ -38,6 +38,9 @@ pub struct ServerSettings {
     pub simulation_distance: u8,
     pub hardcore: bool,
     pub whitelist: bool,
+    /// Players on the whitelist may let in someone the whitelist just turned
+    /// away. Operators always can.
+    pub whitelist_by_members: bool,
     #[serde(default)]
     pub tab_stats: bool,
 }
@@ -51,7 +54,8 @@ impl Default for ServerSettings {
             view_distance: 12,
             simulation_distance: 8,
             hardcore: false,
-            whitelist: false,
+            whitelist: true,
+            whitelist_by_members: true,
             tab_stats: false,
         }
     }
@@ -67,6 +71,7 @@ pub(super) struct ServerSettingsPatch {
     simulation_distance: Option<u8>,
     hardcore: Option<bool>,
     whitelist: Option<bool>,
+    whitelist_by_members: Option<bool>,
     tab_stats: Option<bool>,
 }
 
@@ -111,6 +116,9 @@ impl ServerSettings {
         }
         if let Some(value) = patch.whitelist {
             self.whitelist = value;
+        }
+        if let Some(value) = patch.whitelist_by_members {
+            self.whitelist_by_members = value;
         }
         if let Some(value) = patch.tab_stats {
             self.tab_stats = value;

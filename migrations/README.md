@@ -9,7 +9,9 @@ SQLx SHA-384 checksum for every migration and a SHA-256 over the ordered
 inventory. The release gate refuses to run with a missing, duplicated, renamed,
 or modified migration entry.
 
-The history currently ends at version 20. Version 16 is the deployed CI
+The history currently ends at version 21, which records who added each
+whitelist entry, gives server events an optional detail line and keeps the
+players a whitelist recently turned away. Version 16 is the deployed CI
 build-demand marker migration. Stable CI-build retention is version 17, the
 fenced pull-request build queue is version 18 and the AI gateway (settings,
 conversations, jobs, tool calls and the usage ledger) is version 19. Server

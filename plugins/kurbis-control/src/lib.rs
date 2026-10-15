@@ -3,6 +3,7 @@ mod ai;
 mod api;
 mod chat;
 mod command;
+mod join_requests;
 mod menu;
 mod plugins;
 mod stats;
@@ -17,8 +18,8 @@ use std::{
 use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata,
     events::{
-        BedrockFormResponseEvent, EventPriority, InventoryClickEvent, InventoryCloseEvent,
-        InventoryDragEvent, PlayerChatEvent,
+        AsyncPlayerPreLoginEvent, BedrockFormResponseEvent, EventPriority, InventoryClickEvent,
+        InventoryCloseEvent, InventoryDragEvent, PlayerChatEvent, PlayerLoginEvent,
     },
     permission::{Permission, PermissionDefault, PermissionLevel},
     permissions, register_plugin,
@@ -136,6 +137,26 @@ impl Plugin for KurbisControl {
                 true,
             )?;
             stats::start(&context);
+            context.register_permission(&Permission {
+                node: join_requests::PERMISSION.into(),
+                description: "Let in a player the whitelist just turned away. \
+                              The command itself checks who may."
+                    .into(),
+                default: PermissionDefault::Allow,
+                children: vec![],
+            })?;
+            context.register_command(join_requests::command(), join_requests::PERMISSION);
+            context.register_event_handler::<AsyncPlayerPreLoginEvent, _>(
+                join_requests::PreLogin,
+                EventPriority::High,
+                true,
+            )?;
+            context.register_event_handler::<PlayerLoginEvent, _>(
+                join_requests::Login,
+                EventPriority::High,
+                true,
+            )?;
+            join_requests::start(&context);
             context.register_command(ai::command(), PERMISSION);
             context.register_command(plugins::command(), PERMISSION);
             ai::start(&context);

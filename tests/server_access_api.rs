@@ -1082,3 +1082,402 @@ async fn concurrent_plugin_login_link_mints_enforce_the_per_server_limit() {
     assert_eq!(request_count, 6);
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+async fn in_game_whitelist_adds_record_who_added_them_and_follow_the_member_setting() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let fixture = ApiFixture::new().await;
+    let member_id = Uuid::new_v4();
+    let operator_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO whitelist_entries(server_id, player_id, name) VALUES($1, $2, 'Member')",
+    )
+    .bind(fixture.server_id)
+    .bind(member_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO operator_entries(server_id, player_id, name) VALUES($1, $2, 'Operator')",
+    )
+    .bind(fixture.server_id)
+    .bind(operator_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let whitelist_path = format!("/api/v1/servers/{}/whitelist", fixture.server_id);
+    let in_game_path = format!("{whitelist_path}/in-game");
+    let add = |name: &str, adder: (Uuid, &str)| {
+        scoped_request(
+            Method::POST,
+            &in_game_path,
+            ServerCredential::Plugin(&fixture.capability),
+            Some(json!({
+                "name": name,
+                "player_id": Uuid::new_v4(),
+                "added_by": {"player_id": adder.0, "name": adder.1},
+            })),
+        )
+    };
+
+    // A player on the whitelist may let someone in while the setting is on,
+    // which it is for a server that never stored it.
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(add("Alex", (member_id, "Member")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let whitelist = json_body(response).await;
+    assert_eq!(whitelist["whitelist_by_members"], true);
+    let alex = whitelist["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Alex")
+        .unwrap();
+    assert_eq!(alex["added_by"], "Member");
+    assert_eq!(alex["added_in_game"], true);
+
+    let activity = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::GET,
+            &format!("/api/v1/servers/{}/activity", fixture.server_id),
+            ServerCredential::Plugin(&fixture.capability),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(activity.status(), StatusCode::OK);
+    let activity = json_body(activity).await;
+    assert_eq!(activity[0]["type"], "whitelist");
+    assert_eq!(
+        activity[0]["detail"],
+        "Member added Alex to the whitelist in game"
+    );
+
+    // Someone who is not on the whitelist cannot let others in.
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(add("Bob", (Uuid::new_v4(), "Stranger")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(response).await["code"],
+        "whitelist_add_not_allowed"
+    );
+
+    // With the setting off only operators can.
+    sqlx::query(
+        "UPDATE servers SET settings = settings || '{\"whitelist_by_members\": false}'
+         WHERE id = $1",
+    )
+    .bind(fixture.server_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(add("Carol", (member_id, "Member")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(add("Carol", (operator_id, "Operator")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let whitelist = json_body(response).await;
+    assert_eq!(whitelist["whitelist_by_members"], false);
+    let carol = whitelist["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Carol")
+        .unwrap();
+    assert_eq!(carol["added_by"], "Operator");
+
+    // Only the server's own plugin can add from in game; a login-link
+    // session can neither use that route nor send its fields to the panel one.
+    let login_token = fixture.mint_link_token().await;
+    let redeemed = fixture.redeem(&login_token).await;
+    let session_token = redeemed
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("kurbis_server_session=")
+        .unwrap()
+        .to_owned();
+    let in_game_body = json!({
+        "name": "Dana",
+        "player_id": Uuid::new_v4(),
+        "added_by": {"player_id": operator_id, "name": "Operator"},
+    });
+    for path in [&in_game_path, &whitelist_path] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(scoped_request(
+                Method::POST,
+                path,
+                ServerCredential::Session(&session_token),
+                Some(in_game_body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "{path}: {}",
+            response.status()
+        );
+    }
+    let dana_added: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM whitelist_entries WHERE server_id = $1 AND name = 'Dana')",
+    )
+    .bind(fixture.server_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(!dana_added);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn join_requests_are_listed_and_answered_in_the_panel() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let fixture = ApiFixture::new().await;
+    let base = format!("/api/v1/servers/{}/whitelist", fixture.server_id);
+    let steve = Uuid::new_v4();
+    let alex = Uuid::new_v4();
+    let report = |player_id: Uuid, name: &str| {
+        scoped_request(
+            Method::POST,
+            &format!("{base}/requests"),
+            ServerCredential::Plugin(&fixture.capability),
+            Some(json!({"player_id": player_id, "name": name})),
+        )
+    };
+    let owner_session = format!("join-request-owner-{}", fixture.server_id);
+    sqlx::query("INSERT INTO sessions(id, token_hash, user_id) VALUES($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(token_hash(&owner_session))
+        .bind(fixture.owner_id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let as_owner = |method: Method, path: String| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, format!("kurbis_session={owner_session}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // The plugin reports a turned-away player; a quick retry only counts.
+    for _ in 0..2 {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(report(steve, "Steve"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(report(alex, "Alex"))
+        .await
+        .unwrap();
+    let whitelist = json_body(response).await;
+    assert_eq!(whitelist["owner_has_minecraft_account"], false);
+    let requests = whitelist["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["name"], "Alex");
+    assert_eq!(requests[1]["name"], "Steve");
+    assert_eq!(requests[1]["attempts"], 2);
+    let announced: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM server_events
+         WHERE server_id = $1 AND detail = 'Steve tried to join but is not on the whitelist'",
+    )
+    .bind(fixture.server_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(announced, 1);
+
+    // A login-link session can let a player in but cannot claim one.
+    let login_token = fixture.mint_link_token().await;
+    let redeemed = fixture.redeem(&login_token).await;
+    let session_token = redeemed
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("kurbis_server_session=")
+        .unwrap()
+        .to_owned();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::POST,
+            &format!("{base}/requests/{alex}/claim"),
+            ServerCredential::Session(&session_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::POST,
+            &format!("{base}/requests/{steve}/let-in"),
+            ServerCredential::Session(&session_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let whitelist = json_body(response).await;
+    let entry = whitelist["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Steve")
+        .unwrap();
+    assert_eq!(entry["player_id"], steve.to_string());
+    assert_eq!(entry["added_in_game"], false);
+    assert_eq!(whitelist["requests"].as_array().unwrap().len(), 1);
+
+    // The plugin cannot answer requests, and a whitelisted player's report
+    // is ignored.
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(scoped_request(
+            Method::POST,
+            &format!("{base}/requests/{alex}/let-in"),
+            ServerCredential::Plugin(&fixture.capability),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(report(steve, "Steve"))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(response).await["requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The owner, who has no linked Minecraft account, says Alex is them.
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(as_owner(
+            Method::POST,
+            format!("{base}/requests/{alex}/claim"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let whitelist = json_body(response).await;
+    let entry = whitelist["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Alex")
+        .unwrap();
+    assert_eq!(entry["added_by"], "Server access test");
+    assert!(whitelist["requests"].as_array().unwrap().is_empty());
+    let operator: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operator_entries WHERE server_id = $1 AND player_id = $2)",
+    )
+    .bind(fixture.server_id)
+    .bind(alex)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(operator);
+    // Nothing was linked to the owner's account.
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identities WHERE user_id = $1 AND minecraft_player_id IS NOT NULL",
+    )
+    .bind(fixture.owner_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(linked, 0);
+
+    // Once the owner has a linked Minecraft account they cannot claim, and
+    // dismissing forgets a request.
+    let carol = Uuid::new_v4();
+    fixture
+        .app
+        .clone()
+        .oneshot(report(carol, "Carol"))
+        .await
+        .unwrap();
+    let owner_player = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities(id, user_id, provider, subject, display_name, minecraft_player_id)
+         VALUES($1, $2, 'minecraft_java', $3, 'OwnerPlayer', $3::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.owner_id)
+    .bind(owner_player.to_string())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(as_owner(
+            Method::POST,
+            format!("{base}/requests/{carol}/claim"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(as_owner(Method::DELETE, format!("{base}/requests/{carol}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let whitelist = json_body(response).await;
+    assert_eq!(whitelist["owner_has_minecraft_account"], true);
+    assert!(whitelist["requests"].as_array().unwrap().is_empty());
+
+    fixture.cleanup().await;
+}

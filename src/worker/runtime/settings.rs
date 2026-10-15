@@ -175,6 +175,23 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_without_a_whitelist_setting_lets_everyone_in() {
+        // CI previews pass only a MOTD and a view distance; hosted servers
+        // always store the setting, which defaults to on.
+        let config = render_pumpkin_config(
+            &serde_json::json!({"motd": "Kurbis preview", "view_distance": 10}),
+            AccountLookups::ThroughApiProxy,
+            PermissionLevel::Gamemaster,
+            25565,
+            19132,
+            "0.0.0.0:19132".parse().unwrap(),
+            "192.0.2.20".parse().unwrap(),
+            19132,
+        );
+        assert!(config.contains("white_list = false\nenforce_whitelist = false\n"));
+    }
+
+    #[test]
     fn plugins_load_unprompted_without_the_environment() {
         let config = render_pumpkin_config(
             &Value::Null,

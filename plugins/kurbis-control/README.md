@@ -24,6 +24,20 @@ may be edited online or while sleeping; runtime configuration values are applied
 on the next server start. Whitelist entries can be added by name, removed by
 clicking an entry with confirmation, and enabled or disabled with one click; changes
 are synchronized to the online runtime.
+When the whitelist turns someone away, the plugin reports them to the panel,
+whose players page lists them with Let in and Dismiss (and, while the owner
+has no linked Minecraft account, That's me, which whitelists that player and
+makes them an operator). It also tells every operator online
+in chat, and every player on the whitelist while the server's
+`whitelist_by_members` setting is on (the default; the whitelist page of the
+menu and the web panel turn it off). The message links to `/letin <name>`,
+which asks for confirmation; `/letin <name> confirm` adds them through the
+API, which checks the adder again and records who added them on the whitelist
+entry and in the server's activity. Only players turned away in the last 15
+minutes can be let in this way, and each one is announced at most once a
+minute. Pumpkin checks the whitelist only for Java logins, so the plugin also
+stops Bedrock players who are not on it. Adds from `/kurbis whitelist add` and
+the menu record the operator who made them too.
 The command form supports the same views, settings and whitelist changes,
 lifecycle actions with an explicit confirmation step, and a two-step snapshot
 restore. Restoring from an online runtime performs a clean stop and queues
