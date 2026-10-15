@@ -125,8 +125,8 @@ where
     Ok((pipeline, identity))
 }
 
-/// Construct the respond5-side coordinator pipeline that delegates only the
-/// untrusted compilation namespace to a dedicated lxhalle SSH account.
+/// Construct the control-plane-side coordinator pipeline that delegates only the
+/// untrusted compilation namespace to a dedicated builder SSH account.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn remote_bubblewrap_pipeline<S, A>(

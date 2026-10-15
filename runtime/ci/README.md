@@ -200,20 +200,20 @@ input/output files remain separately bounded and are copied with counted reads.
 The native `bubblewrap` backend, Docker backend, and remote `bubblewrap_ssh`
 transport use `CI_BUILD_CONCURRENCY` (bounded to 1-64) for cross-process
 PostgreSQL slot admission; each slot reserves its requested memory plus host
-system headroom. The SSH transport samples `/proc/meminfo` on lxhalle through
+system headroom. The SSH transport samples `/proc/meminfo` on the builder host through
 the pinned SSH connection and fences stale per-job workspaces by lease token,
 so independent control-plane processes share the same admission identity.
 This is coordination and cleanup, not kernel cgroup enforcement: remote
 namespace-only builds still must not be described as memory-, CPU-, or PID-
 enforced.
 
-## Remote Bubblewrap mode (respond5 watcher → lxhalle builder)
+## Remote Bubblewrap mode (control-plane watcher → remote builder)
 
-A control plane running in the isolated rootless respond5 stack can set
+A control plane running in an isolated rootless Compose stack can set
 `CI_BUILDER_BACKEND=bubblewrap_ssh`. Set `CI_GITHUB_API_BASE_URL` only when using a loopback fixture; production defaults to `https://api.github.com`. In this mode the control plane remains the
 poller, Check Run client, artifact cache, and preview coordinator. It sends one
 framed JSON-plus-archive job over a pinned non-root SSH account to the checked-in
-`tools/ci_bubblewrap_runner.py` on lxhalle. The runner enters a private user and
+`tools/ci_bubblewrap_runner.py` on the builder host. The runner enters a private user and
 mount namespace, mounts the operator workspace as an exact 5 GiB/1,310,720-inode
 tmpfs below that account's HOME, and runs the pinned Bubblewrap build with
 read-only root/toolchain inputs. A compile job has two phases. The fetch phase
@@ -224,7 +224,7 @@ downloads the SHA-1-checked Minecraft server jar that upstream's
 phase then compiles `--offline` in a namespace with no network. The rootfs
 must carry empty `etc/resolv.conf` and `etc/ssl/certs/ca-certificates.crt`
 files as mount points for the fetch phase. It returns only bounded build logs
-and SHA-256-labelled artifacts; the respond5 coordinator verifies each stream
+and SHA-256-labelled artifacts; the control-plane coordinator verifies each stream
 before the normal BLAKE3 artifact-cache verification and runtime registration.
 
 The SSH transport must use a dedicated non-root key, `BatchMode=yes`,
@@ -241,7 +241,7 @@ unique workspace in a `finally` path after every job.
 ### Persistent operator configuration
 
 The deployment must persist the operator values outside the checkout and inject
-them through the service's real deployment environment. On lxhalle, keep the
+them through the service's real deployment environment. On the builder host, keep the
 non-secret configuration at `$HOME/.config/kurbis/ci-bubblewrap/env` (mode `0600`)
 and keep immutable fixtures on a user-owned local filesystem, for example
 `/var/tmp/kurbis-ci-bubblewrap-20261007` (mode `0700`). The accepted fixture
@@ -250,7 +250,7 @@ root, the checked-in source preparer, and the private HOME workspace
 `$HOME/.cache/kurbis/ci/workspace-tmpfs`. The Bubblewrap and SSH backends derive
 the persistent compiler cache from its sibling
 `$HOME/.cache/kurbis/ci/compiler-cache`; keep that directory mode 0700 on local
-operator-owned storage, not public `/tmp`. `$HOME` on lxhalle is NFS; therefore
+operator-owned storage, not public `/tmp`. When `$HOME` on the builder host is NFS,
 the workspace path is only the operator namespace anchor. The runner mounts an
 exact `size=5G,nr_inodes=1310720,mode=700` tmpfs over each per-job workspace
 inside its private user/mount namespace. Do not place source, artifacts, or
@@ -258,22 +258,22 @@ Cargo state in bare public `/tmp`; any local staging path must be a dedicated
 mode-0700 operator directory with private files. The `/var/tmp` path above is
 only that private immutable fixture root, never the host-wide directory itself.
 
-On respond5, store the deployment-only SSH material at
+On the control-plane host, store the deployment-only SSH material at
 `/etc/dokploy/secrets/kurbis-hoster/ci-builder-ssh` with directory mode `0700`,
 files mode `0600`, and ownership `65532:65532` so the unprivileged
 control-plane can read it after a read-only bind mount. The directory contains a
 dedicated `id_ed25519`, a `config` with `IdentitiesOnly=yes`,
 `BatchMode=yes`, and `StrictHostKeyChecking=yes`, and a `known_hosts` file
-containing only the pinned lxhalle Ed25519 key. The corresponding public key is
-installed in the `ci` account with forwarding and TTY disabled. Set
+containing only the builder's pinned Ed25519 key. The corresponding public key is
+installed in the builder account with forwarding and TTY disabled. Set
 `CI_BUILDER_SSH_HOST_DIRECTORY` to this host path and set the
-`CI_BUBBLEWRAP_*` variables to the absolute lxhalle paths above in Dokploy's
+`CI_BUBBLEWRAP_*` variables to the absolute builder paths above in the deployment's
 service environment; never commit either the private key or a PAT.
 
 This is deliberately **namespace-only**. The preflight proves user/PID/mount/IPC/
 UTS/network isolation, read-only root and toolchain inputs, dropped
 capabilities, `NoNewPrivs`, no route, and the exact namespace-local workspace
-tmpfs. lxhalle does not delegate per-build cgroup controllers, so this backend
+tmpfs. It does not rely on delegated per-build cgroup controllers, so this backend
 must not claim hard CPU, memory, swap, or PID limits. Cross-process admission
 and process timeouts remain coordination controls, not kernel cgroup quotas.
 If any immutable path, pinned host key, workspace contract, or toolchain probe
@@ -281,6 +281,6 @@ is missing, startup fails closed; it never falls back to Docker or rootful
 execution.
 
 To roll back only this operator setup, stop the deployment before unmounting
-its read-only SSH directory, then remove the named lxhalle fixture/config paths
-and the respond5 secret directory. Do not remove unrelated Docker resources or
+its read-only SSH directory, then remove the named builder fixture/config paths
+and the control-plane host's secret directory. Do not remove unrelated Docker resources or
 edit `/etc/docker`, system services, or rootful production sockets.

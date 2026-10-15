@@ -101,7 +101,7 @@ def lock_path() -> Path:
 def private_build_temp_root() -> Path:
     """Return a user-owned, mode-0700 temp root below HOME.
 
-    Remote build preparation runs on a shared lxhalle host. Never use the
+    Remote build preparation runs on a shared build host. Never use the
     host-wide /tmp directory for source, BuildKit probe context, or generated
     build metadata.
     """

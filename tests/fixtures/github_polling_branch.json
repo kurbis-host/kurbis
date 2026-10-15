@@ -1,0 +1,20 @@
+{
+  "repository": "Pumpkin-MC/Pumpkin",
+  "captured_at": "2026-10-05T03:18:27.596810+00:00",
+  "authentication": "anonymous public GitHub API fixture; no token material",
+  "pulls": [],
+  "branches": [
+    {
+      "name": "copilot/pumpkin-game-tick-research",
+      "commit": {
+        "sha": "1abbc7bf0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "name": "master",
+      "commit": {
+        "sha": "1859221e0123456789abcdef0123456789abcdef"
+      }
+    }
+  ]
+}

@@ -12,7 +12,7 @@
 //!
 //! Real Linux/Dokploy execution is deliberately not faked here.  The opt-in
 //! hook and its required environment are documented in
-//! `verification/milestone5/README.md` and exercised by
+//! `docs/ci-preview-acceptance.md` and exercised by
 //! `tools/run_milestone5_acceptance.sh`.
 
 #[path = "milestone5_acceptance/harness.rs"]

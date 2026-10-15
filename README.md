@@ -1,122 +1,108 @@
-# Kurbis Hoster
+<p align="center">
+  <img src="assets/kurbis.svg" alt="" width="96" height="96">
+</p>
 
-Kurbis Hoster is a Minecraft hosting platform built around a Rust control plane, a native Minecraft gateway, and worker agents that run isolated Pumpkin servers.
+<h1 align="center">Kurbis</h1>
 
-The project is designed for a free single-region hosting service where servers can sleep when unused, wake when players connect, and persist world data through snapshots.
+<p align="center">
+  Free Minecraft servers that sleep when nobody plays and wake when someone joins.<br>
+  Java and Bedrock, on <a href="https://github.com/Pumpkin-MC/Pumpkin">Pumpkin</a>.
+</p>
 
-## Architecture
+<p align="center">
+  <a href="https://kurbis.host">kurbis.host</a> ·
+  <a href="docs/self-hosting.md">Self-hosting</a> ·
+  <a href="docs/development.md">Development</a> ·
+  <a href="LICENSE">AGPL-3.0</a>
+</p>
 
-The system is split into three main parts:
+---
 
-- **Control plane**: Rust/Axum service backed by PostgreSQL. It owns users, servers, placements, lifecycle operations, worker state, and routing information.
-- **Gateway**: Rust Java hostname proxy, Bedrock transport, and authenticated Pumpkin waiting-session orchestration. Local protocol coverage uses a real Java 26.3 client with disposable test identities; Bedrock 1.26.51 login is blocked by the pinned NetherNet signaling issue.
-- **Workers**: Rust agents responsible for Docker containers or native host processes, local storage, snapshots, and Pumpkin lifecycle management.
+Kurbis is the hosting platform behind [kurbis.host](https://kurbis.host). Every
+account gets one server. A server costs nothing while nobody is on it: after
+five idle minutes it saves, snapshots its world to object storage and gives its
+memory back. The next player who joins its address wakes it. They wait in a
+lobby while the world is restored and the server starts, then the game
+transfers them to it by itself.
 
-The web panel in `web/` provides the user interface for managing hosted servers.
+There's no sign-up form. Joining a free address with a verified Minecraft
+account claims it and creates that player's account and server. Google or
+Discord can be linked later to manage the server from the web panel.
+
+## How it works
+
+```
+ Java / Bedrock client
+          │  join  name.kurbis.host
+          ▼
+ ┌─────────────────┐  route, wake    ┌───────────────────┐
+ │     Gateway     │ ──────────────▶ │   Control plane   │──▶ PostgreSQL
+ │ hostname proxy, │                 │ accounts, servers │
+ │ waiting lobby   │                 │ placement, locks  │
+ └────────┬────────┘                 └─────────┬─────────┘
+          │ transfer when ready                │ assignments
+          ▼                                    ▼
+ ┌─────────────────────────────────────────────────────┐
+ │ Worker: runs isolated Pumpkin servers (Docker or    │──▶ S3-compatible
+ │ native), restores and publishes world snapshots     │    object storage
+ └─────────────────────────────────────────────────────┘
+```
+
+A server moves through
+`sleeping → queued → restoring → starting → online → stopping → snapshotting → sleeping`.
+
+- **Waking** takes the lifecycle lock, reserves worker capacity, restores the
+  latest valid snapshot, starts Pumpkin, checks readiness, then publishes the route.
+- **Sleeping** stops new routes, saves the world cleanly, validates a new
+  snapshot, then releases the worker's resources.
+
+Lifecycle operations hold a lock in PostgreSQL, so concurrent joins start a
+server only once, and a lost worker's servers recover from their last snapshot
+on another worker.
 
 ## Features
 
-- Verified online Minecraft Java and Bedrock identities automatically register or resume an account on join.
-- Server names are claimed only by joining them: the first verified player to join a free address creates that account’s server. Signing in with Google or Discord claims nothing; the web panel shows which names are free and says to join one. Each account has one server, and account merges preserve all existing worlds.
-- An owner who has not linked Google or Discord gets a one-use account link in the lobby chat. Opened in a browser signed in to Kurbis, it links the Minecraft player and their server to that account; opened anywhere else, it signs in to the player’s own account. Linking Google or Discord from that account later merges the two accounts the same way.
-- Java 26.3 hostname routing, sleeping-server wake, waiting sessions, and native backend transfer, exercised with a real protocol client.
-- Wake-on-join for sleeping servers.
-- Automatic sleep after inactivity.
-- Worker scheduling with resource reservations.
-- Persistent world snapshots using S3-compatible object storage.
-- Server lifecycle operations with PostgreSQL-backed locking and recovery.
-- OP-only `/kurbis` in-game management, with a one-use 15-minute login link that opens a persistent, independently revocable panel grant for that server without signing into a Kurbis account. Grant authorization remains bound to one server and is also denied after server deletion or owner suspension.
-- OP-only `/ai` in-game assistant: the control plane's AI gateway runs a model through Anthropic's API or any OpenAI-compatible endpoint, with tools the plugin executes as the asking operator, records the cost of every model call in a usage ledger, and enforces monthly per-server and per-account budgets. Owners turn it off, pick the model and effort, and lower the server budget in the panel.
-- Server plugins: owners install free plugins from the [Pumpkin market](https://market.pumpkinmc.org/) or upload their own WebAssembly component in the web panel; operators install, update, turn on and off and remove market plugins in game with `/plugins` or the `/kurbis` menu. The control plane stores each binary once in object storage and keeps the authoritative plugin list; the worker writes the enabled plugins into the runtime and loads every change into a running server without a restart. Plugins load without the host-control environment and with a 256 MiB memory cap.
-- Container isolation through Docker.
+- **Wake on join, sleep when idle.** Java 26.3 hostname routing, a waiting
+  lobby and native transfer to the backend once it's up.
+- **Accounts from Minecraft identities.** Verified Java and Bedrock players
+  register or resume an account just by joining. Google or Discord sign-in
+  can be linked, and merging accounts keeps every world.
+- **Web panel.** Lifecycle controls, settings, players and whitelist, logs,
+  snapshots and plugins, with live updates over SSE.
+- **In-game management.** OP-only `/kurbis` opens a chest-menu panel and can
+  hand out a one-use login link scoped to that server.
+- **Plugins.** Install free plugins from the
+  [Pumpkin market](https://market.pumpkinmc.org/) or upload your own
+  WebAssembly component. Changes load into a running server without a restart.
+- **AI assistant (optional).** OP-only `/ai` runs a model through Anthropic's
+  API or any OpenAI-compatible endpoint, with per-server and per-account
+  monthly budgets.
+- **Pumpkin previews (optional).** Every open pull request on Pumpkin gets a
+  joinable preview address. Its code is compiled in a sandbox with no network.
+- **Isolation.** Rootless Docker per server, an internal-only network, and a
+  firewall that admits only the gateway.
 
-## Repository Layout
+## Repository layout
 
-```
-.
-├── src/              # Rust control plane, gateway, worker, and integrations
-├── migrations/       # PostgreSQL schema migrations
-├── tests/            # Integration tests
-├── web/              # Next.js management panel
-├── plugins/          # In-game kurbis-control plugin (WASI component)
-├── PLAN.md           # Detailed architecture and implementation plan
-└── PROGRESS.md       # Current development progress
-```
+| Path | What's there |
+| --- | --- |
+| [`src/`](src) | Rust: control plane, gateway, worker, snapshots, CI previews (binaries in [`src/bin`](src/bin)) |
+| [`migrations/`](migrations) | PostgreSQL schema |
+| [`web/`](web) | Next.js web panel and the landing page |
+| [`plugins/kurbis-control/`](plugins/kurbis-control) | The in-game `/kurbis` and `/ai` plugin (WASI component) |
+| [`runtime/`](runtime) | Container images, the Pumpkin integration patches, the CI builder |
+| [`tests/`](tests) | Rust integration tests against a real PostgreSQL |
+| [`tools/`](tools), [`scripts/`](scripts) | Build, verification and deployment helpers |
+| [`contracts/openapi.json`](contracts/openapi.json) | The HTTP API, generated from the Rust router |
+| [`docs/`](docs) | Development, self-hosting, configuration and design notes |
 
-## Requirements
+## Quick start
 
-- Rust 1.98.1
-- PostgreSQL
-- Native host processes for local development (Docker is not needed)
-- Docker Engine 25 or later and Compose v2 for the container deployment and Docker workers
-- Node.js and pnpm 11.2.2 (for the web panel)
+You need Rust 1.98.1, Node.js with pnpm 11.2.2, and PostgreSQL. Docker is
+only needed for container deployments; local development runs on macOS or
+Linux directly.
 
-## Development
-
-Local development runs directly on macOS or Linux. See [native setup](runtime/pumpkin/NATIVE.md) for workers and the waiting gateway runtime. On macOS, workers default to the native backend.
-
-Build the Rust project through host-wide memory admission (10 GiB build cap,
-4 GiB reserved for the OS/services):
-
-```bash
-tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build
-```
-
-Run Rust tests through the same admission gate:
-
-```bash
-TEST_DATABASE_URL=postgres://localhost/melon_hoster_test \
-  tools/run_bounded_build.py --memory-bytes 10737418240 -- \
-  cargo test --locked --all-targets -- --test-threads=1
-```
-
-Use `tools/docker_build_with_limits.sh` rather than raw `docker buildx build` or
-`docker compose build`; it serializes independent build clients, samples memory
-on the Docker daemon host, reserves 4 GiB of headroom, and verifies BuildKit's
-per-RUN cgroup memory/swap/CPU caps under controlled pressure before building.
-
-Use a disposable local database. The schema is bootstrapped from the canonical
-empty-database definition; historical migration fixtures and upgrade
-compatibility are not supported.
-
-### Frontend-only preview
-
-To preview the marketing landing page locally without PostgreSQL, the control
-plane, workers, or OAuth credentials:
-
-```bash
-cd web
-pnpm install --frozen-lockfile
-bun run dev # or pnpm run dev
-```
-
-Open `http://localhost:3000`. The landing page, its interactive wake/sleep demo,
-and `/login` render without backend requests. `/` always shows the marketing
-page, including for signed-in visitors; use `/app` to open the management panel.
-Actual sign-in, management routes, and API requests still require the control
-plane. Run the web command from `web/`, not the Rust repository root.
-
-### Full local stack
-
-Local panel development uses an isolated PostgreSQL database and the loopback OAuth fixture, so it does not need production OAuth credentials. The checked-out local settings live in the ignored `web/.env.local` file. Create the database once:
-
-```bash
-createdb kurbis_dev_e2e
-```
-
-Start the local OAuth fixture and control plane in separate terminals:
-
-```bash
-set -a; source web/.env.local; set +a
-cargo run --example browser_fixture
-```
-
-```bash
-set -a; source web/.env.local; set +a
-cargo run --bin control-plane
-```
-
-Then run the panel:
+**Just the web panel and landing page**, with no backend:
 
 ```bash
 cd web
@@ -124,251 +110,56 @@ pnpm install --frozen-lockfile
 pnpm run dev
 ```
 
-The fixture signs in as a local development identity (`Browser Player`); it does not contact a real OAuth provider. The control plane listens on `127.0.0.1:8080`, and the panel on `http://localhost:3000`.
+Then open http://localhost:3000. The panel itself (`/app`) needs the control plane.
 
-To test real Google and Discord sign-in on this PC, register these exact local callback URLs in the provider consoles:
+**The whole stack** in a tmux dashboard (also needs tmux, Git and CMake). The
+first run writes a private `.env` for you to fill in:
 
-```text
-http://localhost:3000/auth/google/callback
-http://localhost:3000/auth/discord/callback
+```bash
+./start.sh native debug
 ```
 
-Put both client IDs and secrets in the ignored `web/.env.local` file. Remove the provider-specific `*_OAUTH_AUTHORIZE_URL`, `*_OAUTH_TOKEN_URL`, and `*_OAUTH_USERINFO_URL` overrides so the control plane uses Google's and Discord's production OAuth endpoints. For this mode, run the control plane and panel without `examples/browser_fixture.rs`.
+[Development](docs/development.md) covers running the control plane against a
+local OAuth fixture, native workers and the test suites.
+[Self-hosting](docs/self-hosting.md) covers the Docker deployment, TLS,
+firewalling and object storage.
 
-## Start a deployment
+## Tests
 
-The root launcher starts the full service set in a tmux dashboard. The first
-run creates a private `.env`; set the public panel URL, Minecraft root domain,
-worker's reachable IP, and Google/Discord OAuth credentials in that file.
-Register these callback URLs with both providers:
-
-```text
-https://<public-panel-origin>/auth/google/callback
-https://<public-panel-origin>/auth/discord/callback
+```bash
+TEST_DATABASE_URL=postgres://localhost/kurbis_test \
+  tools/run_bounded_build.py --memory-bytes 10737418240 -- \
+  cargo test --locked --all-targets -- --test-threads=1
 ```
 
-Choose one deployment mode:
+Point it at a disposable database; the tests bootstrap their own schema in
+it. The browser suite runs the real panel, API and PostgreSQL in Playwright; see
+[its README](web/tests/e2e/README.md).
 
-```sh
-./start.sh native debug    # host processes, fast Rust and Next.js iteration
-./start.sh native release  # host processes, optimized Rust and production panel
-./start.sh docker          # Compose services plus the host Docker worker
-```
+## Documentation
 
-Native mode needs Rust 1.98.1, Git, CMake, Node.js/pnpm, tmux, and a local
-PostgreSQL server. If `DATABASE_URL_NATIVE` cannot connect, the launcher uses
-the current operating-system PostgreSQL role to create or update the configured
-database role and create the database. That local role must have PostgreSQL
-administrator permissions; remote PostgreSQL databases must be provisioned
-separately. Native debug accepts an HTTP loopback `PUBLIC_BASE_URL`; native
-release and Docker require HTTPS. Native mode does not use Docker. Docker mode
-builds the pinned Pumpkin images and application images, starts PostgreSQL,
-control plane, gateway, waiting runtime, and panel in Compose, then runs the
-worker on the Linux host. The worker stays on the host because it controls the
-host Docker engine and worker storage mounts. Docker mode needs Linux, Docker
-Engine with Compose v2, Rust/Cargo, and tmux; use native mode on macOS. The
-first Pumpkin image build takes substantially longer than later starts.
+- [Development](docs/development.md): local stack, builds, tests
+- [Self-hosting](docs/self-hosting.md): deployment modes, networking, TLS, releases
+- [Configuration](docs/configuration.md): OAuth providers, the AI assistant
+- [Pumpkin previews](docs/pumpkin-previews.md): the CI preview service
+- [Native host development](runtime/pumpkin/NATIVE.md) and the [hosted Pumpkin runtime](runtime/pumpkin/README.md)
+- [Control-plane workers](docs/control-plane-workers.md): background tasks and supervision
 
-For native debug with `ROOT_DOMAIN=localhost`, the launcher creates a local
-self-signed Bedrock TLS certificate when certificate paths are not configured.
-Clients will need to trust that certificate to validate the local server. For
-other hostnames, configure `BEDROCK_TLS_CERT_FILE` and
-`BEDROCK_TLS_KEY_FILE` with a certificate trusted for the root domain and its
-server subdomains.
+## Contributing
 
-The Docker Compose deployment publishes the panel on `PANEL_PORT`, Java on
-`JAVA_PORT`, and Bedrock TCP and UDP on `BEDROCK_PORT`. For Docker deployments,
-`BEDROCK_TLS_HOST_DIRECTORY` must point to a host directory containing
-`fullchain.pem` and `privkey.pem`; Compose mounts that directory read-only at
-`/run/kurbis-tls` and configures the gateway to use those files. Provide a
-certificate trusted for `ROOT_DOMAIN` and its server subdomains. The private key
-must be readable by the gateway's container UID/GID `2613:2613` without granting
-world access (for example, a root-owned key with group `2613`, mode `0640`, and
-traversable parent directories or an equivalent ACL). Do not make the key
-world-readable to work around container permissions. The Docker gateway does not
-generate production certificates.
+Issues and pull requests are welcome. Run the tests above before opening a
+pull request, and keep changes focused. By contributing you agree that your
+contribution is licensed under the AGPL-3.0.
 
-Put an HTTPS reverse proxy in front of the panel port and point `PUBLIC_BASE_URL`
-at that HTTPS origin. Open
-the worker's configured TCP/UDP port range (`WORKER_PORT_MIN` through
-`WORKER_PORT_MAX`) as well as the gateway ports. For enforced Linux filesystem
-quotas, set `WORKER_STORAGE_MODE=loopback_ext4` and run the worker with the
-permissions needed to mount ext4 loop devices; `directory` mode has no hard
-disk quota. Docker workers require `WORKER_GATEWAY_ADDRESS` to equal the source IP the
-Gateway uses to reach the worker and require `WORKER_GATEWAY_BEDROCK_IP` plus
-`WORKER_GATEWAY_BEDROCK_PORT` to match the public shared Bedrock Gateway endpoint.
-Each rootless Pumpkin remains on a per-runtime internal network; a bounded,
-fixed-destination relay publishes only its Java, NetherNet UDP, and signaling
-ports on separate per-runtime networks. Host nftables admits only the Gateway
-source on those leased ports. NetherNet SDP advertises the shared Gateway
-endpoint rather than a worker port, so clients cannot bypass the Gateway ACL;
-missing nftables privileges fail worker startup before it acquires assignments.
-For remote Gateways, configure the actual routed source address with
-`WORKER_GATEWAY_ADDRESS` (network ACLs must preserve or predictably SNAT that
-source). Local Compose defaults it to `GATEWAY_IP`. A matching Java probe is
-also published on loopback for worker-local readiness checks; it is not
-reachable from remote hosts. The worker must have host `CAP_NET_ADMIN` for the
-dedicated nftables chain; this firewall privilege is separate from Docker,
-which must still run rootless under a non-root account.
+## License
 
-Managed Pumpkin plugin API traffic uses a per-server, per-generation sidecar
-proxy. The server container remains on its own Docker `internal` network with
-IPv6 and masquerading disabled; that network contains Pumpkin, its API proxy,
-and its fixed-backend ingress relay. The relay's own OUTPUT firewall permits
-only the exact Pumpkin IPv4 address and Java/Bedrock backend ports. Only the proxy also joins `WORKER_RUNTIME_API_EGRESS_NETWORK`. It carries
-no worker, gateway, database, or object-store credentials: it pins the request
-to the configured `WORKER_RUNTIME_API_PROXY_UPSTREAM`, checks the presented
-server/preview capability against its hash, and allows only the managed plugin's
-own server or CI-preview routes and methods. The upstream must use HTTPS. For
-local Compose only, the checked-in `.env.example` opts into private-network HTTP
-and uses `http://control-plane:8080` on the dedicated internal
-`kurbis-hoster_runtime-api-egress` network shared with the control plane and
-managed proxy sidecars (and no panel, gateway, or database service). Remote
-workers may use an IPv4 bridge with external routing for the control-plane
-origin, but must use HTTPS and apply host/cloud egress rules that allow only
-that origin; the proxy itself still pins every HTTP request to that single
-configured origin.
-Redirects are never followed; bodies are bounded; GETs retry once only for a
-connection error or timeout, while mutations are never retried. An unhealthy
-proxy fails runtime startup closed. The sidecar's port is never host-published,
-so gateway-only Minecraft ingress remains unchanged.
-The starter `.env` uses local snapshot storage under `data/objects`;
-for production durability, set `OBJECT_STORE_TYPE=s3` and configure the `S3_*`
-values. Set `DOCKER_SUBNET`, `WAITING_IP`, and `GATEWAY_IP` if the default
-Compose subnet conflicts with an existing network.
+Kurbis is free software under the [GNU Affero General Public License v3.0](LICENSE).
+If you run a modified version as a service, you must offer its users the
+source code of your version.
 
-Use `./start.sh attach` to reopen the dashboard and `./start.sh stop` to stop
-the dashboard and Compose services. In tmux, use the mouse or `Ctrl-b` followed
-by an arrow key to select a process pane; `Ctrl-b z` zooms the selected pane,
-and `Ctrl-b d` detaches. Persistent PostgreSQL data is kept when stopping
-Compose. Stop hosted worlds from the panel before shutting down their worker.
+The Pumpkin integration in [`runtime/pumpkin/`](runtime/pumpkin) modifies
+Pumpkin and stays under Pumpkin's
+[GPL-3.0](runtime/pumpkin/LICENSE).
 
-For production releases, run `python3 scripts/release.py` from a clean checkout
-exactly matching `origin/main`; [`deployment/production-rollout.md`](deployment/production-rollout.md)
-describes what it does. It compiles Pumpkin on the remote CI builder, deploys
-the Compose stack through Dokploy, and then moves the separate systemd-managed
-host worker onto the release, restoring the previous worker if the new one
-does not come up. Set `TEST_DATABASE_URL` to a disposable PostgreSQL database
-for the release gate. For stranded CI coordination rows, use
-the bounded, dry-run-first procedure in [`deployment/ci-cleanup.md`](deployment/ci-cleanup.md);
-never reset production data with broad SQL or Compose volume deletion.
-
-## Configuration
-
-Runtime configuration is loaded through environment variables. See `src/config.rs` for available settings and defaults.
-
-The control plane requires a Google OAuth client and a Discord OAuth application. Set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `DISCORD_OAUTH_CLIENT_ID`, and `DISCORD_OAUTH_CLIENT_SECRET` in its runtime environment. Keep client secrets in the deployment secret store; never put production credentials in source control. Register these exact callback URLs with the providers:
-
-```text
-https://<public-panel-origin>/auth/google/callback
-https://<public-panel-origin>/auth/discord/callback
-```
-
-Google requests `openid email profile`; Discord requests only `identify email`. The control plane supplies each provider's standard authorization, token, and profile endpoints. The corresponding `*_OAUTH_AUTHORIZE_URL`, `*_OAUTH_TOKEN_URL`, and `*_OAUTH_USERINFO_URL` settings can point to a local OAuth fixture during development and testing.
-
-The in-game AI assistant is optional. Set `AI_PROVIDER` to offer it; without a provider `/ai` reports that the assistant is not set up and the control plane starts no AI worker. `AI_PROVIDER=anthropic` calls Anthropic's Messages API with `AI_API_KEY`, with prompt caching, progress updates between tool calls and server-side fallbacks; `AI_BASE_URL` defaults to `https://api.anthropic.com/v1`. `AI_PROVIDER=openai` calls any OpenAI-compatible Chat Completions API, such as Ollama, vLLM, LiteLLM or Open WebUI, at `AI_BASE_URL` (for example `http://ollama:11434/v1`), sending `AI_API_KEY` as a bearer token when it is set. `AI_MODELS` lists the models owners can choose, comma-separated, and its first entry is the default; it defaults to `claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5` for Anthropic and is required for OpenAI-compatible endpoints. Claude models are charged at Anthropic's prices and other models only when the entry prices them as `id=INPUT/OUTPUT` in US dollars per million tokens (`gpt-oss-120b=0.15/0.6`); a configured price also replaces Anthropic's. `AI_DEFAULT_EFFORT` (`low`, `medium` or `high`; default `medium`) applies to servers whose owner has not chosen otherwise. `AI_SERVER_MONTHLY_BUDGET_USD` (default 5) and `AI_ACCOUNT_MONTHLY_BUDGET_USD` (default 20) cap spending per calendar month in UTC; a server's budget never exceeds its owner's account budget. `AI_MAX_CONCURRENT_CALLS` (default 16) bounds model calls in flight across all servers. `control-plane check-ai` runs one tool round trip with every offered model using the same settings and exits non-zero when one fails, so it verifies a deployment from inside its control plane container.
-
-The production deployment uses PostgreSQL for durable state and an S3-compatible object store for snapshots.
-
-## Lifecycle Model
-
-A hosted server moves through states such as:
-
-```
-sleeping → queued → restoring → starting → online → stopping → snapshotting → sleeping
-```
-
-Starting a server:
-
-1. Acquire the lifecycle lock.
-2. Reserve worker capacity.
-3. Restore the latest valid snapshot if needed.
-4. Start the assigned Pumpkin runtime.
-5. Verify readiness.
-6. Publish routing information.
-
-Stopping a server:
-
-1. Stop accepting new routes.
-2. Save the world cleanly.
-3. Create and validate a snapshot.
-4. Release worker resources.
-5. Return the server to sleep.
-
-## Testing Goals
-
-The test suite focuses on full lifecycle behavior:
-
-- Concurrent wake requests only start one server.
-- Gateway routing survives control-plane restarts.
-- Snapshot recovery works after worker loss.
-- Worker capacity limits are enforced.
-- Invalid routes and failed lifecycle operations recover cleanly.
-
-## Current Status
-
-See [`PROGRESS.md`](PROGRESS.md) for the current implementation state and [`PLAN.md`](PLAN.md) for the full design.
-
-
-## Verification and runtime builds
-
-`PROGRESS.md` records completed checks and remaining requirements. The local implementation is covered by Rust/Postgres, browser, and real-protocol integration tests; Linux hard-quota and production-provider checks are called out separately where they cannot be established by local fixtures.
-
-Browser lifecycle and OAuth verification uses a disposable database and real panel/API/Postgres, with controlled external provider and worker boundaries. Run it using [the E2E instructions](web/tests/e2e/README.md).
-
-Build local hoster binaries with `tools/run_bounded_build.py --memory-bytes 10737418240 -- cargo build --bins`. Native workers use the local host-control binary produced by [the native build script](runtime/pumpkin/NATIVE.md); they do not need Docker. Docker workers require the source-built Pumpkin image containing the host-control interface. Use `tools/docker_build_with_limits.sh --file runtime/Dockerfile --tag melon-hoster:local .` rather than an unbounded Compose/Docker build; [runtime build instructions](runtime/pumpkin/README.md) pin the upstream revision and include the complete integration source.
-
-To verify authenticated host-control behavior against a built Pumpkin binary, run `python3 tools/verify_host_control.py --binary /absolute/path/to/pumpkin`. This launches an actual disposable server and checks Java 26.3 login, save/shutdown, and player activity. The native lifecycle harness also exercises Java waiting sessions, transfers, and cross-worker world recovery; it does not establish Linux hard-quota behavior.
-
-For faster development on this Mac or Linux, use [native host execution](runtime/pumpkin/NATIVE.md). Build with `tools/build_pumpkin_native.sh` and select `WORKER_RUNTIME=native`; the shared lifecycle and snapshot system works without Docker. Native development mode has no hard memory or filesystem isolation.
-
-## Pumpkin pull-request and branch previews
-
-Set `CI_GITHUB_PAT` to enable the CI poller. The watcher is intentionally
-allowlisted to `Pumpkin-MC/Pumpkin`; `CI_REPOSITORY` is accepted only when it
-matches that exact owner/repository. The default branch is `master` (override it
-only to follow another branch in that same allowlisted repository). Periodic
-GitHub polling is the active event source and runs every 60 seconds with ETag
-checkpoints. It always builds the latest default-branch head, and eagerly
-builds and caches only the exact current PR heads that polling observes as
-opened, reopened, or updated. Open pull requests that have not changed since
-the previous poll get a preview address but are built on the first join. No PR
-ancestors, unrelated commits, branches, or arbitrary commit aliases are
-proactively built.
-
-Kurbis writes nothing to the watched repository by default. To post a Check
-Run with the preview address on each pull-request head, set
-`CI_GITHUB_CHECK_RUNS_ENABLED=true` and `CI_GITHUB_CHECK_RUNS_TOKEN`; startup
-fails if the flag is true without a token. GitHub only lets GitHub App tokens
-write Check Runs, not personal access tokens.
-
-Pull-request code is untrusted. On the remote builder the network-enabled fetch
-phase executes none of it, and the phase that compiles it has no network and
-only read access to the dependency cache shared with default-branch and release
-builds. A pull request that the checked-in patches do not apply to fails in the
-patch step with a message asking for a rebase.
-
-The signed webhook implementation remains available but dormant. It is not
-configured or started by default; only an explicit
-`CI_GITHUB_WEBHOOK_ENABLED=true` plus `CI_GITHUB_WEBHOOK_SECRET` starts the
-webhook consumer. Leave both webhook settings disabled for the polling-only
-deployment.
-
-Builds use the checked-in Pumpkin patch and pinned rootless builder image, then
-publish isolated previews below `pumpkin.kurbis.host` (the CI hostname suffix is
-fixed in the service and separate from `ROOT_DOMAIN`). Configure wildcard DNS
-and TLS before enabling the polling service. Do not configure a GitHub
-repository webhook for the default polling-only deployment.
-`CI_BUILDER_DOCKER_HOST` must point to a dedicated rootless Docker daemon over
-restricted SSH; never give the control plane a host Docker socket. Repository
-Dockerfiles are not used.
-The builder backend is explicit and fail-closed. Docker remains the default and requires a dedicated non-root rootless daemon over restricted SSH; never use `ssh://root@host` or the rootful `/var/run/docker.sock`. A Bubblewrap backend is available only with `CI_BUILDER_BACKEND=bubblewrap` and never falls back to Docker. It provides `bubblewrap_namespace_only` isolation (private paths, read-only root/toolchain, no network, dropped capabilities, `NoNewPrivs`, a kernel-enforced size-bounded `/work` tmpfs, timeout/descendant cleanup, and cross-process memory admission) but does not claim cgroup CPU, memory, or PID enforcement. Bubblewrap's writable build tree is never checked with post-hoc `du`, `statvfs`, or shell `ulimit` claims: startup/build preflight must find the operator-mounted tmpfs below private `$HOME` with exactly `size=5G,nr_inodes=1310720`, or the backend fails closed. Configure its immutable rootfs/toolchain paths and a pre-created private `CI_BUBBLEWRAP_WORKSPACE` mount such as `$HOME/.cache/kurbis/ci/workspace-tmpfs`; ordinary host directories and other tmpfs limits are rejected. The direct `bubblewrap` backend is native-control-plane-only: Compose deliberately does not pass or mount these host fixtures, so select it only with `./start.sh native ...` on Linux; a direct Compose Bubblewrap selection fails closed. Native `start.sh` resolves `CI_PLUGIN_SOURCE=plugins/kurbis-control` from the checkout, while Compose supplies `/opt/kurbis/plugins/kurbis-control` inside the control-plane image. For the explicit `bubblewrap_ssh` Compose deployment, set the absolute remote `CI_BUBBLEWRAP_*` values and `CI_BUILDER_SSH_TARGET` in the deployment environment and set `CI_BUILDER_SSH_HOST_DIRECTORY` to the private read-only SSH material directory; Compose mounts only that SSH directory, never builder rootfs or workspaces.
-
-Branch previews remain lobbies and build lazily on first join. A full immutable
-`commit-<sha>` hostname also builds lazily when a player joins; repeat joins use
-the same build/artifact cache. A new observed PR head moves the stable PR alias
-only after that head is ready, and late/out-of-order older events can never move
-it backward. Deleted branches expire their stable alias and enter
- generation-fenced runtime cleanup. Closing a pull request does not currently
-expire its preview. Check Run details are read-only and do not expose build logs,
-runtime capabilities, or controls.
+Kurbis is not an official Minecraft or PumpkinMC product. It is not approved by
+or associated with Mojang or Microsoft.

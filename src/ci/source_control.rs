@@ -787,7 +787,7 @@ mod http_tests {
             .unwrap_or_default();
         let is_pr = path.contains("/pulls?");
         let fixture: LiveBranchFixture = serde_json::from_str(include_str!(
-            "../../verification/fixtures/github_polling_branch.json"
+            "../../tests/fixtures/github_polling_branch.json"
         ))
         .unwrap();
         let etag = if is_pr {
