@@ -7,11 +7,7 @@ export const metadata: Metadata = {
 		template: "%s · kurbis",
 	},
 	description: "A free Minecraft server that starts when friends join, stops when they leave, and saves the world in between.",
-	icons: {
-		icon: "/kurbis.svg",
-		shortcut: "/kurbis.svg",
-		apple: "/kurbis.svg",
-	},
+	// The icons are files beside this one: favicon.ico, icon.svg and apple-icon.png (a PNG, as iOS wants for the home screen).
 };
 
 export default function RootLayout({
