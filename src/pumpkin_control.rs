@@ -134,9 +134,15 @@ impl PumpkinControl {
 
     pub async fn players(&self, socket: &Path) -> Result<Vec<WaitingPlayer>> {
         let response = self.request(socket, json!({"action":"players"})).await?;
-        response
+        let mut players = response
             .waiting_players
-            .context("players response omitted waiting_players")
+            .context("players response omitted waiting_players")?;
+        for player in &mut players {
+            if player.edition == PlayerEdition::Bedrock {
+                player.server_address = bedrock_server_address(&player.server_address);
+            }
+        }
+        Ok(players)
     }
 
     pub async fn replace_whitelist(
@@ -332,6 +338,38 @@ impl PumpkinControl {
     }
 }
 
+/// The address a Bedrock player typed, as `host` or `host:port`.
+///
+/// A Bedrock client that joins over NetherNet reports the signaling URL it
+/// used with the port appended once more, for example
+/// `https://alpha.kurbis.host:19132:19132`. Anything that is not a host
+/// followed by port numbers is returned unchanged, so it is still rejected.
+fn bedrock_server_address(reported: &str) -> String {
+    let reported = reported.trim();
+    let without_scheme = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| {
+            reported
+                .get(..scheme.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                .map(|_| &reported[scheme.len()..])
+        })
+        .unwrap_or(reported);
+    let mut parts = without_scheme.split(':');
+    let host = parts.next().unwrap_or_default();
+    let ports = parts.collect::<Vec<_>>();
+    if host.is_empty()
+        || host.contains('/')
+        || ports.iter().any(|port| port.parse::<u16>().is_err())
+    {
+        return reported.to_owned();
+    }
+    match ports.first() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
 /// Longest path a Unix socket address can hold, without its terminator.
 const MAX_SOCKET_PATH_BYTES: usize = 107;
 
@@ -359,6 +397,32 @@ async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_nethernet_signaling_url_becomes_the_typed_address() {
+        assert_eq!(
+            bedrock_server_address("https://flam3rboy2.kurbis.host:19132:19132"),
+            "flam3rboy2.kurbis.host:19132"
+        );
+        assert_eq!(
+            bedrock_server_address("HTTPS://alpha.kurbis.host:19132"),
+            "alpha.kurbis.host:19132"
+        );
+        assert_eq!(
+            bedrock_server_address("alpha.kurbis.host:19132"),
+            "alpha.kurbis.host:19132"
+        );
+        assert_eq!(
+            bedrock_server_address("alpha.kurbis.host"),
+            "alpha.kurbis.host"
+        );
+        assert_eq!(
+            bedrock_server_address("https://alpha.kurbis.host/v1/join"),
+            "https://alpha.kurbis.host/v1/join"
+        );
+        assert_eq!(bedrock_server_address("[::1]:19132"), "[::1]:19132");
+        assert_eq!(bedrock_server_address(""), "");
+    }
 
     #[tokio::test]
     async fn message_request_requests_a_chat_copy() {
