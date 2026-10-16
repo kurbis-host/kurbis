@@ -288,20 +288,6 @@ html:has(.landing:not([data-film="failed"])) {
   to { opacity: 1; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
-
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
 /* -- the game's interface, as HTML ------------------------------------------------------ */
 /* The film draws its interface the way the game does (lib/landing/engine/hud.ts): the dark,
    purple-edged panel of a tooltip, grey bevelled buttons, yellow titles. Plain pages that

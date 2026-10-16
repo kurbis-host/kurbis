@@ -58,8 +58,6 @@ export interface Globals {
   uTilesEmit: IUniform<Texture | null>;
   /** Things without baked light count as in daylight above this height, and in the dark below it. */
   uDayFloor: IUniform<number>;
-  /** 1 where the visitor asked for less motion: the wind drops. */
-  uCalm: IUniform<number>;
 }
 
 export function makeGlobals(): Globals {
@@ -89,7 +87,6 @@ export function makeGlobals(): Globals {
     uTiles: { value: null },
     uTilesEmit: { value: null },
     uDayFloor: { value: -9 },
-    uCalm: { value: 0 },
   };
 }
 

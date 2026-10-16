@@ -95,7 +95,6 @@ uniform float uSaturation;
 uniform float uAspect;
 uniform float uWobble;
 uniform vec4 uWhite;
-uniform float uDark;
 uniform float uSwirl;
 uniform vec2 uSwirlTile;
 uniform float uTime;
@@ -124,7 +123,6 @@ void main() {
     color = mix(color, texture(tSwirl, vec2(tile.x, (31.0 - frame + tile.y) / 32.0)).rgb * 2.4, uSwirl);
   }
   color = mix(color, uWhite.rgb, uWhite.a);
-  color *= 1.0 - uDark;
   float grey = dot(color, vec3(0.2126, 0.7152, 0.0722));
   color = mix(vec3(grey), color, uSaturation);
   vec2 from = (vUv - 0.5) / vec2(0.9, 0.86);
@@ -142,12 +140,10 @@ export interface Covers {
   swirl: number;
   /** Lens bend while going through the portal. */
   wobble: number;
-  /** A dip to dark, for a film that steps from stop to stop instead of flying. */
-  dark: number;
 }
 
 export class Post {
-  readonly covers: Covers = { white: 0, swirl: 0, wobble: 0, dark: 0 };
+  readonly covers: Covers = { white: 0, swirl: 0, wobble: 0 };
   bloom = 0.38;
   threshold = 1.1;
   vignette = 0.32;
@@ -190,7 +186,6 @@ export class Post {
       uAspect: { value: 1 },
       uWobble: { value: 0 },
       uWhite: { value: [1.0, 0.68, 0.6, 0] },
-      uDark: { value: 0 },
       uSwirl: { value: 0 },
       uSwirlTile: { value: new Vector2(0.98, 0.815) },
       uTime: { value: 0 },
@@ -269,7 +264,6 @@ export class Post {
     final.uWobble.value = this.covers.wobble;
     (final.uWhite.value as number[])[3] = this.covers.white;
     final.uSwirl.value = this.covers.swirl;
-    final.uDark.value = this.covers.dark;
     final.uTime.value = time % 97;
     final.uClock.value = time;
     this.run(this.final, null);

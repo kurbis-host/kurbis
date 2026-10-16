@@ -59,13 +59,6 @@ const seen = (home: number): [string, [number, number][]][] => [
   ["Ending_", [[home - 0.02, 99]]],
 ];
 
-/**
- * Where a film that does not fly stands (for a visitor who asked for less motion): the
- * stops, and one look at each band of the dig. It steps from one to the next under a
- * short dip to dark.
- */
-const STANDS = [0.12, 1.3, 1.95, 2.36, 3.4, 4.18, 4.38, 4.6, 4.72, 6.2, 6.62];
-const DIP = 0.22;
 /** A frame that takes longer than this (milliseconds) is a slow one; this many seconds of them, and the film draws less. */
 const SLOW = 24;
 const PATIENCE = 1.5;
@@ -145,10 +138,6 @@ export class Film {
   private caveAwake = true;
   private cursor: Touch["cursor"] = "";
   private leap: { at: number; to: number; done: boolean } | null = null;
-  /** Less motion: the camera stands at the stops instead of flying between them. */
-  calm = false;
-  private stand: number | null = null;
-  private step: { at: number; to: number } | null = null;
   /** How far the film has turned itself down to keep its pace: 0 is everything on. */
   private level = 0;
   private slow = 0;
@@ -297,7 +286,6 @@ export class Film {
     this.target = to;
     if (instant) {
       this.place(to);
-      this.stand = null; // (a film that stands takes its place afresh)
       this.tl.settle(this.s);
     }
   }
@@ -351,7 +339,6 @@ export class Film {
   advance(dt: number) {
     this.dt = dt;
     this.time += dt;
-    this.stage.globals.uCalm.value = this.calm ? 1 : 0;
     const was = this.at;
     this.follow(dt);
     // Gone round the ring under the film's cover (./ring.ts): from the end of the credits to the
@@ -362,46 +349,16 @@ export class Film {
     }
   }
 
-  /** The picture follows the scroll: eased, the short way round the ring; or, for less motion, it stands at the stop nearest it. */
+  /** The picture follows the scroll: eased, the short way round the ring. */
   private follow(dt: number) {
-    if (!this.calm) {
-      this.stand = null;
-      this.step = null;
-      // (The short way is over the seam, where the tail's end and the lead-in's top are one place, all cover.)
-      const { round, last } = this.ring;
-      let ahead = this.target - this.at;
-      if (Math.abs(ahead) > round / 2) ahead -= Math.sign(ahead) * round;
-      let at = Math.abs(ahead) < 1e-5 ? this.target : this.at + ahead * (1 - Math.exp(-dt / EASE));
-      if (at >= last) at -= round;
-      else if (at < -LEAD) at += round;
-      this.place(at);
-      return;
-    }
-    // The credits are read, not flown through: they follow the scroll, as a page of text does.
-    if (this.target > this.stage.data.constants.END) {
-      this.stand = null;
-      this.step = null;
-      this.place(this.target);
-      return;
-    }
-    // Standing: at the stop the scroll is nearest to (before the sky, the sky's). Nothing plays catch-up on the way.
-    const to = STANDS.reduce((best, stop) => (Math.abs(stop - this.target) < Math.abs(best - this.target) ? stop : best));
-    if (this.stand === null) {
-      this.stand = to;
-      this.place(to);
-      this.tl.settle(to);
-    } else if (to !== this.stand && !this.step) {
-      this.step = { at: this.time, to };
-    }
-    if (this.step) {
-      const age = this.time - this.step.at;
-      if (age >= DIP && this.stand !== this.step.to) {
-        this.stand = this.step.to;
-        this.place(this.stand);
-        this.tl.settle(this.s);
-      }
-      if (age >= 2 * DIP) this.step = null;
-    }
+    // (The short way is over the seam, where the tail's end and the lead-in's top are one place, all cover.)
+    const { round, last } = this.ring;
+    let ahead = this.target - this.at;
+    if (Math.abs(ahead) > round / 2) ahead -= Math.sign(ahead) * round;
+    let at = Math.abs(ahead) < 1e-5 ? this.target : this.at + ahead * (1 - Math.exp(-dt / EASE));
+    if (at >= last) at -= round;
+    else if (at < -LEAD) at += round;
+    this.place(at);
   }
 
   /** Turn the film down a step if frames have been slow for a while: bloom first, then pixels. */
@@ -439,14 +396,6 @@ export class Film {
     globals.uEye.value.copy(state.eye);
     globals.uTime.value = this.time;
     this.grade(this.s);
-    if (this.calm) {
-      // No flight through the cloud, no bending lens, no swirl: the dip stands in for all three.
-      const age = this.step ? this.time - this.step.at : 2 * DIP;
-      this.post.covers.dark = Math.max(1 - Math.abs(age - DIP) / DIP, 0);
-      this.post.covers.white = 0;
-      this.post.covers.wobble = 0;
-      this.post.covers.swirl = 0;
-    } else this.post.covers.dark = 0;
     if (this.leap) {
       // Cover the frame, move under the cover, uncover.
       const age = this.time - this.leap.at;
@@ -454,15 +403,13 @@ export class Film {
         this.leap.done = true;
         this.onJump(this.leap.to);
       }
-      const cover = leapCover(age);
-      if (this.calm) this.post.covers.dark = Math.max(this.post.covers.dark, cover);
-      else this.post.covers.swirl = Math.max(this.post.covers.swirl, cover);
+      this.post.covers.swirl = Math.max(this.post.covers.swirl, leapCover(age));
       if (age > 0.9) this.leap = null;
     }
     // Past "The End" the film's cover comes over the credits as the scroll goes on, and over
     // the lead-in on the other side of it, it lifts on the sky (./ring.ts). Scrolled up, the
-    // same backwards. (A film that does not fly cuts from the one to the other.)
-    const cover = this.calm ? 0 : this.ring.cover(this.at);
+    // same backwards.
+    const cover = this.ring.cover(this.at);
     if (this.ctx.ui) this.ctx.ui.cover = Math.max(this.ctx.ui.cover, cover);
     this.tl.update(this.s, this.time, this.dt);
     // The interface sits behind the portal's swirl: as it fills the frame, the interface goes under it.

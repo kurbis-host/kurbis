@@ -72,7 +72,6 @@ in vec4 aKey;
 
 uniform float uTime;
 uniform float uWind;
-uniform float uCalm;
 uniform vec4 uWaves;
 
 out vec2 vUv;
@@ -93,7 +92,7 @@ void main() {
   int face = int(aCell.w + 0.5);
   int which = int(corner + 0.5);
   vec3 world = aCell.xyz + CORNERS[face * 4 + which];
-  if (uWind > 0.0) world += windAt(world) * (uWind * (1.0 - uCalm));
+  if (uWind > 0.0) world += windAt(world) * uWind;
   for (int i = 0; i < 2; i++) {
     float level = uWaves[i * 2];
     float height = uWaves[i * 2 + 1];

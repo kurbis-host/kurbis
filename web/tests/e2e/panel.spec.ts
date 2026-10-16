@@ -248,7 +248,6 @@ test('account server list and selector open the shared server route without an o
 test('panel routes support AA accessibility, responsive widths and keyboard dialog control', async ({ page, request, browser }, testInfo) => {
   test.setTimeout(120000);
   const axeResults: Record<string, unknown> = {};
-  await page.emulateMedia({ reducedMotion: 'reduce' });
   // The landing page is a WebGL film where it can be (landing.spec.ts). Here it is audited
   // and compared as the page it is without one: its own HTML, the same on every machine.
   await page.addInitScript(() => {

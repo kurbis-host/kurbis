@@ -11,7 +11,6 @@ import { HAZE_GLSL, LIGHT_GLSL, linearColor, type Globals } from "./shading";
 const VERTEX = /* glsl */ `
 in float _sway;        // how far a point of a plant is from its root
 uniform float uTime;
-uniform float uCalm;
 uniform vec4 uMoves;   // wind: strength, rooted or loose; swell: the water's level, its height
 uniform vec2 uAtlas;   // for what is mapped onto the block atlas: its tiles across, and a tile's pixels across (0: not)
 out vec2 vUv;
@@ -25,7 +24,7 @@ void main() {
     // is, so corners that meet stay together; a rooted thing moves by its distance from the root.
     float gust = sin(dot(world.xyz, vec3(0.35, 0.22, 0.10)) - uTime * 1.3);
     float flutter = sin(dot(world.xyz, vec3(1.3, -0.9, 0.7)) + uTime * 3.1);
-    float amount = uMoves.x * mix(1.0, _sway, uMoves.y) * (1.0 - uCalm);
+    float amount = uMoves.x * mix(1.0, _sway, uMoves.y);
     float push = (gust + flutter * 0.3) * amount;
     world.xyz += vec3(push, push * 0.35, flutter * 0.15 * amount);
   }

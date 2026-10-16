@@ -99,11 +99,6 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
       const onVisible = () => (document.hidden ? film.stop() : film.start());
       home();
       film.setScroll(where(), true);
-      // A visitor who asked for less motion gets a film that stands at the stops.
-      const still = window.matchMedia("(prefers-reduced-motion: reduce)");
-      const onStill = () => void (film.calm = still.matches);
-      onStill();
-      still.addEventListener("change", onStill);
       film.onJump = (to) => {
         window.scrollTo({ top: ring.page(to) * window.innerHeight, behavior: "instant" });
         film.setScroll(to, true);
@@ -112,7 +107,6 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
       const pick = await pickaxe(stage.pack.has("tex/item_iron_pickaxe.png") ? stage.pack.picture("tex/item_iron_pickaxe.png") : null);
       if (cancelled) {
         // (Torn down while the pointer was made: this film never starts, or two would draw on one interface.)
-        still.removeEventListener("change", onStill);
         film.dispose();
         return;
       }
@@ -148,13 +142,12 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
         const field = event.target instanceof HTMLInputElement ? event.target : null;
         const other = !field && event.target instanceof HTMLElement && (event.target.isContentEditable || /^(TEXTAREA|SELECT)$/.test(event.target.tagName));
         if (other || event.defaultPrevented) return;
-        const behavior = film.calm ? "instant" : "smooth";
         if ((event.key === "Home" || (event.key === "ArrowUp" && event.metaKey)) && !(field && field.selectionStart !== 0)) {
           event.preventDefault();
-          window.scrollTo({ top: ring.page(0) * window.innerHeight, behavior });
+          window.scrollTo({ top: ring.page(0) * window.innerHeight, behavior: "smooth" });
         } else if ((event.key === "End" || (event.key === "ArrowDown" && event.metaKey)) && !(field && field.selectionEnd !== field.value.length) && film.target < film.rolled - 0.01) {
           event.preventDefault();
-          window.scrollTo({ top: Math.ceil(ring.page(film.rolled) * window.innerHeight), behavior }); // (not a pixel short of it)
+          window.scrollTo({ top: Math.ceil(ring.page(film.rolled) * window.innerHeight), behavior: "smooth" }); // (not a pixel short of it)
         }
       };
       // The game's own keys, which players press without thinking: F1 puts the interface away,
@@ -246,7 +239,6 @@ export default function FilmCanvas({ worker, onState, onFilm }: { worker: string
       if (process.env.NODE_ENV !== "production") (window as unknown as { kurbisFilm?: unknown }).kurbisFilm = film;
       cleanup = () => {
         onFilm?.(null);
-        still.removeEventListener("change", onStill);
         window.removeEventListener("pointermove", at);
         window.removeEventListener("pointerdown", onDown);
         window.removeEventListener("pointerup", onUp);

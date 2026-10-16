@@ -159,7 +159,7 @@ python3 art/landing/scripts/compare_web.py <previs frames> /tmp/frames sheet.jpg
 
 (The previs frames are stills pulled from `renders/previs2/visit.mp4` and `visit_tall.mp4`, named `<frame>_<scroll position>.jpg`.)
 
-Where the browser differs from the previs on purpose: light is baked per block corner plus a short list of live lamps, haze is worked out per pixel from the same boxes, there is no motion blur, and a triggered piece is taken back when the scroll returns before its start. A visitor who asked for less motion gets a film that stands at the stops and steps between them under a short dip to dark.
+Where the browser differs from the previs on purpose: light is baked per block corner plus a short list of live lamps, haze is worked out per pixel from the same boxes, there is no motion blur, and a triggered piece is taken back when the scroll returns before its start.
 
 ## Scale and terrain rules
 

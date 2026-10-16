@@ -187,24 +187,6 @@ test.describe("the landing film", () => {
     const audit = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"]).analyze();
     expect(audit.violations).toEqual([]);
   });
-
-  test("stands at the stops for a visitor who asked for less motion", async ({ page }) => {
-    const problems = watch(page);
-    await page.emulateMedia({ reducedMotion: "reduce" });
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto("/");
-    await expect(page.getByRole("main")).toHaveAttribute("data-film", "playing", { timeout: 60000 });
-    const canvas = page.locator("canvas").first();
-    await scrollTo(page, 1.3);
-    const at = await canvas.screenshot();
-    // A little further on is still the same stop: the camera has not moved.
-    await scrollTo(page, 1.36);
-    await page.waitForTimeout(600);
-    expect(at.length).toBeGreaterThan(40000);
-    await scrollTo(page, 3.4);
-    expect((await canvas.screenshot()).equals(at)).toBe(false);
-    expect(problems).toEqual([]);
-  });
 });
 
 test("the film's bundle may be kept for good, where it is asked for by its version", async ({ request }) => {
