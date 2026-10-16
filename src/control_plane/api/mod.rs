@@ -48,6 +48,7 @@ mod console;
 mod console_commands;
 mod events;
 mod exports;
+mod fleet_stats;
 mod github_webhook;
 mod internal;
 mod logs;
@@ -432,6 +433,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                         };
                         response.description("The skin's PNG, 64 by 64 (or 64 by 32, the old layout).")
                     })
+            }),
+        )
+        .api_route(
+            "/api/v1/stats",
+            api_get_with(fleet_stats::fleet_stats, |operation| {
+                operation
+                    .description("The whole service at a glance, for the landing page: servers made, servers and players online now, the CPU and memory they use, their ticks per second, the last two hours a minute at a time, and the last thirty days of servers. Needs no session; it may be cached for ten seconds.")
+                    .response::<200, Json<crate::fleet_stats::FleetStats>>()
             }),
         )
         .api_route("/api/v1/session", api_get(session::session))

@@ -311,6 +311,53 @@ export interface components {
             /** Format: int64 */
             after_id?: number | null;
         };
+        /** @description One minute of the service, as it was sampled at the start of that minute. */
+        FleetSample: {
+            /** Format: int64 */
+            cpu_total_millis?: number | null;
+            /** Format: int64 */
+            cpu_used_millis?: number | null;
+            /** Format: int64 */
+            memory_total_bytes?: number | null;
+            /** Format: int64 */
+            memory_used_bytes?: number | null;
+            /** Format: date-time */
+            minute: string;
+            /** Format: int64 */
+            players_online: number;
+            /** Format: int64 */
+            servers_online: number;
+            /** Format: double */
+            tps?: number | null;
+        };
+        /** @description The whole service now, and how it got here. */
+        FleetStats: {
+            /** Format: int64 */
+            cpu_total_millis?: number | null;
+            /** Format: int64 */
+            cpu_used_millis?: number | null;
+            /** @description The last two hours, a sample a minute, oldest first. A minute nobody sampled is missing. */
+            history: components["schemas"]["FleetSample"][];
+            /** Format: date-time */
+            measured_at: string;
+            /** Format: int64 */
+            memory_total_bytes?: number | null;
+            /** Format: int64 */
+            memory_used_bytes?: number | null;
+            /** Format: int64 */
+            players_online: number;
+            /** @description Servers there were at the end of each of the last thirty days, oldest first; the last is today so far. */
+            servers_by_day: number[];
+            /**
+             * Format: int64
+             * @description Servers made and not deleted.
+             */
+            servers_created: number;
+            /** Format: int64 */
+            servers_online: number;
+            /** Format: double */
+            tps?: number | null;
+        };
         /** @enum {string} */
         GameMode: "Survival" | "Creative" | "Adventure" | "Spectator";
         InGamePlayer: {

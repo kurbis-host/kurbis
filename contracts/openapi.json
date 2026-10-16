@@ -896,6 +896,123 @@
         }
       }
     },
+    "/api/v1/stats": {
+      "get": {
+        "description": "The whole service at a glance, for the landing page: servers made, servers and players online now, the CPU and memory they use, their ticks per second, the last two hours a minute at a time, and the last thirty days of servers. Needs no session; it may be cached for ten seconds.",
+        "responses": {
+          "200": {
+            "description": "The whole service now, and how it got here.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStats"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/session": {
       "get": {
         "responses": {
@@ -8734,6 +8851,145 @@
             "format": "int64"
           }
         }
+      },
+      "FleetSample": {
+        "description": "One minute of the service, as it was sampled at the start of that minute.",
+        "type": "object",
+        "properties": {
+          "cpu_total_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cpu_used_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "minute": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "servers_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tps": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "required": [
+          "minute",
+          "servers_online",
+          "players_online"
+        ]
+      },
+      "FleetStats": {
+        "description": "The whole service now, and how it got here.",
+        "type": "object",
+        "properties": {
+          "cpu_total_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cpu_used_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "history": {
+            "description": "The last two hours, a sample a minute, oldest first. A minute nobody sampled is missing.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FleetSample"
+            }
+          },
+          "measured_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "memory_total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "servers_by_day": {
+            "description": "Servers there were at the end of each of the last thirty days, oldest first; the last is today so far.",
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "servers_created": {
+            "description": "Servers made and not deleted.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "servers_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tps": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "required": [
+          "measured_at",
+          "servers_created",
+          "servers_online",
+          "players_online",
+          "history",
+          "servers_by_day"
+        ]
       },
       "GameMode": {
         "type": "string",

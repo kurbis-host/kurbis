@@ -128,6 +128,17 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
             "runtime stats schema is missing {property}"
         );
     }
+    let fleet_stats = &paths["/api/v1/stats"]["get"];
+    assert!(
+        fleet_stats["security"]
+            .as_array()
+            .is_none_or(|security| security.is_empty()),
+        "the landing page reads the service's stats without a session"
+    );
+    assert_eq!(
+        fleet_stats["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/FleetStats"
+    );
     assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands"));
     assert!(paths.contains_key("/api/v1/servers/{server_id}/console/commands/{command_id}"));
     assert!(schemas.contains_key("ConsoleCommandRequest"));

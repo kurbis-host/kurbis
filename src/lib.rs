@@ -3,6 +3,7 @@ pub mod config;
 pub mod contracts;
 pub mod control_plane;
 pub mod db;
+pub mod fleet_stats;
 pub mod gateway;
 pub mod model;
 pub mod pumpkin_control;

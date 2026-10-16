@@ -28,6 +28,7 @@ const surfaces = {
   servers: (path) => path === "/api/v1/servers"
     || path === "/api/v1/server-addresses/{subdomain}"
     || path === "/api/v1/skins/{name}"
+    || path === "/api/v1/stats"
     || path === "/api/v1/server/login-links"
     || path.startsWith("/api/v1/server/sessions/")
     || path === "/api/v1/server/sessions"

@@ -4,6 +4,7 @@ mod admission;
 mod ai;
 mod events;
 mod exports;
+mod fleet_stats;
 mod plugins;
 mod resources;
 mod routing;

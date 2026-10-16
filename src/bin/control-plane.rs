@@ -19,7 +19,7 @@ use kurbis_hoster::{
         operation_signal::OperationSignal,
         plugins::{self, PluginMarket},
     },
-    db, init_tracing,
+    db, fleet_stats, init_tracing,
 };
 
 fn classify_ci_poll_failure(error: Error) -> WorkerError {
@@ -130,6 +130,21 @@ async fn main() -> Result<()> {
                     }
                     Err(error) => Err(WorkerError::retryable(error)),
                 }
+            }
+        },
+    );
+    // The landing page's graphs: the service sampled once a minute. Checked more often than
+    // that, so each minute is sampled near its start; a minute already sampled is left alone.
+    let fleet_pool = pool.clone();
+    workers.spawn(
+        "fleet-stats",
+        SupervisorConfig::optional(std::time::Duration::from_secs(15)),
+        move || {
+            let pool = fleet_pool.clone();
+            async move {
+                fleet_stats::record_minute(&pool)
+                    .await
+                    .map_err(WorkerError::retryable)
             }
         },
     );
