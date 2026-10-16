@@ -76,8 +76,6 @@ THROUGH = 5.26  # the camera is in the portal: the set changes here, under the s
 WHITE = (0.655, 0.668, 0.695, 0.72)  # the puff the dive goes through: closing, white, white, clear
 HOME = 6.34  # the camera is through the second frame: the set changes back to the valley, under the swirl
 SWIRL = ((5.13, 5.22, 5.30, 5.46), (6.27, 6.31, 6.37, 6.45))  # the portal's swirl fills the frame: closing, full, full, clear
-# The closing set's signs: what the service is, a pair of lines each (lib/landing/copy.ts says the same).
-SPECS = (["ONE SERVER", "PER PLAYER"], ["2 GB RAM", "5 GB WORLD"], ["JAVA AND", "BEDROCK"], ["STARTS IN", "ABOUT 5 S"], ["STOPS AFTER", "5 MIN EMPTY"], ["NO PLAYER", "LIMIT"])
 
 PACE = 2.0  # seconds per screen in the previs
 FRAME = {"tall": False}  # which way up the frame is: wide (16:9) or tall (9:16)
@@ -1935,45 +1933,60 @@ def camera_shots():
     )
     shot_b = Shot([(s, N(*e)) for s, e, _ in path], [(s, N(*at)) for s, _, at in path], lens=[(THROUGH, 16.0), (5.75, 17.5), (NAME_STOP, 18.0), (HOME, 16.0)])
 
-    # C: home. Out of the swirl high over the meadow, down to the signs and the lectern,
-    # where it drifts to the end of the film. (The tall frame drifts back a little, to keep
-    # all three signs in it.)
+    # C: home. Out of the swirl high over the meadow, down to the wall of maps and the
+    # address over it, where it drifts to the end of the film. (Near enough that a map's
+    # pixel is about two of the screen's in the wide frame; the tall frame keeps the wall
+    # above the book, which opens along its bottom.)
     e = S["ending"]
-    slide, turn = P((V(0.25, 0.15, 0.0), V(0.15, 0.0, 0.0)), (V(0.05, -0.1, 0.0), V(-0.05, 0.0, 0.0)))  # (the drift, and where it looks)
+    slide, turn = P((V(0.2, 0.12, 0.0), V(0.1, 0.0, 0.0)), (V(0.04, -0.08, 0.0), V(-0.04, 0.0, 0.0)))  # (the drift, and where it looks)
     path = (
         (HOME, e["sky"], e["sky_aim"]),
         (6.55, e["eye"], e["aim"]),
         (END, e["eye"] + slide, e["aim"] + turn),
     )
-    shot_c = Shot([(s, at) for s, at, _ in path], [(s, at) for s, _, at in path], lens=[(HOME, 16.0), (6.55, P(20.0, 18.0)), (END, P(20.0, 18.0))])
+    shot_c = Shot([(s, at) for s, at, _ in path], [(s, at) for s, _, at in path], lens=[(HOME, 16.0), (6.55, P(22.0, 18.0)), (END, P(22.0, 18.0))])
     return [shot_a, shot_b, shot_c]
 
 
 # -- home: the closing set ------------------------------------------------------------
 def set_ending():
-    """The way home: the valley again, made whole, where a row of signs says what the
-    service is and a lectern holds the book of questions (the page turns its pages).
-    Everything here is called Ending_ so the page shows it only once the camera is home."""
+    """The way home: the valley again, made whole, where a wall of maps says how the whole
+    service is doing right now (the page draws them: web/lib/landing/film/maps.ts), the
+    address stands over it, and a lectern holds the book of questions (the page turns its
+    pages). Everything here is called Ending_ so the page shows it only once the camera is home."""
     b, mats = S["b"], S["mats"]
     # The hole the pumpkin dug, filled again: the world is whole at the end.
     voxel.grid_object("Ending_Patch", np.concatenate([np.full((2, 2, 6), b["dirt"], np.uint8), np.full((2, 2, 1), b["grass"], np.uint8)], axis=2), b, mats["voxel"], "World", origin=(-2.0, 0.0, -6.0))
-    # Three signs on the flat of the meadow, two of the facts on each.
-    centre_x = 1.9
-    spots = [(centre_x + (k - 1) * 1.7, 2.0) for k in range(3)]
-    cell = 0.016
-    for k, (x, y) in enumerate(spots):
-        lines = SPECS[2 * k] + SPECS[2 * k + 1]
-        board = boxmodel.sign(f"Ending_Sign_{k}")
-        board.location = (x, y, ground_at(x, y))
-        rows = len(lines) * font.ROWS + (len(lines) - 1) * 2
-        type_block(f"Ending_Spec_{k}", lines, (x, y - 1 / 16 - cell, ground_at(x, y) + 14 / 16 + (0.75 - rows * cell) / 2), "ink", cell=cell, depth=1, leading=2)
-    lectern_at = V(centre_x, 4.0, 0.0)
+    # The wall: oak planks on the flat of the meadow, a block deep and a column wider than
+    # the maps on either side; six maps in item frames on its face, toward the camera. Three
+    # across and two down in the wide frame, two across and three down in the tall one.
+    across, down = P((3, 2), (2, 3))
+    left, face = P(0, 1), 2  # the wall's first column, and the line its face stands on
+    ground = int(round(ground_at(left + 0.5, face + 0.5)))
+    assert all(int(round(ground_at(x + 0.5, face + 0.5))) == ground for x in range(left - 1, left + across + 1)), "the wall wants flat ground"
+    wall = np.full((across + 2, 1, down), b["planks"], np.uint8)
+    voxel.grid_object("Ending_Wall", wall, b, mats["voxel"], "World", origin=(left - 1, face, ground))
+    maps = []
+    for k in range(across * down):
+        row, column = divmod(k, across)
+        at = V(left + column + 0.5, face, ground + down - row - 0.5)
+        boxmodel.item_frame(f"Ending_Map_{k}").location = at
+        maps.append(at + V(0, -1.15 / 16, 0))  # (the map's face)
+    centre_x = left + across / 2
+    # The lectern against the wall's left end, before the planks. (The tall frame is
+    # too narrow for it beside the maps: there it stands out of sight, and its book is the
+    # interface's alone.)
+    lectern_at = P(V(left - 0.5, face - 0.45, 0.0), V(left - 1.6, face - 1.0, 0.0))
     lectern_at.z = ground_at(lectern_at.x, lectern_at.y)
     boxmodel.lectern("Ending_Lectern").location = lectern_at
+    top = ground + down
     S["ending"] = {
         "sky": V(centre_x, -1.5, P(8.0, 9.0)), "sky_aim": V(centre_x, 8.0, 2.5),
-        "eye": P(V(centre_x + 0.3, -2.7, 2.15), V(centre_x + 0.1, -2.75, 2.0)), "aim": V(centre_x + P(0.3, 0.15), 4.5, 1.6),
-        "spots": [V(x, y, ground_at(x, y) + 1.25) for x, y in spots], "lectern": lectern_at + V(0, 0, 1.0),
+        "eye": P(V(centre_x, face - 4.6, top - 0.65), V(centre_x, face - 3.0, top - 1.0)),
+        "aim": P(V(centre_x, face, top - 0.45), V(centre_x, face, top - 1.5)),
+        "maps": maps, "lectern": lectern_at + V(0, 0, 1.0),
+        # The address stands just over the wall, a little behind it; and how big its type is set.
+        "address": V(centre_x, face + 0.6, top + P(0.45, 0.7)), "cell": P(0.04, 0.035),
     }
 
 

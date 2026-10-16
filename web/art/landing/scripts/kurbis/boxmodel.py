@@ -11,7 +11,7 @@ import bpy
 import numpy as np
 
 from . import core
-from .blocks import NX, NY, NZ, PX, PY, PZ, candle
+from .blocks import NX, NY, NZ, PX, PY, PZ, candle, flat_material
 from mathutils import Matrix, Vector
 
 from .voxel import QUADS
@@ -356,6 +356,30 @@ def sign(name, col="Props", post=True):
     if post:
         mesh.box((-1, -1, 0), (2, 2, 14), (0, 14))
     return mesh.object(name, mat, col)
+
+
+def item_frame(name, col="Props"):
+    """An item frame holding a filled map, as the game models one (`item_frame_map`): a
+    leather back with a birch rim a pixel deep, the map over the whole of its face. Its
+    origin is the middle of the face of the block it hangs on; it faces -Y.
+
+    The map is `{name}_Map`, a block-wide square a little in front of the rim, noted
+    `kind="map"`: the page draws what it shows (web/lib/landing/film/maps.ts); here it is
+    blank paper."""
+    root = core.empty(name, col)
+    back = bpy.data.materials.get("ItemFrame_back") or tex_material("ItemFrame_back", "block/item_frame.png", clip=False)
+    wood = bpy.data.materials.get("ItemFrame_wood") or tex_material("ItemFrame_wood", "block/birch_planks.png", clip=False)
+    BoxMesh(16, 16).faces((-7, -1, -7), (14, 1, 14), {NY: (1, 1, 14, 14), PY: (1, 1, 14, 14)}).object(f"{name}_Back", back, col, parent=root)
+    rim = BoxMesh(16, 16)
+    rim.faces((-8, -1, -8), (16, 1, 1), {NY: (0, 15, 16, 1), NZ: (0, 0, 16, 1), PZ: (0, 15, 16, 1), NX: (15, 15, 1, 1), PX: (0, 15, 1, 1)})
+    rim.faces((-8, -1, 7), (16, 1, 1), {NY: (0, 0, 16, 1), NZ: (0, 0, 16, 1), PZ: (0, 15, 16, 1), NX: (15, 0, 1, 1), PX: (0, 0, 1, 1)})
+    rim.faces((-8, -1, -7), (1, 1, 14), {NY: (15, 1, 1, 14), NX: (15, 1, 1, 14), PX: (0, 1, 1, 14)})
+    rim.faces((7, -1, -7), (1, 1, 14), {NY: (0, 1, 1, 14), NX: (15, 1, 1, 14), PX: (0, 1, 1, 14)})
+    rim.object(f"{name}_Rim", wood, col, parent=root)
+    paper = bpy.data.materials.get("Map") or flat_material("Map", (0.84, 0.79, 0.55))
+    face = BoxMesh(128, 128).faces((-8, -1.15, -8), (16, 0, 16), {NY: (0, 0, 128, 128)}).object(f"{name}_Map", paper, col, parent=root)
+    core.note(face, kind="map")
+    return root
 
 
 def tiles(name, rel, quads, uvs=None, col="Props", **material):

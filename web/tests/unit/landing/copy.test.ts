@@ -5,14 +5,16 @@
  * The credits the film rolls at its end are the interface's: this holds them to the HTML.
  */
 
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FilmContext } from "../../../components/landing/film-context";
 import { Mirror } from "../../../components/landing/mirror";
 import { COPY } from "../../../lib/landing/copy";
 import { roll } from "../../../lib/landing/film/credits";
+import { STATS, saidOf } from "../../../lib/landing/stats";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: () => {} }) }));
 afterEach(cleanup);
@@ -20,6 +22,7 @@ afterEach(cleanup);
 interface Reference {
   type: Record<string, string[]>;
   constants: { NAMES: string[] };
+  points: { ending: { maps: number[][] } };
 }
 
 const loud = (words: readonly string[] | string) => (typeof words === "string" ? words : words.join(" ")).toUpperCase();
@@ -48,8 +51,11 @@ describe.each(["wide", "tall"])("the copy in the %s film", (aspect) => {
     expect(set("Nether_Headline")).toBe(loud(COPY.nether.headline));
     expect(set("Nether_Caption")).toBe(loud(COPY.nether.caption));
     expect(set("Nether_Host")).toBe(loud(COPY.surface.host));
-    // (Two of the facts on each of the closing set's three signs.)
-    [0, 1, 2].forEach((k) => expect(set(`Ending_Spec_${k}`)).toBe(loud([...COPY.ending.specs[2 * k].sign, ...COPY.ending.specs[2 * k + 1].sign])));
+  });
+
+  it("hangs a map for each of the service's figures at the end", () => {
+    // (The page draws what they show: film/maps.ts. The page's HTML says it as sentences.)
+    expect(ref.points.ending.maps).toHaveLength(STATS.length);
   });
 
   it("says in the interface what the page says", () => {
@@ -87,5 +93,51 @@ describe("the splash's tooltip", () => {
     expect(link).toHaveAttribute("href", href);
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+});
+
+describe("the wall of maps", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is said in the page's HTML where the film cannot play: each map's title, then, once the list is in view, a sentence each", async () => {
+    let answer: (response: Response) => void = () => {};
+    const fetch = vi.fn(() => new Promise<Response>((resolve) => (answer = resolve)));
+    vi.stubGlobal("fetch", fetch);
+    let inView: () => void = () => {};
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(private readonly seen: IntersectionObserverCallback) {}
+        observe() {
+          inView = () => this.seen([{ isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+        }
+        disconnect() {}
+      },
+    );
+    render(createElement(FilmContext.Provider, { value: { film: null, state: "failed" } }, createElement(Mirror)));
+    const ending = document.querySelector("section[aria-labelledby='landing-ending']")!;
+    for (const stat of STATS) expect(ending.textContent).toContain(`${saidOf(stat).title}: ${COPY.ending.unknown}`);
+    expect(fetch).not.toHaveBeenCalled(); // (nothing is asked for as the page loads)
+
+    inView();
+    const GIB = 1024 ** 3;
+    const stats = {
+      measured_at: "2026-10-16T12:00:30Z",
+      servers_created: 1284,
+      servers_online: 0,
+      players_online: 0,
+      cpu_used_millis: null,
+      cpu_total_millis: 16000,
+      memory_used_bytes: null,
+      memory_total_bytes: 64 * GIB,
+      tps: null,
+      history: [],
+      servers_by_day: [1284],
+    };
+    answer(new Response(JSON.stringify(stats), { status: 200, headers: { "content-type": "application/json" } }));
+    await waitFor(() => expect(ending.textContent).toContain("1,284 servers made so far."));
+    expect(ending.textContent).toContain("0.0 of 16 CPU cores in use.");
+    expect(ending.textContent).toContain(COPY.ending.asleep.said);
+    expect(fetch).toHaveBeenCalledWith("/api/v1/stats", expect.anything());
   });
 });

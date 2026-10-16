@@ -118,8 +118,6 @@ export interface Constants {
   NAME_STOP: number;
   HOME: number;
   SWIRL: [number, number, number, number][];
-  /** The closing set's signs. */
-  SPECS: string[][];
 }
 
 export interface Spots {
@@ -164,8 +162,12 @@ export interface CastPoints {
 
 /** Places and numbers the sets worked out while they were built. */
 export interface Points {
-  /** The closing set: where the camera comes and rests, the signs' boards, the lectern's book. */
-  ending: { sky: Vec3; sky_aim: Vec3; eye: Vec3; aim: Vec3; spots: Vec3[]; lectern: Vec3 };
+  /**
+   * The closing set: where the camera comes and rests, the middle of each map on the wall
+   * (in the order they hang), the lectern's book, and where the address stands (the bottom
+   * middle of its line) and the size of its type's cells.
+   */
+  ending: { sky: Vec3; sky_aim: Vec3; eye: Vec3; aim: Vec3; maps: Vec3[]; lectern: Vec3; address: Vec3; cell: number };
   gate: Vec3;
   lever_side: Vec3;
   /** The homestead: where its lectern's book is, the tunnel the friends come by, its gate, and the creeper's blast. */

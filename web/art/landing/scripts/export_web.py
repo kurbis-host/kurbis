@@ -35,7 +35,7 @@ VALLEY_FLOOR = -12  # faces at or above this height are the valley proper (the s
 KEY_SUN = tuple(np.array((-0.47, -0.57, 0.67)) / np.linalg.norm((-0.47, -0.57, 0.67)))  # toward the key suns of the open-air stops, near enough
 # Constants of the film the page reads rather than repeats.
 CONSTANTS = (
-    "PART", "END", "WAKE_UP", "FALL", "STOMP", "DIG0", "BREAK", "LAND", "WAKE", "ARRIVAL_RATE", "BOARD", "ARRIVE", "PORTAL_LIT", "THROUGH", "WHITE", "NAME_STOP", "HOME", "SWIRL", "SPECS",
+    "PART", "END", "WAKE_UP", "FALL", "STOMP", "DIG0", "BREAK", "LAND", "WAKE", "ARRIVAL_RATE", "BOARD", "ARRIVE", "PORTAL_LIT", "THROUGH", "WHITE", "NAME_STOP", "HOME", "SWIRL",
     "PACE", "POND_LEVEL", "SWELL", "SUN", "SUN_LIGHT", "HERO_EYE", "HERO_PUMPKIN", "LANDING_SPOT", "SLAB_RATE", "CAVE_PUMPKIN", "TORCHES", "LANTERNS",
     "SNAPSHOT", "SNAP_TILT", "LEVER", "NAMES", "BEATS", "REWIND", "HEADS", "YARD", "HOUSE",
 )

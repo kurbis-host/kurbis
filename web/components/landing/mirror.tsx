@@ -1,5 +1,6 @@
 import { Fragment } from "react";
 import { COPY } from "../../lib/landing/copy";
+import { FleetFigures } from "./fleet-figures";
 import { BarControls, LeverControl } from "./mirror-controls";
 import { NameField, NameProvider } from "./name-field";
 
@@ -77,11 +78,7 @@ export function Mirror() {
         <section aria-labelledby="landing-ending">
           <div className="landing-text">
             <h2 id="landing-ending">{ending.title}</h2>
-            <ul>
-              {ending.specs.map(({ said }) => (
-                <li key={said}>{said}</li>
-              ))}
-            </ul>
+            <FleetFigures />
             <h3>{ending.book}</h3>
             <dl>
               {ending.faq.map(([question, answer]) => (

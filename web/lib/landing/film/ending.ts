@@ -1,8 +1,8 @@
 /**
  * Home: through the second frame and back in the valley, made whole. Over the meadow
- * stands the visitor's address (theirs, once they have picked a name); a row of signs
- * says what the service is; and the lectern's book holds the questions people ask, a
- * page at a time. (The credits roll after it: ./credits.ts.)
+ * stands the visitor's address (theirs, once they have picked a name); a wall of maps
+ * says how the whole service is doing right now (./maps.ts); and the lectern's book holds
+ * the questions people ask, a page at a time. (The credits roll after it: ./credits.ts.)
  *
  * The book opens by itself while the camera rests by the lectern, and turns its pages
  * on real time; its arrows (or a click on the lectern) turn them by hand.
@@ -28,13 +28,10 @@ export function setEnding(ctx: Ctx) {
   const at = points.ending;
   const home = C.HOME;
   const lectern = vec(at.lectern);
-  const signs = at.spots.map(vec);
 
   // -- the address over the meadow, and the line under it -----------------------------------
-  const middle = signs.reduce((sum, spot) => sum.add(spot), new Vector3()).multiplyScalar(1 / signs.length);
-  // (Nearer and lower in the tall frame, under the cherry tree's crown rather than behind it.)
-  const anchor = new Vector3(middle.x, middle.y + (tall ? 2.4 : 4.5), middle.z + (tall ? 1.05 : 1.7));
-  const cell = tall ? 0.045 : 0.075;
+  const anchor = vec(at.address);
+  const cell = at.cell;
   const host = COPY.surface.host.toUpperCase();
   const line = stage.makeType([COPY.ending.title.toUpperCase()], { palette: "cream", cell: cell * 0.45, depth: 3, day: 1 });
   line.add(stage.makeRim([COPY.ending.title.toUpperCase()], { cell: cell * 0.45, width: 0.3, day: 1 })); // (it stands on the bright sky)

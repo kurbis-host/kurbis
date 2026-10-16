@@ -23,6 +23,8 @@ import { setInterface } from "./interface";
 import { setCaveLife, setMeadowLife } from "./life";
 import { setNether, type NameField } from "./nether";
 import { setEnding } from "./ending";
+import { setMaps } from "./maps";
+import type { FleetStats } from "../stats";
 import { LEAD, setCredits, type Credits } from "./credits";
 import { Ring } from "./ring";
 import { setRide, type Ride } from "./ride";
@@ -123,6 +125,8 @@ export class Film {
   onClaimClose: () => void = () => {};
   /** The cave went to sleep, or woke: whoever pulled the lever. */
   onCave: (awake: boolean) => void = () => {};
+  /** The service's figures, as the wall of maps at the end has them (./maps.ts): the page's own HTML says them too. */
+  onStats: (stats: FleetStats) => void = () => {};
   /** A screenshot was taken (F2): the page saves it, as a download of that name unless it does more. */
   onSave: (picture: Blob, name: string) => void = (picture, name) => {
     const link = document.createElement("a");
@@ -195,6 +199,7 @@ export class Film {
     this.ctx.go = (href) => this.onLink(href);
     this.ctx.open = (href) => this.onOpen(href);
     setEnding(this.ctx);
+    setMaps(this.ctx, (stats) => this.onStats(stats));
     this.credits = setCredits(this.ctx);
     // On the days the game itself marks, what it does on them; on every other day, nothing.
     const day = today();

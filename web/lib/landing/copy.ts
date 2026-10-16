@@ -216,18 +216,29 @@ export const COPY = {
 		 */
 		sock: ["Lost sock", "Found it."],
 	},
-	/** Home again, at the end of the film: the signs, and the book of questions. */
+	/** Home again, at the end of the film: the wall of maps, and the book of questions. */
 	ending: {
 		title: "See you in there.",
-		/** Each sign's two lines, and the same as a sentence for the page's own HTML. */
-		specs: [
-			{ sign: ["One server", "per player"], said: "One server per player." },
-			{ sign: ["2 GB RAM", "5 GB world"], said: "2 GB of RAM and 5 GB of world." },
-			{ sign: ["Java and", "Bedrock"], said: "Java and Bedrock players join the same world." },
-			{ sign: ["Starts in", "about 5 s"], said: "It starts in about 5 seconds when someone joins." },
-			{ sign: ["Stops after", "5 min empty"], said: "It stops after 5 minutes with nobody on." },
-			{ sign: ["No player", "limit"], said: "No player limit." },
-		],
+		/**
+		 * The wall of maps (film/maps.ts), a map each: its title and the line under its figure;
+		 * the tooltip's lines ({...} are the figures, as `mapValues` gives them); and the same
+		 * as a sentence for the page's own HTML. The map's pixel face has no ellipsis.
+		 */
+		maps: {
+			servers: { title: "Servers", under: "made so far", tip: "{servers} servers made", span: "Last 30 days", said: "{servers} servers made so far." },
+			online: { title: "Online", under: "servers awake", tip: "{online} servers awake", span: "Last 2 hours", said: "{online} of them awake right now." },
+			players: { title: "Players", under: "playing now", tip: "{players} players on", span: "Last 2 hours", said: "{players} players on them." },
+			cpu: { title: "CPU", under: "in use", of: "{used} of {total} cores", tip: "{cores} of {allCores} cores in use", span: "Last 2 hours", said: "{cores} of {allCores} CPU cores in use." },
+			ram: { title: "RAM", under: "in use", of: "{used} of {total} GB", tip: "{gb} of {allGb} GB in use", span: "Last 2 hours", said: "{gb} of {allGb} GB of RAM in use." },
+			tps: { title: "TPS", under: "ticks a second", tip: "{tps} ticks a second, of 20", span: "Last 2 hours", said: "{tps} ticks a second on average." },
+		},
+		/** The ticks' map while every server sleeps (none ticks): its figure and its line, and the HTML's sentence. */
+		asleep: { figure: "zzz", under: "all asleep", said: "Every server is asleep." },
+		/** The maps' tooltip before the first figures, and how old the figures are. */
+		waiting: "Asking the servers...",
+		updated: "Updated {seconds} s ago",
+		/** The HTML's list before the figures are in. */
+		unknown: "-",
 		book: "Questions",
 		faq: [
 			["How fast does it start?", "About 5 seconds. Join the address and you wait in a lobby while it starts."],
@@ -244,7 +255,7 @@ export const COPY = {
 			["How many players?", "No limit is set. The 2 GB of RAM is what limits it."],
 			[
 				"What happens when it stops?",
-				"Your world is saved before the server stops, and comes back exactly as you left it. Older backups are kept too.",
+				"It stops after 5 minutes with nobody on. Your world is saved first, and comes back exactly as you left it. Older backups are kept too.",
 			],
 		],
 		/** Its pages are numbered: "Page 2 of 6". */
