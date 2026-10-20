@@ -1,5 +1,11 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fd6bea6..f66359c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3225,0 +3226 @@ dependencies = [
++ "rtc",
 diff --git a/crates/pumpkin-config/src/networking/bedrock.rs b/crates/pumpkin-config/src/networking/bedrock.rs
-index 9e936794..3f2106b6 100644
+index 9e93679..3f2106b 100644
 --- a/crates/pumpkin-config/src/networking/bedrock.rs
 +++ b/crates/pumpkin-config/src/networking/bedrock.rs
 @@ -27 +27 @@ pub struct NetherNetConfig {
@@ -24,8 +30,15 @@ index 9e936794..3f2106b6 100644
 +            toml::from_str("external_ip = \"203.0.113.7\"\nexternal_port = 19132").unwrap();
 @@ -110,0 +120 @@ mod tests {
 +        assert_eq!(config.external_port, Some(19132));
+diff --git a/crates/pumpkin-core/Cargo.toml b/crates/pumpkin-core/Cargo.toml
+index 88d16b5..79af2ff 100644
+--- a/crates/pumpkin-core/Cargo.toml
++++ b/crates/pumpkin-core/Cargo.toml
+@@ -105,0 +106,2 @@ webrtc.workspace = true
++# Only for MulticastDnsMode, which webrtc does not re-export.
++rtc = { version = "0.21.1", default-features = false }
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
-index 43adfd8e..d914c798 100644
+index 43adfd8..d914c79 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
 @@ -1 +1,4 @@
@@ -155,16 +168,26 @@ index 43adfd8e..d914c798 100644
 +}
 +
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
-index b555a71e..5b71f303 100644
+index 677b992..b174d8d 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
-@@ -149 +149,3 @@ async fn negotiate_inner(
+@@ -7,0 +8 @@ use async_trait::async_trait;
++use rtc::ice::mdns::MulticastDnsMode;
+@@ -149 +150,3 @@ async fn negotiate_inner(
 -                state.ice_router.public_addr().port(),
 +                state
 +                    .external_port
 +                    .unwrap_or_else(|| state.ice_router.public_addr().port()),
+@@ -200 +203,6 @@ async fn build_peer(
+-    let mut setting_engine_builder = SettingEngineBuilder::default();
++    // A server never resolves `.local` candidates, and webrtc's default mDNS
++    // socket joins 224.0.0.251 on the default route's interface. A container
++    // without a default route fails that join with ENODEV, which fails the
++    // whole negotiation.
++    let mut setting_engine_builder =
++        SettingEngineBuilder::default().with_multicast_dns_mode(MulticastDnsMode::Disabled);
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
-index 998cf006..ba972458 100644
+index 998cf00..ba97245 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
 @@ -22,0 +23 @@ pub(super) struct NetherNetState {
