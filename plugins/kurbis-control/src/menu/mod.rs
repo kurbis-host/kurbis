@@ -354,13 +354,15 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
     let key = player_key(player);
     let data = page_data(&view)?;
 
-    let mut state = lock_state();
-    if let Some(active) = state.menus.get_mut(&key) {
-        // Reuse open container without closing/reopening screen
-        active.view = view.clone();
-        active.actions.clear();
-        render_menu(&active.inventory, &mut active.actions, &view, &data)?;
-        return Ok(());
+    {
+        let mut state = lock_state();
+        if let Some(active) = state.menus.get_mut(&key) {
+            // Reuse open container without closing/reopening screen
+            active.view = view.clone();
+            active.actions.clear();
+            render_menu(&active.inventory, &mut active.actions, &view, &data)?;
+            return Ok(());
+        }
     }
 
     let title = view_title(&view);
@@ -372,7 +374,12 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
     let mut actions = HashMap::new();
     render_menu(&inventory, &mut actions, &view, &data)?;
 
-    state.menus.insert(
+    // Opening a screen replaces the player's current one, which makes the host
+    // call back into our InventoryCloseEvent handler while open_gui runs. That
+    // handler takes the state lock, so it must be free here, and the menu is
+    // recorded only afterwards so that close cannot forget the menu being opened.
+    player.open_gui(gui);
+    lock_state().menus.insert(
         key,
         ActiveMenu {
             inventory,
@@ -380,7 +387,6 @@ pub(crate) fn open(player: &Player, view: View) -> Result<()> {
             view,
         },
     );
-    player.open_gui(gui);
     Ok(())
 }
 
