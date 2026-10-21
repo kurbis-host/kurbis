@@ -16,7 +16,7 @@ use crate::{
 use super::actor::{
     ApiBrowserServerHeaders, ApiJson, ApiPath, ApiQuery, ApiServerHeaders, ApiWasm, ServerIdPath,
 };
-use super::internal::{require_browser_server_access, require_server_access};
+use super::internal::{require_browser_server_access, require_server_access, require_server_view};
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -63,7 +63,7 @@ pub(super) async fn server_plugins(
     headers: ApiServerHeaders,
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<ServerPlugins>, ApiError> {
-    let server = require_server_access(&state, &headers, path.server_id).await?;
+    let server = require_server_view(&state, &headers, path.server_id).await?;
     Ok(Json(plugins::server_plugins(&state.pool, server.id).await?))
 }
 
@@ -73,7 +73,7 @@ pub(super) async fn market_plugins(
     ApiPath(path): ApiPath<ServerIdPath>,
     ApiQuery(query): ApiQuery<MarketPluginQuery>,
 ) -> Result<Json<MarketPlugins>, ApiError> {
-    let server = require_server_access(&state, &headers, path.server_id).await?;
+    let server = require_server_view(&state, &headers, path.server_id).await?;
     let query = query
         .query
         .map(|query| query.chars().take(64).collect::<String>());

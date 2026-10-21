@@ -7,6 +7,10 @@ export interface components {
             sessions: components["schemas"]["AccountSession"][];
             worlds: components["schemas"]["AccountWorld"][];
         };
+        AccountIdPath: {
+            /** Format: uuid */
+            account_id: string;
+        };
         AccountIdentity: {
             /** Format: date-time */
             created_at: string;
@@ -16,6 +20,14 @@ export interface components {
             /** Format: uuid */
             id: string;
             provider: string;
+        };
+        AccountListQuery: {
+            /** Format: int64 */
+            limit?: number | null;
+            /** Format: int64 */
+            offset?: number | null;
+            /** @description Matches account and identity names and emails, or an account id exactly. */
+            search?: string | null;
         };
         AccountSession: {
             /** Format: date-time */
@@ -50,6 +62,699 @@ export interface components {
             id: number;
             status?: string | null;
             summary: string;
+        };
+        AdminAccount: {
+            account_status: string;
+            /** Format: int64 */
+            ai_cost_this_month_micros: number;
+            /** Format: date-time */
+            created_at: string;
+            display_name: string;
+            /** Format: uuid */
+            id: string;
+            identities: components["schemas"]["AdminIdentitySummary"][];
+            /**
+             * Format: date-time
+             * @description The latest request of any of the account's browser sessions.
+             */
+            last_seen_at?: string | null;
+            /** Format: int64 */
+            servers: number;
+        };
+        AdminAccountCounts: {
+            /** Format: int64 */
+            signups_last_day: number;
+            /** Format: int64 */
+            signups_last_week: number;
+            /** Format: int64 */
+            suspended: number;
+            /** Format: int64 */
+            total: number;
+        };
+        AdminAccountDetail: {
+            account: components["schemas"]["AdminAccount"];
+            /** Format: int64 */
+            ai_cost_total_micros: number;
+            identities: components["schemas"]["AdminIdentity"][];
+            /** @description Whether the account may read this dashboard. */
+            is_admin: boolean;
+            servers: components["schemas"]["AdminServer"][];
+            /** @description Browser sessions, latest first. */
+            sessions: components["schemas"]["AdminSession"][];
+        };
+        AdminAccountPage: {
+            items: components["schemas"]["AdminAccount"][];
+            /** Format: int64 */
+            total: number;
+        };
+        AdminAi: {
+            /** @description Null when no model provider is configured. */
+            budgets?: components["schemas"]["AdminAiBudgets"] | null;
+            /** @description The last 30 days, oldest first, every day present. */
+            by_day: components["schemas"]["AdminAiDay"][];
+            /** @description Requests of the last 30 days by state. */
+            jobs_by_state: components["schemas"]["AdminStateCount"][];
+            /** @description This month. */
+            models: components["schemas"]["AdminAiModel"][];
+            month: components["schemas"]["AdminAiMonth"];
+            /** @description The latest 50 requests that failed or stalled. */
+            problem_jobs: components["schemas"]["AdminAiJob"][];
+            top_accounts: components["schemas"]["AdminAiSpender"][];
+            /** @description The ten that spent most this month. */
+            top_servers: components["schemas"]["AdminAiSpender"][];
+        };
+        /** @description The budgets the AI gateway enforces, each a month's spend in millionths of a US dollar. */
+        AdminAiBudgets: {
+            /** Format: int64 */
+            account_monthly_micros: number;
+            /** Format: uint */
+            max_concurrent_calls: number;
+            models: string[];
+            /**
+             * Format: int64
+             * @description The default for a server; a server may set its own up to the account's.
+             */
+            server_monthly_micros: number;
+        };
+        AdminAiDay: {
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: date */
+            day: string;
+            /** Format: int64 */
+            model_calls: number;
+        };
+        AdminAiJob: {
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: date-time */
+            created_at: string;
+            error?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            /** Format: int32 */
+            model_calls: number;
+            operator_name: string;
+            prompt: string;
+            /** Format: uuid */
+            server_id: string;
+            /** Format: int32 */
+            stalls: number;
+            state: string;
+            subdomain?: string | null;
+            /** Format: int32 */
+            tool_calls: number;
+        };
+        AdminAiModel: {
+            /** Format: int64 */
+            cache_creation_input_tokens: number;
+            /** Format: int64 */
+            cache_read_input_tokens: number;
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: int64 */
+            input_tokens: number;
+            model: string;
+            /** Format: int64 */
+            model_calls: number;
+            /** Format: int64 */
+            output_tokens: number;
+        };
+        AdminAiMonth: {
+            /** Format: int64 */
+            cache_creation_input_tokens: number;
+            /** Format: int64 */
+            cache_read_input_tokens: number;
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: int64 */
+            input_tokens: number;
+            /**
+             * Format: int64
+             * @description Requests started this month.
+             */
+            jobs: number;
+            /** Format: int64 */
+            model_calls: number;
+            /** Format: int64 */
+            output_tokens: number;
+        };
+        /** @description A server or account and what it spent this month. */
+        AdminAiSpender: {
+            /** Format: int64 */
+            cost_micros: number;
+            /** Format: uuid */
+            id: string;
+            /** Format: int64 */
+            model_calls: number;
+            /** @description The server's address or the account's name; null once it is deleted. */
+            name?: string | null;
+        };
+        AdminBuild: {
+            aliases: components["schemas"]["AdminBuildAlias"][];
+            commit_sha: string;
+            /** Format: date-time */
+            created_at: string;
+            failure_class?: string | null;
+            failure_message?: string | null;
+            failure_stage?: string | null;
+            has_log: boolean;
+            /** Format: uuid */
+            id: string;
+            /** @description Pull requests whose queued build this is. */
+            pull_requests: number[];
+            /** Format: date-time */
+            requested_at?: string | null;
+            retention_policy: string;
+            /** Format: date-time */
+            retry_at?: string | null;
+            /** Format: int32 */
+            retry_count: number;
+            stage: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** @description Where a build is published: a preview hostname and the ref it follows. */
+        AdminBuildAlias: {
+            hostname: string;
+            kind: string;
+            ref_name: string;
+        };
+        AdminBuildLog: {
+            build_log?: string | null;
+            commit_sha: string;
+            failure_message?: string | null;
+            /** Format: uuid */
+            id: string;
+            stage: string;
+        };
+        /** @description A builder slot in use. */
+        AdminBuilderSlot: {
+            builder_identity: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            heartbeat_at: string;
+            /** Format: int64 */
+            requested_memory_bytes: number;
+            /** Format: int16 */
+            slot: number;
+        };
+        AdminCi: {
+            builder_slots: components["schemas"]["AdminBuilderSlot"][];
+            /** @description The latest 50 builds to change. */
+            builds: components["schemas"]["AdminBuild"][];
+            /** @description Builds by stage: unfinished ones, and those finished in the last week. */
+            builds_by_stage: components["schemas"]["AdminStateCount"][];
+            github_rate_limits: components["schemas"]["AdminGitHubRateLimit"][];
+            /** @description Previews not yet expired, latest change first. */
+            previews: components["schemas"]["AdminPreview"][];
+            /** @description Pull-request build requests: live ones, and those finished in the last week. */
+            queue: components["schemas"]["AdminStateCount"][];
+            repositories: components["schemas"]["AdminCiRepository"][];
+            webhook_deliveries: components["schemas"]["AdminWebhookDeliveries"];
+        };
+        AdminCiRepository: {
+            default_branch: string;
+            enabled: boolean;
+            /** Format: date-time */
+            last_successful_poll?: string | null;
+            /**
+             * Format: date-time
+             * @description A poller holds the repository until then.
+             */
+            poll_lease_expires_at?: string | null;
+            repository: string;
+        };
+        /** @description The accounts made in one week, and how many of them had their server woken in each
+         *      week after. */
+        AdminCohort: {
+            /** Format: int64 */
+            accounts: number;
+            /** @description Accounts with a wake in UTC calendar week 0 (the week of signup), 1, … up to 7
+             *      after it; only weeks that have begun are listed. */
+            returned: number[];
+            /**
+             * Format: date
+             * @description Monday of the signup week.
+             */
+            week: string;
+        };
+        /** @description One UTC day. */
+        AdminDay: {
+            /** Format: int64 */
+            ai_cost_micros: number;
+            /** Format: date */
+            day: string;
+            /** Format: int32 */
+            peak_players_online?: number | null;
+            /**
+             * Format: int32
+             * @description Highest per-minute sample of the day; null for days nobody sampled.
+             */
+            peak_servers_online?: number | null;
+            /** Format: int32 */
+            servers_created: number;
+            /** Format: int32 */
+            servers_woken: number;
+            /** Format: int32 */
+            signups: number;
+            /**
+             * Format: int32
+             * @description Successful wakes asked for that day, and the servers they woke.
+             */
+            wakes: number;
+        };
+        AdminFailure: {
+            /** Format: date-time */
+            at: string;
+            kind: string;
+            message: string;
+            /** @description The failed row: an operation, export, plugin, command, job or build id, a pull
+             *      request number, a webhook delivery or an object key. */
+            reference: string;
+            /** Format: uuid */
+            server_id?: string | null;
+            source: string;
+            subdomain?: string | null;
+        };
+        /** @description Failures that said the same thing, ids and numbers aside. */
+        AdminFailureGroup: {
+            /** Format: int64 */
+            count: number;
+            /** Format: date-time */
+            first_at: string;
+            kind: string;
+            /** Format: date-time */
+            last_at: string;
+            /** @description The latest failure's own words. */
+            message: string;
+            /**
+             * Format: uuid
+             * @description The latest failure's server, when it had one.
+             */
+            server_id?: string | null;
+            /** Format: int64 */
+            servers: number;
+            signature: string;
+            source: string;
+            subdomain?: string | null;
+        };
+        AdminFailures: {
+            /** @description The 100 groups seen last, latest first. */
+            groups: components["schemas"]["AdminFailureGroup"][];
+            /** @description The latest 100 failures. */
+            recent: components["schemas"]["AdminFailure"][];
+        };
+        AdminGitHubRateLimit: {
+            /** Format: int32 */
+            consecutive_failures: number;
+            /**
+             * Format: date-time
+             * @description Requests wait until then after GitHub said to slow down.
+             */
+            paused_until?: string | null;
+            /** Format: int64 */
+            remaining?: number | null;
+            /** Format: date-time */
+            reset_at?: string | null;
+            scope: string;
+        };
+        AdminGrowth: {
+            /** @description The last twelve signup weeks, oldest first. */
+            cohorts: components["schemas"]["AdminCohort"][];
+            /** @description Every day since the first account, oldest first. */
+            days: components["schemas"]["AdminDay"][];
+        };
+        AdminIdentity: {
+            /** Format: date-time */
+            created_at: string;
+            display_name: string;
+            email?: string | null;
+            email_verified: boolean;
+            /** Format: uuid */
+            minecraft_player_id?: string | null;
+            provider: string;
+            /** @description The provider's id for the account; Minecraft identities use the player's UUID. */
+            subject: string;
+        };
+        /** @description A linked sign-in, as the list shows it. */
+        AdminIdentitySummary: {
+            display_name: string;
+            email?: string | null;
+            provider: string;
+        };
+        AdminOperation: {
+            /** Format: int32 */
+            attempt: number;
+            /** Format: date-time */
+            claimed_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            generation: number;
+            /** Format: uuid */
+            id: string;
+            kind: string;
+            last_error?: string | null;
+            /** Format: date-time */
+            next_attempt_at: string;
+            status: string;
+            /** Format: date-time */
+            updated_at: string;
+            worker_name?: string | null;
+        };
+        AdminOperationCounts: {
+            /** Format: int64 */
+            failed_last_day: number;
+            /**
+             * Format: int64
+             * @description Pending again after a failed attempt.
+             */
+            retrying: number;
+            /** Format: int64 */
+            running: number;
+        };
+        AdminOverview: {
+            accounts: components["schemas"]["AdminAccountCounts"];
+            /** Format: int64 */
+            ai_cost_this_month_micros: number;
+            fleet: components["schemas"]["FleetUsage"];
+            github_rate_limits: components["schemas"]["AdminGitHubRateLimit"][];
+            /** Format: date-time */
+            measured_at: string;
+            operations: components["schemas"]["AdminOperationCounts"];
+            servers: components["schemas"]["AdminServerCounts"];
+            servers_by_state: components["schemas"]["AdminStateCount"][];
+            start_queue: components["schemas"]["AdminStartQueue"];
+            storage: components["schemas"]["AdminStorage"];
+            /** @description The tasks of the control plane that answered. */
+            tasks: components["schemas"]["AdminTask"][];
+            workers: components["schemas"]["AdminWorkerCounts"];
+        };
+        AdminPlacement: {
+            active: boolean;
+            /** Format: int32 */
+            bedrock_port?: number | null;
+            /** Format: int64 */
+            generation: number;
+            /** Format: int32 */
+            java_port?: number | null;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            worker_id: string;
+            worker_name: string;
+        };
+        AdminPluginError: {
+            enabled: boolean;
+            name: string;
+            /** Format: date-time */
+            reported_at?: string | null;
+            runtime_error: string;
+            version: string;
+        };
+        AdminPreview: {
+            commit_sha: string;
+            /** Format: date-time */
+            expires_at: string;
+            hostname: string;
+            /** Format: uuid */
+            id: string;
+            kind: string;
+            /** Format: date-time */
+            last_activity_at?: string | null;
+            /** Format: int64 */
+            players_online: number;
+            ref_name: string;
+            runtime_state?: string | null;
+            state: string;
+            worker_name?: string | null;
+        };
+        /**
+         * @description How far back a chart looks.
+         * @enum {string}
+         */
+        AdminRange: "hour" | "day" | "week" | "month";
+        /** @description A server as the dashboard lists it. */
+        AdminServer: {
+            /** Format: date-time */
+            created_at: string;
+            desired_state: string;
+            /** Format: uuid */
+            id: string;
+            last_error?: string | null;
+            /**
+             * Format: date-time
+             * @description When the latest successful wake was asked for.
+             */
+            last_woken_at?: string | null;
+            observed_state: string;
+            /** Format: uuid */
+            owner_id: string;
+            owner_name: string;
+            owner_status: string;
+            /** Format: int64 */
+            players_online: number;
+            /** Format: int64 */
+            storage_bytes: number;
+            subdomain: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            worker_id?: string | null;
+            worker_name?: string | null;
+        };
+        AdminServerCounts: {
+            /** Format: int64 */
+            failed: number;
+            /**
+             * Format: int64
+             * @description In a passing state for more than ten minutes.
+             */
+            stuck: number;
+            /**
+             * Format: int64
+             * @description Servers not deleted.
+             */
+            total: number;
+        };
+        AdminServerDetail: {
+            /** @description The latest 50, newest first. */
+            operations: components["schemas"]["AdminOperation"][];
+            placement?: components["schemas"]["AdminPlacement"] | null;
+            plugin_errors: components["schemas"]["AdminPluginError"][];
+            /** @description Over the range, oldest first; minutes the server was not running are missing. */
+            samples: components["schemas"]["AdminServerSample"][];
+            server: components["schemas"]["AdminServer"];
+            /** @description Every snapshot still kept, newest first, complete or not. */
+            snapshots: components["schemas"]["AdminSnapshot"][];
+            start_request?: components["schemas"]["AdminStartRequest"] | null;
+        };
+        /** @description Which servers a list shows. */
+        AdminServerFilter: ("all" | "online" | "sleeping" | "failed" | "queued") | "stuck" | "never_started";
+        AdminServerPage: {
+            items: components["schemas"]["AdminServer"][];
+            /**
+             * Format: int64
+             * @description Servers matching the filter and search, across every page.
+             */
+            total: number;
+        };
+        /** @description A server over one bucket of minutes: its most players, and its average usage. */
+        AdminServerSample: {
+            /** Format: int64 */
+            cpu_used_millis?: number | null;
+            /** Format: int64 */
+            memory_used_bytes?: number | null;
+            /** Format: date-time */
+            minute: string;
+            /** Format: int32 */
+            players_online: number;
+            /** Format: double */
+            tps?: number | null;
+        };
+        AdminServerStorage: {
+            /** Format: uuid */
+            server_id: string;
+            /** Format: int64 */
+            storage_bytes: number;
+            subdomain: string;
+        };
+        AdminSession: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: date-time */
+            last_seen_at: string;
+        };
+        AdminSnapshot: {
+            complete: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            generation: number;
+            reason: string;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        AdminStartQueue: {
+            /**
+             * Format: int64
+             * @description Servers waiting for a worker with room.
+             */
+            depth: number;
+            /** Format: date-time */
+            oldest_requested_at?: string | null;
+        };
+        AdminStartRequest: {
+            /**
+             * Format: int64
+             * @description Servers ahead of this one in the queue.
+             */
+            ahead: number;
+            reason: string;
+            /** Format: date-time */
+            requested_at: string;
+        };
+        AdminStateCount: {
+            /** Format: int64 */
+            count: number;
+            state: string;
+        };
+        AdminStorage: {
+            /** Format: int64 */
+            database_bytes: number;
+            largest_servers: components["schemas"]["AdminServerStorage"][];
+            largest_tables: components["schemas"]["AdminTableSize"][];
+            /**
+             * Format: int64
+             * @description What servers' worlds take, as they last reported.
+             */
+            server_bytes: number;
+            /** Format: int64 */
+            snapshot_bytes: number;
+            /**
+             * Format: int64
+             * @description Complete snapshots and their total size.
+             */
+            snapshots: number;
+        };
+        AdminTableSize: {
+            /**
+             * Format: int64
+             * @description Table, indexes and TOAST.
+             */
+            bytes: number;
+            name: string;
+            /**
+             * Format: int64
+             * @description Rows by the planner's estimate.
+             */
+            rows: number;
+        };
+        /** @description One of the control plane's background tasks (start queue, maintenance, CI poller…). */
+        AdminTask: {
+            /** Format: uint32 */
+            consecutive_failures: number;
+            last_error?: string | null;
+            /** Format: date-time */
+            last_heartbeat?: string | null;
+            /** Format: date-time */
+            last_success?: string | null;
+            name: string;
+            /** @description The control plane is unhealthy while a required task is not running. */
+            required: boolean;
+            state: components["schemas"]["AdminTaskState"];
+        };
+        /** @enum {string} */
+        AdminTaskState: "starting" | "running" | "backing_off" | "fatal" | "stopped";
+        AdminWebhookDeliveries: {
+            /** Format: int64 */
+            failing: number;
+            /** Format: int64 */
+            pending: number;
+        };
+        AdminWorker: {
+            address: string;
+            /**
+             * Format: int64
+             * @description What its running servers use, from their fresh samples; null when none reported.
+             */
+            cpu_used_millis?: number | null;
+            draining: boolean;
+            /** Format: date-time */
+            heartbeat_at: string;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: date-time
+             * @description When the running worker process's exclusive lease runs out.
+             */
+            lease_expires_at?: string | null;
+            /** @description Heartbeat within the last 30 seconds: it may take new servers. */
+            live: boolean;
+            /** Format: int64 */
+            memory_used_bytes?: number | null;
+            name: string;
+            /** Format: int32 */
+            port_max: number;
+            /** Format: int32 */
+            port_min: number;
+            /**
+             * Format: int64
+             * @description Ports leased to servers and previews.
+             */
+            ports_leased: number;
+            previews: components["schemas"]["AdminWorkerPreview"][];
+            /** Format: int64 */
+            reserved_cpu_millis: number;
+            /** Format: int64 */
+            reserved_disk_bytes: number;
+            /** Format: int64 */
+            reserved_memory_bytes: number;
+            runtime_architecture: string;
+            servers: components["schemas"]["AdminWorkerServer"][];
+            supports_ci_previews: boolean;
+            /** Format: int64 */
+            total_cpu_millis: number;
+            /** Format: int64 */
+            total_disk_bytes: number;
+            /** Format: int64 */
+            total_memory_bytes: number;
+        };
+        AdminWorkerCounts: {
+            /** Format: int64 */
+            draining: number;
+            /**
+             * Format: int64
+             * @description Heartbeat within the last 30 seconds.
+             */
+            live: number;
+            /** Format: int64 */
+            total: number;
+        };
+        /** @description A Pumpkin preview placed on a worker. */
+        AdminWorkerPreview: {
+            hostname?: string | null;
+            /** Format: int64 */
+            players_online: number;
+            /** Format: uuid */
+            preview_id: string;
+            state: string;
+        };
+        /** @description A server placed on a worker. */
+        AdminWorkerServer: {
+            active: boolean;
+            /** Format: uuid */
+            id: string;
+            observed_state: string;
+            /** Format: int64 */
+            players_online: number;
+            subdomain: string;
         };
         AiActiveJob: {
             /** Format: uuid */
@@ -268,6 +973,10 @@ export interface components {
             code: string;
             message: string;
         };
+        BuildIdPath: {
+            /** Format: uuid */
+            build_id: string;
+        };
         CommandResponse: {
             observed_state: components["schemas"]["ObservedState"];
         };
@@ -311,7 +1020,8 @@ export interface components {
             /** Format: int64 */
             after_id?: number | null;
         };
-        /** @description One minute of the service, as it was sampled at the start of that minute. */
+        /** @description The service in one minute, as it was sampled at the start of that minute, or in a
+         *      bucket of minutes starting at `minute` (see [`history`]). */
         FleetSample: {
             /** Format: int64 */
             cpu_total_millis?: number | null;
@@ -356,6 +1066,32 @@ export interface components {
             /** Format: int64 */
             servers_online: number;
             /** Format: double */
+            tps?: number | null;
+        };
+        /** @description The running servers' totals at one moment. */
+        FleetUsage: {
+            /**
+             * Format: int64
+             * @description CPU of every live worker, in thousandths of a core.
+             */
+            cpu_total_millis?: number | null;
+            /**
+             * Format: int64
+             * @description CPU the running servers use, in thousandths of a core.
+             */
+            cpu_used_millis?: number | null;
+            /** Format: int64 */
+            memory_total_bytes?: number | null;
+            /** Format: int64 */
+            memory_used_bytes?: number | null;
+            /** Format: int64 */
+            players_online: number;
+            /** Format: int64 */
+            servers_online: number;
+            /**
+             * Format: double
+             * @description The running servers' average ticks per second.
+             */
             tps?: number | null;
         };
         /** @enum {string} */
@@ -572,6 +1308,9 @@ export interface components {
             message: string;
             retryable: boolean;
         };
+        RangeQuery: {
+            range?: components["schemas"]["AdminRange"];
+        };
         /** @enum {string} */
         ResetMode: "world" | "full";
         RuntimeStats: {
@@ -684,6 +1423,9 @@ export interface components {
             /** Format: uuid */
             server_id: string;
         };
+        ServerDetailQuery: {
+            range?: components["schemas"]["AdminRange"];
+        };
         ServerEvent: {
             /** Format: int64 */
             id: number;
@@ -739,6 +1481,15 @@ export interface components {
         ServerIdPath: {
             /** Format: uuid */
             server_id: string;
+        };
+        ServerListQuery: {
+            filter?: components["schemas"]["AdminServerFilter"];
+            /** Format: int64 */
+            limit?: number | null;
+            /** Format: int64 */
+            offset?: number | null;
+            /** @description Matches addresses and owner names, or a server or owner id exactly. */
+            search?: string | null;
         };
         /** @description One plugin installed on a server. */
         ServerPlugin: {
@@ -872,6 +1623,8 @@ export interface components {
             storage_bytes: number;
         };
         Session: {
+            /** @description The account may read the operator dashboard and every server. */
+            is_admin: boolean;
             limits: components["schemas"]["ServiceLimits"];
             /** @description Every server address is `<name>.<server_domain>`. */
             server_domain: string;

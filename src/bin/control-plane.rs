@@ -112,18 +112,7 @@ async fn main() -> Result<()> {
             async move {
                 match maintenance.run_once().await {
                     Ok(report) => {
-                        if report.operations_assigned > 0
-                            || report.exports_assigned > 0
-                            || report.exports_requeued > 0
-                            || report.exports_expired > 0
-                            || report.garbage_collection.chunks_deleted > 0
-                            || report.garbage_collection.manifests_deleted > 0
-                            || report.garbage_collection.exports_deleted > 0
-                            || report.garbage_collection.staging_deleted > 0
-                            || report.ci_world_snapshot_gc_completed > 0
-                            || report.github_webhook_processed_gc_deleted > 0
-                            || report.plugin_blobs_deleted > 0
-                        {
+                        if report.did_work() {
                             tracing::info!(?report, "worker maintenance completed");
                         }
                         Ok(())
@@ -133,7 +122,8 @@ async fn main() -> Result<()> {
             }
         },
     );
-    // The landing page's graphs: the service sampled once a minute. Checked more often than
+    // The landing page's graphs and the operator dashboard's history: the service and each
+    // running server sampled once a minute, and today's roll-up. Checked more often than
     // that, so each minute is sampled near its start; a minute already sampled is left alone.
     let fleet_pool = pool.clone();
     workers.spawn(

@@ -121,7 +121,7 @@ pub(super) async fn get_console_command(
     ApiPath(path): ApiPath<ServerConsoleCommandPath>,
 ) -> Result<Json<ConsoleCommandResponse>, ApiError> {
     let server_id = path.server_id;
-    internal::require_browser_server_access(&state, &headers, server_id).await?;
+    internal::require_browser_server_view(&state, &headers, server_id).await?;
     let row = sqlx::query_as::<_, ConsoleCommandRecord>(&format!(
         "{CONSOLE_COMMAND_SELECT} WHERE server_id = $1 AND id = $2"
     ))

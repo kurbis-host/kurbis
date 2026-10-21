@@ -106,6 +106,40 @@ by an arrow key to select a process pane; `Ctrl-b z` zooms the selected pane,
 and `Ctrl-b d` detaches. Persistent PostgreSQL data is kept when stopping
 Compose. Stop hosted worlds from the panel before shutting down their worker.
 
+## Operator dashboard
+
+Accounts listed in [`ADMIN_IDENTITIES`](configuration.md) can open `/admin`.
+It is read-only: an admin sees everything and can change nothing through it.
+Its API lives under `/api/v1/admin/*` and answers 404 to everyone else.
+
+- `/admin` shows health: background tasks, workers, the start queue, failed
+  and stuck servers, operations and the GitHub rate limit. Below are fleet
+  charts for the last hour, day, week and month, and storage use.
+- `/admin/servers`, `/admin/accounts` and `/admin/workers` list every server,
+  account and worker. `/admin/accounts/<id>` shows one account with its
+  sign-ins and servers.
+- `/admin/failures` collects failed operations; `/admin/ci` the Pumpkin
+  preview builds; `/admin/ai` assistant use and spend; `/admin/growth` the
+  daily totals.
+- An admin can open any server's panel at `/manage/<id>` and read it. Its
+  Lifecycle tab, shown only to admins, adds the owner, placement, operations,
+  snapshots and usage samples.
+
+The dashboard keeps its own history, so retention is:
+
+| Data | Kept |
+| --- | --- |
+| `fleet_stats`, one sample of the whole service a minute | 30 days |
+| `server_runtime_samples`, one sample of each running server a minute | 7 days |
+| `daily_stats`, one row a UTC day: signups, servers created, wakes, servers woken, peak servers and players, AI spend | for good |
+| `server_logs`, console lines | 14 days |
+| `server_events`, server activity | 7 days |
+
+Migration 0023 fills `daily_stats` from the rows that already exist. The
+control plane writes the minute samples and prunes them. The
+`worker-maintenance` task deletes old console lines and events in bounded
+batches.
+
 ## How kurbis.host releases
 
 For production releases, run `python3 scripts/release.py` from a clean checkout

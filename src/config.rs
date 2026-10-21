@@ -64,6 +64,8 @@ pub struct ControlPlaneConfig {
     pub ci_github_webhook_enabled: bool,
     pub ci_github_webhook_secret: Option<SecretString>,
     pub oauth: OAuthConfig,
+    /// Linked accounts whose owners may read the operator dashboard.
+    pub admin_identities: Vec<AdminIdentity>,
 }
 
 impl fmt::Debug for ControlPlaneConfig {
@@ -78,6 +80,7 @@ impl fmt::Debug for ControlPlaneConfig {
             .field("ci_github_webhook_enabled", &self.ci_github_webhook_enabled)
             .field("ci_github_webhook_secret", &self.ci_github_webhook_secret)
             .field("oauth", &self.oauth)
+            .field("admin_identities", &self.admin_identities)
             .finish()
     }
 }
@@ -530,6 +533,42 @@ impl OAuthProvider {
     }
 }
 
+/// A Google or Discord account, by the provider's stable account id (the `subject` of
+/// its row in `identities`). Whoever has it linked may read the operator dashboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminIdentity {
+    pub provider: OAuthProvider,
+    pub subject: String,
+}
+
+/// Parse `ADMIN_IDENTITIES`: comma-separated `google:<subject>` or `discord:<subject>`.
+fn parse_admin_identities(value: &str) -> Result<Vec<AdminIdentity>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (provider, subject) = entry.split_once(':').with_context(|| {
+                format!("ADMIN_IDENTITIES entry {entry:?} must be provider:subject")
+            })?;
+            let provider = match provider.trim() {
+                "google" => OAuthProvider::Google,
+                "discord" => OAuthProvider::Discord,
+                other => bail!("ADMIN_IDENTITIES provider {other:?} must be google or discord"),
+            };
+            let subject = subject.trim();
+            ensure!(
+                !subject.is_empty() && subject.len() <= 255,
+                "ADMIN_IDENTITIES entry {entry:?} has no subject"
+            );
+            Ok(AdminIdentity {
+                provider,
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
+}
+
 impl OAuthConfig {
     pub fn provider(&self, provider: OAuthProvider) -> &OAuthProviderConfig {
         match provider {
@@ -594,6 +633,7 @@ impl ControlPlaneConfig {
                     "identify email",
                 )?,
             },
+            admin_identities: parse_admin_identities(&value("ADMIN_IDENTITIES", ""))?,
         })
     }
 }
@@ -1074,9 +1114,34 @@ fn gib_env(name: &str, default: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommonConfig, GatewayConfig, ObjectStoreConfig, check_runs_token, https_public_base_url,
-        parse_bool, validate_ci_remote_path, validate_ci_repository,
+        AdminIdentity, CommonConfig, GatewayConfig, OAuthProvider, ObjectStoreConfig,
+        check_runs_token, https_public_base_url, parse_admin_identities, parse_bool,
+        validate_ci_remote_path, validate_ci_repository,
     };
+
+    #[test]
+    fn admin_identities_name_a_provider_and_its_subject() {
+        assert_eq!(parse_admin_identities("").unwrap(), Vec::new());
+        assert_eq!(
+            parse_admin_identities(" google:1234 , discord:5678,").unwrap(),
+            vec![
+                AdminIdentity {
+                    provider: OAuthProvider::Google,
+                    subject: "1234".to_owned(),
+                },
+                AdminIdentity {
+                    provider: OAuthProvider::Discord,
+                    subject: "5678".to_owned(),
+                },
+            ]
+        );
+        for invalid in ["google", "github:1", "discord:", "minecraft_java:abc"] {
+            assert!(
+                parse_admin_identities(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn ci_repository_is_explicitly_allowlisted_to_upstream_pumpkin() {
@@ -1088,8 +1153,7 @@ mod tests {
     #[test]
     fn remote_bubblewrap_paths_reject_shell_syntax() {
         assert!(
-            validate_ci_remote_path("/home/ci/kurbis-ci/ci_bubblewrap_runner.py", "runner")
-                .is_ok()
+            validate_ci_remote_path("/home/ci/kurbis-ci/ci_bubblewrap_runner.py", "runner").is_ok()
         );
         for path in [
             "relative/runner.py",

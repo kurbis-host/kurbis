@@ -39,6 +39,7 @@ use super::{
 mod account;
 mod activity;
 mod actor;
+mod admin;
 mod admission;
 mod ai;
 mod ci;
@@ -839,6 +840,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
             "/internal/worker/control/exports/{export_id}/fail",
             post(worker_control::fail_export),
         )
+        .merge(admin::router())
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

@@ -7878,6 +7878,1626 @@
           }
         ]
       }
+    },
+    "/api/v1/admin/overview": {
+      "get": {
+        "description": "Admin only: whether everything is fine. Background tasks, workers, the start queue, servers by state, failing operations, the fleet now, storage and accounts.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/fleet": {
+      "get": {
+        "description": "Admin only: the whole service over the range, oldest first.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "range",
+            "schema": {
+              "$ref": "#/components/schemas/AdminRange"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FleetSample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/servers": {
+      "get": {
+        "description": "Admin only: every server, newest change first, filtered by state and search.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "$ref": "#/components/schemas/AdminServerFilter"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "description": "Matches addresses and owner names, or a server or owner id exactly.",
+            "schema": {
+              "description": "Matches addresses and owner names, or a server or owner id exactly.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminServerPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/servers/{server_id}": {
+      "get": {
+        "description": "Admin only: a server's lifecycle: its owner, placement, queue entry, operations, snapshots, plugin errors and samples over the range.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "server_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          },
+          {
+            "in": "query",
+            "name": "range",
+            "schema": {
+              "$ref": "#/components/schemas/AdminRange"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminServerDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/accounts": {
+      "get": {
+        "description": "Admin only: every account, newest first, filtered by search.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "description": "Matches account and identity names and emails, or an account id exactly.",
+            "schema": {
+              "description": "Matches account and identity names and emails, or an account id exactly.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAccountPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/accounts/{account_id}": {
+      "get": {
+        "description": "Admin only: an account's identities, sessions, servers and AI spend.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAccountDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/workers": {
+      "get": {
+        "description": "Admin only: every worker with its capacity, heartbeat, lease and what runs on it.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AdminWorker"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/failures": {
+      "get": {
+        "description": "Admin only: everything that failed over the range, grouped by what it said, and the latest failures.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "range",
+            "schema": {
+              "$ref": "#/components/schemas/AdminRange"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminFailures"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/ci": {
+      "get": {
+        "description": "Admin only: Pumpkin preview builds: the watched repository, GitHub's rate limit, the build queue, builder slots, recent builds and running previews.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminCi"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/ci/builds/{build_id}/log": {
+      "get": {
+        "description": "Admin only: a preview build's log.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminBuildLog"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/ai": {
+      "get": {
+        "description": "Admin only: the AI assistant's spend this month against its budgets, by day, model, server and account, and its failed or stalled requests.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAi"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/growth": {
+      "get": {
+        "description": "Admin only: every day's signups, servers, wakes, peaks and AI spend, and the share of each signup week that came back.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminGrowth"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "accountSessionCookie": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -7948,6 +9568,18 @@
           "worlds"
         ]
       },
+      "AccountIdPath": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "account_id"
+        ]
+      },
       "AccountIdentity": {
         "type": "object",
         "properties": {
@@ -7982,6 +9614,32 @@
           "email_verified",
           "created_at"
         ]
+      },
+      "AccountListQuery": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "search": {
+            "description": "Matches account and identity names and emails, or an account id exactly.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "AccountSession": {
         "type": "object",
@@ -8092,6 +9750,2092 @@
           "type",
           "summary",
           "created_at"
+        ]
+      },
+      "AdminAccount": {
+        "type": "object",
+        "properties": {
+          "account_status": {
+            "type": "string"
+          },
+          "ai_cost_this_month_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminIdentitySummary"
+            }
+          },
+          "last_seen_at": {
+            "description": "The latest request of any of the account's browser sessions.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "servers": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "account_status",
+          "created_at",
+          "identities",
+          "servers",
+          "ai_cost_this_month_micros"
+        ]
+      },
+      "AdminAccountCounts": {
+        "type": "object",
+        "properties": {
+          "signups_last_day": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "signups_last_week": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "suspended": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "total",
+          "suspended",
+          "signups_last_day",
+          "signups_last_week"
+        ]
+      },
+      "AdminAccountDetail": {
+        "type": "object",
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/AdminAccount"
+          },
+          "ai_cost_total_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminIdentity"
+            }
+          },
+          "is_admin": {
+            "description": "Whether the account may read this dashboard.",
+            "type": "boolean"
+          },
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminServer"
+            }
+          },
+          "sessions": {
+            "description": "Browser sessions, latest first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminSession"
+            }
+          }
+        },
+        "required": [
+          "account",
+          "is_admin",
+          "identities",
+          "sessions",
+          "servers",
+          "ai_cost_total_micros"
+        ]
+      },
+      "AdminAccountPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAccount"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "total",
+          "items"
+        ]
+      },
+      "AdminAi": {
+        "type": "object",
+        "properties": {
+          "budgets": {
+            "description": "Null when no model provider is configured.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminAiBudgets"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "by_day": {
+            "description": "The last 30 days, oldest first, every day present.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAiDay"
+            }
+          },
+          "jobs_by_state": {
+            "description": "Requests of the last 30 days by state.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStateCount"
+            }
+          },
+          "models": {
+            "description": "This month.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAiModel"
+            }
+          },
+          "month": {
+            "$ref": "#/components/schemas/AdminAiMonth"
+          },
+          "problem_jobs": {
+            "description": "The latest 50 requests that failed or stalled.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAiJob"
+            }
+          },
+          "top_accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAiSpender"
+            }
+          },
+          "top_servers": {
+            "description": "The ten that spent most this month.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAiSpender"
+            }
+          }
+        },
+        "required": [
+          "month",
+          "by_day",
+          "models",
+          "top_servers",
+          "top_accounts",
+          "jobs_by_state",
+          "problem_jobs"
+        ]
+      },
+      "AdminAiBudgets": {
+        "description": "The budgets the AI gateway enforces, each a month's spend in millionths of a US dollar.",
+        "type": "object",
+        "properties": {
+          "account_monthly_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_concurrent_calls": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "server_monthly_micros": {
+            "description": "The default for a server; a server may set its own up to the account's.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "server_monthly_micros",
+          "account_monthly_micros",
+          "max_concurrent_calls",
+          "models"
+        ]
+      },
+      "AdminAiDay": {
+        "type": "object",
+        "properties": {
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "day",
+          "cost_micros",
+          "model_calls"
+        ]
+      },
+      "AdminAiJob": {
+        "type": "object",
+        "properties": {
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "operator_name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "state": {
+            "type": "string"
+          },
+          "subdomain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_calls": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "required": [
+          "id",
+          "server_id",
+          "operator_name",
+          "prompt",
+          "state",
+          "stalls",
+          "model_calls",
+          "tool_calls",
+          "cost_micros",
+          "created_at"
+        ]
+      },
+      "AdminAiModel": {
+        "type": "object",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "model": {
+            "type": "string"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "model",
+          "cost_micros",
+          "model_calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_creation_input_tokens"
+        ]
+      },
+      "AdminAiMonth": {
+        "type": "object",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "jobs": {
+            "description": "Requests started this month.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "cost_micros",
+          "model_calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_creation_input_tokens",
+          "jobs"
+        ]
+      },
+      "AdminAiSpender": {
+        "description": "A server or account and what it spent this month.",
+        "type": "object",
+        "properties": {
+          "cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "model_calls": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "description": "The server's address or the account's name; null once it is deleted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "cost_micros",
+          "model_calls"
+        ]
+      },
+      "AdminBuild": {
+        "type": "object",
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminBuildAlias"
+            }
+          },
+          "commit_sha": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "failure_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_stage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_log": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "pull_requests": {
+            "description": "Pull requests whose queued build this is.",
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "requested_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "retention_policy": {
+            "type": "string"
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "retry_count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "commit_sha",
+          "stage",
+          "retry_count",
+          "retention_policy",
+          "created_at",
+          "updated_at",
+          "has_log",
+          "aliases",
+          "pull_requests"
+        ]
+      },
+      "AdminBuildAlias": {
+        "description": "Where a build is published: a preview hostname and the ref it follows.",
+        "type": "object",
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "ref_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "kind",
+          "ref_name"
+        ]
+      },
+      "AdminBuildLog": {
+        "type": "object",
+        "properties": {
+          "build_log": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_sha": {
+            "type": "string"
+          },
+          "failure_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stage": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "commit_sha",
+          "stage"
+        ]
+      },
+      "AdminBuilderSlot": {
+        "description": "A builder slot in use.",
+        "type": "object",
+        "properties": {
+          "builder_identity": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "heartbeat_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "requested_memory_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "slot": {
+            "type": "integer",
+            "format": "int16",
+            "maximum": 32767,
+            "minimum": -32768
+          }
+        },
+        "required": [
+          "builder_identity",
+          "slot",
+          "requested_memory_bytes",
+          "heartbeat_at",
+          "created_at"
+        ]
+      },
+      "AdminCi": {
+        "type": "object",
+        "properties": {
+          "builder_slots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminBuilderSlot"
+            }
+          },
+          "builds": {
+            "description": "The latest 50 builds to change.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminBuild"
+            }
+          },
+          "builds_by_stage": {
+            "description": "Builds by stage: unfinished ones, and those finished in the last week.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStateCount"
+            }
+          },
+          "github_rate_limits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminGitHubRateLimit"
+            }
+          },
+          "previews": {
+            "description": "Previews not yet expired, latest change first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminPreview"
+            }
+          },
+          "queue": {
+            "description": "Pull-request build requests: live ones, and those finished in the last week.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStateCount"
+            }
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminCiRepository"
+            }
+          },
+          "webhook_deliveries": {
+            "$ref": "#/components/schemas/AdminWebhookDeliveries"
+          }
+        },
+        "required": [
+          "repositories",
+          "github_rate_limits",
+          "queue",
+          "builds_by_stage",
+          "builder_slots",
+          "builds",
+          "previews",
+          "webhook_deliveries"
+        ]
+      },
+      "AdminCiRepository": {
+        "type": "object",
+        "properties": {
+          "default_branch": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_successful_poll": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "poll_lease_expires_at": {
+            "description": "A poller holds the repository until then.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "default_branch",
+          "enabled"
+        ]
+      },
+      "AdminCohort": {
+        "description": "The accounts made in one week, and how many of them had their server woken in each\n week after.",
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "returned": {
+            "description": "Accounts with a wake in UTC calendar week 0 (the week of signup), 1, … up to 7\n after it; only weeks that have begun are listed.",
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "week": {
+            "description": "Monday of the signup week.",
+            "type": "string",
+            "format": "date"
+          }
+        },
+        "required": [
+          "week",
+          "accounts",
+          "returned"
+        ]
+      },
+      "AdminDay": {
+        "description": "One UTC day.",
+        "type": "object",
+        "properties": {
+          "ai_cost_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "peak_players_online": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "peak_servers_online": {
+            "description": "Highest per-minute sample of the day; null for days nobody sampled.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "servers_created": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "servers_woken": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "signups": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "wakes": {
+            "description": "Successful wakes asked for that day, and the servers they woke.",
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "required": [
+          "day",
+          "signups",
+          "servers_created",
+          "wakes",
+          "servers_woken",
+          "ai_cost_micros"
+        ]
+      },
+      "AdminFailure": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "reference": {
+            "description": "The failed row: an operation, export, plugin, command, job or build id, a pull\n request number, a webhook delivery or an object key.",
+            "type": "string"
+          },
+          "server_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "source": {
+            "type": "string"
+          },
+          "subdomain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "kind",
+          "message",
+          "at",
+          "reference"
+        ]
+      },
+      "AdminFailureGroup": {
+        "description": "Failures that said the same thing, ids and numbers aside.",
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "first_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message": {
+            "description": "The latest failure's own words.",
+            "type": "string"
+          },
+          "server_id": {
+            "description": "The latest failure's server, when it had one.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "servers": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "signature": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "subdomain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "kind",
+          "signature",
+          "message",
+          "count",
+          "servers",
+          "first_at",
+          "last_at"
+        ]
+      },
+      "AdminFailures": {
+        "type": "object",
+        "properties": {
+          "groups": {
+            "description": "The 100 groups seen last, latest first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminFailureGroup"
+            }
+          },
+          "recent": {
+            "description": "The latest 100 failures.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminFailure"
+            }
+          }
+        },
+        "required": [
+          "groups",
+          "recent"
+        ]
+      },
+      "AdminGitHubRateLimit": {
+        "type": "object",
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "paused_until": {
+            "description": "Requests wait until then after GitHub said to slow down.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "reset_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "scope": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "consecutive_failures"
+        ]
+      },
+      "AdminGrowth": {
+        "type": "object",
+        "properties": {
+          "cohorts": {
+            "description": "The last twelve signup weeks, oldest first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminCohort"
+            }
+          },
+          "days": {
+            "description": "Every day since the first account, oldest first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminDay"
+            }
+          }
+        },
+        "required": [
+          "days",
+          "cohorts"
+        ]
+      },
+      "AdminIdentity": {
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email_verified": {
+            "type": "boolean"
+          },
+          "minecraft_player_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "subject": {
+            "description": "The provider's id for the account; Minecraft identities use the player's UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "subject",
+          "display_name",
+          "email_verified",
+          "created_at"
+        ]
+      },
+      "AdminIdentitySummary": {
+        "description": "A linked sign-in, as the list shows it.",
+        "type": "object",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "display_name"
+        ]
+      },
+      "AdminOperation": {
+        "type": "object",
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "claimed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "worker_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "generation",
+          "attempt",
+          "created_at",
+          "next_attempt_at",
+          "updated_at"
+        ]
+      },
+      "AdminOperationCounts": {
+        "type": "object",
+        "properties": {
+          "failed_last_day": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retrying": {
+            "description": "Pending again after a failed attempt.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "running",
+          "retrying",
+          "failed_last_day"
+        ]
+      },
+      "AdminOverview": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "$ref": "#/components/schemas/AdminAccountCounts"
+          },
+          "ai_cost_this_month_micros": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fleet": {
+            "$ref": "#/components/schemas/FleetUsage"
+          },
+          "github_rate_limits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminGitHubRateLimit"
+            }
+          },
+          "measured_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "operations": {
+            "$ref": "#/components/schemas/AdminOperationCounts"
+          },
+          "servers": {
+            "$ref": "#/components/schemas/AdminServerCounts"
+          },
+          "servers_by_state": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStateCount"
+            }
+          },
+          "start_queue": {
+            "$ref": "#/components/schemas/AdminStartQueue"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/AdminStorage"
+          },
+          "tasks": {
+            "description": "The tasks of the control plane that answered.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminTask"
+            }
+          },
+          "workers": {
+            "$ref": "#/components/schemas/AdminWorkerCounts"
+          }
+        },
+        "required": [
+          "measured_at",
+          "tasks",
+          "workers",
+          "start_queue",
+          "servers",
+          "servers_by_state",
+          "operations",
+          "fleet",
+          "storage",
+          "accounts",
+          "github_rate_limits",
+          "ai_cost_this_month_micros"
+        ]
+      },
+      "AdminPlacement": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "bedrock_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "java_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "worker_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "worker_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id",
+          "worker_name",
+          "generation",
+          "active",
+          "updated_at"
+        ]
+      },
+      "AdminPluginError": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reported_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "runtime_error": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "enabled",
+          "runtime_error"
+        ]
+      },
+      "AdminPreview": {
+        "type": "object",
+        "properties": {
+          "commit_sha": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_activity_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ref_name": {
+            "type": "string"
+          },
+          "runtime_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "worker_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "hostname",
+          "kind",
+          "ref_name",
+          "commit_sha",
+          "state",
+          "expires_at",
+          "players_online"
+        ]
+      },
+      "AdminRange": {
+        "description": "How far back a chart looks.",
+        "type": "string",
+        "enum": [
+          "hour",
+          "day",
+          "week",
+          "month"
+        ]
+      },
+      "AdminServer": {
+        "description": "A server as the dashboard lists it.",
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "desired_state": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_woken_at": {
+            "description": "When the latest successful wake was asked for.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "observed_state": {
+            "type": "string"
+          },
+          "owner_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "owner_name": {
+            "type": "string"
+          },
+          "owner_status": {
+            "type": "string"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "storage_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "subdomain": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "worker_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "subdomain",
+          "owner_id",
+          "owner_name",
+          "owner_status",
+          "desired_state",
+          "observed_state",
+          "players_online",
+          "storage_bytes",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "AdminServerCounts": {
+        "type": "object",
+        "properties": {
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stuck": {
+            "description": "In a passing state for more than ten minutes.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "description": "Servers not deleted.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "total",
+          "failed",
+          "stuck"
+        ]
+      },
+      "AdminServerDetail": {
+        "type": "object",
+        "properties": {
+          "operations": {
+            "description": "The latest 50, newest first.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminOperation"
+            }
+          },
+          "placement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminPlacement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "plugin_errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminPluginError"
+            }
+          },
+          "samples": {
+            "description": "Over the range, oldest first; minutes the server was not running are missing.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminServerSample"
+            }
+          },
+          "server": {
+            "$ref": "#/components/schemas/AdminServer"
+          },
+          "snapshots": {
+            "description": "Every snapshot still kept, newest first, complete or not.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminSnapshot"
+            }
+          },
+          "start_request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminStartRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "server",
+          "operations",
+          "snapshots",
+          "plugin_errors",
+          "samples"
+        ]
+      },
+      "AdminServerFilter": {
+        "description": "Which servers a list shows.",
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "all",
+              "online",
+              "sleeping",
+              "failed",
+              "queued"
+            ]
+          },
+          {
+            "description": "In a passing state for more than ten minutes.",
+            "type": "string",
+            "const": "stuck"
+          },
+          {
+            "description": "Never woken successfully.",
+            "type": "string",
+            "const": "never_started"
+          }
+        ]
+      },
+      "AdminServerPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminServer"
+            }
+          },
+          "total": {
+            "description": "Servers matching the filter and search, across every page.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "total",
+          "items"
+        ]
+      },
+      "AdminServerSample": {
+        "description": "A server over one bucket of minutes: its most players, and its average usage.",
+        "type": "object",
+        "properties": {
+          "cpu_used_millis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "minute": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "tps": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "required": [
+          "minute",
+          "players_online"
+        ]
+      },
+      "AdminServerStorage": {
+        "type": "object",
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "storage_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "subdomain": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_id",
+          "subdomain",
+          "storage_bytes"
+        ]
+      },
+      "AdminSession": {
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "last_seen_at"
+        ]
+      },
+      "AdminSnapshot": {
+        "type": "object",
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "generation",
+          "reason",
+          "size_bytes",
+          "complete",
+          "created_at"
+        ]
+      },
+      "AdminStartQueue": {
+        "type": "object",
+        "properties": {
+          "depth": {
+            "description": "Servers waiting for a worker with room.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "oldest_requested_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "depth"
+        ]
+      },
+      "AdminStartRequest": {
+        "type": "object",
+        "properties": {
+          "ahead": {
+            "description": "Servers ahead of this one in the queue.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "requested_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "reason",
+          "requested_at",
+          "ahead"
+        ]
+      },
+      "AdminStateCount": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "count"
+        ]
+      },
+      "AdminStorage": {
+        "type": "object",
+        "properties": {
+          "database_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "largest_servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminServerStorage"
+            }
+          },
+          "largest_tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminTableSize"
+            }
+          },
+          "server_bytes": {
+            "description": "What servers' worlds take, as they last reported.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "snapshot_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "snapshots": {
+            "description": "Complete snapshots and their total size.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "snapshots",
+          "snapshot_bytes",
+          "server_bytes",
+          "database_bytes",
+          "largest_tables",
+          "largest_servers"
+        ]
+      },
+      "AdminTableSize": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "description": "Table, indexes and TOAST.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rows": {
+            "description": "Rows by the planner's estimate.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "name",
+          "rows",
+          "bytes"
+        ]
+      },
+      "AdminTask": {
+        "description": "One of the control plane's background tasks (start queue, maintenance, CI poller…).",
+        "type": "object",
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_heartbeat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_success": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "description": "The control plane is unhealthy while a required task is not running.",
+            "type": "boolean"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AdminTaskState"
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "required",
+          "consecutive_failures"
+        ]
+      },
+      "AdminTaskState": {
+        "type": "string",
+        "enum": [
+          "starting",
+          "running",
+          "backing_off",
+          "fatal",
+          "stopped"
+        ]
+      },
+      "AdminWebhookDeliveries": {
+        "type": "object",
+        "properties": {
+          "failing": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "pending",
+          "failing"
+        ]
+      },
+      "AdminWorker": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "cpu_used_millis": {
+            "description": "What its running servers use, from their fresh samples; null when none reported.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "heartbeat_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lease_expires_at": {
+            "description": "When the running worker process's exclusive lease runs out.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "live": {
+            "description": "Heartbeat within the last 30 seconds: it may take new servers.",
+            "type": "boolean"
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "port_max": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "port_min": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "ports_leased": {
+            "description": "Ports leased to servers and previews.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "previews": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminWorkerPreview"
+            }
+          },
+          "reserved_cpu_millis": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reserved_disk_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reserved_memory_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runtime_architecture": {
+            "type": "string"
+          },
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminWorkerServer"
+            }
+          },
+          "supports_ci_previews": {
+            "type": "boolean"
+          },
+          "total_cpu_millis": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_disk_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_memory_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "address",
+          "runtime_architecture",
+          "supports_ci_previews",
+          "draining",
+          "heartbeat_at",
+          "live",
+          "total_memory_bytes",
+          "reserved_memory_bytes",
+          "total_disk_bytes",
+          "reserved_disk_bytes",
+          "total_cpu_millis",
+          "reserved_cpu_millis",
+          "port_min",
+          "port_max",
+          "ports_leased",
+          "servers",
+          "previews"
+        ]
+      },
+      "AdminWorkerCounts": {
+        "type": "object",
+        "properties": {
+          "draining": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "live": {
+            "description": "Heartbeat within the last 30 seconds.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "total",
+          "live",
+          "draining"
+        ]
+      },
+      "AdminWorkerPreview": {
+        "description": "A Pumpkin preview placed on a worker.",
+        "type": "object",
+        "properties": {
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "preview_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "preview_id",
+          "state",
+          "players_online"
+        ]
+      },
+      "AdminWorkerServer": {
+        "description": "A server placed on a worker.",
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "observed_state": {
+            "type": "string"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "subdomain": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "subdomain",
+          "observed_state",
+          "active",
+          "players_online"
         ]
       },
       "AiActiveJob": {
@@ -8704,6 +12448,18 @@
           "message"
         ]
       },
+      "BuildIdPath": {
+        "type": "object",
+        "properties": {
+          "build_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "build_id"
+        ]
+      },
       "CommandResponse": {
         "type": "object",
         "properties": {
@@ -8853,7 +12609,7 @@
         }
       },
       "FleetSample": {
-        "description": "One minute of the service, as it was sampled at the start of that minute.",
+        "description": "The service in one minute, as it was sampled at the start of that minute, or in a\n bucket of minutes starting at `minute` (see [`history`]).",
         "type": "object",
         "properties": {
           "cpu_total_millis": {
@@ -8989,6 +12745,62 @@
           "players_online",
           "history",
           "servers_by_day"
+        ]
+      },
+      "FleetUsage": {
+        "description": "The running servers' totals at one moment.",
+        "type": "object",
+        "properties": {
+          "cpu_total_millis": {
+            "description": "CPU of every live worker, in thousandths of a core.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cpu_used_millis": {
+            "description": "CPU the running servers use, in thousandths of a core.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_used_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "players_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "servers_online": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tps": {
+            "description": "The running servers' average ticks per second.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "required": [
+          "servers_online",
+          "players_online"
         ]
       },
       "GameMode": {
@@ -9659,6 +13471,14 @@
           "retryable"
         ]
       },
+      "RangeQuery": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "$ref": "#/components/schemas/AdminRange"
+          }
+        }
+      },
       "ResetMode": {
         "type": "string",
         "enum": [
@@ -10053,6 +13873,14 @@
           "command_id"
         ]
       },
+      "ServerDetailQuery": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "$ref": "#/components/schemas/AdminRange"
+          }
+        }
+      },
       "ServerEvent": {
         "type": "object",
         "properties": {
@@ -10275,6 +14103,35 @@
         "required": [
           "server_id"
         ]
+      },
+      "ServerListQuery": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "$ref": "#/components/schemas/AdminServerFilter"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "search": {
+            "description": "Matches addresses and owner names, or a server or owner id exactly.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "ServerPlugin": {
         "description": "One plugin installed on a server.",
@@ -10650,6 +14507,10 @@
       "Session": {
         "type": "object",
         "properties": {
+          "is_admin": {
+            "description": "The account may read the operator dashboard and every server.",
+            "type": "boolean"
+          },
           "limits": {
             "$ref": "#/components/schemas/ServiceLimits"
           },
@@ -10664,7 +14525,8 @@
         "required": [
           "user",
           "limits",
-          "server_domain"
+          "server_domain",
+          "is_admin"
         ]
       },
       "SessionUser": {

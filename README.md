@@ -79,6 +79,9 @@ on another worker.
   monthly budgets.
 - **Pumpkin previews (optional).** Every open pull request on Pumpkin gets a
   joinable preview address. Its code is compiled in a sandbox with no network.
+- **Operator dashboard.** Read-only `/admin` for the accounts in
+  `ADMIN_IDENTITIES`: service health, fleet charts, every server and account,
+  failures, previews, AI spend and daily growth.
 - **Isolation.** Rootless Docker per server, an internal-only network, and a
   firewall that admits only the gateway.
 
@@ -139,8 +142,8 @@ it. The browser suite runs the real panel, API and PostgreSQL in Playwright; see
 ## Documentation
 
 - [Development](docs/development.md): local stack, builds, tests
-- [Self-hosting](docs/self-hosting.md): deployment modes, networking, TLS, releases
-- [Configuration](docs/configuration.md): OAuth providers, the AI assistant
+- [Self-hosting](docs/self-hosting.md): deployment modes, networking, TLS, the operator dashboard, releases
+- [Configuration](docs/configuration.md): OAuth providers, admins, the AI assistant
 - [Pumpkin previews](docs/pumpkin-previews.md): the CI preview service
 - [Native host development](runtime/pumpkin/NATIVE.md) and the [hosted Pumpkin runtime](runtime/pumpkin/README.md)
 - [Control-plane workers](docs/control-plane-workers.md): background tasks and supervision

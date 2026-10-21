@@ -5,6 +5,10 @@
 //! Usage comes only from runtime samples the API would still show for their server
 //! (`crate::runtime_stats`): fresh, and from the server's current generation. A
 //! resource no running server reported stays unknown rather than being read as zero.
+//!
+//! The same per-minute pass keeps the operator dashboard's history: a sample of each
+//! running server, and the day's roll-up (`daily_stats`, recounted by the database's
+//! `refresh_daily_stats`).
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -17,8 +21,10 @@ use crate::runtime_stats::RUNTIME_STATS_FRESHNESS_SECONDS;
 pub const HISTORY_MINUTES: i32 = 120;
 /// Days of servers the page graphs, a bar a day.
 pub const SERVER_DAYS: i32 = 30;
-/// How long a minute's sample is kept.
-const RETENTION_HOURS: i32 = 24;
+/// How long a minute's sample of the whole service is kept.
+pub const FLEET_RETENTION_DAYS: i32 = 30;
+/// How long a minute's sample of one server is kept.
+pub const SERVER_SAMPLE_RETENTION_DAYS: i32 = 7;
 
 /// The running servers' totals at one moment.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -35,7 +41,8 @@ pub struct FleetUsage {
     pub tps: Option<f64>,
 }
 
-/// One minute of the service, as it was sampled at the start of that minute.
+/// The service in one minute, as it was sampled at the start of that minute, or in a
+/// bucket of minutes starting at `minute` (see [`history`]).
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct FleetSample {
     pub minute: DateTime<Utc>,
@@ -122,7 +129,8 @@ pub async fn usage<'e>(executor: impl PgExecutor<'e>) -> sqlx::Result<FleetUsage
     Ok(now(executor).await?.usage)
 }
 
-/// Sample the current minute, unless it already is, and forget samples older than a day.
+/// Sample the current minute of the service and of each running server, unless it
+/// already is, recount today and yesterday, and forget samples past their retention.
 pub async fn record_minute(pool: &PgPool) -> sqlx::Result<()> {
     let usage = usage(pool).await?;
     sqlx::query(
@@ -140,22 +148,67 @@ pub async fn record_minute(pool: &PgPool) -> sqlx::Result<()> {
     .bind(usage.tps.map(|tps| tps.clamp(0.0, 20.0)))
     .execute(pool)
     .await?;
-    sqlx::query("DELETE FROM fleet_stats WHERE minute < now() - make_interval(hours => $1)")
-        .bind(RETENTION_HOURS)
+    sqlx::query(
+        "INSERT INTO server_runtime_samples(server_id, minute, players_online, cpu_used_millis,
+                                            memory_used_bytes, tps)
+         SELECT servers.id, date_trunc('minute', now()),
+                (SELECT count(*) FROM server_players WHERE server_players.server_id = servers.id),
+                round((stats.stats->>'cpu_percent')::double precision / 100
+                      * (stats.stats->>'cpu_limit_millis')::double precision)::bigint,
+                (stats.stats->>'memory_used_bytes')::bigint,
+                least(greatest((stats.stats->>'tps')::double precision, 0), 20)
+         FROM servers
+         LEFT JOIN server_runtime_stats stats
+           ON stats.server_id = servers.id AND stats.generation = servers.generation
+          AND stats.measured_at > now() - make_interval(secs => $1::double precision)
+         WHERE servers.observed_state = 'online'
+         ON CONFLICT(server_id, minute) DO NOTHING",
+    )
+    .bind(RUNTIME_STATS_FRESHNESS_SECONDS as f64)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "SELECT refresh_daily_stats((now() AT TIME ZONE 'UTC')::date - 1,
+                                    (now() AT TIME ZONE 'UTC')::date)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM fleet_stats WHERE minute < now() - make_interval(days => $1)")
+        .bind(FLEET_RETENTION_DAYS)
         .execute(pool)
         .await?;
+    sqlx::query(
+        "DELETE FROM server_runtime_samples WHERE minute < now() - make_interval(days => $1)",
+    )
+    .bind(SERVER_SAMPLE_RETENTION_DAYS)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-async fn history(pool: &PgPool) -> sqlx::Result<Vec<FleetSample>> {
+/// The service over the last `minutes`, a sample per `bucket_minutes`, oldest first. A
+/// bucket holds the most servers and players of its minutes and their average usage, and
+/// is stamped with its first minute; a bucket nobody sampled is missing.
+pub async fn history(
+    pool: &PgPool,
+    minutes: i32,
+    bucket_minutes: i32,
+) -> sqlx::Result<Vec<FleetSample>> {
     let rows = sqlx::query(
-        "SELECT minute, servers_online, players_online, cpu_used_millis, cpu_total_millis,
-                memory_used_bytes, memory_total_bytes, tps
+        "SELECT date_bin(make_interval(mins => $2), minute, timestamptz 'epoch') AS minute,
+                max(servers_online) AS servers_online, max(players_online) AS players_online,
+                round(avg(cpu_used_millis))::bigint AS cpu_used_millis,
+                round(avg(cpu_total_millis))::bigint AS cpu_total_millis,
+                round(avg(memory_used_bytes))::bigint AS memory_used_bytes,
+                round(avg(memory_total_bytes))::bigint AS memory_total_bytes,
+                avg(tps) AS tps
          FROM fleet_stats
          WHERE minute > now() - make_interval(mins => $1)
-         ORDER BY minute",
+         GROUP BY 1
+         ORDER BY 1",
     )
-    .bind(HISTORY_MINUTES)
+    .bind(minutes)
+    .bind(bucket_minutes.max(1))
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -191,8 +244,11 @@ async fn servers_by_day(pool: &PgPool) -> sqlx::Result<Vec<i64>> {
 
 /// The whole service now, the last two hours of it, and its last thirty days of servers.
 pub async fn fleet_stats(pool: &PgPool) -> sqlx::Result<FleetStats> {
-    let (now, history, servers_by_day) =
-        tokio::try_join!(now(pool), history(pool), servers_by_day(pool))?;
+    let (now, history, servers_by_day) = tokio::try_join!(
+        now(pool),
+        history(pool, HISTORY_MINUTES, 1),
+        servers_by_day(pool)
+    )?;
     let FleetUsage {
         servers_online,
         players_online,

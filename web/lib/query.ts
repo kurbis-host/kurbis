@@ -19,6 +19,20 @@ export const queryKeys = {
   pluginMarket: (serverId: string) => ["servers", serverId, "plugins", "market"] as const,
   pluginMarketSearch: (serverId: string, query: string) => ["servers", serverId, "plugins", "market", query] as const,
   eventStatus: (serverId: string) => ["servers", serverId, "event-status"] as const,
+  admin: {
+    overview: ["admin", "overview"] as const,
+    fleet: (range: string) => ["admin", "fleet", range] as const,
+    servers: (query: object) => ["admin", "servers", query] as const,
+    server: (serverId: string, range: string) => ["admin", "servers", serverId, range] as const,
+    accounts: (query: object) => ["admin", "accounts", query] as const,
+    account: (accountId: string) => ["admin", "accounts", accountId] as const,
+    workers: ["admin", "workers"] as const,
+    failures: (range: string) => ["admin", "failures", range] as const,
+    ci: ["admin", "ci"] as const,
+    buildLog: (buildId: string) => ["admin", "ci", "builds", buildId] as const,
+    ai: ["admin", "ai"] as const,
+    growth: ["admin", "growth"] as const,
+  },
 };
 
 export function selectedServerId(pathname: string) {

@@ -22,6 +22,7 @@ import {
   PageHeader,
   Surface,
   SwitchField,
+  useReadOnly,
 } from "./ui";
 
 type Server = components["schemas"]["Server"];
@@ -122,7 +123,8 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
     }
   };
 
-  const disabled = !allowed.canEdit;
+  const readOnly = useReadOnly();
+  const disabled = readOnly || !allowed.canEdit;
 
   return (
     <>

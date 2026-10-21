@@ -16,7 +16,7 @@ use crate::model::{OperationRecord as DbOperation, SnapshotRecord as DbSnapshot}
 
 use super::activity::{EventRow, ServerEventKind};
 use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
-use super::internal::{require_server_access, server_by_id};
+use super::internal::{require_server_view, server_by_id};
 use super::logs::LogEntry;
 use super::operators::{Operators, operators_state};
 use super::players::player_list;
@@ -219,7 +219,7 @@ pub(super) async fn server_events(
 > {
     let server_id = path.server_id;
     let headers = headers.0;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     let cursor = event_cursor(&headers, &query)?;
 
     // LISTEN before the first durable read. A commit between these two steps is
@@ -237,7 +237,7 @@ pub(super) async fn server_events(
     };
     let output = stream::unfold(stream_state, |mut stream_state| async move {
         loop {
-            if let Err(error) = require_server_access(
+            if let Err(error) = require_server_view(
                 &stream_state.state,
                 &stream_state.headers,
                 stream_state.server_id,

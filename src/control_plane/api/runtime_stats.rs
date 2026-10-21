@@ -8,7 +8,7 @@ use crate::runtime_stats::{RUNTIME_STATS_FRESHNESS_SECONDS, RuntimeStats};
 use super::{
     ApiError, AppState,
     actor::{ApiPath, ApiServerHeaders, ServerIdPath},
-    internal::require_server_access,
+    internal::require_server_view,
 };
 
 /// Return the latest current-generation runtime sample when it is still fresh.
@@ -21,7 +21,7 @@ pub(super) async fn runtime_stats(
     headers: ApiServerHeaders,
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Option<RuntimeStats>>, ApiError> {
-    let server = require_server_access(&state, &headers, path.server_id).await?;
+    let server = require_server_view(&state, &headers, path.server_id).await?;
     let row = sqlx::query(
         "SELECT stats, measured_at
          FROM server_runtime_stats

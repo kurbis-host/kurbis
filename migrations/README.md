@@ -9,9 +9,12 @@ SQLx SHA-384 checksum for every migration and a SHA-256 over the ordered
 inventory. The release gate refuses to run with a missing, duplicated, renamed,
 or modified migration entry.
 
-The history currently ends at version 22, which keeps a sample a minute of the
-whole service (servers and players online, CPU, memory and TPS) for a day, for
-the landing page's graphs. Version 21 records who added each whitelist entry,
+The history currently ends at version 23, which keeps the operator dashboard's
+history: the whole service's per-minute samples for 30 days instead of one, a
+sample a minute of each running server for 7 days, and a roll-up of every day
+(signups, servers, wakes, peaks and AI spend) for good. Version 22 keeps a
+sample a minute of the whole service (servers and players online, CPU, memory
+and TPS) for the landing page's graphs. Version 21 records who added each whitelist entry,
 gives server events an optional detail line and keeps the players a whitelist
 recently turned away. Version 16 is the deployed CI
 build-demand marker migration. Stable CI-build retention is version 17, the

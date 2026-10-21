@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCount, formatQuantity, formatUsd, formatUtcDay, parseUsdInput, usdInputValue } from "../../lib/format";
+import { formatCores, formatCount, formatShare, formatQuantity, formatUsd, formatUtcDay, parseUsdInput, usdInputValue } from "../../lib/format";
 
 describe("micro-USD money", () => {
   it("shows dollars and cents, and keeps sub-cent amounts from reading as $0.00", () => {
@@ -46,5 +46,27 @@ describe("counts and days", () => {
   it("names the UTC day whatever the viewer's time zone", () => {
     expect(formatUtcDay("2026-10-01T00:00:00Z")).toBe("October 1");
     expect(formatUtcDay("2026-09-30T23:30:00-02:00")).toBe("October 1");
+  });
+});
+
+describe("fleet figures", () => {
+  it("shows thousandths of a core as cores, singular only for exactly one", () => {
+    expect(formatCores(0)).toBe("0 cores");
+    expect(formatCores(500)).toBe("0.5 cores");
+    expect(formatCores(1000)).toBe("1 core");
+    expect(formatCores(1049)).toBe("1 core");
+    expect(formatCores(960)).toBe("1 core");
+    expect(formatCores(1250)).toBe("1.3 cores");
+    expect(formatCores(16_000)).toBe("16 cores");
+    expect(formatCores(12_345_000)).toBe("12,345 cores");
+  });
+
+  it("shows a share as a whole percentage", () => {
+    expect(formatShare(0)).toBe("0%");
+    expect(formatShare(0.004)).toBe("0%");
+    expect(formatShare(0.005)).toBe("1%");
+    expect(formatShare(0.426)).toBe("43%");
+    expect(formatShare(1)).toBe("100%");
+    expect(formatShare(1.5)).toBe("150%");
   });
 });

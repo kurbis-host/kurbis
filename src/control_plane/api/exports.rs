@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::snapshot::physical_object_path;
 
 use super::actor::{ApiPath, ApiServerHeaders, ServerExportPath, ServerIdPath};
-use super::internal::require_server_access;
+use super::internal::{require_server_access, require_server_view};
 use super::{ApiError, AppState, lifecycle_error};
 
 #[derive(Debug, Clone, Serialize, FromRow, JsonSchema)]
@@ -67,7 +67,7 @@ pub(super) async fn list_exports(
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Vec<WorldExport>>, ApiError> {
     let server_id = path.server_id;
-    require_server_access(&state, &headers, server_id).await?;
+    require_server_view(&state, &headers, server_id).await?;
     let exports = sqlx::query_as::<_, WorldExport>(
         "SELECT id, server_id, status, stage, source_generation, archive_key, archive_size,
                 archive_checksum, last_error, created_at, updated_at, expires_at
@@ -103,7 +103,7 @@ pub(super) async fn get_export(
 ) -> Result<Json<WorldExport>, ApiError> {
     let server_id = path.server_id;
     let export_id = path.export_id;
-    require_server_access(&state, &headers, server_id).await?;
+    require_server_view(&state, &headers, server_id).await?;
     Ok(Json(export_by_id(&state, server_id, export_id).await?))
 }
 
@@ -141,7 +141,7 @@ pub(super) async fn download_export(
 ) -> Result<Response, ApiError> {
     let server_id = path.server_id;
     let export_id = path.export_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     let export = export_by_id(&state, server_id, export_id).await?;
     if export.status != "completed" || export.expires_at.is_none_or(|expiry| expiry <= Utc::now()) {
         return Err(ApiError::with_code(

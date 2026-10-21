@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::actor::{ApiBrowserServerHeaders, ApiJson, ApiPath, ApiQuery, ServerIdPath};
-use super::internal::require_browser_server_access;
+use super::internal::{require_browser_server_access, require_browser_server_view};
 use super::player_resolution::{resolve_player_name, validate_player_name};
 use super::{ApiError, AppState, mutation_error};
 
@@ -76,7 +76,7 @@ pub(super) async fn operators(
     headers: ApiBrowserServerHeaders,
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Operators>, ApiError> {
-    let server = require_browser_server_access(&state, &headers, path.server_id).await?;
+    let server = require_browser_server_view(&state, &headers, path.server_id).await?;
     Ok(Json(operators_state(&state.pool, server.id).await?))
 }
 

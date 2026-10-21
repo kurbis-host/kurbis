@@ -68,3 +68,16 @@ export function parseUsdInput(text: string) {
   if (!match) return null;
   return Number(match[1]) * MICROS_PER_USD + Number((match[2] ?? "").padEnd(6, "0"));
 }
+
+const decimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+
+/** Thousandths of a CPU core as cores: "0.5 cores", "1 core". */
+export function formatCores(millis: number) {
+  const cores = decimal.format(millis / 1000);
+  return `${cores} ${cores === "1" ? "core" : "cores"}`;
+}
+
+/** A share between 0 and 1 as a whole percentage. */
+export function formatShare(share: number) {
+  return `${Math.round(share * 100)}%`;
+}

@@ -41,6 +41,8 @@ x-control-plane-environment: &control-plane-environment
   GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
   DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID}
   DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET}
+  # Comma-separated google:<id> or discord:<id> accounts that may read /admin.
+  ADMIN_IDENTITIES: ${ADMIN_IDENTITIES:-}
   OBJECT_STORE_TYPE: ${OBJECT_STORE_TYPE:-s3}
   OBJECT_STORE_LOCAL_ROOT: /var/lib/kurbis/object-store
   S3_BUCKET: ${S3_BUCKET:-}

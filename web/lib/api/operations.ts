@@ -2,6 +2,10 @@ import createClient, { type Client } from "openapi-fetch";
 import type { components, paths } from "./generated";
 import { ApiError, apiRequest, apiVoid } from "./client";
 
+export type AdminRange = components["schemas"]["AdminRange"];
+export type AdminServerQuery = NonNullable<paths["/api/v1/admin/servers"]["get"]["parameters"]["query"]>;
+export type AdminAccountQuery = NonNullable<paths["/api/v1/admin/accounts"]["get"]["parameters"]["query"]>;
+
 export function apiOperations(client: Client<paths>) {
   const serverParams = (serverId: string) => ({ params: { path: { server_id: serverId } } });
   const aiJobParams = (serverId: string, jobId: string) => ({ params: { path: { server_id: serverId, job_id: jobId } } });
@@ -102,6 +106,24 @@ export function apiOperations(client: Client<paths>) {
     revokeServerSession: (sessionId: string) => apiVoid(client.DELETE("/api/v1/server/sessions/{session_id}", {
       params: { path: { session_id: sessionId } },
     })),
+    getAdminOverview: () => apiRequest(client.GET("/api/v1/admin/overview")),
+    getAdminFleet: (range: AdminRange) => apiRequest(client.GET("/api/v1/admin/fleet", { params: { query: { range } } })),
+    getAdminServers: (query: AdminServerQuery) => apiRequest(client.GET("/api/v1/admin/servers", { params: { query } })),
+    getAdminServer: (serverId: string, range: AdminRange) => apiRequest(client.GET("/api/v1/admin/servers/{server_id}", {
+      params: { path: { server_id: serverId }, query: { range } },
+    })),
+    getAdminAccounts: (query: AdminAccountQuery) => apiRequest(client.GET("/api/v1/admin/accounts", { params: { query } })),
+    getAdminAccount: (accountId: string) => apiRequest(client.GET("/api/v1/admin/accounts/{account_id}", {
+      params: { path: { account_id: accountId } },
+    })),
+    getAdminWorkers: () => apiRequest(client.GET("/api/v1/admin/workers")),
+    getAdminFailures: (range: AdminRange) => apiRequest(client.GET("/api/v1/admin/failures", { params: { query: { range } } })),
+    getAdminCi: () => apiRequest(client.GET("/api/v1/admin/ci")),
+    getAdminBuildLog: (buildId: string) => apiRequest(client.GET("/api/v1/admin/ci/builds/{build_id}/log", {
+      params: { path: { build_id: buildId } },
+    })),
+    getAdminAi: () => apiRequest(client.GET("/api/v1/admin/ai")),
+    getAdminGrowth: () => apiRequest(client.GET("/api/v1/admin/growth")),
     logout: () => apiVoid(client.POST("/auth/logout")),
     redeemMinecraft: (token: string) => apiVoid(client.POST("/auth/minecraft/redeem", { body: { token } })),
     redeemServer: (token: string) => apiRequest(client.POST("/auth/server/redeem", { body: { token } })),

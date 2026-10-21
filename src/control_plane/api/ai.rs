@@ -21,7 +21,10 @@ use super::{
         ApiBrowserServerHeaders, ApiJson, ApiPath, ApiServerCapabilityHeaders, ApiServerHeaders,
         ServerIdPath,
     },
-    internal::{require_browser_server_access, require_server_access, require_server_capability},
+    internal::{
+        require_browser_server_access, require_server_access, require_server_capability,
+        require_server_view,
+    },
     operators::operators_state,
 };
 
@@ -71,7 +74,7 @@ pub(super) async fn ai_overview(
     headers: ApiServerHeaders,
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<AiOverview>, ApiError> {
-    let server = require_server_access(&state, &headers, path.server_id).await?;
+    let server = require_server_view(&state, &headers, path.server_id).await?;
     Ok(Json(
         ai::overview(&state.pool, state.ai.as_ref(), server.id, server.owner_id).await?,
     ))
@@ -129,7 +132,7 @@ pub(super) async fn ai_job(
     headers: ApiServerHeaders,
     ApiPath(path): ApiPath<ServerAiJobPath>,
 ) -> Result<Json<AiJobDetail>, ApiError> {
-    let server = require_server_access(&state, &headers, path.server_id).await?;
+    let server = require_server_view(&state, &headers, path.server_id).await?;
     ai::job_detail(&state.pool, server.id, path.job_id)
         .await?
         .map(Json)

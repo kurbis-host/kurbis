@@ -14,7 +14,7 @@ use super::actor::{
 };
 use super::internal::{
     require_active_user, require_browser_server_access, require_server_access,
-    require_server_capability,
+    require_server_capability, require_server_view,
 };
 use super::player_resolution::{ResolvedPlayer, resolve_player_name, validate_player_name};
 use super::server_access::instance_capability_server_id;
@@ -142,7 +142,7 @@ pub(super) async fn whitelist(
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Whitelist>, ApiError> {
     let server_id = path.server_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     Ok(Json(whitelist_state(&state.pool, server.id).await?))
 }
 

@@ -22,6 +22,7 @@ import {
   Notice,
   PageHeader,
   Surface,
+  useReadOnly,
 } from "./ui";
 
 type PlayerPresence = components["schemas"]["PlayerPresence"];
@@ -69,6 +70,7 @@ function PlayerNameForm({
     resolver: zodResolver(playerMutationSchema),
     defaultValues: { name: "" },
   });
+  const readOnly = useReadOnly();
 
   return (
     <form
@@ -89,6 +91,7 @@ function PlayerNameForm({
           autoComplete="off"
           maxLength={64}
           placeholder="Player name"
+          disabled={readOnly}
           {...form.register("name")}
         />
       </Field>
@@ -137,6 +140,7 @@ export function Players({
 }) {
   const queryClient = useQueryClient();
   const now = useNow(renderedAt);
+  const readOnly = useReadOnly();
   const serverId = initialServer.id;
   const [requestError, setRequestError] = useState<string | null>(null);
   const { data: server = initialServer } = useQuery({
@@ -242,7 +246,7 @@ export function Players({
           <Notice tone="danger">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <span>Some player data couldn't be refreshed: {errorMessage(playersError ?? whitelistError ?? operatorsError)}</span>
-              <Button size="small" variant="secondary" onClick={() => { void refetchPlayers(); void refetchWhitelist(); void refetchOperators(); }}>Retry</Button>
+              <Button size="small" variant="secondary" readSafe onClick={() => { void refetchPlayers(); void refetchWhitelist(); void refetchOperators(); }}>Retry</Button>
             </div>
           </Notice>
         </div>
@@ -283,7 +287,7 @@ export function Players({
                       {isWhitelisted ? (
                         <span className="inline-flex min-h-[28px] items-center gap-1 rounded-[7px] bg-[#d8e6cf] px-2 text-[9px] font-[850] tracking-[0.04em] text-[#46643b] uppercase"><Check size={12} /> Allowed</span>
                       ) : (
-                        <button className={quietAction} type="button" disabled={addWhitelist.isPending} onClick={() => addWhitelist.mutate({ name: player.name })}>
+                        <button className={quietAction} type="button" disabled={readOnly || addWhitelist.isPending} onClick={() => addWhitelist.mutate({ name: player.name })}>
                           {addWhitelist.isPending && addWhitelist.variables?.name === player.name ? <LoaderCircle className="animate-spin" size={12} /> : <Plus size={12} />}
                           Allow
                         </button>
@@ -293,7 +297,7 @@ export function Players({
                           {locked ? <Crown size={12} /> : <ShieldCheck size={12} />}{locked ? "Owner" : "Operator"}
                         </span>
                       ) : (
-                        <button className={quietAction} type="button" disabled={addOperator.isPending} onClick={() => addOperator.mutate({ name: player.name })}>
+                        <button className={quietAction} type="button" disabled={readOnly || addOperator.isPending} onClick={() => addOperator.mutate({ name: player.name })}>
                           {addOperator.isPending && addOperator.variables?.name === player.name ? <LoaderCircle className="animate-spin" size={12} /> : <Shield size={12} />}
                           Grant OP
                         </button>
@@ -331,17 +335,17 @@ export function Players({
                       <span className="mt-[3px] block text-[11px] text-ink-soft">{joinAttempts(request, now)}</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <button className={quietAction} type="button" disabled={answering} onClick={() => letIn.mutate(request)}>
+                      <button className={quietAction} type="button" disabled={readOnly || answering} onClick={() => letIn.mutate(request)}>
                         {letIn.isPending && letIn.variables?.player_id === request.player_id ? <LoaderCircle className="animate-spin" size={12} /> : <Check size={12} />}
                         Let in
                       </button>
                       {whitelist.owner_has_minecraft_account ? null : (
-                        <button className={quietAction} type="button" disabled={answering} onClick={() => claim.mutate(request)}>
+                        <button className={quietAction} type="button" disabled={readOnly || answering} onClick={() => claim.mutate(request)}>
                           {claim.isPending && claim.variables?.player_id === request.player_id ? <LoaderCircle className="animate-spin" size={12} /> : <Crown size={12} />}
                           That&apos;s me
                         </button>
                       )}
-                      <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#ece5d6] text-ink-soft disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Dismiss ${request.name}'s request`} disabled={answering} onClick={() => dismiss.mutate(request)}>
+                      <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#ece5d6] text-ink-soft disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Dismiss ${request.name}'s request`} disabled={readOnly || answering} onClick={() => dismiss.mutate(request)}>
                         <X size={15} />
                       </button>
                     </div>
@@ -369,7 +373,7 @@ export function Players({
                       <strong className="block truncate text-[13px]">{entry.name}</strong>
                       <span className="mt-[3px] block text-[11px] text-ink-soft">{players.some((player) => hasIdentity(entry, player)) ? "Online now" : "Saved access"}{addedBy(entry)}</span>
                     </div>
-                    <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${entry.name} from whitelist`} disabled={removeWhitelist.isPending} onClick={() => removeWhitelist.mutate(entry)}>
+                    <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${entry.name} from whitelist`} disabled={readOnly || removeWhitelist.isPending} onClick={() => removeWhitelist.mutate(entry)}>
                       {removeWhitelist.isPending && removeWhitelist.variables?.name === entry.name ? <LoaderCircle className="animate-spin" size={15} /> : <Trash2 size={15} />}
                     </button>
                   </li>
@@ -408,7 +412,7 @@ export function Players({
                       {locked ? (
                         <span className="inline-flex min-h-8 items-center gap-1 rounded-[7px] bg-[#f1e3c8] px-2 text-[9px] font-[850] tracking-[0.04em] text-[#72501f] uppercase" title="The server owner's operator access is protected."><Crown size={12} /> Locked</span>
                       ) : (
-                        <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${entry.name} as operator`} disabled={removeOperator.isPending} onClick={() => removeOperator.mutate(entry)}>
+                        <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${entry.name} as operator`} disabled={readOnly || removeOperator.isPending} onClick={() => removeOperator.mutate(entry)}>
                           {removeOperator.isPending && removeOperator.variables?.name === entry.name ? <LoaderCircle className="animate-spin" size={15} /> : <Trash2 size={15} />}
                         </button>
                       )}

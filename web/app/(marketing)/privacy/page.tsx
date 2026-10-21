@@ -11,7 +11,7 @@ export default function PrivacyPage() {
 		<LegalPage
 			title="Privacy"
 			lead="What Kurbis knows about you, why, for how long, and what you can do about it."
-			updated="14 October 2026"
+			updated="21 October 2026"
 		>
 			<h2>Who is responsible</h2>
 			<p>
@@ -57,13 +57,27 @@ export default function PrivacyPage() {
 			</p>
 
 			<h2>Your server</h2>
-			<p>Everything that makes up your server is kept for as long as the server exists, and deleted with it:</p>
+			<p>Everything that makes up your server is deleted with it, and some of it sooner:</p>
 			<ul>
 				<li>its world, settings and backups (older backups are removed automatically);</li>
 				<li>its whitelist and operators: player names and IDs;</li>
 				<li>who played on it: player name, edition, and when they connected and were last seen;</li>
-				<li>its logs and activity, which can include player names, chat and the commands people type.</li>
+				<li>
+					its console output, which can include player names, chat and the commands people type, for 14 days; its activity for 7
+					days;
+				</li>
+				<li>how many players were on it and how much processor and memory it used, sampled once a minute, for 7 days.</li>
 			</ul>
+			<p>
+				We also keep counts for the whole service: totals sampled once a minute for 30 days, and for each day the number of new
+				accounts, new servers, server starts, the most servers and players online at once and what the AI assistant cost. These
+				daily totals are kept; they do not say who anyone is.
+			</p>
+			<p>
+				The people who run Kurbis can read every account and every server, including console output and AI conversations, to
+				keep the service running and to fix problems (Art. 6 (1) (f) GDPR). They can only look; they cannot change anything
+				this way.
+			</p>
 			<p>You can download your world at any time from the panel.</p>
 
 			<h2>The AI assistant</h2>

@@ -215,6 +215,55 @@ pub(super) async fn require_browser_server_access(
     require_server_access_inner(state, headers, server_id, false).await
 }
 
+/// Read a server: whoever may use it (see [`require_server_access`]), and admins.
+pub(super) async fn require_server_view(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+) -> Result<ServerRecord, ApiError> {
+    or_admin_view(
+        state,
+        headers,
+        server_id,
+        require_server_access(state, headers, server_id).await,
+    )
+    .await
+}
+
+/// Read a server's panel-only data: its browser sessions (see
+/// [`require_browser_server_access`]), and admins.
+pub(super) async fn require_browser_server_view(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+) -> Result<ServerRecord, ApiError> {
+    or_admin_view(
+        state,
+        headers,
+        server_id,
+        require_browser_server_access(state, headers, server_id).await,
+    )
+    .await
+}
+
+/// An admin may read any server, even one no other credential of the request reaches.
+async fn or_admin_view(
+    state: &AppState,
+    headers: &HeaderMap,
+    server_id: Uuid,
+    access: Result<ServerRecord, ApiError>,
+) -> Result<ServerRecord, ApiError> {
+    let Err(error) = access else {
+        return access;
+    };
+    if super::admin::admin_user(state, headers).await?.is_none() {
+        return Err(error);
+    }
+    server_by_id(&state.pool, server_id)
+        .await?
+        .ok_or_else(ApiError::server_not_found)
+}
+
 /// Restrict plugin protocol endpoints to the server's own runtime capability.
 pub(super) async fn require_server_capability(
     state: &AppState,

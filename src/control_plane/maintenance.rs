@@ -191,9 +191,68 @@ pub struct MaintenanceReport {
     pub ci_world_snapshot_gc_completed: u64,
     pub github_webhook_processed_gc_deleted: u64,
     pub plugin_blobs_deleted: u64,
+    pub server_logs_deleted: u64,
+    pub server_events_deleted: u64,
+}
+
+impl MaintenanceReport {
+    /// Whether the pass changed anything.
+    pub fn did_work(&self) -> bool {
+        let gc = &self.garbage_collection;
+        [
+            self.operations_assigned,
+            self.exports_assigned,
+            self.exports_requeued,
+            self.exports_expired,
+            gc.chunks_deleted,
+            gc.manifests_deleted,
+            gc.exports_deleted,
+            gc.staging_deleted,
+            self.ci_world_snapshot_gc_completed,
+            self.github_webhook_processed_gc_deleted,
+            self.plugin_blobs_deleted,
+            self.server_logs_deleted,
+            self.server_events_deleted,
+        ]
+        .into_iter()
+        .any(|count| count > 0)
+    }
 }
 
 const GITHUB_WEBHOOK_RETENTION_BATCH_SIZE: i64 = 128;
+
+/// Console lines are kept this long; the panel's console shows the latest few hundred.
+pub const SERVER_LOG_RETENTION_DAYS: i32 = 14;
+/// Server events are change notices for the panel's live updates and activity list.
+pub const SERVER_EVENT_RETENTION_DAYS: i32 = 7;
+const HISTORY_DELETE_BATCH: i64 = 5_000;
+/// Batches per table and pass, so a long backlog is worked off over several passes.
+const HISTORY_DELETE_BATCHES: usize = 20;
+
+/// Delete rows of `table` (`server_logs` or `server_events`) older than `days`.
+///
+/// Both tables only ever append, so their ids rise with `created_at`: walking the
+/// primary key from the oldest row finds every expired row without a time index, and a
+/// batch that is not entirely expired means the rest is newer.
+async fn delete_expired_history(pool: &PgPool, table: &'static str, days: i32) -> Result<u64> {
+    let mut deleted = 0;
+    for _ in 0..HISTORY_DELETE_BATCHES {
+        let batch = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE id IN (SELECT id FROM {table} ORDER BY id LIMIT $1)
+               AND created_at < now() - make_interval(days => $2)"
+        ))
+        .bind(HISTORY_DELETE_BATCH)
+        .bind(days)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        deleted += batch;
+        if batch < HISTORY_DELETE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(deleted)
+}
 
 fn webhook_mode_enabled_from_environment() -> bool {
     std::env::var("CI_GITHUB_WEBHOOK_ENABLED")
@@ -251,6 +310,11 @@ impl WorkerMaintenance {
         };
         let plugin_blobs_deleted =
             crate::control_plane::plugins::collect_garbage(&self.pool, &self.object_store).await?;
+        let server_logs_deleted =
+            delete_expired_history(&self.pool, "server_logs", SERVER_LOG_RETENTION_DAYS).await?;
+        let server_events_deleted =
+            delete_expired_history(&self.pool, "server_events", SERVER_EVENT_RETENTION_DAYS)
+                .await?;
         Ok(MaintenanceReport {
             operations_assigned,
             exports_assigned,
@@ -260,6 +324,8 @@ impl WorkerMaintenance {
             ci_world_snapshot_gc_completed,
             github_webhook_processed_gc_deleted,
             plugin_blobs_deleted,
+            server_logs_deleted,
+            server_events_deleted,
         })
     }
 

@@ -33,7 +33,7 @@ function ToolCalls({ serverId, jobId }: { serverId: string; jobId: string }) {
       <Notice tone="danger">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span>The tool calls couldn&apos;t be loaded: {errorMessage(error)}</span>
-          <Button size="small" variant="secondary" onClick={() => void refetch()}>Retry</Button>
+          <Button size="small" variant="secondary" readSafe onClick={() => void refetch()}>Retry</Button>
         </div>
       </Notice>
     );
@@ -111,7 +111,7 @@ function JobRow({ serverId, job, models, now }: { serverId: string; job: AiJob; 
             </Button>
           ) : null}
           {job.tool_calls > 0 ? (
-            <Button size="small" variant="quiet" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setExpanded(!expanded)}>
+            <Button size="small" variant="quiet" readSafe aria-expanded={expanded} aria-controls={detailsId} onClick={() => setExpanded(!expanded)}>
               <ChevronDown size={14} className={`transition-transform ${expanded ? "rotate-180" : ""}`} />
               {expanded ? "Hide tool calls" : "Show tool calls"}
             </Button>

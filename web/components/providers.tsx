@@ -9,6 +9,7 @@ import { browserApi } from "../lib/api/operations";
 import { serverEventStreamPath } from "../lib/api/paths";
 import { queryKeys, selectedServerId } from "../lib/query";
 import { applyServerEvent, parseServerEvent, serverEventKinds } from "../lib/sse";
+import { ReadOnlyProvider } from "./ui";
 
 type Server = components["schemas"]["Server"];
 type ServerScopedSession = components["schemas"]["ServerScopedSession"];
@@ -75,9 +76,15 @@ export function AppProviders({ session, servers, serverSessions, children }: { s
   return <QueryClientProvider client={client}><Tooltip.Provider delayDuration={300}><EventsBridge />{children}</Tooltip.Provider></QueryClientProvider>;
 }
 
-export function ServerProviders({ server, session, servers, serverSessions, children }: { server: Server; session?: Session; servers?: Server[]; serverSessions?: ServerScopedSession[]; children: ReactNode }) {
+export function ServerProviders({ server, session, servers, serverSessions, readOnly = false, children }: { server: Server; session?: Session; servers?: Server[]; serverSessions?: ServerScopedSession[]; readOnly?: boolean; children: ReactNode }) {
   const [client] = useState(() => {
     return createPanelClient({ server, session, servers, serverSessions });
   });
-  return <QueryClientProvider client={client}><Tooltip.Provider delayDuration={300}><EventsBridge scopedServerId={session ? undefined : server.id} />{children}</Tooltip.Provider></QueryClientProvider>;
+  return <QueryClientProvider client={client}><Tooltip.Provider delayDuration={300}><ReadOnlyProvider value={readOnly}><EventsBridge scopedServerId={session && !readOnly ? undefined : server.id} />{children}</ReadOnlyProvider></Tooltip.Provider></QueryClientProvider>;
+}
+
+/** The admin dashboard: its own query cache, no server event stream. */
+export function AdminProviders({ children }: { children: ReactNode }) {
+  const [client] = useState(() => new QueryClient({ defaultOptions: { queries: { staleTime: 10_000, retry: 1, refetchOnWindowFocus: true } } }));
+  return <QueryClientProvider client={client}><Tooltip.Provider delayDuration={200}>{children}</Tooltip.Provider></QueryClientProvider>;
 }

@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
-use super::internal::require_server_access;
+use super::internal::require_server_view;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -93,7 +93,7 @@ pub(super) async fn activity(
     ApiQuery(query): ApiQuery<LimitQuery>,
 ) -> Result<Json<Vec<ActivityEntry>>, ApiError> {
     let server_id = path.server_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     let rows = sqlx::query_as::<_, EventRow>(
         "SELECT id, event_type, detail, created_at
          FROM server_events

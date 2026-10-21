@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::actor::{ApiPath, ApiServerHeaders, ServerIdPath};
-use super::internal::require_server_access;
+use super::internal::require_server_view;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -85,6 +85,6 @@ pub(super) async fn players(
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Vec<PlayerPresence>>, ApiError> {
     let server_id = path.server_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     Ok(Json(player_list(&state.pool, server.id).await?))
 }

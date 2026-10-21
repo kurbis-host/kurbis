@@ -4,7 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import * as Switch from "@radix-ui/react-switch";
 import { AlertCircle, Box, Info, TriangleAlert } from "lucide-react";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import type { LifecyclePresentation } from "../lib/lifecycle";
 
 const buttonBase =
@@ -21,18 +21,36 @@ const buttonVariants = {
     "bg-transparent text-ink-soft shadow-none enabled:hover:bg-[rgba(67,58,45,0.08)] enabled:hover:text-ink",
 } as const;
 
+const ReadOnlyContext = createContext(false);
+
+/**
+ * Inside, the panel only shows: an admin reading someone else's server. Buttons and
+ * switches that change something are disabled; the API would refuse them anyway.
+ */
+export const ReadOnlyProvider = ReadOnlyContext.Provider;
+
+export function useReadOnly() {
+  return useContext(ReadOnlyContext);
+}
+
 export function Button({
   variant = "primary",
   size = "normal",
   className = "",
+  readSafe = false,
+  disabled,
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: keyof typeof buttonVariants;
   size?: "normal" | "small";
+  /** Only reads (copy, expand, retry), so it stays usable in a read-only panel. */
+  readSafe?: boolean;
 }) {
+  const readOnly = useReadOnly();
   return (
     <button
       className={`${buttonBase} ${buttonVariants[variant]} ${size === "small" ? "min-h-9 px-3 text-[13px]" : ""} ${className}`}
+      disabled={disabled || (readOnly && !readSafe)}
       {...props}
     />
   );
@@ -208,6 +226,7 @@ export function SwitchField({
   description: string;
   disabled?: boolean;
 }) {
+  const readOnly = useReadOnly();
   return (
     <label className="flex min-h-[54px] items-center justify-between gap-5">
       <span className="grid gap-[3px]">
@@ -220,7 +239,7 @@ export function SwitchField({
         className="group h-[25px] w-11 shrink-0 cursor-pointer rounded-full border-0 bg-[#a7a292] p-[3px] transition-[background-color] duration-150 data-[state=checked]:bg-grass disabled:cursor-not-allowed disabled:opacity-45"
         checked={checked}
         onCheckedChange={onCheckedChange}
-        disabled={disabled}
+        disabled={disabled || readOnly}
         aria-label={label}
       >
         <Switch.Thumb className="block size-[19px] rounded-[6px] bg-[#fffdf8] shadow-[0_2px_5px_rgba(0,0,0,0.22)] transition-transform duration-150 group-data-[state=checked]:translate-x-[19px]" />

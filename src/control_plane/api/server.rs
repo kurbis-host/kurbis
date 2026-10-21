@@ -16,7 +16,7 @@ use crate::model::{
 use super::actor::{
     ApiAccountOrServerGrantHeaders, ApiJson, ApiPath, ApiServerHeaders, ServerIdPath,
 };
-use super::internal::{require_active_user, require_server_access};
+use super::internal::{require_active_user, require_server_access, require_server_view};
 use super::types::{
     LifecycleStatus, Operation, Problem, Server, ServerSettings, ServerSettingsPatch, Snapshot,
     StorageUsage,
@@ -119,7 +119,7 @@ pub(super) async fn get_server(
     ApiPath(path): ApiPath<ServerIdPath>,
 ) -> Result<Json<Option<Server>>, ApiError> {
     let server_id = path.server_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     Ok(Json(Some(
         server_view(&state.pool, server, &state.config.root_domain).await?,
     )))

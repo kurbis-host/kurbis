@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::actor::{ApiPath, ApiQuery, ApiServerHeaders, ServerIdPath};
-use super::internal::require_server_access;
+use super::internal::require_server_view;
 use super::{ApiError, AppState};
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -35,7 +35,7 @@ pub(super) async fn logs(
     ApiQuery(query): ApiQuery<LogQuery>,
 ) -> Result<Json<LogPage>, ApiError> {
     let server_id = path.server_id;
-    let server = require_server_access(&state, &headers, server_id).await?;
+    let server = require_server_view(&state, &headers, server_id).await?;
     let limit = query.limit.unwrap_or(200).clamp(1, 500);
     if query.after_id.is_some_and(|cursor| cursor < 0) {
         return Err(ApiError::with_code(

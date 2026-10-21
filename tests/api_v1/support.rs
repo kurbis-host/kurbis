@@ -1,6 +1,6 @@
 pub(crate) use std::{sync::Arc, time::Duration};
 
-pub(crate) use crate::common::{api_state, create_user, test_pool};
+pub(crate) use crate::common::{api_state, api_state_with_admins, create_user, test_pool};
 pub(crate) use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},

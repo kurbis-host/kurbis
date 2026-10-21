@@ -12,7 +12,7 @@ import { browserApi } from "../../lib/api/operations";
 import { formatUsd, usdInputValue } from "../../lib/format";
 import { queryKeys } from "../../lib/query";
 import { aiSettingsFormSchema, type AiSettingsFormValues } from "../../lib/schemas";
-import { Button, controlStyles, Field, Notice, Surface, SwitchField } from "../ui";
+import { Button, controlStyles, Field, Notice, Surface, SwitchField, useReadOnly } from "../ui";
 
 type AiDefaults = components["schemas"]["AiDefaults"];
 type AiModel = components["schemas"]["AiModel"];
@@ -29,6 +29,7 @@ export function AiSettingsForm({
   models: AiModel[];
   defaults: AiDefaults;
 }) {
+  const readOnly = useReadOnly();
   const queryClient = useQueryClient();
   const accountBudget = defaults.account_monthly_budget_micros;
   // The control plane caps the default server budget at the account budget.
@@ -73,6 +74,7 @@ export function AiSettingsForm({
       <p className="mt-1.5 mb-0 text-xs leading-[1.45] text-ink-soft">
         These apply to every operator&apos;s requests on this server.
       </p>
+      <fieldset className="contents" disabled={readOnly}>
       <form className="mt-4 grid gap-4" onSubmit={save} noValidate>
         <Controller
           control={control}
@@ -133,6 +135,7 @@ export function AiSettingsForm({
           </Button>
         </div>
       </form>
+      </fieldset>
     </Surface>
   );
 }

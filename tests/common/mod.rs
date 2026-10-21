@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use kurbis_hoster::db;
 use kurbis_hoster::{
-    config::{CommonConfig, ControlPlaneConfig, OAuthConfig, OAuthProviderConfig},
+    config::{AdminIdentity, CommonConfig, ControlPlaneConfig, OAuthConfig, OAuthProviderConfig},
     control_plane::{api::AppState, lifecycle::Lifecycle},
 };
 use object_store::ObjectStore;
@@ -14,6 +14,17 @@ pub fn api_state(
     pool: PgPool,
     internal_token: &str,
     object_store: Arc<dyn ObjectStore>,
+) -> Arc<AppState> {
+    api_state_with_admins(pool, internal_token, object_store, Vec::new())
+}
+
+/// An API whose operator dashboard is open to the accounts with these identities linked.
+#[allow(dead_code)] // Shared by integration targets; each target uses a different fixture subset.
+pub fn api_state_with_admins(
+    pool: PgPool,
+    internal_token: &str,
+    object_store: Arc<dyn ObjectStore>,
+    admin_identities: Vec<AdminIdentity>,
 ) -> Arc<AppState> {
     let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is configured");
     Arc::new(AppState {
@@ -49,6 +60,7 @@ pub fn api_state(
                     scopes: "identify email".to_owned(),
                 },
             },
+            admin_identities,
         },
         http: reqwest::Client::new(),
         object_store,

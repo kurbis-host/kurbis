@@ -38,6 +38,8 @@ pub struct Session {
     pub limits: ServiceLimits,
     /// Every server address is `<name>.<server_domain>`.
     pub server_domain: String,
+    /// The account may read the operator dashboard and every server.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -61,6 +63,8 @@ pub(super) async fn session(
     headers: ApiAccountHeaders,
 ) -> Result<Json<Session>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
+    let is_admin =
+        user.account_status == "active" && super::admin::is_admin(&state, user.id).await?;
     Ok(Json(Session {
         user: SessionUser {
             id: user.id,
@@ -75,5 +79,6 @@ pub(super) async fn session(
             player_limit: None,
         },
         server_domain: state.config.root_domain.clone(),
+        is_admin,
     }))
 }

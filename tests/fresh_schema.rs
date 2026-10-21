@@ -10,8 +10,8 @@ use uuid::Uuid;
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 const MIGRATION_MANIFEST_SHA256: &str =
-    "ef8fee05f8ed5805b5814adff92eca0b7cce7540a6299dd1787d55a4a9665660";
-const LATEST_MIGRATION: i64 = 22;
+    "ccb198d4244c720dd373422a9d082838bd419e02c6721e816eea1286cb4bbdd2";
+const LATEST_MIGRATION: i64 = 23;
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {
@@ -237,6 +237,23 @@ async fn assert_migration_one_checksum(pool: &PgPool) -> anyhow::Result<()> {
 }
 
 async fn assert_schema_objects(pool: &PgPool) -> anyhow::Result<()> {
+    for (table, purpose) in [
+        (
+            "server_runtime_samples",
+            "the operator dashboard's per-server samples",
+        ),
+        ("daily_stats", "the operator dashboard's daily roll-up"),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables
+             WHERE table_schema='public' AND table_name=$1)",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        assert!(exists, "{purpose}");
+    }
+
     let fleet_stats_table: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables
          WHERE table_schema='public' AND table_name='fleet_stats')",

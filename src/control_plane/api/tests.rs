@@ -88,6 +88,23 @@ fn openapi_matches_the_public_route_inventory_and_security_contracts() {
     }
 
     assert!(paths.contains_key("/api/v1/servers/{server_id}/commands"));
+    let admin_paths: Vec<_> = paths
+        .keys()
+        .filter(|path| path.starts_with("/api/v1/admin/"))
+        .collect();
+    assert!(
+        admin_paths.len() >= 12,
+        "operator dashboard routes: {admin_paths:?}"
+    );
+    for path in admin_paths {
+        assert_eq!(
+            paths[path]["get"]["security"],
+            serde_json::json!([{"accountSessionCookie": []}]),
+            "{path} is read with the account session only"
+        );
+    }
+    let session = &schemas["Session"]["properties"];
+    assert_eq!(session["is_admin"]["type"], "boolean");
     let runtime_stats = &paths["/api/v1/servers/{server_id}/runtime-stats"]["get"];
     assert!(
         runtime_stats["security"]
@@ -362,6 +379,7 @@ fn test_state(pool: PgPool) -> Arc<AppState> {
                     scopes: "identify email".to_owned(),
                 },
             },
+            admin_identities: Vec::new(),
         },
         http: reqwest::Client::new(),
         object_store: Arc::new(object_store::memory::InMemory::new()),

@@ -54,6 +54,7 @@ const surfaces = {
     || path.startsWith("/api/v1/servers/{server_id}/ai/"),
   "server-plugins": (path) => path === "/api/v1/servers/{server_id}/plugins"
     || path.startsWith("/api/v1/servers/{server_id}/plugins/"),
+  admin: (path) => path.startsWith("/api/v1/admin/"),
 };
 for (const path of Object.keys(document.paths)) {
   const owners = Object.values(surfaces).filter((belongs) => belongs(path)).length;

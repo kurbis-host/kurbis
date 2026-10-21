@@ -250,7 +250,7 @@ async fn fleet_stats_are_public_cacheable_and_carry_their_history() {
 }
 
 #[tokio::test]
-async fn a_minute_is_sampled_once_and_a_day_is_kept() {
+async fn a_minute_is_sampled_once_and_a_month_is_kept() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     // Start well inside a minute, so both samples below fall in the same one.
@@ -263,7 +263,7 @@ async fn a_minute_is_sampled_once_and_a_day_is_kept() {
     }
     sqlx::query(
         "INSERT INTO fleet_stats(minute, servers_online, players_online)
-         VALUES(date_trunc('minute', now()) - interval '2 days', 1, 1)
+         VALUES(date_trunc('minute', now()) - interval '31 days', 1, 1)
          ON CONFLICT(minute) DO NOTHING",
     )
     .execute(&pool)
@@ -293,7 +293,7 @@ async fn a_minute_is_sampled_once_and_a_day_is_kept() {
         "a minute already sampled is left as it was"
     );
     let old: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM fleet_stats WHERE minute < now() - interval '1 day'",
+        "SELECT count(*) FROM fleet_stats WHERE minute < now() - interval '30 days'",
     )
     .fetch_one(&pool)
     .await

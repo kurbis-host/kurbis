@@ -9,7 +9,7 @@ import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { formatBytes, formatCount } from "../lib/format";
 import { queryKeys } from "../lib/query";
-import { Button, ConfirmDialog, EmptyState, Notice, PageHeader, StatusLabel, Surface, controlStyles } from "./ui";
+import { Button, ConfirmDialog, EmptyState, Notice, PageHeader, StatusLabel, Surface, controlStyles, useReadOnly } from "./ui";
 
 type MarketPlugin = components["schemas"]["MarketPlugin"];
 type Server = components["schemas"]["Server"];
@@ -44,6 +44,7 @@ function Tile({ icon, children }: { icon?: string | null; children: ReactNode })
 
 export function Plugins({ initialServer, initialPlugins }: { initialServer: Server; initialPlugins: ServerPlugins }) {
   const queryClient = useQueryClient();
+  const readOnly = useReadOnly();
   const serverId = initialServer.id;
   const [requestError, setRequestError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -140,13 +141,14 @@ export function Plugins({ initialServer, initialPlugins }: { initialServer: Serv
                         <Switch.Root
                           className="group h-[25px] w-11 shrink-0 cursor-pointer rounded-full border-0 bg-[#a7a292] p-[3px] transition-[background-color] duration-150 data-[state=checked]:bg-grass disabled:cursor-not-allowed disabled:opacity-45"
                           checked={plugin.enabled}
-                          disabled={toggle.isPending}
+                          disabled={readOnly || toggle.isPending}
                           onCheckedChange={() => toggle.mutate(plugin)}
                           aria-label={`${plugin.enabled ? "Turn off" : "Turn on"} ${plugin.name}`}
                         >
                           <Switch.Thumb className="block size-[19px] rounded-[6px] bg-[#fffdf8] shadow-[0_2px_5px_rgba(0,0,0,0.22)] transition-transform duration-150 group-data-[state=checked]:translate-x-[19px]" />
                         </Switch.Root>
                         <ConfirmDialog
+                          disabled={readOnly}
                           trigger={
                             <button className="grid size-9 cursor-pointer place-items-center rounded-sm border-0 bg-[#f2ddd5] text-[#7a3028] disabled:cursor-not-allowed disabled:opacity-45" type="button" aria-label={`Remove ${plugin.name}`}>
                               <Trash2 size={15} />

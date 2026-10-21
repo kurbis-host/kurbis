@@ -58,6 +58,7 @@ export const session: Session = {
     player_limit: null,
   },
   server_domain: "kurbis.host",
+  is_admin: false,
 };
 
 export const finishedAiJob: AiJob = {

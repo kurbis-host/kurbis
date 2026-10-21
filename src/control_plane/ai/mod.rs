@@ -68,7 +68,7 @@ impl AiGateway {
         &self.inner.pool
     }
 
-    fn config(&self) -> &AiConfig {
+    pub(crate) fn config(&self) -> &AiConfig {
         &self.inner.config
     }
 
