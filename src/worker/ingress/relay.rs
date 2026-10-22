@@ -286,6 +286,9 @@ pub async fn start_container(
         "0.5",
         "--pids-limit",
         "64",
+        // PID 1 must reap the health-check execs Docker kills on timeout;
+        // without it they stay zombies and exhaust the PID limit.
+        "--init",
         "--user",
         "0:0",
         "--cap-add",
@@ -559,6 +562,10 @@ fn verify_container_security(
     ensure!(
         host.get("PidsLimit").and_then(Value::as_i64) == Some(64),
         "ingress relay PID limit is not 64"
+    );
+    ensure!(
+        host.get("Init").and_then(Value::as_bool) == Some(true),
+        "ingress relay has no init process to reap health-check children"
     );
     let capabilities = host
         .get("CapAdd")
@@ -960,7 +967,7 @@ mod tests {
             "Config": {"User":"0:0", "Env":["KURBIS_INGRESS_BACKEND_IPV4=172.20.0.2"]},
             "HostConfig": {
                 "ReadonlyRootfs":true, "Memory":268435456, "MemorySwap":268435456,
-                "NanoCpus":500000000, "PidsLimit":64,
+                "NanoCpus":500000000, "PidsLimit":64, "Init":true,
                 "CapAdd":["NET_ADMIN","SETUID","SETGID","SETPCAP"], "CapDrop":["ALL"],
                 "SecurityOpt":["no-new-privileges:true"], "RestartPolicy":{"Name":"no"},
                 "PortBindings":{
@@ -975,6 +982,9 @@ mod tests {
         tampered["HostConfig"]["PortBindings"]["19132/udp"][0]["HostIp"] =
             serde_json::json!("0.0.0.0");
         assert!(verify_container_security(&tampered, id, 4, ports).is_err());
+        let mut without_init = network.clone();
+        without_init["HostConfig"]["Init"] = serde_json::json!(false);
+        assert!(verify_container_security(&without_init, id, 4, ports).is_err());
         let mut escaped = network.clone();
         escaped["HostConfig"]["PortBindings"]["19132/tcp"]
             .as_array_mut()

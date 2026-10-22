@@ -197,6 +197,8 @@ pub async fn start_container(
         "0.25".to_owned(),
         "--pids-limit".to_owned(),
         "64".to_owned(),
+        // PID 1 must reap health-check execs that Docker kills on timeout.
+        "--init".to_owned(),
         "--user".to_owned(),
         "0:0".to_owned(),
     ];
