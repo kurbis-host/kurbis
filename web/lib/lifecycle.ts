@@ -30,6 +30,8 @@ export function lifecycleActions(server: Server) {
     canStop: ["queued", "restoring", "starting", "online", "failed"].includes(state),
     canRestart: state === "online",
     canEdit: state === "sleeping",
+    // The API takes a whitelist change while sleeping or online; a running server applies it live.
+    canChangeAccess: state === "sleeping" || state === "online",
     canSnapshot: state === "online",
     canRestore: state === "sleeping" || state === "online",
     canDelete: state === "sleeping",

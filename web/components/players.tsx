@@ -8,6 +8,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { errorMessage } from "../lib/api/client";
 import { formatRelative } from "../lib/format";
+import { lifecycleActions, lifecycle } from "../lib/lifecycle";
 import type { components } from "../lib/api/generated";
 import { browserApi } from "../lib/api/operations";
 import { queryKeys } from "../lib/query";
@@ -22,6 +23,7 @@ import {
   Notice,
   PageHeader,
   Surface,
+  SwitchField,
   useReadOnly,
 } from "./ui";
 
@@ -174,6 +176,19 @@ export function Players({
     queryClient.setQueryData(queryKeys.operators(serverId), next);
     void queryClient.invalidateQueries({ queryKey: queryKeys.operators(serverId) });
   };
+  const setEnforced = useMutation({
+    mutationFn: (whitelist: boolean) =>
+      browserApi.updateServer(serverId, {
+        // A null leaves that setting as it is.
+        settings: { difficulty: null, gamemode: null, hardcore: null, motd: null, simulation_distance: null, tab_stats: null, view_distance: null, whitelist, whitelist_by_members: null },
+      }),
+    onMutate: () => setRequestError(null),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(queryKeys.server(serverId), updated);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.whitelist(serverId) });
+    },
+    onError: (error) => setRequestError(errorMessage(error)),
+  });
   const addWhitelist = useMutation({
     mutationFn: (target: MutationTarget) => browserApi.addWhitelistEntry(serverId, target),
     onMutate: () => setRequestError(null),
@@ -225,6 +240,7 @@ export function Players({
   const operatorFor = (player: PlayerPresence) => operators.entries.find((entry) => hasIdentity(entry, player));
   const submitWhitelist = (values: PlayerMutationValues) => addWhitelist.mutateAsync({ name: values.name }).then(() => undefined);
   const submitOperator = (values: PlayerMutationValues) => addOperator.mutateAsync({ name: values.name }).then(() => undefined);
+  const canChangeSettings = lifecycleActions(server).canChangeAccess;
   const hasQueryError = playersFailed || whitelistFailed || operatorsFailed;
 
   return (
@@ -251,15 +267,11 @@ export function Players({
           </Notice>
         </div>
       ) : null}
-      {!server.settings.whitelist ? (
-        <div className="mb-[18px]">
-          <Notice>Whitelist enforcement is currently off. Saved entries stay in place and will apply when you enable it in Settings.</Notice>
-        </div>
-      ) : whitelist.synchronized ? null : (
+      {server.settings.whitelist && !whitelist.synchronized ? (
         <div className="mb-[18px]">
           <Notice tone="warning">Whitelist changes are waiting for the live runtime to acknowledge revision {whitelist.revision}.</Notice>
         </div>
-      )}
+      ) : null}
 
       <div className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] items-start gap-[18px] max-[920px]:grid-cols-1">
         <Surface className="p-6">
@@ -362,6 +374,24 @@ export function Players({
                 <p className="mt-1.5 mb-0 text-xs text-ink-soft">Players allowed to join when enforcement is enabled.</p>
               </div>
               <Count>{whitelist.entries.length}</Count>
+            </div>
+            <div className="mt-3.5 border-t border-[#ddd4c3] pt-1.5">
+              <SwitchField
+                label="Only whitelisted players may join"
+                description={
+                  server.settings.whitelist
+                    ? "Everyone else is turned away."
+                    : "Off: anyone can join. Entries stay saved for when you turn it on."
+                }
+                checked={server.settings.whitelist}
+                onCheckedChange={(value) => setEnforced.mutate(value)}
+                disabled={!canChangeSettings || setEnforced.isPending}
+              />
+              {canChangeSettings ? null : (
+                <p className="mt-1 mb-0 text-xs text-ink-soft">
+                  This can be changed while the world is sleeping or online, not while it is {lifecycle[server.observed_state].label.toLowerCase()}.
+                </p>
+              )}
             </div>
             <PlayerNameForm label="Add by player name" buttonLabel="Add to whitelist" pending={addWhitelist.isPending} disabled={false} onSubmit={submitWhitelist} />
             {whitelist.entries.length ? (

@@ -143,6 +143,50 @@ describe("player and access management", () => {
     ]);
   });
 
+  it("turns whitelist enforcement off and on from the page, changing nothing else", async () => {
+    const bodies: unknown[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = await requestFrom(input, init);
+      const path = new URL(request.url, "http://localhost").pathname;
+      if (path.endsWith(`/servers/${server.id}`) && request.method === "PATCH") {
+        bodies.push(request.body);
+        const whitelist = (request.body as { settings: { whitelist: boolean } }).settings.whitelist;
+        return Response.json({ ...server, observed_state: "online", desired_state: "running", settings: { ...server.settings, whitelist } });
+      }
+      if (path.endsWith("/whitelist") && request.method === "GET") return Response.json(emptyWhitelist);
+      throw new Error(`unexpected request ${request.method} ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    setup();
+    const user = userEvent.setup();
+
+    const toggle = screen.getByRole("switch", { name: "Only whitelisted players may join" });
+    expect(toggle).toBeChecked();
+    await user.click(toggle);
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(screen.getByText(/Off: anyone can join/)).toBeVisible();
+    await user.click(toggle);
+    await waitFor(() => expect(toggle).toBeChecked());
+
+    const untouched = { difficulty: null, gamemode: null, hardcore: null, motd: null, simulation_distance: null, tab_stats: null, view_distance: null, whitelist_by_members: null };
+    expect(bodies).toEqual([
+      { settings: { ...untouched, whitelist: false } },
+      { settings: { ...untouched, whitelist: true } },
+    ]);
+  });
+
+  it("cannot change enforcement while the world is starting or stopping", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const starting = { ...server, observed_state: "starting" as const, desired_state: "running" as const };
+    client.setQueryData(queryKeys.server(server.id), starting);
+    client.setQueryData(queryKeys.players(server.id), []);
+    client.setQueryData(queryKeys.whitelist(server.id), emptyWhitelist);
+    client.setQueryData(queryKeys.operators(server.id), emptyOperators);
+    render(<Players initialServer={starting} initialPlayers={[]} initialWhitelist={emptyWhitelist} />, { wrapper: wrapper(client) });
+    expect(screen.getByRole("switch", { name: "Only whitelisted players may join" })).toBeDisabled();
+    expect(screen.getByText(/not while it is starting/)).toBeVisible();
+  });
+
   it("supports offline name-only additions to both lists", async () => {
     let whitelist: WhitelistState = emptyWhitelist;
     let operators: OperatorRoster = emptyOperators;
