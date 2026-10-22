@@ -85,7 +85,7 @@ export function ServerLifecycle({ serverId }: { serverId: string }) {
                     empty="Every plugin loaded."
                     rows={detail.plugin_errors.map((plugin) => ({
                       key: plugin.name,
-                      cells: [`${plugin.name} ${plugin.version}${plugin.enabled ? "" : " (off)"}`, <Message key="error" text={plugin.runtime_error} />, <Ago key="reported" at={plugin.reported_at} />],
+                      cells: [`${[plugin.name, plugin.version].filter(Boolean).join(" ")}${plugin.enabled ? "" : " (off)"}`, <Message key="error" text={plugin.runtime_error} />, <Ago key="reported" at={plugin.reported_at} />],
                     }))}
                   />
                 </Section>

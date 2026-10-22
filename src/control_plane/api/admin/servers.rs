@@ -185,7 +185,8 @@ pub(super) struct AdminSnapshot {
 #[derive(Debug, Serialize, JsonSchema, sqlx::FromRow)]
 pub(super) struct AdminPluginError {
     name: String,
-    version: String,
+    /// Null for a plugin installed without a version.
+    version: Option<String>,
     enabled: bool,
     runtime_error: String,
     reported_at: Option<DateTime<Utc>>,

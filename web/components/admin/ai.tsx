@@ -41,14 +41,14 @@ export function AdminAiPage() {
                 <Table
                   head={["Server", "Spent", "Calls"]}
                   empty="No spend this month."
-                  rows={ai.top_servers.map((server) => ({ key: server.id, cells: [<ServerLink key="server" id={server.id} subdomain={server.name} page="ai" />, formatUsd(server.cost_micros), formatCount(server.model_calls)] }))}
+                  rows={ai.top_servers.map((server) => ({ key: server.id ?? "deleted", cells: [<ServerLink key="server" id={server.id ?? ""} subdomain={server.name} page="ai" />, formatUsd(server.cost_micros), formatCount(server.model_calls)] }))}
                 />
               </Section>
               <Section title="Top accounts this month">
                 <Table
                   head={["Account", "Spent", "Calls"]}
                   empty="No spend this month."
-                  rows={ai.top_accounts.map((account) => ({ key: account.id, cells: [<AccountLink key="account" id={account.id} name={account.name} />, formatUsd(account.cost_micros), formatCount(account.model_calls)] }))}
+                  rows={ai.top_accounts.map((account) => ({ key: account.id ?? "deleted", cells: [<AccountLink key="account" id={account.id ?? ""} name={account.name} />, formatUsd(account.cost_micros), formatCount(account.model_calls)] }))}
                 />
               </Section>
             </div>

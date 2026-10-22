@@ -10180,7 +10180,11 @@
             "format": "int64"
           },
           "id": {
-            "type": "string",
+            "description": "Null once the server is deleted: its usage stays, detached.",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "uuid"
           },
           "model_calls": {
@@ -10196,7 +10200,6 @@
           }
         },
         "required": [
-          "id",
           "cost_micros",
           "model_calls"
         ]
@@ -11028,12 +11031,15 @@
             "type": "string"
           },
           "version": {
-            "type": "string"
+            "description": "Null for a plugin installed without a version.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "name",
-          "version",
           "enabled",
           "runtime_error"
         ]

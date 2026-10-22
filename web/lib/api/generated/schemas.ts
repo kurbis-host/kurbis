@@ -205,8 +205,11 @@ export interface components {
         AdminAiSpender: {
             /** Format: int64 */
             cost_micros: number;
-            /** Format: uuid */
-            id: string;
+            /**
+             * Format: uuid
+             * @description Null once the server is deleted: its usage stays, detached.
+             */
+            id?: string | null;
             /** Format: int64 */
             model_calls: number;
             /** @description The server's address or the account's name; null once it is deleted. */
@@ -475,7 +478,8 @@ export interface components {
             /** Format: date-time */
             reported_at?: string | null;
             runtime_error: string;
-            version: string;
+            /** @description Null for a plugin installed without a version. */
+            version?: string | null;
         };
         AdminPreview: {
             commit_sha: string;

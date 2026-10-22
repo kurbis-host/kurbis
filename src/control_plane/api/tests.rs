@@ -1099,8 +1099,9 @@ async fn account_sessions_are_persistent_revocable_and_renewed_on_visits() {
         .unwrap();
 }
 
+/// Rows with every nullable column the dashboard reads left empty: it must list them.
 #[tokio::test]
-async fn admin_ci_lists_previews_that_follow_no_ref() {
+async fn admin_dashboard_reads_rows_with_empty_optional_columns() {
     let _serial = DB_TEST_LOCK.lock().await;
     let pool = test_pool().await;
     let (user_id, token) = create_user_session(&pool, "active").await;
@@ -1116,7 +1117,9 @@ async fn admin_ci_lists_previews_that_follow_no_ref() {
             subject,
         }];
     let app = router(state);
+    let server_id = create_server(&pool, user_id).await;
 
+    // A commit preview follows no ref.
     let sha = "a".repeat(40);
     let build_id: Uuid = sqlx::query_scalar(
         "INSERT INTO ci_builds(repository, commit_sha, patch_fingerprint, toolchain_version,
@@ -1128,7 +1131,6 @@ async fn admin_ci_lists_previews_that_follow_no_ref() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    // A commit preview follows no ref, so its ref_name is NULL.
     let hostname = format!("admin-ci-{}.mc.example", build_id.simple());
     sqlx::query(
         "INSERT INTO ci_preview_aliases(repository, commit_sha, kind, hostname, build_id, state, expires_at)
@@ -1140,14 +1142,56 @@ async fn admin_ci_lists_previews_that_follow_no_ref() {
     .execute(&pool)
     .await
     .unwrap();
-
-    let response = app
-        .oneshot(authenticated_request("/api/v1/admin/ci", &token))
+    // A plugin without a version that failed to load.
+    let blob = format!("{:064x}", server_id.as_u128());
+    sqlx::query("INSERT INTO plugin_blobs(sha256, size_bytes) VALUES($1, 1)")
+        .bind(&blob)
+        .execute(&pool)
         .await
         .unwrap();
-    let status = response.status();
-    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    let body: Value = serde_json::from_slice(&body).unwrap();
+    sqlx::query(
+        "INSERT INTO server_plugins(server_id, source, name, sha256, runtime_error)
+         VALUES($1, 'upload', 'unversioned', $2, 'did not load')",
+    )
+    .bind(server_id)
+    .bind(&blob)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // AI usage of a server that no longer exists keeps no server id.
+    sqlx::query(
+        "INSERT INTO ai_usage(owner_id, server_id, model, input_tokens, output_tokens,
+                              cache_creation_input_tokens, cache_read_input_tokens, cost_micros)
+         VALUES($1, NULL, 'model', 1, 1, 0, 0, 1)",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut responses = Vec::new();
+    for uri in [
+        "/api/v1/admin/overview".to_owned(),
+        "/api/v1/admin/fleet".to_owned(),
+        "/api/v1/admin/servers".to_owned(),
+        format!("/api/v1/admin/servers/{server_id}"),
+        "/api/v1/admin/accounts".to_owned(),
+        format!("/api/v1/admin/accounts/{user_id}"),
+        "/api/v1/admin/workers".to_owned(),
+        "/api/v1/admin/failures".to_owned(),
+        "/api/v1/admin/ci".to_owned(),
+        "/api/v1/admin/ai".to_owned(),
+        "/api/v1/admin/growth".to_owned(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(&uri, &token))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        responses.push((uri, status, serde_json::from_slice::<Value>(&body).unwrap()));
+    }
 
     sqlx::query("DELETE FROM ci_preview_aliases WHERE build_id = $1")
         .bind(build_id)
@@ -1164,13 +1208,24 @@ async fn admin_ci_lists_previews_that_follow_no_ref() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM plugin_blobs WHERE sha256 = $1")
+        .bind(&blob)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let preview = body["previews"]
+    for (uri, status, body) in &responses {
+        assert_eq!(*status, StatusCode::OK, "{uri}: {body}");
+    }
+    let body_of = |uri: &str| &responses.iter().find(|(u, ..)| u == uri).unwrap().2;
+    let preview = body_of("/api/v1/admin/ci")["previews"]
         .as_array()
         .unwrap()
         .iter()
         .find(|preview| preview["hostname"] == hostname)
         .expect("the commit preview is listed");
     assert_eq!(preview["ref_name"], Value::Null);
+    let detail = body_of(&format!("/api/v1/admin/servers/{server_id}"));
+    assert_eq!(detail["plugin_errors"][0]["version"], Value::Null);
+    assert_eq!(body_of("/api/v1/admin/ai")["top_servers"][0]["id"], Value::Null);
 }

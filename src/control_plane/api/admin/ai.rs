@@ -53,7 +53,8 @@ pub(super) struct AdminAiModel {
 /// A server or account and what it spent this month.
 #[derive(Debug, Serialize, JsonSchema, sqlx::FromRow)]
 pub(super) struct AdminAiSpender {
-    id: Uuid,
+    /// Null once the server is deleted: its usage stays, detached.
+    id: Option<Uuid>,
     /// The server's address or the account's name; null once it is deleted.
     name: Option<String>,
     cost_micros: i64,
