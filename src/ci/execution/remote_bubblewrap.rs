@@ -761,7 +761,8 @@ impl RootlessBuildRuntime for SshBubblewrapBuildRuntime {
     }
 
     async fn verify_sandbox(&self, limits: SandboxLimits) -> Result<(), BuildPipelineError> {
-        self.assert_capability_lease()?;
+        // The preflight below is what renews the capability lease, so an
+        // expired lease must not be rejected here or it could never be renewed.
         if limits != self.profile.limits {
             return Err(BuildPipelineError::Sandbox(
                 "remote Bubblewrap workload limits differ from the registered resource profile"
