@@ -397,11 +397,17 @@ impl<C: SourceControlClient + 'static> CiPoller<C> {
         repository: &str,
         builder: &dyn crate::ci::BuildCoordinator,
     ) -> Result<()> {
-        // A requested build can lose its queue entry when a coordinator stops
-        // between admission and enqueueing; give it one back before claiming.
-        // Unrequested build rows stay lazy until a join asks for them.
+        // Every open pull request is built ahead of any join, including one
+        // whose head a release left under an older key, and a build that lost
+        // its queue entry when a coordinator stopped between admission and
+        // enqueueing gets one back. Queue claiming below paces the work.
         self.repository
-            .recover_unqueued_pull_request_builds(repository)
+            .queue_open_pull_request_builds(
+                repository,
+                &self.config.patch_fingerprint,
+                &self.config.toolchain_version,
+                &self.config.target_architecture,
+            )
             .await?;
         loop {
             let claims = self

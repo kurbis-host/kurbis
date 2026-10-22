@@ -317,10 +317,8 @@ where
             .ensure_build_with_retention(&request.key, request.retention)
             .await
             .map_err(|error| BuildPipelineError::Database(error.to_string()))?;
-        // A source poll may materialize a queued PR identity without asking
-        // for work. Mark only actual coordinator calls as recoverable demand;
-        // this keeps a large historical open-PR set from becoming a build
-        // backlog while preserving restart recovery for admitted jobs.
+        // Branch and commit previews are only built when a coordinator is
+        // asked to; the mark records that the build was asked for.
         self.repository
             .mark_build_requested(build.id)
             .await

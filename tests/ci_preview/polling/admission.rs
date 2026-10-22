@@ -125,7 +125,7 @@ async fn production_poll_orchestration_eagerly_builds_fork_pr_once_with_one_chec
 }
 
 #[tokio::test]
-async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
+async fn polling_builds_every_open_pr_head_under_the_current_patch_set() {
     let _test_guard = CI_TEST_LOCK.lock().await;
     use kurbis_hoster::ci::{CiPoller, CiPollerConfig, ControlledBuildPipeline, SandboxLimits};
 
@@ -158,7 +158,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     assert_eq!(queued.stage, CiBuildStage::Queued);
 
     // A second open pull request whose build row exists only so its preview
-    // address resolves. Nobody asked for it, so polling must not compile it.
+    // address resolves. Nobody joined it, but polling still builds it.
     let lazy_sha = "0123456789abcdef0123456789abcdef01234567";
     sqlx::query(
         "INSERT INTO ci_refs(repository_id,kind,name,number,commit_sha,source_repository,closed,deleted)
@@ -169,7 +169,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     .execute(&pool)
     .await
     .unwrap();
-    let lazy_key = BuildKey::new(
+    let other_key = BuildKey::new(
         &repository_name,
         lazy_sha,
         "patch-recovery-v1",
@@ -177,11 +177,7 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
         "x86_64-linux",
     )
     .unwrap();
-    repository.ensure_build(&lazy_key).await.unwrap();
-    // The first one was admitted (a join or a pushed head) before its queue
-    // entry was written.
-    assert!(repository.mark_build_requested(queued.id).await.unwrap());
-
+    repository.ensure_build(&other_key).await.unwrap();
     let source = std::sync::Arc::new(EmptyPollSource);
     let components = std::sync::Arc::new(TestBuildComponents::default());
     let builder = std::sync::Arc::new(ControlledBuildPipeline::new(
@@ -211,14 +207,106 @@ async fn polling_recovers_admitted_pr_build_after_unchanged_provider_poll() {
     poller.poll_once(watched.id).await.unwrap();
     let recovered = repository.ensure_build(&key).await.unwrap().0;
     assert_eq!(recovered.stage, CiBuildStage::Ready);
-    let lazy = repository.ensure_build(&lazy_key).await.unwrap().0;
-    assert_eq!(lazy.stage, CiBuildStage::Queued);
+    let other = repository.ensure_build(&other_key).await.unwrap().0;
+    assert_eq!(other.stage, CiBuildStage::Ready);
     assert_eq!(
         components
             .compile_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2
     );
+    // Polling again queues nothing: both heads already succeeded.
+    poller.poll_once(watched.id).await.unwrap();
+    assert_eq!(
+        components
+            .compile_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn open_pr_queueing_skips_stale_keys_and_cancelled_requests_but_rebuilds_expired_ones() {
+    let _test_guard = CI_TEST_LOCK.lock().await;
+    let pool = pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    let repository_name = format!("fixture/Pumpkin-{}", Uuid::new_v4());
+    let watched = repository
+        .register_repository(&repository_name, "main")
+        .await
+        .unwrap();
+    // PR 1: current key. PR 2: only an old key. PR 3: current key, cancelled.
+    // PR 4: current key, built. PR 5: closed. PR 6: built, then expired and
+    // reset to queued by polling.
+    let heads = [
+        (1, "1111111111111111111111111111111111111111", "current", false),
+        (2, "2222222222222222222222222222222222222222", "old", false),
+        (3, "3333333333333333333333333333333333333333", "current", false),
+        (4, "4444444444444444444444444444444444444444", "current", false),
+        (5, "5555555555555555555555555555555555555555", "current", true),
+        (6, "6666666666666666666666666666666666666666", "current", false),
+    ];
+    let mut builds = std::collections::HashMap::new();
+    for (number, sha, fingerprint, closed) in heads {
+        sqlx::query(
+            "INSERT INTO ci_refs(repository_id,kind,name,number,commit_sha,source_repository,closed,deleted)
+             VALUES($1,'pull_request',$2,$3,$4,'contributor/Pumpkin',$5,false)",
+        )
+        .bind(watched.id)
+        .bind(format!("pr-{number}"))
+        .bind(number as i64)
+        .bind(sha)
+        .bind(closed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = BuildKey::new(&repository_name, sha, fingerprint, "test-toolchain", "x86_64-linux")
+            .unwrap();
+        builds.insert(number, (repository.ensure_build(&key).await.unwrap().0, key));
+    }
+    for number in [3, 4, 6] {
+        let (build, key) = &builds[&number];
+        repository
+            .enqueue_pull_request_build(&repository_name, number as i64, key, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE ci_build_queue SET state = $2, finished_at = now() WHERE build_id = $1",
+        )
+        .bind(build.id)
+        .bind(if number == 3 { "cancelled" } else { "succeeded" })
+        .execute(&pool)
+        .await
+        .unwrap();
+        if number == 4 {
+            sqlx::query("UPDATE ci_builds SET stage = 'ready' WHERE id = $1")
+                .bind(build.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    let queued = repository
+        .queue_open_pull_request_builds(&repository_name, "current", "test-toolchain", "x86_64-linux")
+        .await
+        .unwrap();
+    let again = repository
+        .queue_open_pull_request_builds(&repository_name, "current", "test-toolchain", "x86_64-linux")
+        .await
+        .unwrap();
+
+    let pending: Vec<i64> = sqlx::query_scalar(
+        "SELECT pull_request_number FROM ci_build_queue
+         WHERE repository_id = $1 AND state = 'pending' ORDER BY 1",
+    )
+    .bind(watched.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, vec![1, 6], "open PRs whose current build still has to run");
+    assert_eq!((queued, again), (2, 0));
     pool.close().await;
 }
 

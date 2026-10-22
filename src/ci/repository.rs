@@ -277,12 +277,22 @@ impl CiPreviewRepository {
         Ok(id)
     }
 
-    /// Give a queue entry back to a pull-request build that was explicitly
-    /// requested (see `mark_build_requested`) but has none, for example after
-    /// a coordinator stopped between admission and enqueueing. Build rows that
-    /// polling created only so a preview address exists are not requests:
-    /// queueing those compiled every open pull request. Idempotent.
-    pub async fn recover_unqueued_pull_request_builds(&self, repository: &str) -> Result<u64> {
+    /// Queue a build for every open pull request whose head has a build under
+    /// the current patch fingerprint, toolchain and architecture and no queue
+    /// entry. Polling gives each open pull request a build row so its
+    /// preview address resolves; this turns that row into work, so every open
+    /// pull request has a ready preview before anyone joins it. It also gives
+    /// an entry back to a build whose coordinator stopped between admission
+    /// and enqueueing, and rebuilds a head whose artifact expired (polling
+    /// resets its build to queued). Builds under another key are stale and
+    /// left alone, and so are heads whose request was cancelled. Idempotent.
+    pub async fn queue_open_pull_request_builds(
+        &self,
+        repository: &str,
+        patch_fingerprint: &str,
+        toolchain_version: &str,
+        target_architecture: &str,
+    ) -> Result<u64> {
         let result = sqlx::query(
             "INSERT INTO public.ci_build_queue(
                 repository_id, pull_request_number, commit_sha, build_id,
@@ -299,10 +309,11 @@ impl CiPreviewRepository {
              JOIN public.ci_watched_repositories watched ON watched.id = ref.repository_id
              JOIN public.ci_builds build
                ON build.repository = watched.repository AND build.commit_sha = ref.commit_sha
+              AND build.patch_fingerprint = $2 AND build.toolchain_version = $3
+              AND build.target_architecture = $4
              WHERE watched.repository = $1 AND watched.enabled
                AND ref.kind = 'pull_request' AND ref.number IS NOT NULL
                AND NOT ref.closed AND NOT ref.deleted
-               AND build.requested_at IS NOT NULL
                -- A live lease means a coordinator is building it right now;
                -- queueing it again only records an empty success every poll.
                AND (build.lease_expires_at IS NULL OR build.lease_expires_at <= now())
@@ -312,12 +323,16 @@ impl CiPreviewRepository {
                    SELECT 1 FROM public.ci_build_queue existing
                    WHERE existing.repository_id = watched.id
                      AND existing.pull_request_number = ref.number
-                     AND existing.state IN ('pending', 'running', 'failed')
+                     AND (existing.state IN ('pending', 'running', 'failed')
+                          OR (existing.build_id = build.id AND existing.state = 'cancelled'))
                )
              ORDER BY watched.id, ref.number, build.updated_at DESC, build.id
              ON CONFLICT DO NOTHING",
         )
         .bind(repository)
+        .bind(patch_fingerprint)
+        .bind(toolchain_version)
+        .bind(target_architecture)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -773,10 +788,7 @@ impl CiPreviewRepository {
         Ok(due.unwrap_or(false))
     }
 
-    /// Mark a build as explicitly requested so a poller restart can recover it.
-    /// Source polling creates build identities for stable PR aliases, but those
-    /// identities are not work until a current-head event, webhook, or preview
-    /// join asks the coordinator to run them.
+    /// Mark a build as requested once a coordinator is asked to run it.
     pub async fn mark_build_requested(&self, build_id: Uuid) -> Result<bool> {
         let updated = sqlx::query(
             "UPDATE ci_builds SET requested_at = COALESCE(requested_at, now()), updated_at = now()
