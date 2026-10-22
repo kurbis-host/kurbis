@@ -1,5 +1,5 @@
 diff --git a/crates/pumpkin-core/src/command/mod.rs b/crates/pumpkin-core/src/command/mod.rs
-index 7db7c799..d48aca6a 100644
+index 7db7c79..d48aca6 100644
 --- a/crates/pumpkin-core/src/command/mod.rs
 +++ b/crates/pumpkin-core/src/command/mod.rs
 @@ -107,6 +107,8 @@ pub fn set_broadcast_console_to_ops(value: bool) {
@@ -146,19 +146,19 @@ index 7db7c799..d48aca6a 100644
                  let (world, spawn_point) = Self::get_world_and_spawn_point(server);
                  CommandSource::new(
 diff --git a/crates/pumpkin-core/src/entity/player.rs b/crates/pumpkin-core/src/entity/player.rs
-index 22651024..798fc2d3 100644
+index 790f152..f856c1f 100644
 --- a/crates/pumpkin-core/src/entity/player.rs
 +++ b/crates/pumpkin-core/src/entity/player.rs
-@@ -402,6 +402,8 @@ pub enum SpamType {
- }
+@@ -406,6 +406,8 @@ pub type HeldChunkTickets = (Vector2<i32>, Option<i8>, Option<i8>);
  
+ #[repr(C)]
  pub struct Player {
 +    /// Unique for this authenticated client connection, including reconnects.
 +    pub connection_id: uuid::Uuid,
      /// The underlying living entity object that represents the player.
      pub living_entity: LivingEntity,
      /// The player's game profile information, including their username and UUID.
-@@ -724,6 +726,7 @@ impl Player {
+@@ -728,6 +730,7 @@ impl Player {
          let initially_loaded = !supports_player_loaded;
  
          Self {
@@ -167,7 +167,7 @@ index 22651024..798fc2d3 100644
              config: ArcSwap::new(Arc::new(config)),
              advancements: Arc::new(Mutex::new(
 diff --git a/crates/pumpkin-core/src/lib.rs b/crates/pumpkin-core/src/lib.rs
-index c91d676e..d878e74a 100644
+index c91d676..d878e74 100644
 --- a/crates/pumpkin-core/src/lib.rs
 +++ b/crates/pumpkin-core/src/lib.rs
 @@ -476,6 +476,9 @@ impl PumpkinServer {
@@ -181,7 +181,7 @@ index c91d676e..d878e74a 100644
          self.server.management_hub.broadcast_server_started();
  
 diff --git a/crates/pumpkin-core/src/net/bedrock/login/login.rs b/crates/pumpkin-core/src/net/bedrock/login/login.rs
-index 9203349e..4cbe843f 100644
+index 9203349..4cbe843 100644
 --- a/crates/pumpkin-core/src/net/bedrock/login/login.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/login/login.rs
 @@ -61,6 +61,26 @@ impl BedrockClient {
@@ -212,7 +212,7 @@ index 9203349e..4cbe843f 100644
              LoginError::InvalidTokenFormat(serde_json::Error::custom(
                  "raw_token is not valid UTF-8",
 diff --git a/crates/pumpkin-core/src/net/bedrock/mod.rs b/crates/pumpkin-core/src/net/bedrock/mod.rs
-index ac5d1c82..35e41455 100644
+index ac5d1c8..35e4145 100644
 --- a/crates/pumpkin-core/src/net/bedrock/mod.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/mod.rs
 @@ -101,6 +101,7 @@ pub struct BedrockClient {
@@ -232,7 +232,7 @@ index ac5d1c82..35e41455 100644
              network_writer: Arc::new(RwLock::new(BedrockBatchEncoder::new())),
              network_reader: Mutex::new(BedrockBatchDecoder::new()),
 diff --git a/crates/pumpkin-core/src/net/mod.rs b/crates/pumpkin-core/src/net/mod.rs
-index d1d21578..74058ffe 100644
+index a5701c4..c3d20b6 100644
 --- a/crates/pumpkin-core/src/net/mod.rs
 +++ b/crates/pumpkin-core/src/net/mod.rs
 @@ -31,6 +31,8 @@ use thiserror::Error;
@@ -245,10 +245,10 @@ index d1d21578..74058ffe 100644
  pub mod chunk_sender;
  pub use chunk_sender::ChunkSender;
 diff --git a/crates/pumpkin-core/src/plugin/mod.rs b/crates/pumpkin-core/src/plugin/mod.rs
-index d9bb5426..d07a04ac 100644
+index b51b6ca..1bba116 100644
 --- a/crates/pumpkin-core/src/plugin/mod.rs
 +++ b/crates/pumpkin-core/src/plugin/mod.rs
-@@ -349,7 +349,7 @@ impl PluginManager {
+@@ -350,7 +350,7 @@ impl PluginManager {
                                  // the loader might handle it or we might get a duplicate.
                                  // Most WASM loaders will just create a new instance.
                                  if let Err(e) =
@@ -257,7 +257,7 @@ index d9bb5426..d07a04ac 100644
                                  {
                                      error!("Failed to hot-reload plugin {:?}: {}", path, e);
                                  }
-@@ -392,7 +392,7 @@ impl PluginManager {
+@@ -393,7 +393,7 @@ impl PluginManager {
          let mut retry_tasks = Vec::new();
  
          for path in files_to_retry {
@@ -266,7 +266,7 @@ index d9bb5426..d07a04ac 100644
                  retry_tasks.push(task);
              }
          }
-@@ -718,6 +718,11 @@ impl PluginManager {
+@@ -719,6 +719,11 @@ impl PluginManager {
                  if loader.can_load(&path) {
                      match loader.load(&path).await {
                          Ok((instance, metadata, loader_data)) => {
@@ -278,7 +278,7 @@ index d9bb5426..d07a04ac 100644
                              let plugin_override =
                                  server.advanced_config.plugins.overrides.get(&metadata.name);
  
-@@ -913,7 +918,7 @@ impl PluginManager {
+@@ -914,7 +919,7 @@ impl PluginManager {
          self: &Arc<Self>,
          server: &Arc<Server>,
          path: &Path,
@@ -287,7 +287,7 @@ index d9bb5426..d07a04ac 100644
          if !server.advanced_config.plugins.enabled {
              return Err(ManagerError::LoaderError(LoaderError::RuntimeError(
                  "Plugin system is disabled in configuration".to_string(),
-@@ -924,6 +929,7 @@ impl PluginManager {
+@@ -925,6 +930,7 @@ impl PluginManager {
          for loader in &loaders {
              if loader.can_load(path) {
                  let (instance, metadata, loader_data) = loader.load(path).await?;
@@ -295,7 +295,7 @@ index d9bb5426..d07a04ac 100644
  
                  let plugin_override = server.advanced_config.plugins.overrides.get(&metadata.name);
  
-@@ -963,6 +969,7 @@ impl PluginManager {
+@@ -964,6 +970,7 @@ impl PluginManager {
                      )));
                  }
  
@@ -303,7 +303,7 @@ index d9bb5426..d07a04ac 100644
                  return self
                      .spawn_plugin_initialization(
                          server.clone(),
-@@ -972,7 +979,8 @@ impl PluginManager {
+@@ -973,7 +980,8 @@ impl PluginManager {
                          loader.clone(),
                          path.to_path_buf(),
                      )
@@ -313,7 +313,7 @@ index d9bb5426..d07a04ac 100644
              }
          }
  
-@@ -992,6 +1000,7 @@ impl PluginManager {
+@@ -993,6 +1001,7 @@ impl PluginManager {
      ) -> Result<(), ManagerError> {
          self.start_loading_plugin(server, path)
              .await?
@@ -321,7 +321,7 @@ index d9bb5426..d07a04ac 100644
              .await
              .map_err(|e| {
                  ManagerError::LoaderError(LoaderError::InitializationFailed(format!(
-@@ -1000,6 +1009,68 @@ impl PluginManager {
+@@ -1001,6 +1010,68 @@ impl PluginManager {
              })
      }
  
@@ -390,8 +390,26 @@ index d9bb5426..d07a04ac 100644
      /// Wait for a plugin to finish loading
      pub async fn wait_for_plugin(&self, plugin_name: &str) -> Result<(), ManagerError> {
          loop {
+diff --git a/crates/pumpkin-core/src/server/connection_cache.rs b/crates/pumpkin-core/src/server/connection_cache.rs
+index 1d194ef..17efb57 100644
+--- a/crates/pumpkin-core/src/server/connection_cache.rs
++++ b/crates/pumpkin-core/src/server/connection_cache.rs
+@@ -52,7 +52,12 @@ impl Default for CachedBranding {
+ }
+ 
+ impl CachedBranding {
+-    const BRAND: &'static str = "Pumpkin";
++    /// A hosted build names the exact revision it was compiled from, so the
++    /// F3 screen tells players and operators which server they are on.
++    const BRAND: &'static str = match option_env!("KURBIS_SERVER_BRAND") {
++        Some(brand) => brand,
++        None => "Pumpkin",
++    };
+     const BRAND_BYTES: &'static [u8] = &{
+         let brand = Self::BRAND.as_bytes();
+         let len = brand.len();
 diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
-index 40520aa3..c4b41498 100644
+index f0a193e..0726751 100644
 --- a/crates/pumpkin-core/src/server/mod.rs
 +++ b/crates/pumpkin-core/src/server/mod.rs
 @@ -45,7 +45,7 @@ use rsa::RsaPublicKey;
@@ -403,7 +421,7 @@ index 40520aa3..c4b41498 100644
  use std::{future::Future, sync::atomic::Ordering, time::Duration};
  use tokio::sync::OnceCell;
  use tokio::task::JoinHandle;
-@@ -101,6 +101,8 @@ pub struct Server {
+@@ -103,6 +103,8 @@ pub struct Server {
      pub dimensions: Vec<Dimension>,
      /// Assigns unique IDs to containers.
      container_id: AtomicU32,
@@ -412,7 +430,7 @@ index 40520aa3..c4b41498 100644
      pub recipe_manager: Arc<recipe::RecipeManager>,
      pub datapack_manager: Arc<crate::data::datapack::DatapackManager>,
      pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
-@@ -284,6 +286,7 @@ impl Server {
+@@ -286,6 +288,7 @@ impl Server {
              plugin_manager: Arc::new(PluginManager::new(plugin_loaders)),
              permission_manager,
              container_id: 0.into(),
@@ -420,7 +438,7 @@ index 40520aa3..c4b41498 100644
              recipe_manager: Arc::new(recipe::RecipeManager::new()),
              datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
              enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
-@@ -605,7 +608,10 @@ impl Server {
+@@ -607,7 +610,10 @@ impl Server {
          }
  
          for world in self.worlds.load().iter() {
@@ -432,7 +450,7 @@ index 40520aa3..c4b41498 100644
          }
  
          self.management_hub.broadcast_server_saved();
-@@ -704,6 +710,8 @@ impl Server {
+@@ -706,6 +712,8 @@ impl Server {
              'after: {
                  player.screen_handler_sync_handler.store_player(player.clone());
                  world.add_player(&player).is_ok().then(|| {
@@ -441,7 +459,7 @@ index 40520aa3..c4b41498 100644
                      {
                          let mut user_cache = self
                              .data
-@@ -742,6 +750,8 @@ impl Server {
+@@ -744,6 +752,8 @@ impl Server {
      }
  
      pub fn remove_player(&self, player: &Player) {
@@ -451,10 +469,10 @@ index 40520aa3..c4b41498 100644
              Some(player.gameprofile.id),
              Some(player.gameprofile.name.clone()),
 diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
-index 91250dc6..7f2c6aae 100644
+index 238888f..5aad586 100644
 --- a/crates/pumpkin-core/src/world/mod.rs
 +++ b/crates/pumpkin-core/src/world/mod.rs
-@@ -6886,6 +6886,20 @@ impl World {
+@@ -6933,6 +6933,20 @@ impl World {
          }
      }
  
@@ -476,7 +494,7 @@ index 91250dc6..7f2c6aae 100644
          let mut custom_data = self
              .custom_data
 diff --git a/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs b/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
-index ddf15314..5655dbe2 100644
+index ddf1531..5655dbe 100644
 --- a/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
 +++ b/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
 @@ -283,7 +283,8 @@ impl pumpkin::plugin::command::HostCommandSender for PluginHostState {
@@ -490,7 +508,7 @@ index ddf15314..5655dbe2 100644
                  Ok(CommandSenderType::Player(self.add(player)?))
              }
 diff --git a/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs b/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
-index ddf15314..5655dbe2 100644
+index 7cfaf7f..62d67aa 100644
 --- a/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
 +++ b/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
 @@ -283,7 +283,8 @@ impl pumpkin::plugin::command::HostCommandSender for PluginHostState {
@@ -504,74 +522,147 @@ index ddf15314..5655dbe2 100644
                  Ok(CommandSenderType::Player(self.add(player)?))
              }
 diff --git a/crates/pumpkin-world/src/chunk/io/file_manager.rs b/crates/pumpkin-world/src/chunk/io/file_manager.rs
-index 16cd99af..36845f62 100644
+index adf1ce8..caed947 100644
 --- a/crates/pumpkin-world/src/chunk/io/file_manager.rs
 +++ b/crates/pumpkin-world/src/chunk/io/file_manager.rs
-@@ -10,7 +10,7 @@ use tokio::{
-     join,
-     sync::{OnceCell, RwLock, mpsc},
- };
--use tracing::{debug, error, trace};
-+use tracing::{error, trace};
+@@ -351,25 +351,33 @@ impl<R: RegionFile, D: SingleChunkDataSerializer> ChunkFileManager<R, D> {
+         }
+     }
  
- use crate::{
-     chunk::{ChunkReadingError, ChunkWritingError, io::Dirtiable},
-@@ -365,10 +365,15 @@ where
-                         let was_dirty = chunk.is_dirty();
-                         chunk.mark_dirty(false);
+-    async fn flush_entries(&self, sync: bool, only_due: bool) {
++    /// Writes the staged chunks of every open region and returns the first failure. A failed
++    /// write keeps its chunks staged, so a later flush retries them.
++    async fn flush_entries(&self, sync: bool, only_due: bool) -> Result<(), ChunkWritingError> {
+         let entries = self.entries();
+-        join_all(entries.iter().map(|entry| async {
+-            if let Err(err) = entry.save_pending(self.config.clone()).await {
++        let saved = join_all(entries.iter().map(|entry| async {
++            entry.save_pending(self.config.clone()).await.inspect_err(|err| {
+                 error!("Failed saving pending chunks: {err}");
+-            }
++            })
+         }))
+         .await;
+-        let result = run_blocking(move || {
+-            for entry in entries {
+-                if let Err(err) = entry.flush(sync, only_due) {
+-                    error!("Failed writing region file: {err}");
+-                }
+-            }
++        let flushed = run_blocking(move || {
++            entries
++                .into_iter()
++                .map(|entry| {
++                    entry.flush(sync, only_due).map_err(|err| {
++                        error!("Failed writing region file: {err}");
++                        ChunkWritingError::IoError(err)
++                    })
++                })
++                .collect::<Vec<_>>()
+         })
+-        .await;
+-        if result.is_err() {
++        .await
++        .map_err(|_| {
+             error!("Region flush task failed");
+-        }
++            ChunkWritingError::IoError(std::io::Error::other("region flush task failed"))
++        })?;
++        saved.into_iter().chain(flushed).collect()
+     }
+ }
  
--                        if was_dirty {
--                            writer
-+                        if was_dirty
-+                            && let Err(error) = writer
-                                 .update_chunk(chunk.clone(), &self.chunk_config)
--                                .await?;
-+                                .await
-+                        {
-+                            for retry in &chunk_locks {
-+                                retry.mark_dirty(true);
-+                            }
-+                            return Err(error);
-                         }
-                     }
-                     // Write-lock released here — flush can proceed under a read-lock.
-@@ -383,19 +388,19 @@ where
-                     watchers.get(&path).is_some_and(|&c| c > 0)
-                 };
+@@ -507,13 +515,15 @@ where
+     }
  
--                if !is_watched {
--                    // A read-lock suffices for `write()` since we have already
--                    // applied all mutations above.
--                    {
--                        let serializer = chunk_serializer.read().await;
--                        debug!("Flushing {} to disk", path.display());
--                        serializer
--                            .write(&path)
--                            .await
--                            .map_err(ChunkWritingError::IoError)?;
--                        // Read-lock released here.
--                    };
-+                // A completed host snapshot must reach disk even while players
-+                // watch this region. Failed writes remain eligible for retry.
-+                {
-+                    let serializer = chunk_serializer.read().await;
-+                    if let Err(error) = serializer.write(&path).await {
-+                        for retry in &chunk_locks {
-+                            retry.mark_dirty(true);
-+                        }
-+                        return Err(ChunkWritingError::IoError(error));
-+                    }
-+                }
+     async fn flush_due(&self) {
+-        self.flush_entries(false, true).await;
++        // Each failure was logged where it happened and stays staged for the next flush.
++        let _ = self.flush_entries(false, true).await;
+         self.evict();
+     }
  
-+                if !is_watched {
-                     // Drop our handle so `can_remove` may succeed.
-                     drop(chunk_serializer);
+-    async fn flush_all(&self) {
+-        self.flush_entries(true, false).await;
++    async fn flush_all(&self) -> Result<(), ChunkWritingError> {
++        let result = self.flush_entries(true, false).await;
+         self.evict();
++        result
+     }
+ }
  
+@@ -562,7 +572,7 @@ where
+         }
+     }
+ 
+-    async fn flush_all(&self) {
++    async fn flush_all(&self) -> Result<(), ChunkWritingError> {
+         match self {
+             Self::Linear(io) => io.flush_all().await,
+             Self::Anvil(io) => io.flush_all().await,
+@@ -677,7 +687,7 @@ mod tests {
+             vec![entity.clone()]
+         );
+         drop(chunk);
+-        manager.flush_all().await;
++        manager.flush_all().await.unwrap();
+ 
+         let reopened = AnvilRegion::open(&entities.join("r.0.0.mca"), Vector2::new(0, 0)).unwrap();
+         let nbt = AnvilRegion::decode_chunk(reopened.read_chunk(0).unwrap().unwrap()).unwrap();
+@@ -716,8 +726,31 @@ mod tests {
+         assert!(chunks[1].is_dirty());
+         chunks[1].fail.store(false, Ordering::Relaxed);
+         drop(chunks);
+-        manager.flush_all().await;
++        manager.flush_all().await.unwrap();
+         let region = AnvilRegion::open(&path, Vector2::new(0, 0)).unwrap();
+         assert!(region.read_chunk(1).unwrap().is_some());
+     }
++
++    #[tokio::test]
++    async fn flush_all_reports_a_failed_write_and_a_later_flush_retries_it() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let folder = folder(dir.path());
++        let entities = &folder.entities_folder;
++        let manager =
++            ChunkFileManager::<AnvilRegion, ChunkEntityData>::new(AnvilChunkConfig::default());
++        let chunk = Arc::new(entity_chunk(0));
++        // The region file is only created by the flush. A file where its directory
++        // belongs makes that flush fail after the chunk has been staged.
++        std::fs::write(entities, b"not a directory").unwrap();
++        manager
++            .save_chunks(&folder, vec![(Vector2::new(0, 0), chunk.clone())])
++            .await
++            .unwrap_err();
++        assert!(manager.flush_all().await.is_err());
++        std::fs::remove_file(entities).unwrap();
++        std::fs::create_dir(entities).unwrap();
++        manager.flush_all().await.unwrap();
++        let region = AnvilRegion::open(&entities.join("r.0.0.mca"), Vector2::new(0, 0)).unwrap();
++        assert!(region.read_chunk(0).unwrap().is_some());
++    }
+ }
+diff --git a/crates/pumpkin-world/src/chunk/io/mod.rs b/crates/pumpkin-world/src/chunk/io/mod.rs
+index e25f377..d5412f6 100644
+--- a/crates/pumpkin-world/src/chunk/io/mod.rs
++++ b/crates/pumpkin-world/src/chunk/io/mod.rs
+@@ -79,8 +79,9 @@ where
+     /// from the cache.
+     fn flush_due(&self) -> impl Future<Output = ()> + Send + '_;
+ 
+-    /// Writes every staged chunk and syncs the region files.
+-    fn flush_all(&self) -> impl Future<Output = ()> + Send + '_;
++    /// Writes every staged chunk and syncs the region files. A chunk that could not be written
++    /// stays staged, and the first failure is returned.
++    fn flush_all(&self) -> impl Future<Output = Result<(), ChunkWritingError>> + Send + '_;
+ }
+ 
+ /// One open region file (32x32 chunks) of a storage format.
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
-index 9371ab66..afb91e80 100644
+index dce4c34..c8b92a3 100644
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
-@@ -353,6 +353,30 @@ impl Level {
+@@ -372,6 +372,39 @@ impl Level {
          self.tasks.spawn(task)
      }
  
@@ -596,27 +687,34 @@ index 9371ab66..afb91e80 100644
 +            .save_chunks(&self.level_folder, entities)
 +            .await
 +            .map_err(|error| format!("Entity save failed: {error}"))?;
++        // The saves above only stage chunks; the snapshot needs them on disk.
++        self.chunk_saver
++            .flush_all()
++            .await
++            .map_err(|error| format!("Chunk flush failed: {error}"))?;
++        self.entity_saver
++            .flush_all()
++            .await
++            .map_err(|error| format!("Entity flush failed: {error}"))?;
 +        Ok(())
 +    }
 +
      pub async fn shutdown(&self) {
          let world_id = self.level_folder.root_folder.display();
          info!("Saving level ({})...", world_id);
-diff --git a/crates/pumpkin-core/src/server/connection_cache.rs b/crates/pumpkin-core/src/server/connection_cache.rs
-index 1d194ef..17efb57 100644
---- a/crates/pumpkin-core/src/server/connection_cache.rs
-+++ b/crates/pumpkin-core/src/server/connection_cache.rs
-@@ -52,7 +52,12 @@ impl Default for CachedBranding {
- }
+@@ -436,9 +469,13 @@ impl Level {
+         self.write_entity_chunks(chunks_to_write).await;
  
- impl CachedBranding {
--    const BRAND: &'static str = "Pumpkin";
-+    /// A hosted build names the exact revision it was compiled from, so the
-+    /// F3 screen tells players and operators which server they are on.
-+    const BRAND: &'static str = match option_env!("KURBIS_SERVER_BRAND") {
-+        Some(brand) => brand,
-+        None => "Pumpkin",
-+    };
-     const BRAND_BYTES: &'static [u8] = &{
-         let brand = Self::BRAND.as_bytes();
-         let len = brand.len();
+         info!("Flushing chunk data to disk for {}...", world_id);
+-        self.chunk_saver.flush_all().await;
++        if let Err(error) = self.chunk_saver.flush_all().await {
++            error!("Failed flushing chunk data for {world_id}: {error}");
++        }
+         info!("Flushing entity data to disk for {}...", world_id);
+-        self.entity_saver.flush_all().await;
++        if let Err(error) = self.entity_saver.flush_all().await {
++            error!("Failed flushing entity data for {world_id}: {error}");
++        }
+     }
+ 
+     /// Writes region files whose saved chunks have waited long enough.

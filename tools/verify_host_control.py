@@ -197,7 +197,7 @@ enabled = false
                     command="kurbis_fixture_unknown_command",
                 )
                 assert rejected_by_dispatcher["ok"] is True, rejected_by_dispatcher
-                assert any("unknown command" in line.lower() for line in rejected_by_dispatcher["output"]), rejected_by_dispatcher
+                assert any(line.lower().startswith("unknown") for line in rejected_by_dispatcher["output"]), rejected_by_dispatcher
                 evidence["checks"].append({"dispatcher_rejection_output": rejected_by_dispatcher})
                 invalid_command = rpc(rpc_path, token, "execute_command", command="   ")
                 assert invalid_command["ok"] is False, invalid_command

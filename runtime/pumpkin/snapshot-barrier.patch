@@ -1,5 +1,5 @@
 diff --git a/crates/pumpkin-core/src/lib.rs b/crates/pumpkin-core/src/lib.rs
-index d878e74a..0dee942c 100644
+index d878e74..0dee942 100644
 --- a/crates/pumpkin-core/src/lib.rs
 +++ b/crates/pumpkin-core/src/lib.rs
 @@ -609,6 +609,7 @@ impl PumpkinServer {
@@ -31,7 +31,7 @@ index d878e74a..0dee942c 100644
                          server.remove_player(&player);
                          if let Err(error) = server.player_data_storage.handle_player_leave(&player)
 diff --git a/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs b/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
-index d31683b7..f5941420 100644
+index d31683b..f594142 100644
 --- a/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/play/chat_command.rs
 @@ -8,6 +8,7 @@ impl BedrockClient {
@@ -43,7 +43,7 @@ index d31683b7..f5941420 100644
          if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
              return;
 diff --git a/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs b/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
-index d32485e9..13060f0b 100644
+index d32485e..13060f0 100644
 --- a/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/play/chat_message.rs
 @@ -8,6 +8,7 @@ impl BedrockClient {
@@ -55,7 +55,7 @@ index d32485e9..13060f0b 100644
          if player.check_chat_spam(server, crate::entity::player::SpamType::Chat) {
              return;
 diff --git a/crates/pumpkin-core/src/net/bedrock/play/player_action.rs b/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
-index 8205626b..d8be5ad7 100644
+index 8205626..d8be5ad 100644
 --- a/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/play/player_action.rs
 @@ -235,7 +235,11 @@ impl BedrockClient {
@@ -71,7 +71,7 @@ index 8205626b..d8be5ad7 100644
                  });
              }
 diff --git a/crates/pumpkin-core/src/net/java/play/chat_command.rs b/crates/pumpkin-core/src/net/java/play/chat_command.rs
-index a2740195..5cefc45f 100644
+index 5b3c0f8..9b93ed9 100644
 --- a/crates/pumpkin-core/src/net/java/play/chat_command.rs
 +++ b/crates/pumpkin-core/src/net/java/play/chat_command.rs
 @@ -8,6 +8,7 @@ impl JavaClient {
@@ -83,7 +83,7 @@ index a2740195..5cefc45f 100644
          if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
              return;
 diff --git a/crates/pumpkin-core/src/net/java/play/chat_message.rs b/crates/pumpkin-core/src/net/java/play/chat_message.rs
-index 6536ce65..aa979764 100644
+index 6536ce6..aa97976 100644
 --- a/crates/pumpkin-core/src/net/java/play/chat_message.rs
 +++ b/crates/pumpkin-core/src/net/java/play/chat_message.rs
 @@ -9,6 +9,7 @@ impl JavaClient {
@@ -95,13 +95,13 @@ index 6536ce65..aa979764 100644
  
          if let Some(command) = chat_message.message.strip_prefix('/') {
 diff --git a/crates/pumpkin-core/src/net/java/play/client_command.rs b/crates/pumpkin-core/src/net/java/play/client_command.rs
-index afdb65c1..28fde8c0 100644
+index 0a76143..4b470c8 100644
 --- a/crates/pumpkin-core/src/net/java/play/client_command.rs
 +++ b/crates/pumpkin-core/src/net/java/play/client_command.rs
-@@ -16,7 +16,9 @@ impl JavaClient {
-                 let Some(server) = player.world().server.upgrade() else {
+@@ -17,7 +17,9 @@ impl JavaClient {
                      return;
                  };
+                 let hardcore = server.basic_config.hardcore;
 +                let server_c = server.clone();
                  server.spawn_task(async move {
 +                    let _snapshot_activity = server_c.begin_snapshot_activity().await;
@@ -109,7 +109,7 @@ index afdb65c1..28fde8c0 100644
                          .world()
                          .clone()
 diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
-index c4b41498..ca3f0e28 100644
+index 0726751..6e03375 100644
 --- a/crates/pumpkin-core/src/server/mod.rs
 +++ b/crates/pumpkin-core/src/server/mod.rs
 @@ -45,9 +45,10 @@ use rsa::RsaPublicKey;
@@ -125,7 +125,7 @@ index c4b41498..ca3f0e28 100644
  use tokio::task::JoinHandle;
  use tokio_util::task::TaskTracker;
  
-@@ -66,6 +67,14 @@ pub use recipe::RecipeManager;
+@@ -67,6 +68,14 @@ pub use recipe::RecipeManager;
  
  use crate::data::advancement_data::AdvancementManager;
  
@@ -138,9 +138,9 @@ index c4b41498..ca3f0e28 100644
 +}
 +
  /// Represents a Minecraft server instance.
+ #[repr(C)]
  pub struct Server {
-     pub basic_config: BasicConfiguration,
-@@ -103,6 +112,16 @@ pub struct Server {
+@@ -105,6 +114,16 @@ pub struct Server {
      container_id: AtomicU32,
      /// Changes for every successful player join and leave, including brief sessions.
      pub player_activity_revision: AtomicU64,
@@ -157,7 +157,7 @@ index c4b41498..ca3f0e28 100644
      pub recipe_manager: Arc<recipe::RecipeManager>,
      pub datapack_manager: Arc<crate::data::datapack::DatapackManager>,
      pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
-@@ -287,6 +306,11 @@ impl Server {
+@@ -289,6 +308,11 @@ impl Server {
              permission_manager,
              container_id: 0.into(),
              player_activity_revision: AtomicU64::new(0),
@@ -169,7 +169,7 @@ index c4b41498..ca3f0e28 100644
              recipe_manager: Arc::new(recipe::RecipeManager::new()),
              datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
              enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
-@@ -619,6 +643,78 @@ impl Server {
+@@ -621,6 +645,78 @@ impl Server {
          Ok(())
      }
  
@@ -248,7 +248,7 @@ index c4b41498..ca3f0e28 100644
      /// Adds a new player to the server.
      ///
      /// This function takes an `Arc<Client>` representing the connected client and performs the following actions:
-@@ -650,6 +746,20 @@ impl Server {
+@@ -652,6 +748,20 @@ impl Server {
          profile: GameProfile,
          config: Option<PlayerConfig>,
      ) -> Option<(Arc<Player>, Arc<World>)> {
@@ -269,7 +269,7 @@ index c4b41498..ca3f0e28 100644
          let gamemode = self
              .defaultgamemode
              .lock()
-@@ -710,6 +820,7 @@ impl Server {
+@@ -712,6 +822,7 @@ impl Server {
              'after: {
                  player.screen_handler_sync_handler.store_player(player.clone());
                  world.add_player(&player).is_ok().then(|| {
@@ -277,7 +277,7 @@ index c4b41498..ca3f0e28 100644
                      self.player_activity_revision
                          .fetch_add(1, Ordering::Release);
                      {
-@@ -1150,6 +1261,13 @@ impl Server {
+@@ -1152,6 +1263,13 @@ impl Server {
      /// Main server tick method. This now handles both player/network ticking (which always runs)
      /// and world/game logic ticking (which is affected by freeze state).
      pub fn tick(self: &Arc<Self>) {
