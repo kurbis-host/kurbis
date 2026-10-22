@@ -10,8 +10,8 @@ use uuid::Uuid;
 // SHA-384 of migration 0001 recorded in production (f6b05712 / deployment 1236700).
 const PRODUCTION_MIGRATION_ONE_SHA384: &str = "dd990a0fc9afdbb38a3e9b212694cf7d92675733fccf696f05778840e72eaf801213c3384efe5474dd45f89c215b0509";
 const MIGRATION_MANIFEST_SHA256: &str =
-    "ccb198d4244c720dd373422a9d082838bd419e02c6721e816eea1286cb4bbdd2";
-const LATEST_MIGRATION: i64 = 23;
+    "0ca1971538239ee1f144c6005b99968c58f1900b2699d100c32c4d11fd174e28";
+const LATEST_MIGRATION: i64 = 24;
 
 #[test]
 fn production_migration_one_checksum_is_immutable() {

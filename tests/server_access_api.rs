@@ -1462,5 +1462,48 @@ async fn join_requests_are_listed_and_answered_in_the_panel() {
     assert_eq!(whitelist["owner_has_minecraft_account"], true);
     assert!(whitelist["requests"].as_array().unwrap().is_empty());
 
+    // Players are told apart by UUID: a Bedrock account whose name differs
+    // from a whitelisted Java player's only in case is a different player and
+    // can be let in beside them.
+    let java_dana = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO whitelist_entries(server_id, player_id, name) VALUES($1, $2, 'DanaMC')",
+    )
+    .bind(fixture.server_id)
+    .bind(java_dana)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let bedrock_dana = Uuid::new_v4();
+    fixture
+        .app
+        .clone()
+        .oneshot(report(bedrock_dana, "danamc"))
+        .await
+        .unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(as_owner(
+            Method::POST,
+            format!("{base}/requests/{bedrock_dana}/let-in"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let whitelist = json_body(response).await;
+    let danas: Vec<&Value> = whitelist["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["name"]
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case("danamc")
+        })
+        .collect();
+    assert_eq!(danas.len(), 2);
+
     fixture.cleanup().await;
 }
