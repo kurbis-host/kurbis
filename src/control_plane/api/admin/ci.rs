@@ -35,7 +35,8 @@ pub(super) struct AdminBuilderSlot {
 pub(super) struct AdminBuildAlias {
     hostname: String,
     kind: String,
-    ref_name: String,
+    /// Empty for a commit preview, which follows no ref.
+    ref_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, sqlx::FromRow)]
@@ -64,7 +65,8 @@ pub(super) struct AdminPreview {
     id: Uuid,
     hostname: String,
     kind: String,
-    ref_name: String,
+    /// Empty for a commit preview, which follows no ref.
+    ref_name: Option<String>,
     commit_sha: String,
     state: String,
     expires_at: DateTime<Utc>,

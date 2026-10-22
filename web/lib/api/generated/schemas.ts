@@ -240,7 +240,8 @@ export interface components {
         AdminBuildAlias: {
             hostname: string;
             kind: string;
-            ref_name: string;
+            /** @description Empty for a commit preview, which follows no ref. */
+            ref_name?: string | null;
         };
         AdminBuildLog: {
             build_log?: string | null;
@@ -488,7 +489,8 @@ export interface components {
             last_activity_at?: string | null;
             /** Format: int64 */
             players_online: number;
-            ref_name: string;
+            /** @description Empty for a commit preview, which follows no ref. */
+            ref_name?: string | null;
             runtime_state?: string | null;
             state: string;
             worker_name?: string | null;

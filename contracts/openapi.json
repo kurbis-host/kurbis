@@ -10303,13 +10303,16 @@
             "type": "string"
           },
           "ref_name": {
-            "type": "string"
+            "description": "Empty for a commit preview, which follows no ref.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "hostname",
-          "kind",
-          "ref_name"
+          "kind"
         ]
       },
       "AdminBuildLog": {
@@ -11067,7 +11070,11 @@
             "format": "int64"
           },
           "ref_name": {
-            "type": "string"
+            "description": "Empty for a commit preview, which follows no ref.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "runtime_state": {
             "type": [
@@ -11089,7 +11096,6 @@
           "id",
           "hostname",
           "kind",
-          "ref_name",
           "commit_sha",
           "state",
           "expires_at",

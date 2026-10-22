@@ -115,7 +115,7 @@ export function AdminCiPage() {
                   key: build.id,
                   cells: [
                     <code key="sha" className="text-xs">{build.commit_sha.slice(0, 10)}</code>,
-                    <span key="for" className="text-xs">{[...build.pull_requests.map((number) => `#${number}`), ...build.aliases.map((alias) => alias.ref_name)].join(", ") || "—"}</span>,
+                    <span key="for" className="text-xs">{[...build.pull_requests.map((number) => `#${number}`), ...build.aliases.map((alias) => alias.ref_name ?? alias.hostname)].join(", ") || "—"}</span>,
                     <Status key="stage" tone={stageTone(build.stage)}>{build.stage}</Status>,
                     build.failure_message ? <Message key="failure" text={`${build.failure_stage ?? ""} ${build.failure_class ?? ""}: ${build.failure_message}`.trim()} /> : "—",
                     formatCount(build.retry_count),
@@ -134,7 +134,7 @@ export function AdminCiPage() {
                   key: preview.id,
                   cells: [
                     <code key="host" className="text-xs">{preview.hostname}</code>,
-                    <span key="ref" className="text-xs">{preview.kind} {preview.ref_name}</span>,
+                    <span key="ref" className="text-xs">{[preview.kind, preview.ref_name ?? preview.commit_sha.slice(0, 10)].join(" ")}</span>,
                     <Status key="state" tone={preview.state === "running" || preview.state === "ready" ? "good" : preview.state === "failed" ? "danger" : "quiet"}>{preview.state}</Status>,
                     preview.runtime_state ?? "—",
                     preview.worker_name ?? "—",

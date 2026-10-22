@@ -1098,3 +1098,79 @@ async fn account_sessions_are_persistent_revocable_and_renewed_on_visits() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn admin_ci_lists_previews_that_follow_no_ref() {
+    let _serial = DB_TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    let (user_id, token) = create_user_session(&pool, "active").await;
+    let subject: String = sqlx::query_scalar("SELECT subject FROM identities WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut state = test_state(pool.clone());
+    Arc::get_mut(&mut state).unwrap().config.admin_identities =
+        vec![crate::config::AdminIdentity {
+            provider: crate::config::OAuthProvider::Google,
+            subject,
+        }];
+    let app = router(state);
+
+    let sha = "a".repeat(40);
+    let build_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO ci_builds(repository, commit_sha, patch_fingerprint, toolchain_version,
+                               target_architecture, expires_at)
+         VALUES('admin-ci/test', $1, 'fingerprint', 'toolchain', 'arch', now() + interval '1 day')
+         RETURNING id",
+    )
+    .bind(&sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // A commit preview follows no ref, so its ref_name is NULL.
+    let hostname = format!("admin-ci-{}.mc.example", build_id.simple());
+    sqlx::query(
+        "INSERT INTO ci_preview_aliases(repository, commit_sha, kind, hostname, build_id, state, expires_at)
+         VALUES('admin-ci/test', $1, 'commit', $2, $3, 'lobby', now() + interval '1 day')",
+    )
+    .bind(&sha)
+    .bind(&hostname)
+    .bind(build_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(authenticated_request("/api/v1/admin/ci", &token))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    sqlx::query("DELETE FROM ci_preview_aliases WHERE build_id = $1")
+        .bind(build_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ci_builds WHERE id = $1")
+        .bind(build_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let preview = body["previews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|preview| preview["hostname"] == hostname)
+        .expect("the commit preview is listed");
+    assert_eq!(preview["ref_name"], Value::Null);
+}
