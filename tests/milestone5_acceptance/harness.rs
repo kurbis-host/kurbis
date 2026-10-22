@@ -985,3 +985,58 @@ async fn artifact_receipt_digest_mismatch_fails_closed_before_ready_alias() {
     );
     close_disposable_pool(pool).await;
 }
+
+#[tokio::test]
+async fn a_new_patch_fingerprint_requeues_a_pull_request_whose_old_request_failed() {
+    let pool = disposable_pool().await;
+    let repository = CiPreviewRepository::new(pool.clone());
+    repository
+        .register_repository(REPOSITORY, "master")
+        .await
+        .unwrap();
+    let key = |fingerprint: &str| {
+        BuildKey::new(
+            REPOSITORY,
+            COMMIT_SHA,
+            fingerprint,
+            TOOLCHAIN,
+            TARGET_ARCHITECTURE,
+        )
+        .unwrap()
+    };
+    let old = repository
+        .enqueue_pull_request_build(REPOSITORY, 5005, &key("old-patch"), None)
+        .await
+        .unwrap();
+    // The same request again is the idempotent case.
+    assert_eq!(
+        repository
+            .enqueue_pull_request_build(REPOSITORY, 5005, &key("old-patch"), None)
+            .await
+            .unwrap(),
+        old
+    );
+    // A release changed the Pumpkin integration: the unchanged head now has
+    // another build key, and the request for it must not reuse the old row,
+    // whose claim would fail with "build key does not match".
+    let new = repository
+        .enqueue_pull_request_build(REPOSITORY, 5005, &key("new-patch"), None)
+        .await
+        .unwrap();
+    assert_ne!(new, old);
+    let states: Vec<(String, String)> = sqlx::query_as(
+        "SELECT build.patch_fingerprint, queue.state FROM ci_build_queue queue
+         JOIN ci_builds build ON build.id = queue.build_id ORDER BY build.patch_fingerprint",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        [
+            ("new-patch".to_owned(), "pending".to_owned()),
+            ("old-patch".to_owned(), "superseded".to_owned()),
+        ]
+    );
+    close_disposable_pool(pool).await;
+}

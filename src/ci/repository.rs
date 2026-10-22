@@ -222,18 +222,21 @@ impl CiPreviewRepository {
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;
-        let existing: Vec<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, commit_sha, state FROM ci_build_queue
+        let existing: Vec<(Uuid, String, Uuid, String)> = sqlx::query_as(
+            "SELECT id, commit_sha, build_id, state FROM ci_build_queue
              WHERE repository_id = $1 AND pull_request_number = $2 FOR UPDATE",
         )
         .bind(repository_id)
         .bind(pull_request_number)
         .fetch_all(&mut *tx)
         .await?;
-        if let Some((id, _commit_sha, _state)) = existing
-            .iter()
-            .find(|(_, commit_sha, state)| commit_sha == &key.commit_sha && state != "superseded")
-        {
+        // The build id carries the whole key. A request for the same commit
+        // under another patch fingerprint (a release changed the Pumpkin
+        // integration) is a new request: the old row would be claimed against
+        // a patch set this control plane no longer has and fail for good.
+        if let Some((id, ..)) = existing.iter().find(|(_, commit_sha, build_id, state)| {
+            commit_sha == &key.commit_sha && *build_id == build.id && state != "superseded"
+        }) {
             sqlx::query(
                 "UPDATE ci_build_queue SET source_repository = COALESCE($2, source_repository),
                         requested_at = CASE WHEN state = 'pending' THEN now() ELSE requested_at END,
