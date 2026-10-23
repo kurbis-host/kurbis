@@ -317,6 +317,26 @@ mod tests {
         assert!(fingerprinted.contains(&"trusted-plugin/src/ai/mod.rs".to_owned()));
     }
 
+    /// `--unidiff-zero` trusts the line numbers of a hunk without context, so
+    /// a lockfile hunk applied after upstream added packages above it lands
+    /// inside another package and `cargo --locked` then refuses the build.
+    #[test]
+    fn manifest_hunks_in_the_gateway_patch_carry_context() {
+        let patch = String::from_utf8(NETHERNET_PATCH.to_vec()).unwrap();
+        let mut manifest = false;
+        for line in patch.lines() {
+            if let Some(file) = line.strip_prefix("diff --git a/") {
+                manifest = file.ends_with("Cargo.lock") || file.ends_with("Cargo.toml");
+            } else if manifest && line.starts_with("@@ ") {
+                let old_range = line.split_whitespace().nth(1).unwrap();
+                assert!(
+                    !old_range.ends_with(",0") && old_range.contains(','),
+                    "manifest hunk without context: {line}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn invalid_patch_source_is_permanent_but_local_storage_errors_are_transient() {
         let invalid = archive_error(ArchiveError::Invalid("malformed archive".into()));
