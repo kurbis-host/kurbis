@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde_json::Value;
 
 use crate::{
+    contracts::world::{WorldGeneration, render_pumpkin_world_config},
     model::DEFAULT_SERVER_MOTD,
     runtime_api_proxy::{MINECRAFT_SERVICES_PREFIX, SERVICE_BASE_URL},
 };
@@ -23,7 +24,8 @@ pub(crate) enum PermissionLevel {
     /// A hosted server: only its operators may run privileged commands.
     Player,
     /// A CI preview exists to try a change out, so everyone who joins may
-    /// use gamemaster commands such as /gamemode, /give and /tp.
+    /// use gamemaster commands such as /gamemode, /give and /tp, and build at
+    /// spawn, which Pumpkin otherwise keeps for level-4 operators.
     Gamemaster,
 }
 
@@ -41,6 +43,7 @@ const PLUGIN_CONFIG: &str = "[plugins]\n\
 
 pub(crate) fn render_pumpkin_config(
     settings: &Value,
+    world: &WorldGeneration,
     account_lookups: AccountLookups,
     default_permission_level: PermissionLevel,
     java_port: u16,
@@ -70,13 +73,19 @@ pub(crate) fn render_pumpkin_config(
             format!("url = \"{services}bedrock/discovery\"\n"),
         ),
     };
+    let spawn_protection = match default_permission_level {
+        PermissionLevel::Player => "",
+        PermissionLevel::Gamemaster => "spawn_protection = 0\n",
+    };
     format!(
-        "default_difficulty = {difficulty}\n\
+        "{world}\
+         default_difficulty = {difficulty}\n\
          default_gamemode = {gamemode}\n\
          hardcore = {hardcore}\n\
          white_list = {whitelist}\n\
          enforce_whitelist = {whitelist}\n\
          accepts_transfers = true\n\
+         {spawn_protection}\
          [networking.query]\n\
          enabled = false\n\
          [networking.rcon]\n\
@@ -116,6 +125,7 @@ pub(crate) fn render_pumpkin_config(
         gamemode = serde_json::to_string(gamemode).expect("string serialization cannot fail"),
         motd = serde_json::to_string(motd).expect("string serialization cannot fail"),
         plugins = PLUGIN_CONFIG,
+        world = render_pumpkin_world_config(world),
         default_op_level = match default_permission_level {
             PermissionLevel::Player => 0,
             PermissionLevel::Gamemaster => 2,
@@ -146,6 +156,7 @@ mod tests {
     fn hosted_runtime_requires_online_java_and_full_bedrock_authentication() {
         let config = render_pumpkin_config(
             &Value::Null,
+            &WorldGeneration::default(),
             AccountLookups::ThroughApiProxy,
             PermissionLevel::Player,
             25565,
@@ -180,6 +191,7 @@ mod tests {
         // always store the setting, which defaults to on.
         let config = render_pumpkin_config(
             &serde_json::json!({"motd": "Kurbis preview", "view_distance": 10}),
+            &WorldGeneration::default(),
             AccountLookups::ThroughApiProxy,
             PermissionLevel::Gamemaster,
             25565,
@@ -192,9 +204,33 @@ mod tests {
     }
 
     #[test]
+    fn only_previews_let_everyone_build_at_spawn() {
+        let render = |level| {
+            render_pumpkin_config(
+                &Value::Null,
+                &WorldGeneration::default(),
+                AccountLookups::ThroughApiProxy,
+                level,
+                25565,
+                19132,
+                "0.0.0.0:19132".parse().unwrap(),
+                "192.0.2.20".parse().unwrap(),
+                19132,
+            )
+        };
+        // A top-level key: it must come before the first table header.
+        assert!(
+            render(PermissionLevel::Gamemaster)
+                .contains("accepts_transfers = true\nspawn_protection = 0\n[networking.query]")
+        );
+        assert!(!render(PermissionLevel::Player).contains("spawn_protection"));
+    }
+
+    #[test]
     fn plugins_load_unprompted_without_the_environment() {
         let config = render_pumpkin_config(
             &Value::Null,
+            &WorldGeneration::default(),
             AccountLookups::ThroughApiProxy,
             PermissionLevel::Player,
             25565,

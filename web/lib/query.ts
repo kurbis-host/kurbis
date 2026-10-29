@@ -4,6 +4,7 @@ export const queryKeys = {
   servers: ["servers"] as const,
   serverAddress: (subdomain: string) => ["server-addresses", subdomain] as const,
   serverSessions: ["server-sessions"] as const,
+  worldCatalog: ["world-catalog"] as const,
   server: (serverId: string) => ["servers", serverId] as const,
   activity: (serverId: string) => ["servers", serverId, "activity"] as const,
   logs: (serverId: string) => ["servers", serverId, "logs"] as const,

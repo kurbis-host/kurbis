@@ -1,3 +1,4 @@
+use crate::contracts::world::WorldGeneration;
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
     collections::HashMap,
@@ -155,6 +156,7 @@ impl ServerRuntime for NativeRuntime {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        world: &WorldGeneration,
         _api_capability: Option<&str>,
     ) -> Result<()> {
         if let Some(generation) = self.server_generation(server_id).await? {
@@ -170,6 +172,7 @@ impl ServerRuntime for NativeRuntime {
             server_dir.join("pumpkin.toml"),
             render_pumpkin_config(
                 settings,
+                world,
                 AccountLookups::Direct,
                 PermissionLevel::Player,
                 placement.java_port.try_into()?,

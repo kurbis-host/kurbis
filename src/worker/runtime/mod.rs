@@ -9,6 +9,7 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use crate::{
+    contracts::world::WorldGeneration,
     model::PlacementRecord,
     pumpkin_control::{
         HostStats, InstalledPluginFile, PlayerStatus, PumpkinControl, WaitingPlayer, WhitelistEntry,
@@ -18,6 +19,21 @@ use crate::{
 
 pub mod native;
 pub mod settings;
+
+/// Pumpkin's `/seed` prints the seed's bits unsigned, `Seed: [18446744072589449156]`
+/// for vanilla's -1120102460.
+fn parse_seed_output(output: &[String]) -> Result<i64> {
+    output
+        .iter()
+        .find_map(|line| {
+            let seed = line.trim().strip_prefix("Seed: [")?.strip_suffix(']')?;
+            seed.parse::<u64>()
+                .map(|seed| seed as i64)
+                .or_else(|_| seed.parse::<i64>())
+                .ok()
+        })
+        .with_context(|| format!("the runtime did not report its seed: {output:?}"))
+}
 
 fn runtime_stats_from_host(stats: HostStats, generation: i64) -> RuntimeStats {
     RuntimeStats {
@@ -44,6 +60,7 @@ pub trait ServerRuntime: Send + Sync {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        world: &WorldGeneration,
         api_capability: Option<&str>,
     ) -> Result<()>;
     async fn server_generation(&self, server_id: Uuid) -> Result<Option<i64>>;
@@ -73,6 +90,16 @@ pub trait ServerRuntime: Send + Sync {
             .stats(&self.socket_path(server_dir)?)
             .await?;
         Ok(runtime_stats_from_host(stats, generation))
+    }
+
+    /// The running world's seed, from `/seed`.
+    async fn world_seed(&self, server_dir: &Path) -> Result<i64> {
+        let output = self
+            .control_for(server_dir)
+            .await?
+            .execute_command(&self.socket_path(server_dir)?, "seed")
+            .await?;
+        parse_seed_output(&output)
     }
 
     async fn player_status(&self, server_dir: &Path) -> Result<PlayerStatus> {
@@ -210,6 +237,19 @@ mod tests {
         assert_eq!(stats.generation, 7);
         assert_eq!(stats.cpu_percent, Some(12.5));
         assert!(stats.measured_at >= before && stats.measured_at <= after);
+    }
+
+    #[test]
+    fn reads_the_seed_pumpkin_prints() {
+        let seed = |line: &str| parse_seed_output(&[line.to_owned()]);
+        assert_eq!(
+            seed("Seed: [18446744072589449156]").unwrap(),
+            -1_120_102_460
+        );
+        assert_eq!(seed("Seed: [42]").unwrap(), 42);
+        assert_eq!(seed("Seed: [-42]").unwrap(), -42);
+        assert!(seed("Unknown command").is_err());
+        assert!(parse_seed_output(&[]).is_err());
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub(crate) use lifecycle_bail as bail;
 use crate::contracts::{
     lifecycle::ResetMode,
     worker::{OperationPayload, OperationStage},
+    world::WorldGeneration,
 };
 use crate::control_plane::operation_signal::OperationSignal;
 use crate::model::{DesiredState, ObservedState, OperationKind, OperationStatus, ServerRecord};
@@ -716,9 +717,16 @@ impl Lifecycle {
         server_id: Uuid,
         mode: ResetMode,
         full_reset_settings: serde_json::Value,
+        world: WorldGeneration,
     ) -> Result<ObservedState> {
-        self.request_reset_for_actor(LifecycleActor::Owner, server_id, mode, full_reset_settings)
-            .await
+        self.request_reset_for_actor(
+            LifecycleActor::Owner,
+            server_id,
+            mode,
+            full_reset_settings,
+            world,
+        )
+        .await
     }
 
     pub async fn request_reset_for_actor(
@@ -727,6 +735,7 @@ impl Lifecycle {
         server_id: Uuid,
         mode: ResetMode,
         full_reset_settings: serde_json::Value,
+        world: WorldGeneration,
     ) -> Result<ObservedState> {
         let mut tx = self.pool.begin().await?;
         let server = lock_server(&mut tx, server_id).await?;
@@ -846,6 +855,7 @@ impl Lifecycle {
             operation_payload(OperationPayload {
                 mode: Some(mode),
                 was_running: Some(was_running),
+                world: Some(world),
                 ..OperationPayload::default()
             })?,
         )

@@ -8,6 +8,7 @@ use super::{
 use kurbis_hoster::contracts::{
     lifecycle::ResetMode,
     worker::{OperationProgress, OperationStage},
+    world::WorldGeneration,
 };
 use kurbis_hoster::control_plane::lifecycle::fail_operation;
 use kurbis_hoster::model::{DesiredState, OperationStatus, SERVER_MEMORY_BYTES};
@@ -795,7 +796,12 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     let initial_generation = start.generation;
     assert_eq!(
         lifecycle
-            .request_reset(online_server, ResetMode::World, json!({"unused":true}))
+            .request_reset(
+                online_server,
+                ResetMode::World,
+                json!({"unused":true}),
+                WorldGeneration::default()
+            )
             .await
             .unwrap(),
         ObservedState::Resetting
@@ -852,7 +858,12 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
     );
     assert!(
         lifecycle
-            .request_reset(online_server, ResetMode::World, json!({}))
+            .request_reset(
+                online_server,
+                ResetMode::World,
+                json!({}),
+                WorldGeneration::default()
+            )
             .await
             .is_err()
     );
@@ -982,7 +993,12 @@ async fn resets_advance_generation_recover_persisted_stages_and_preserve_mode_in
         "whitelist":false
     });
     lifecycle
-        .request_reset(sleeping_server, ResetMode::Full, default_settings.clone())
+        .request_reset(
+            sleeping_server,
+            ResetMode::Full,
+            default_settings.clone(),
+            WorldGeneration::default(),
+        )
         .await
         .unwrap();
     let sleeping_reset = claim_operation(&pool, worker).await.unwrap().unwrap();

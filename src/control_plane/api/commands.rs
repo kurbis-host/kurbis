@@ -3,7 +3,10 @@ use std::sync::Arc;
 use axum::{Json, extract::State, http::StatusCode};
 
 use crate::{
-    contracts::lifecycle::{CommandResponse, ServerCommandRequest},
+    contracts::{
+        lifecycle::{CommandResponse, ResetMode, ServerCommandRequest},
+        world::NewWorld,
+    },
     control_plane::lifecycle::{LifecycleActor, LifecycleCommand},
     model::SnapshotReason,
 };
@@ -117,11 +120,8 @@ impl ServerCommandRequest {
                 CommandAuthority::ServerGrant | CommandAuthority::ServerCapability,
                 ServerCommandRequest::Restore { generation },
             ) => LifecycleCommand::Restore { generation },
-            (CommandAuthority::ServerGrant, ServerCommandRequest::Reset { mode }) => {
-                LifecycleCommand::Reset {
-                    mode,
-                    full_reset_settings: ServerSettings::default().into_stored(),
-                }
+            (CommandAuthority::ServerGrant, ServerCommandRequest::Reset { mode, world }) => {
+                reset_command(mode, world)?
             }
             (CommandAuthority::ServerGrant, ServerCommandRequest::Delete) => {
                 LifecycleCommand::Delete
@@ -170,11 +170,8 @@ impl ServerCommandRequest {
                     reason,
                 }
             }
-            (CommandAuthority::AccountOwner, ServerCommandRequest::Reset { mode }) => {
-                LifecycleCommand::Reset {
-                    mode,
-                    full_reset_settings: ServerSettings::default().into_stored(),
-                }
+            (CommandAuthority::AccountOwner, ServerCommandRequest::Reset { mode, world }) => {
+                reset_command(mode, world)?
             }
             (CommandAuthority::AccountOwner, ServerCommandRequest::Delete) => {
                 LifecycleCommand::Delete
@@ -210,6 +207,19 @@ fn manual_reason(reason: Option<String>) -> Result<String, ApiError> {
             "owner and server-scoped commands use the manual reason",
         )),
     }
+}
+
+/// A reset generates its world from the owner's choices, with a seed fixed
+/// now so the panel can show it before Pumpkin creates the world.
+fn reset_command(mode: ResetMode, world: NewWorld) -> Result<LifecycleCommand, ApiError> {
+    let world = world.resolve(rand::random()).map_err(|message| {
+        ApiError::with_code(StatusCode::UNPROCESSABLE_ENTITY, "invalid_world", message)
+    })?;
+    Ok(LifecycleCommand::Reset {
+        mode,
+        full_reset_settings: ServerSettings::default().into_stored(),
+        world,
+    })
 }
 
 fn validate_command(command: &LifecycleCommand) -> Result<(), ApiError> {

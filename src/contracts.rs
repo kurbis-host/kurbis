@@ -31,6 +31,7 @@ macro_rules! string_enum {
 
 pub mod ai;
 pub mod plugins;
+pub mod world;
 
 pub mod console {
     use chrono::{DateTime, Utc};
@@ -122,6 +123,10 @@ pub mod lifecycle {
         },
         Reset {
             mode: ResetMode,
+            /// The world to generate in place of the current one.
+            #[serde(default)]
+            #[garde(skip)]
+            world: crate::contracts::world::NewWorld,
         },
         Delete,
         Restore {
@@ -206,6 +211,7 @@ pub mod worker {
         pub desired_state: DesiredState,
         pub observed_state: ObservedState,
         pub settings: Value,
+        pub world: crate::contracts::world::WorldGeneration,
         pub current_snapshot_generation: Option<i64>,
         pub whitelist_enabled: bool,
         pub whitelist_revision: i64,
@@ -275,6 +281,10 @@ pub mod worker {
         pub snapshot_generation: Option<i64>,
         pub snapshot_size: Option<i64>,
         pub pre_reset_generation: Option<i64>,
+        /// The world a reset generates. It becomes the server's world when
+        /// the worker has cleared the old one, so the pre-reset backup still
+        /// records the world it holds.
+        pub world: Option<crate::contracts::world::WorldGeneration>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -452,6 +462,7 @@ pub mod worker {
                     self.mode.is_none()
                         && self.was_running.is_none()
                         && self.pre_reset_generation.is_none()
+                        && self.world.is_none()
                 }
             };
             let snapshot_values_match_stage = match self.stage {

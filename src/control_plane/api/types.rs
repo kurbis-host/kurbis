@@ -239,6 +239,8 @@ pub struct Server {
     pub java_address: String,
     pub bedrock_address: String,
     pub settings: ServerSettings,
+    /// How the current world was generated. A reset generates a new one.
+    pub world: crate::contracts::world::WorldGeneration,
     #[serde(flatten)]
     pub lifecycle: LifecycleStatus,
     pub current_operation: Option<Operation>,

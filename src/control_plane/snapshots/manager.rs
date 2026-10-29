@@ -501,8 +501,8 @@ impl SnapshotStore {
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
-             VALUES($1,$2,$3,'',0,'',$4,false)",
+            "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, world)
+             SELECT $1,$2,$3,'',0,'',$4,false,world FROM servers WHERE id = $2",
         )
         .bind(Uuid::new_v4())
         .bind(server_id)

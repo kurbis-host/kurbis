@@ -39,4 +39,4 @@ Build with Rust 1.98.1, Git, CMake, and a C/C++ compiler:
 tools/build_pumpkin_native.sh debug
 ```
 
-The build script manages ignored output/native-pumpkin/source, applies host-control.patch, copies host_control.rs, builds the Kurbis control plugin for `wasm32-wasip2`, and writes Pumpkin under output/native-pumpkin/target/debug/pumpkin. Docker image builds also package the plugin and install it into each server's mounted plugin directory. Keep the included GPL-3.0 license with distributed Pumpkin source or binaries.
+The build script manages ignored output/native-pumpkin/source, applies world-types.patch, host-control.patch, copies host_control.rs, builds the Kurbis control plugin for `wasm32-wasip2`, and writes Pumpkin under output/native-pumpkin/target/debug/pumpkin. Docker image builds also package the plugin and install it into each server's mounted plugin directory. Keep the included GPL-3.0 license with distributed Pumpkin source or binaries.

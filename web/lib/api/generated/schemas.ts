@@ -983,6 +983,11 @@ export interface components {
             /** Format: uuid */
             build_id: string;
         };
+        CatalogEntry: {
+            id: string;
+            /** @description Vanilla's English name. */
+            name: string;
+        };
         CommandResponse: {
             observed_state: components["schemas"]["ObservedState"];
         };
@@ -1025,6 +1030,31 @@ export interface components {
         EventsQuery: {
             /** Format: int64 */
             after_id?: number | null;
+        };
+        FlatLayer: {
+            /** @description A block id such as `minecraft:stone`. */
+            block: string;
+            /** Format: int32 */
+            height: number;
+        };
+        FlatPreset: {
+            id: string;
+            name: string;
+            settings: components["schemas"]["FlatSettings"];
+        };
+        /** @description A superflat world's layers, bottom first, and what grows on them, as
+         *      vanilla's `generator-settings` describe them. */
+        FlatSettings: {
+            /** @description A biome id such as `minecraft:plains`. */
+            biome: string;
+            /** @description Place the biome's trees, flowers and ores. */
+            features: boolean;
+            /** @description Add lava lakes. */
+            lakes: boolean;
+            layers: components["schemas"]["FlatLayer"][];
+            /** @description The structure sets this world may generate, such as
+             *      `minecraft:villages`, when structures are on. */
+            structure_overrides: string[];
         };
         /** @description The service in one minute, as it was sampled at the start of that minute, or in a
          *      bucket of minutes starting at `minute` (see [`history`]). */
@@ -1217,6 +1247,19 @@ export interface components {
         MinecraftRedeemRequest: {
             token: string;
         };
+        /** @description The world a reset generates. Everything but the type is optional: a
+         *      superflat world without layers is Classic Flat, a single biome world
+         *      without a biome is plains, and a missing seed is random. */
+        NewWorld: {
+            biome?: string | null;
+            flat?: components["schemas"]["FlatSettings"] | null;
+            /** @description A number or any text, as typed into vanilla's seed field. Text that
+             *      is not a number becomes its Java string hash. */
+            seed?: string | null;
+            /** @default true */
+            structures: boolean;
+            world_type: components["schemas"]["WorldType"];
+        };
         OAuthCallback: {
             code?: string | null;
             error?: string | null;
@@ -1375,6 +1418,8 @@ export interface components {
             subdomain: string;
             /** Format: date-time */
             updated_at: string;
+            /** @description How the current world was generated. A reset generates a new one. */
+            world: components["schemas"]["WorldGeneration"];
         };
         /** @description Whether a server name can still be claimed. Names are claimed only by
          *      joining their address in Minecraft, so this reserves nothing. */
@@ -1414,6 +1459,14 @@ export interface components {
             /** @constant */
             command: "reset";
             mode: components["schemas"]["ResetMode"];
+            /**
+             * @description The world to generate in place of the current one.
+             * @default {
+             *       "structures": true,
+             *       "world_type": "normal"
+             *     }
+             */
+            world: components["schemas"]["NewWorld"];
         } | {
             /** @constant */
             command: "delete";
@@ -1705,6 +1758,15 @@ export interface components {
              *      Bedrock names resolve only from this server's live players or stored roster. */
             name: string;
         };
+        /** @description Everything a new world can be made of, generated from the pinned Pumpkin
+         *      by `tools/generate_world_catalog.py`. */
+        WorldCatalog: {
+            biomes: components["schemas"]["CatalogEntry"][];
+            blocks: components["schemas"]["CatalogEntry"][];
+            flat_presets: components["schemas"]["FlatPreset"][];
+            structures: components["schemas"]["CatalogEntry"][];
+            world_types: components["schemas"]["CatalogEntry"][];
+        };
         WorldExport: {
             archive_checksum?: string | null;
             /** Format: int64 */
@@ -1725,6 +1787,27 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /** @description How a server's current world was generated. */
+        WorldGeneration: {
+            /** @description The only biome of a single biome world; only with
+             *      `single_biome_surface`. */
+            biome?: string | null;
+            /** @description The layers of a superflat world; only with `flat`. */
+            flat?: components["schemas"]["FlatSettings"] | null;
+            /**
+             * Format: int64
+             * @description The world seed, as vanilla stores it. `None` for a world generated
+             *      before Kurbis recorded seeds, until the worker reads it from the world.
+             */
+            seed?: number | null;
+            structures: boolean;
+            world_type: components["schemas"]["WorldType"];
+        };
+        /**
+         * @description Vanilla's world presets on the Create New World screen.
+         * @enum {string}
+         */
+        WorldType: "normal" | "flat" | "large_biomes" | "amplified" | "single_biome_surface";
     };
     responses: never;
     parameters: never;

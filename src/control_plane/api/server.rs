@@ -9,8 +9,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::model::{
-    ObservedState, OperationRecord as DbOperation, SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES,
-    ServerRecord, SnapshotRecord as DbSnapshot, validate_subdomain,
+    ObservedState, OperationRecord as DbOperation, SERVER_MEMORY_BYTES, SERVER_RECORD_COLUMNS,
+    SERVER_STORAGE_BYTES, ServerRecord, SnapshotRecord as DbSnapshot, validate_subdomain,
 };
 
 use super::actor::{
@@ -29,12 +29,11 @@ pub(super) async fn insert_server_record(
     subdomain: &str,
     settings: serde_json::Value,
 ) -> Result<ServerRecord, sqlx::Error> {
-    sqlx::query_as::<_, ServerRecord>(
+    sqlx::query_as::<_, ServerRecord>(&format!(
         "INSERT INTO servers(id, owner_id, subdomain, settings)
          VALUES($1,$2,$3,$4)
-         RETURNING id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
-                   generation, current_snapshot_generation, last_error, created_at, updated_at",
-    )
+         RETURNING {SERVER_RECORD_COLUMNS}"
+    ))
     .bind(Uuid::new_v4())
     .bind(owner_id)
     .bind(subdomain)
@@ -96,6 +95,7 @@ pub(super) async fn server_view(
         java_address: address.clone(),
         bedrock_address: address,
         settings: ServerSettings::from_stored(server.settings)?,
+        world: server.world.0,
         lifecycle,
         current_operation: operation,
         latest_snapshot: snapshot.map(Snapshot::from),
@@ -137,15 +137,13 @@ pub(super) async fn list_servers(
         Err(error) if scoped_server_ids.is_empty() => return Err(error),
         Err(_) => None,
     };
-    let servers = sqlx::query_as::<_, ServerRecord>(
-        "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings,
-                storage_bytes, generation, current_snapshot_generation, last_error,
-                created_at, updated_at
+    let servers = sqlx::query_as::<_, ServerRecord>(&format!(
+        "SELECT {SERVER_RECORD_COLUMNS}
          FROM servers
          WHERE desired_state <> 'deleted'
            AND (($1::uuid IS NOT NULL AND owner_id = $1) OR id = ANY($2))
-         ORDER BY (is_default AND owner_id = $1) DESC, created_at, id",
-    )
+         ORDER BY (is_default AND owner_id = $1) DESC, created_at, id"
+    ))
     .bind(owner_id)
     .bind(&scoped_server_ids)
     .fetch_all(&state.pool)
@@ -218,12 +216,11 @@ pub(super) async fn update_server(
     let server_id = path.server_id;
     require_server_access(&state, &headers, server_id).await?;
     let mut tx = state.pool.begin().await?;
-    let current = sqlx::query_as::<_, ServerRecord>(
-        "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
-                generation, current_snapshot_generation, last_error, created_at, updated_at
+    let current = sqlx::query_as::<_, ServerRecord>(&format!(
+        "SELECT {SERVER_RECORD_COLUMNS}
          FROM servers WHERE id = $1 AND desired_state <> 'deleted'
-         FOR UPDATE",
-    )
+         FOR UPDATE"
+    ))
     .bind(server_id)
     .fetch_optional(&mut *tx)
     .await?
@@ -263,12 +260,11 @@ pub(super) async fn update_server(
     }
     settings.validate()?;
 
-    let server = sqlx::query_as::<_, ServerRecord>(
+    let server = sqlx::query_as::<_, ServerRecord>(&format!(
         "UPDATE servers SET subdomain = $2, settings = $3, updated_at = now()
          WHERE id = $1
-         RETURNING id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
-                   generation, current_snapshot_generation, last_error, created_at, updated_at",
-    )
+         RETURNING {SERVER_RECORD_COLUMNS}"
+    ))
     .bind(current.id)
     .bind(subdomain)
     .bind(settings.into_stored())

@@ -5,7 +5,7 @@ FROM rust:1.98-bookworm AS artifacts
 ARG BUILD_REVISION=development
 RUN apt-get update && apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
-COPY runtime/pumpkin/REVISION runtime/pumpkin/host-control.patch runtime/pumpkin/snapshot-barrier.patch runtime/pumpkin/nethernet-gateway.patch runtime/pumpkin/host_control.rs /tmp/integration/
+COPY runtime/pumpkin/REVISION runtime/pumpkin/world-types.patch runtime/pumpkin/host-control.patch runtime/pumpkin/snapshot-barrier.patch runtime/pumpkin/nethernet-gateway.patch runtime/pumpkin/host_control.rs /tmp/integration/
 COPY tools/pumpkin_source.sh /tmp/pumpkin_source.sh
 RUN /tmp/pumpkin_source.sh /tmp/integration /source
 ENV CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=false RUSTUP_TOOLCHAIN=1.98.1

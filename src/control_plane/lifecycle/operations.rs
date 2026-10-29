@@ -541,12 +541,52 @@ pub async fn update_operation_payload(
     if !payload.merge_progress(op.kind, progress) {
         bail!("worker progress does not match the operation contract");
     }
+    update_server_world(&mut tx, op, &payload).await?;
     sqlx::query("UPDATE operations SET payload = $2, updated_at = now() WHERE id = $1")
         .bind(op.id)
         .bind(serde_json::to_value(payload)?)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// The server's world follows its files: a reset's new world once the old
+/// one is cleared, a restored snapshot's once its files are back. Snapshots
+/// record the server's world, so each one names the world it holds.
+async fn update_server_world(
+    tx: &mut Transaction<'_, Postgres>,
+    op: &OperationRecord,
+    payload: &OperationPayload,
+) -> Result<()> {
+    match (op.kind, payload.stage) {
+        (OperationKind::Reset, OperationStage::Cleared) => {
+            let world = payload
+                .world
+                .as_ref()
+                .context("reset operation is missing its new world")?;
+            sqlx::query("UPDATE servers SET world = $2 WHERE id = $1")
+                .bind(op.server_id)
+                .bind(sqlx::types::Json(world))
+                .execute(&mut **tx)
+                .await?;
+        }
+        (OperationKind::Restore, OperationStage::Restored) => {
+            sqlx::query(
+                "UPDATE servers SET world = snapshots.world FROM snapshots
+                 WHERE servers.id = $1 AND snapshots.server_id = $1 AND snapshots.generation = $2",
+            )
+            .bind(op.server_id)
+            .bind(
+                payload
+                    .target_generation
+                    .context("restore operation is missing its target generation")?,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 

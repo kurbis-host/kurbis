@@ -1946,3 +1946,6 @@ async fn worker_recovery_marks_claimed_console_commands_unknown_and_never_requeu
 async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await.unwrap()).unwrap()
 }
+
+#[path = "worker_control/world_seed.rs"]
+mod world_seed;

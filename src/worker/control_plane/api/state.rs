@@ -116,6 +116,19 @@ impl WorkerControl {
         .await
     }
 
+    pub async fn record_world_seed(
+        &self,
+        server_id: Uuid,
+        generation: i64,
+        seed: i64,
+    ) -> Result<()> {
+        self.post_no_content(
+            &format!("/internal/worker/control/servers/{server_id}/world-seed"),
+            &WorldSeedRequest { generation, seed },
+        )
+        .await
+    }
+
     pub async fn mark_operators_applied(
         &self,
         server_id: Uuid,
@@ -353,6 +366,13 @@ struct PlayersSyncRequest<'a> {
 struct LogSyncRequest<'a> {
     generation: i64,
     lines: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorldSeedRequest {
+    generation: i64,
+    seed: i64,
 }
 
 #[derive(Debug, Serialize)]

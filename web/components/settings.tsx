@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RotateCcw, Save, Square, Trash2 } from "lucide-react";
+import { Save, Square, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
@@ -13,6 +13,7 @@ import { lifecycle, lifecycleActions } from "../lib/lifecycle";
 import { queryKeys } from "../lib/query";
 import { settingsFormSchema, type SettingsFormValues } from "../lib/schemas";
 import { typedSubdomain } from "../lib/subdomain";
+import { CurrentWorld, type ResetMode, ResetWorldDialog } from "./world";
 import {
   Button,
   ConfirmDialog,
@@ -26,6 +27,7 @@ import {
 } from "./ui";
 
 type Server = components["schemas"]["Server"];
+type NewWorld = components["schemas"]["NewWorld"];
 
 export function serverToSettingsValues(server: Server): SettingsFormValues {
   return {
@@ -86,7 +88,8 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
     onError: (error) => setRequestError(errorMessage(error)),
   });
   const reset = useMutation({
-    mutationFn: (mode: "world" | "full") => browserApi.command(serverId, { command: "reset", mode }),
+    mutationFn: ({ mode, world }: { mode: ResetMode; world: NewWorld }) =>
+      browserApi.command(serverId, { command: "reset", mode, world }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.server(serverId) }),
@@ -317,26 +320,18 @@ export function Settings({ initialServer, afterDeleteHref = "/app/setup" }: { in
           <Surface className="p-[22px]">
             <h2 className="m-0 font-display text-xl leading-[1.2] font-[800]">Reset world</h2>
             <p className="mt-2 mb-0 text-[13px] leading-normal text-ink-soft">
-              Both options keep the server address and ownership. Players are warned before an online reset; a pre-reset backup is retained.
+              A reset generates a new world, of any world type and from any seed. Both options keep the server address and ownership. Players are warned before an online reset; a pre-reset backup is retained.
             </p>
+            <CurrentWorld world={server.world} />
             <div className="mt-[17px] grid gap-2.5 [&_button]:w-full">
-              <ConfirmDialog
-                disabled={!allowed.canReset || reset.isPending}
-                title="Reset world progress?"
-                description="This clears every dimension, inventory, advancement, and player progress while preserving server settings, whitelist, bans, and operator access. A pre-reset backup is created first."
-                confirmLabel="Reset world"
-                onConfirm={() => reset.mutate("world")}
-                trigger={<Button variant="secondary" disabled={!allowed.canReset || reset.isPending}><RotateCcw size={15} />World reset</Button>}
-              />
-              <ConfirmDialog
-                danger
-                disabled={!allowed.canReset || reset.isPending}
-                title="Reset the full server?"
-                description="This also restores settings to defaults and clears added whitelist, ban, and operator access. Ownership, address, and derived owner privileges remain. A pre-reset backup is created first."
-                confirmLabel="Reset full server"
-                onConfirm={() => reset.mutate("full")}
-                trigger={<Button variant="danger" disabled={!allowed.canReset || reset.isPending}><RotateCcw size={15} />Full server reset</Button>}
-              />
+              {(["world", "full"] as const).map((mode) => (
+                <ResetWorldDialog
+                  key={mode}
+                  mode={mode}
+                  disabled={!allowed.canReset || reset.isPending}
+                  onReset={(mode, world) => reset.mutateAsync({ mode, world })}
+                />
+              ))}
             </div>
             {reset.isPending ? <p className="mb-0 text-xs text-ink-soft">Reset queued. This page will show its current stage.</p> : null}
           </Surface>

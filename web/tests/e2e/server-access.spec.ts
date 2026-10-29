@@ -280,7 +280,11 @@ test("account and multiple scoped grants share the selector with independent rev
   await page.getByRole("dialog").getByRole("button", { name: "Reset world", exact: true }).click();
   const resetAccepted = await resetResponse;
   expect(resetAccepted.status()).toBe(202);
-  expect(resetAccepted.request().postDataJSON()).toEqual({ command: "reset", mode: "world" });
+  expect(resetAccepted.request().postDataJSON()).toEqual({
+    command: "reset",
+    mode: "world",
+    world: { world_type: "normal", structures: true },
+  });
   await expect.poll(async () => (await pool.query("SELECT observed_state FROM servers WHERE id=$1", [third.serverId])).rows[0].observed_state).toBe("resetting");
   expect(await tickFixture(request)).toMatchObject({ operation: "reset" });
   await expect.poll(async () => (await pool.query(

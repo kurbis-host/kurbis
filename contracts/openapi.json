@@ -1013,6 +1013,23 @@
         }
       }
     },
+    "/api/v1/world-catalog": {
+      "get": {
+        "description": "What a reset can generate a world from: vanilla's world types, superflat presets, biomes, blocks for superflat layers and structure sets, with their English names. Needs no session; it may be cached for a day.",
+        "responses": {
+          "200": {
+            "description": "Everything a new world can be made of, generated from the pinned Pumpkin\n by `tools/generate_world_catalog.py`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorldCatalog"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/session": {
       "get": {
         "responses": {
@@ -12472,6 +12489,22 @@
           "build_id"
         ]
       },
+      "CatalogEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "description": "Vanilla's English name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
       "CommandResponse": {
         "type": "object",
         "properties": {
@@ -12619,6 +12652,82 @@
             "format": "int64"
           }
         }
+      },
+      "FlatLayer": {
+        "type": "object",
+        "properties": {
+          "block": {
+            "description": "A block id such as `minecraft:stone`.",
+            "type": "string"
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "block",
+          "height"
+        ]
+      },
+      "FlatPreset": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/FlatSettings"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "settings"
+        ]
+      },
+      "FlatSettings": {
+        "description": "A superflat world's layers, bottom first, and what grows on them, as\n vanilla's `generator-settings` describe them.",
+        "type": "object",
+        "properties": {
+          "biome": {
+            "description": "A biome id such as `minecraft:plains`.",
+            "type": "string"
+          },
+          "features": {
+            "description": "Place the biome's trees, flowers and ores.",
+            "type": "boolean"
+          },
+          "lakes": {
+            "description": "Add lava lakes.",
+            "type": "boolean"
+          },
+          "layers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlatLayer"
+            }
+          },
+          "structure_overrides": {
+            "description": "The structure sets this world may generate, such as\n `minecraft:villages`, when structures are on.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "layers",
+          "biome",
+          "features",
+          "lakes",
+          "structure_overrides"
+        ]
       },
       "FleetSample": {
         "description": "The service in one minute, as it was sampled at the start of that minute, or in a\n bucket of minutes starting at `minute` (see [`history`]).",
@@ -13152,6 +13261,46 @@
           "token"
         ]
       },
+      "NewWorld": {
+        "description": "The world a reset generates. Everything but the type is optional: a\n superflat world without layers is Classic Flat, a single biome world\n without a biome is plains, and a missing seed is random.",
+        "type": "object",
+        "properties": {
+          "biome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flat": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FlatSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seed": {
+            "description": "A number or any text, as typed into vanilla's seed field. Text that\n is not a number becomes its Java string hash.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "structures": {
+            "type": "boolean",
+            "default": true
+          },
+          "world_type": {
+            "$ref": "#/components/schemas/WorldType"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "world_type"
+        ]
+      },
       "OAuthCallback": {
         "type": "object",
         "properties": {
@@ -13670,6 +13819,14 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "world": {
+            "description": "How the current world was generated. A reset generates a new one.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/WorldGeneration"
+              }
+            ]
           }
         },
         "required": [
@@ -13679,6 +13836,7 @@
           "java_address",
           "bedrock_address",
           "settings",
+          "world",
           "desired_state",
           "observed_state",
           "player_count",
@@ -13827,6 +13985,18 @@
               },
               "mode": {
                 "$ref": "#/components/schemas/ResetMode"
+              },
+              "world": {
+                "description": "The world to generate in place of the current one.",
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/NewWorld"
+                  }
+                ],
+                "default": {
+                  "structures": true,
+                  "world_type": "normal"
+                }
               }
             },
             "additionalProperties": false,
@@ -14764,6 +14934,49 @@
           "name"
         ]
       },
+      "WorldCatalog": {
+        "description": "Everything a new world can be made of, generated from the pinned Pumpkin\n by `tools/generate_world_catalog.py`.",
+        "type": "object",
+        "properties": {
+          "biomes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            }
+          },
+          "blocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            }
+          },
+          "flat_presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlatPreset"
+            }
+          },
+          "structures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            }
+          },
+          "world_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            }
+          }
+        },
+        "required": [
+          "world_types",
+          "flat_presets",
+          "biomes",
+          "blocks",
+          "structures"
+        ]
+      },
       "WorldExport": {
         "type": "object",
         "properties": {
@@ -14830,6 +15043,60 @@
           "stage",
           "created_at",
           "updated_at"
+        ]
+      },
+      "WorldGeneration": {
+        "description": "How a server's current world was generated.",
+        "type": "object",
+        "properties": {
+          "biome": {
+            "description": "The only biome of a single biome world; only with\n `single_biome_surface`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flat": {
+            "description": "The layers of a superflat world; only with `flat`.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FlatSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seed": {
+            "description": "The world seed, as vanilla stores it. `None` for a world generated\n before Kurbis recorded seeds, until the worker reads it from the world.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "structures": {
+            "type": "boolean"
+          },
+          "world_type": {
+            "$ref": "#/components/schemas/WorldType"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "world_type",
+          "structures"
+        ]
+      },
+      "WorldType": {
+        "description": "Vanilla's world presets on the Create New World screen.",
+        "type": "string",
+        "enum": [
+          "normal",
+          "flat",
+          "large_biomes",
+          "amplified",
+          "single_biome_surface"
         ]
       }
     }

@@ -56,6 +56,7 @@ export function apiOperations(client: Client<paths>) {
     removeOperatorEntry: (serverId: string, playerId: string) => apiRequest(client.DELETE("/api/v1/servers/{server_id}/operators", {
       params: { path: { server_id: serverId }, query: { player_id: playerId } },
     })),
+    getWorldCatalog: () => apiRequest(client.GET("/api/v1/world-catalog")),
     getServerAddress: (subdomain: string) => apiRequest(client.GET("/api/v1/server-addresses/{subdomain}", {
       params: { path: { subdomain } },
     })),

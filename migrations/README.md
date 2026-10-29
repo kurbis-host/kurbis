@@ -9,8 +9,11 @@ SQLx SHA-384 checksum for every migration and a SHA-256 over the ordered
 inventory. The release gate refuses to run with a missing, duplicated, renamed,
 or modified migration entry.
 
-The history currently ends at version 24, which stops telling whitelist and
-operator entries apart by name: players are identified by UUID, so a Bedrock
+The history currently ends at version 25, which records how each world was
+generated (world type, superflat or single biome choices, structures and seed)
+on the server and on every snapshot, so a reset can pick a new world and a
+restore brings back the one a snapshot holds. Version 24 stops telling
+whitelist and operator entries apart by name: players are identified by UUID, so a Bedrock
 player whose name differs from a Java player's only in case can be let in
 beside them. Version 23 keeps the operator dashboard's
 history: the whole service's per-minute samples for 30 days instead of one, a

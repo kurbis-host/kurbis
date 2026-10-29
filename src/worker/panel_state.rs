@@ -86,8 +86,35 @@ pub(super) async fn sync_runtime_state(
             "failed to synchronize plugins"
         );
     }
+    if let Err(error) = record_unknown_seed(control, runtime, context, server_dir).await {
+        tracing::warn!(
+            server_id = %context.placement.server_id,
+            ?error,
+            "failed to record the world seed"
+        );
+    }
     whitelist?;
     operators
+}
+
+/// A world made before Kurbis recorded seeds reports its seed once it runs.
+async fn record_unknown_seed(
+    control: &WorkerControl,
+    runtime: &dyn ServerRuntime,
+    context: &WorkerServerContext,
+    server_dir: &Path,
+) -> Result<()> {
+    if context.world.seed.is_some() {
+        return Ok(());
+    }
+    let seed = runtime.world_seed(server_dir).await?;
+    control
+        .record_world_seed(
+            context.placement.server_id,
+            context.placement.generation,
+            seed,
+        )
+        .await
 }
 
 /// The whitelist with every owner on it.
@@ -309,6 +336,7 @@ mod tests {
             desired_state: crate::model::DesiredState::Stopped,
             observed_state: crate::model::ObservedState::Sleeping,
             settings: serde_json::json!({}),
+            world: Default::default(),
             current_snapshot_generation: None,
             whitelist_enabled: false,
             whitelist_revision: 0,

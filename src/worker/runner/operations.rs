@@ -325,6 +325,7 @@ impl WorkerRunner {
                     placement,
                     server_dir,
                     &context.settings,
+                    &context.world,
                     api_capability.as_deref(),
                 )
                 .await?;
@@ -649,6 +650,7 @@ impl WorkerRunner {
                 &placement,
                 &server_dir,
                 &settings,
+                &context.world,
                 api_capability.as_deref(),
             )
             .await?;

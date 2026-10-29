@@ -73,6 +73,7 @@ mod worker_objects;
 mod worker_plugins;
 mod worker_snapshots;
 mod worker_state;
+mod world_catalog;
 
 #[cfg(test)]
 mod tests;
@@ -444,6 +445,14 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
                     .response::<200, Json<crate::fleet_stats::FleetStats>>()
             }),
         )
+        .api_route(
+            "/api/v1/world-catalog",
+            api_get_with(world_catalog::world_catalog, |operation| {
+                operation
+                    .description("What a reset can generate a world from: vanilla's world types, superflat presets, biomes, blocks for superflat layers and structure sets, with their English names. Needs no session; it may be cached for a day.")
+                    .response::<200, Json<crate::contracts::world::WorldCatalog>>()
+            }),
+        )
         .api_route("/api/v1/session", api_get(session::session))
         .api_route("/api/v1/account", api_get(account::account))
         .api_route(
@@ -767,6 +776,7 @@ fn api_router() -> ApiRouter<Arc<AppState>> {
         .route("/internal/worker/control/servers/{server_id}/logs", post(worker_state::append_logs))
         .route("/internal/worker/control/servers/{server_id}/whitelist-applied", post(worker_state::mark_whitelist_applied))
         .route("/internal/worker/control/servers/{server_id}/operators-applied", post(worker_state::mark_operators_applied))
+        .route("/internal/worker/control/servers/{server_id}/world-seed", post(worker_state::record_world_seed))
         .route("/internal/worker/control/servers/{server_id}/plugins/{plugin_id}/binary", get(worker_plugins::plugin_binary))
         .route("/internal/worker/control/servers/{server_id}/plugins-applied", post(worker_plugins::plugins_applied))
         .route("/internal/worker/control/servers/{server_id}/snapshots/reserve", post(worker_snapshots::reserve_snapshot))

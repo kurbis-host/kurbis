@@ -118,6 +118,9 @@ pub enum ConsoleCommandStatus {
     Cancelled,
 }
 
+/// The columns of a `ServerRecord`, for `SELECT` and `RETURNING`.
+pub const SERVER_RECORD_COLUMNS: &str = "id, owner_id, subdomain, is_default, desired_state, observed_state, settings, world, storage_bytes, generation, current_snapshot_generation, last_error, created_at, updated_at";
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ServerRecord {
     pub id: Uuid,
@@ -127,6 +130,8 @@ pub struct ServerRecord {
     pub desired_state: DesiredState,
     pub observed_state: ObservedState,
     pub settings: serde_json::Value,
+    /// How the current world was generated.
+    pub world: sqlx::types::Json<crate::contracts::world::WorldGeneration>,
     pub storage_bytes: i64,
     pub generation: i64,
     pub current_snapshot_generation: Option<i64>,

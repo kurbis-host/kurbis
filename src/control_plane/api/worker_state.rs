@@ -9,7 +9,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    contracts::worker::{WorkerAssignment, WorkerServerContext, WorkerServerState},
+    contracts::{
+        worker::{WorkerAssignment, WorkerServerContext, WorkerServerState},
+        world::WorldGeneration,
+    },
     model::{DesiredState, ObservedState},
     pumpkin_control::{PlayerEdition, WaitingPlayer, WhitelistEntry},
     runtime_stats::RuntimeStats,
@@ -181,6 +184,7 @@ pub(super) async fn server_context(
             DesiredState,
             ObservedState,
             Value,
+            sqlx::types::Json<WorldGeneration>,
             Option<i64>,
             bool,
             i64,
@@ -197,7 +201,7 @@ pub(super) async fn server_context(
                     'java_port', p.java_port, 'bedrock_port', p.bedrock_port,
                     'signal_port', p.signal_port, 'active', p.active,
                     'updated_at', p.updated_at),
-                s.desired_state, s.observed_state, s.settings, s.current_snapshot_generation,
+                s.desired_state, s.observed_state, s.settings, s.world, s.current_snapshot_generation,
                 COALESCE((s.settings->>'whitelist')::boolean, false),
                 COALESCE(w.revision, 0), COALESCE(w.applied_revision, -1),
                 COALESCE(o.revision, 1), COALESCE(o.applied_revision, 0),
@@ -245,14 +249,15 @@ pub(super) async fn server_context(
         desired_state: row.1,
         observed_state: row.2,
         settings: row.3,
-        current_snapshot_generation: row.4,
-        whitelist_enabled: row.5,
-        whitelist_revision: row.6,
-        whitelist_applied_revision: row.7,
-        operator_revision: row.8,
-        operator_applied_revision: row.9,
-        plugin_revision: row.10,
-        plugin_applied_revision: row.11,
+        world: row.4.0,
+        current_snapshot_generation: row.5,
+        whitelist_enabled: row.6,
+        whitelist_revision: row.7,
+        whitelist_applied_revision: row.8,
+        operator_revision: row.9,
+        operator_applied_revision: row.10,
+        plugin_revision: row.11,
+        plugin_applied_revision: row.12,
         plugins,
         whitelist_entries: entries
             .into_iter()
@@ -446,6 +451,39 @@ pub(super) async fn mark_whitelist_applied(
     )
     .bind(server_id)
     .bind(request.revision)
+    .execute(&mut *tx)
+    .await?;
+    if worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await? != worker_id {
+        return Err(worker_auth::invalid_worker_token());
+    }
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorldSeedRequest {
+    generation: i64,
+    seed: i64,
+}
+
+/// Record the seed of a world made before Kurbis recorded seeds, read from
+/// the running world. A recorded seed is never replaced.
+pub(super) async fn record_world_seed(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Path(server_id): Path<Uuid>,
+    Json(request): Json<WorldSeedRequest>,
+) -> Result<StatusCode, ApiError> {
+    let worker_id = worker_auth::authenticated_worker_id(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_current_placement(&mut tx, worker_id, server_id, request.generation).await?;
+    sqlx::query(
+        "UPDATE servers SET world = jsonb_set(world, '{seed}', to_jsonb($2::bigint))
+         WHERE id = $1 AND world->'seed' = 'null'::jsonb",
+    )
+    .bind(server_id)
+    .bind(request.seed)
     .execute(&mut *tx)
     .await?;
     if worker_auth::lock_authenticated_worker_id(&mut tx, &headers).await? != worker_id {

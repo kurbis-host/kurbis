@@ -8,7 +8,10 @@ use axum::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{model::ServerRecord, routing::BedrockSignalTarget};
+use crate::{
+    model::{SERVER_RECORD_COLUMNS, ServerRecord},
+    routing::BedrockSignalTarget,
+};
 
 use super::auth;
 use super::auth::CurrentUser;
@@ -341,11 +344,9 @@ pub(super) async fn server_by_id(
     pool: &PgPool,
     server_id: Uuid,
 ) -> Result<Option<ServerRecord>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
-                generation, current_snapshot_generation, last_error, created_at, updated_at
-         FROM servers WHERE id = $1",
-    )
+    sqlx::query_as(&format!(
+        "SELECT {SERVER_RECORD_COLUMNS} FROM servers WHERE id = $1"
+    ))
     .bind(server_id)
     .fetch_optional(pool)
     .await

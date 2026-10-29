@@ -9,6 +9,7 @@ use super::archive::{
 };
 use crate::ci::BuildPipelineError;
 
+const WORLD_TYPES_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/world-types.patch");
 const HOST_CONTROL_PATCH: &[u8] = include_bytes!("../../../runtime/pumpkin/host-control.patch");
 const SNAPSHOT_BARRIER_PATCH: &[u8] =
     include_bytes!("../../../runtime/pumpkin/snapshot-barrier.patch");
@@ -28,6 +29,7 @@ pub fn checked_in_patch_fingerprint() -> String {
     let pinned = [
         ("host-patcher-capability", HOST_PATCHER_CAPABILITY),
         ("pumpkin-revision", PUMPKIN_REVISION),
+        ("world-types.patch", WORLD_TYPES_PATCH),
         ("host-control.patch", HOST_CONTROL_PATCH),
         ("snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH),
         ("nethernet-gateway.patch", NETHERNET_PATCH),
@@ -201,6 +203,7 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
                 format!("git init failed: {}", bounded_output(&init.stderr)),
             ));
         }
+        Self::apply_patch(root, "world-types.patch", WORLD_TYPES_PATCH, false).await?;
         Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH, false).await?;
         Self::apply_patch(
             root,

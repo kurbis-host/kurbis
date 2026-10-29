@@ -10,10 +10,11 @@ use axum::{
 };
 use kurbis_hoster::{
     config::ObjectStoreConfig,
+    contracts::worker::{OperationProgress, OperationStage},
     control_plane::lifecycle::{
         Lifecycle, claim_operation, complete_delete, complete_reset, complete_restore,
         complete_snapshot, complete_start, complete_stop, deactivate_placement_after_stop,
-        healthy_worker_template, heartbeat_worker, validate_delete,
+        healthy_worker_template, heartbeat_worker, update_operation_payload, validate_delete,
     },
     control_plane::snapshots::SnapshotStore,
     db,
@@ -464,6 +465,13 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .restore_generation(op.server_id, target, &root)
                 .await
                 .map_err(err)?;
+            update_operation_payload(
+                &f.pool,
+                &op,
+                OperationProgress::stage(OperationStage::Restored),
+            )
+            .await
+            .map_err(err)?;
             let snapshot = f
                 .snapshots
                 .create(op.server_id, &root, SnapshotReason::Restore)
@@ -498,10 +506,26 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 .and_then(Value::as_str)
                 .unwrap_or("world");
             tokio::fs::create_dir_all(&root).await.map_err(err)?;
-            f.snapshots
+            // The stages a worker reports: the server's world follows them.
+            update_operation_payload(
+                &f.pool,
+                &op,
+                OperationProgress::stage(OperationStage::Stopped),
+            )
+            .await
+            .map_err(err)?;
+            let backup = f
+                .snapshots
                 .create(op.server_id, &root, SnapshotReason::Reset)
                 .await
                 .map_err(err)?;
+            update_operation_payload(
+                &f.pool,
+                &op,
+                OperationProgress::backed_up(backup.generation),
+            )
+            .await
+            .map_err(err)?;
             if mode == "full" {
                 match tokio::fs::remove_dir_all(&root).await {
                     Ok(()) => {}
@@ -516,6 +540,11 @@ async fn tick(State(f): State<Fixture>) -> Result<Json<Value>, String> {
                 }
             }
             tokio::fs::create_dir_all(&root).await.map_err(err)?;
+            for stage in [OperationStage::Cleared, OperationStage::Initialized] {
+                update_operation_payload(&f.pool, &op, OperationProgress::stage(stage))
+                    .await
+                    .map_err(err)?;
+            }
             let snapshot = f
                 .snapshots
                 .create(op.server_id, &root, SnapshotReason::Reset)

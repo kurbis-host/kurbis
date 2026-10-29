@@ -32,6 +32,7 @@ export const server: Server = {
     whitelist_by_members: true,
     tab_stats: false,
   },
+  world: { world_type: "normal", structures: true, seed: -1120102460 },
   storage_bytes: 512 * 1024 * 1024,
   storage_limit_bytes: 5 * 1024 * 1024 * 1024,
   memory_limit_bytes: 2 * 1024 * 1024 * 1024,

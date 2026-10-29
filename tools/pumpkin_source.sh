@@ -16,7 +16,7 @@ git -C "$destination" fetch --quiet --depth=1 origin "$(cat "$integration/REVISI
 git -C "$destination" reset --quiet --hard FETCH_HEAD
 git -C "$destination" clean --quiet -fdx
 git -C "$destination" submodule update --quiet --init --recursive --depth=1
-for patch in host-control snapshot-barrier; do
+for patch in world-types host-control snapshot-barrier; do
     git -C "$destination" apply --check "$integration/$patch.patch"
     git -C "$destination" apply "$integration/$patch.patch"
 done

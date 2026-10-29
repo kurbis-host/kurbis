@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { blake3 } from '@noble/hashes/blake3';
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { test, expect, Page, APIRequestContext, Locator } from '@playwright/test';
 import { Pool } from 'pg';
 import AxeBuilder from '@axe-core/playwright';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -154,6 +154,7 @@ async function current(page: Page) {
     is_default: boolean;
     subdomain: string;
     settings: { motd: string; whitelist: boolean; difficulty: string; gamemode: string };
+    world: { world_type: string; structures: boolean; seed: number | null; biome?: string };
   }>;
   return servers.find((server) => server.is_default) ?? servers[0] ?? null;
 }
@@ -168,20 +169,30 @@ async function serverApiPath(page: Page, suffix = '') {
 async function serverRoute(page: Page, suffix = '') {
   return `/manage/${await serverId(page)}${suffix}`;
 }
-async function resetFromSettings(page: Page, request: APIRequestContext, id: string, mode: 'world' | 'full') {
+async function resetFromSettings(
+  page: Page,
+  request: APIRequestContext,
+  id: string,
+  mode: 'world' | 'full',
+  chooseWorld: (dialog: Locator) => Promise<void> = async () => {},
+  world: Record<string, unknown> = { world_type: 'normal', structures: true },
+) {
   await page.goto(`/manage/${id}/settings`);
   const trigger = mode === 'world' ? 'World reset' : 'Full server reset';
   const confirmation = mode === 'world' ? 'Reset world' : 'Reset full server';
+  await expect(page.getByText('Live updates connected')).toBeVisible();
   await page.getByRole('button', { name: trigger, exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'World type' })).toBeVisible();
+  await chooseWorld(dialog);
   const accepted = page.waitForResponse((response) =>
     response.url().endsWith(`/api/v1/servers/${id}/commands`) && response.request().method() === 'POST',
   );
   await dialog.getByRole('button', { name: confirmation, exact: true }).click();
   const acceptedResponse = await accepted;
   expect(acceptedResponse.status()).toBe(202);
-  expect(acceptedResponse.request().postDataJSON()).toEqual({ command: 'reset', mode });
+  expect(acceptedResponse.request().postDataJSON()).toEqual({ command: 'reset', mode, world });
   await expect.poll(async () => {
     const result = await pool.query('SELECT observed_state FROM servers WHERE id = $1', [id]);
     return result.rows[0]?.observed_state;
@@ -406,8 +417,40 @@ test('world and full reset preserve their distinct settings, whitelist, and reco
   expect(added.status).toBe(201);
   await writeFixtureWorld(id, 'world data before world reset');
 
-  await resetFromSettings(page, request, id, 'world');
+  await resetFromSettings(
+    page,
+    request,
+    id,
+    'world',
+    async (dialog) => {
+      await dialog.getByRole('combobox', { name: 'World type' }).selectOption('flat');
+      await dialog.getByRole('combobox', { name: 'Preset' }).selectOption('the_void');
+      await dialog.getByRole('switch', { name: 'Generate structures' }).click();
+      await dialog.getByRole('textbox', { name: 'Seed' }).fill('kurbis');
+    },
+    {
+      world_type: 'flat',
+      structures: false,
+      seed: 'kurbis',
+      flat: {
+        layers: [{ block: 'minecraft:air', height: 1 }],
+        biome: 'minecraft:the_void',
+        features: true,
+        lakes: false,
+        structure_overrides: [],
+      },
+    },
+  );
   let server = await current(page);
+  expect(server?.world).toMatchObject({ world_type: 'flat', structures: false, seed: -1120102460 });
+  await page.goto(`/manage/${id}/settings`);
+  await expect(page.getByText('Superflat, The Void', { exact: true })).toBeVisible();
+  await expect(page.getByText('-1120102460', { exact: true })).toBeVisible();
+  const backupWorld = await pool.query(
+    "SELECT world FROM snapshots WHERE server_id = $1 AND reason = 'reset' ORDER BY generation LIMIT 1",
+    [id],
+  );
+  expect(backupWorld.rows[0].world).toMatchObject({ world_type: 'normal', seed: null });
   expect(server?.subdomain).toBe('reset-world');
   expect(server?.settings).toMatchObject({
     motd: 'Keep this through a world reset',
@@ -430,8 +473,20 @@ test('world and full reset preserve their distinct settings, whitelist, and reco
   });
   expect(changedAgain.status).toBe(200);
   await writeFixtureWorld(id, 'world data before full reset');
-  await resetFromSettings(page, request, id, 'full');
+  await resetFromSettings(
+    page,
+    request,
+    id,
+    'full',
+    async (dialog) => {
+      await dialog.getByRole('combobox', { name: 'World type' }).selectOption('single_biome_surface');
+      await dialog.getByRole('combobox', { name: 'Biome' }).selectOption('minecraft:cherry_grove');
+    },
+    { world_type: 'single_biome_surface', structures: true, biome: 'minecraft:cherry_grove' },
+  );
   server = await current(page);
+  expect(server?.world).toMatchObject({ world_type: 'single_biome_surface', biome: 'minecraft:cherry_grove' });
+  expect(typeof server?.world.seed).toBe('number');
   expect(server?.subdomain).toBe('reset-world');
   expect(server?.settings).toMatchObject({
     motd: 'Hosted by Kurbis',

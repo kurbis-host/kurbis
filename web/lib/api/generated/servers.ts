@@ -236,6 +236,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/world-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description What a reset can generate a world from: vanilla's world types, superflat presets, biomes, blocks for superflat layers and structure sets, with their English names. Needs no session; it may be cached for a day. */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Everything a new world can be made of, generated from the pinned Pumpkin
+                 *      by `tools/generate_world_catalog.py`. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["WorldCatalog"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/server/sessions": {
         parameters: {
             query?: never;

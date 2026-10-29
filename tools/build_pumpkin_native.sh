@@ -10,6 +10,7 @@ case "$profile" in
 esac
 source_dir="$root/output/native-pumpkin/source"
 fingerprint=$(cat "$root/runtime/pumpkin/REVISION" \
+    "$root/runtime/pumpkin/world-types.patch" \
     "$root/runtime/pumpkin/host-control.patch" \
     "$root/runtime/pumpkin/snapshot-barrier.patch" \
     "$root/runtime/pumpkin/nethernet-gateway.patch" \

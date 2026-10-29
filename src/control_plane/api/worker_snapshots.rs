@@ -135,8 +135,8 @@ pub(super) async fn reserve_snapshot(
     .await?;
     let id = Uuid::new_v4();
     let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
-        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete)
-         VALUES($1,$2,$3,'',0,'',$4,false) RETURNING created_at",
+        "INSERT INTO snapshots(id, server_id, generation, manifest_key, size_bytes, checksum, reason, complete, world)
+         SELECT $1,$2,$3,'',0,'',$4,false,world FROM servers WHERE id = $2 RETURNING created_at",
     )
     .bind(id).bind(server_id).bind(generation).bind(request.reason).fetch_one(&mut *tx).await?;
     tx.commit().await?;

@@ -16,6 +16,7 @@ use super::{
         settings::{AccountLookups, PermissionLevel, render_pumpkin_config},
     },
 };
+use crate::contracts::world::WorldGeneration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -219,6 +220,7 @@ impl ServerRuntime for DockerRuntime {
         placement: &PlacementRecord,
         server_dir: &Path,
         settings: &Value,
+        world: &WorldGeneration,
         api_capability: Option<&str>,
     ) -> Result<()> {
         let api_capability =
@@ -278,6 +280,7 @@ impl ServerRuntime for DockerRuntime {
             server_dir.join("pumpkin.toml"),
             render_pumpkin_config(
                 settings,
+                world,
                 AccountLookups::ThroughApiProxy,
                 PermissionLevel::Player,
                 25565,
@@ -710,6 +713,7 @@ mod tests {
     fn config_has_no_player_limit_and_escapes_strings() {
         let config = render_pumpkin_config(
             &json!({"motd":"hello \"kurbis\"","view_distance":8}),
+            &WorldGeneration::default(),
             AccountLookups::ThroughApiProxy,
             PermissionLevel::Player,
             25565,

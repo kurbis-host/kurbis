@@ -166,7 +166,10 @@ describe("feature panels in read-only mode", () => {
     expect(screen.getByRole("combobox", { name: "Gamemode" })).toBeDisabled();
     for (const name of ["Hardcore", "Whitelist", "Members can let players in"]) expect(screen.getByRole("switch", { name })).toBeDisabled();
     expect(screen.getByRole("button", { name: /save configuration/i })).toBeDisabled();
-    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+    for (const button of screen.getAllByRole("button")) {
+      if (button.getAttribute("aria-label") === "Copy seed") expect(button).toBeEnabled();
+      else expect(button).toBeDisabled();
+    }
   });
 
   it("settings fields are editable for the owner of a sleeping server", () => {

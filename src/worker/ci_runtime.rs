@@ -1,6 +1,7 @@
 //! Rootless execution of assigned CI preview worlds. CI containers are never
 //! represented as account servers and run with the same DockerSandbox policy.
 
+use crate::contracts::world::WorldGeneration;
 use std::{
     collections::HashSet,
     fs,
@@ -310,6 +311,9 @@ impl CiPreviewWorker {
         }
         let pumpkin_config = render_pumpkin_config(
             &json!({"motd": format!("Kurbis preview {}", &placement.commit_sha[..12]), "view_distance": 10}),
+            // A preview's world is a default one; its snapshot carries it
+            // between runtimes.
+            &WorldGeneration::default(),
             AccountLookups::ThroughApiProxy,
             PermissionLevel::Gamemaster,
             25565,

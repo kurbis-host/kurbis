@@ -8,7 +8,7 @@ use crate::contracts::worker::OperationPayload;
 use crate::control_plane::operation_signal::OperationSignal;
 use crate::model::{
     DesiredState, ObservedState, OperationKind, PlacementRecord, SERVER_CPU_MILLIS,
-    SERVER_MEMORY_BYTES, SERVER_STORAGE_BYTES, ServerRecord, WorkerRecord,
+    SERVER_MEMORY_BYTES, SERVER_RECORD_COLUMNS, SERVER_STORAGE_BYTES, ServerRecord, WorkerRecord,
 };
 
 pub(super) async fn lock_server(
@@ -24,11 +24,9 @@ pub(super) async fn lock_server_optional(
     tx: &mut Transaction<'_, Postgres>,
     server_id: Uuid,
 ) -> Result<Option<ServerRecord>> {
-    Ok(sqlx::query_as::<_, ServerRecord>(
-        "SELECT id, owner_id, subdomain, is_default, desired_state, observed_state, settings, storage_bytes,
-                generation, current_snapshot_generation, last_error, created_at, updated_at
-         FROM servers WHERE id = $1 FOR UPDATE",
-    )
+    Ok(sqlx::query_as::<_, ServerRecord>(&format!(
+        "SELECT {SERVER_RECORD_COLUMNS} FROM servers WHERE id = $1 FOR UPDATE",
+    ))
     .bind(server_id)
     .fetch_optional(&mut **tx)
     .await?)

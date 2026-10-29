@@ -1,0 +1,1072 @@
+diff --git a/crates/pumpkin-config/src/lib.rs b/crates/pumpkin-config/src/lib.rs
+index f3fa8f445..4276d0376 100644
+--- a/crates/pumpkin-config/src/lib.rs
++++ b/crates/pumpkin-config/src/lib.rs
+@@ -186,6 +186,16 @@ pub struct AdvancedConfiguration {
+ pub struct BasicConfiguration {
+     /// The seed for the world generation.
+     pub seed: Seed,
++    /// The world preset of a new world, like vanilla's `level-type`: `minecraft:normal`,
++    /// `minecraft:flat`, `minecraft:large_biomes`, `minecraft:amplified` or
++    /// `minecraft:single_biome_surface`.
++    pub level_type: String,
++    /// The JSON settings of a new flat world, like vanilla's `generator-settings`, e.g.
++    /// `{"layers": [{"block": "minecraft:air", "height": 1}], "biome": "minecraft:the_void", "features": true}`.
++    /// A new `minecraft:single_biome_surface` world reads its biome from it: `{"biome": "minecraft:desert"}`.
++    pub generator_settings: String,
++    /// Whether a new world generates structures, like vanilla's `generate-structures`.
++    pub generate_structures: bool,
+     /// The default game difficulty.
+     pub default_difficulty: Difficulty,
+     /// The op level assigned by the /op command.
+@@ -229,6 +239,9 @@ impl Default for BasicConfiguration {
+     fn default() -> Self {
+         Self {
+             seed: Seed(random::get_seed()),
++            level_type: "minecraft:normal".to_string(),
++            generator_settings: "{}".to_string(),
++            generate_structures: true,
+             default_difficulty: Difficulty::Normal,
+             op_permission_level: PermissionLvl::Four,
+             allow_nether: true,
+diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
+index f0a193ef9..307c4a185 100644
+--- a/crates/pumpkin-core/src/server/mod.rs
++++ b/crates/pumpkin-core/src/server/mod.rs
+@@ -26,7 +26,6 @@ use pumpkin_data::dimension::Dimension;
+ use pumpkin_util::permission::PermissionManager;
+ use pumpkin_util::text::color::NamedColor;
+ use pumpkin_world::dimension::into_level;
+-use pumpkin_world::generation::generator::GeneratorInit;
+ use pumpkin_world::world::WorldPortalExt;
+ use tracing::{debug, error, info, warn};
+ 
+@@ -193,16 +192,17 @@ impl Server {
+             }
+             Err(WorldInfoError::InfoNotFound) => {
+                 warn!(
+-                    "No {LEVEL_DAT_FILE_NAME} in {}, creating a new world with seed {}",
++                    "No {LEVEL_DAT_FILE_NAME} in {}, creating a new {} world with seed {}",
+                     world_path.display(),
++                    basic_config.level_type,
+                     basic_config.seed.0 as i64
+                 );
+-                let overworld_gen = pumpkin_world::generation::generator::VanillaGenerator::new(
++                let default_data = LevelData::for_new_world(
+                     basic_config.seed,
+-                    Dimension::OVERWORLD,
++                    &basic_config.level_type,
++                    &basic_config.generator_settings,
++                    basic_config.generate_structures,
+                 );
+-                let default_data =
+-                    LevelData::from_world_generator(basic_config.seed, &overworld_gen);
+                 AnvilLevelInfo.write_world_info(&default_data, &world_path)?;
+                 default_data
+             }
+diff --git a/crates/pumpkin-world/src/chunk_system/generation.rs b/crates/pumpkin-world/src/chunk_system/generation.rs
+index 42b53e837..73c1bb10d 100644
+--- a/crates/pumpkin-world/src/chunk_system/generation.rs
++++ b/crates/pumpkin-world/src/chunk_system/generation.rs
+@@ -183,6 +183,64 @@ mod tests {
+         }
+     }
+ 
++    /// Vanilla `VoidStartPlatformFeature`: stone within 16 blocks of (8, 8), cobblestone at
++    /// (8, 8), three blocks above the bottom of the world, only in the chunks around (0, 0).
++    #[test]
++    fn the_void_preset_generates_the_vanilla_start_platform() {
++        let settings = crate::world_info::FlatLevelGeneratorPreset::from_name("the_void")
++            .unwrap()
++            .settings;
++        let world_gen = crate::generation::get_world_gen_with_all_settings(
++            Seed(0),
++            Dimension::OVERWORLD,
++            true,
++            settings.to_flat_layers(),
++            settings.biome.clone(),
++            None,
++            None,
++            None,
++            crate::generation::generator::FlatDecoration {
++                features: settings.features,
++                lakes: settings.lakes,
++            },
++        );
++        let platform_y = Dimension::OVERWORLD.min_y + 3;
++
++        for (chunk_x, chunk_z) in [(0, 0), (1, 1), (-1, 0), (2, 0)] {
++            let Chunk::Level(chunk) = generate_single_chunk(
++                &world_gen,
++                &BlockRegistry,
++                chunk_x,
++                chunk_z,
++                StagedChunkEnum::Full,
++            ) else {
++                panic!("full generation must return a level chunk");
++            };
++            for rx in 0..16 {
++                for rz in 0..16 {
++                    let (x, z) = (chunk_x * 16 + rx as i32, chunk_z * 16 + rz as i32);
++                    let near_origin = chunk_x.abs().max(chunk_z.abs()) <= 1;
++                    let expected = if !near_origin || (x - 8).abs().max((z - 8).abs()) > 16 {
++                        BlockStateId::AIR
++                    } else if (x, z) == (8, 8) {
++                        pumpkin_data::Block::COBBLESTONE.default_state.id
++                    } else {
++                        pumpkin_data::Block::STONE.default_state.id
++                    };
++                    for y in Dimension::OVERWORLD.min_y..platform_y + 2 {
++                        let block = chunk.section.get_block_absolute_y(rx, y, rz);
++                        let expected = if y == platform_y {
++                            expected
++                        } else {
++                            BlockStateId::AIR
++                        };
++                        assert_eq!(block, Some(expected), "block at ({x}, {y}, {z})");
++                    }
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn generate_chunk_should_return() {
+         let dimension = Dimension::OVERWORLD;
+diff --git a/crates/pumpkin-world/src/chunk_system/generation_cache.rs b/crates/pumpkin-world/src/chunk_system/generation_cache.rs
+index f564c8fcf..d204b6acb 100644
+--- a/crates/pumpkin-world/src/chunk_system/generation_cache.rs
++++ b/crates/pumpkin-world/src/chunk_system/generation_cache.rs
+@@ -703,8 +703,8 @@ impl Cache {
+                         &noise_gen.random_config,
+                     );
+                 }
+-                generator::WorldGenerator::Flat(_) => {
+-                    self.chunks[mid].get_proto_chunk_mut().stage = StagedChunkEnum::Features;
++                generator::WorldGenerator::Flat(flat_gen) => {
++                    ProtoChunk::generate_flat_features(self, block_registry, flat_gen);
+                 }
+                 generator::WorldGenerator::Custom(custom_gen) => {
+                     custom_gen.step_to_features(self, block_registry);
+diff --git a/crates/pumpkin-world/src/generation/feature/features/fill_layer.rs b/crates/pumpkin-world/src/generation/feature/features/fill_layer.rs
+index b1e2bbbac..70d2627c1 100644
+--- a/crates/pumpkin-world/src/generation/feature/features/fill_layer.rs
++++ b/crates/pumpkin-world/src/generation/feature/features/fill_layer.rs
+@@ -18,6 +18,12 @@ impl FillLayerFeature {
+         _random: &mut RandomGenerator,
+         pos: BlockPos,
+     ) -> bool {
++        self.fill(chunk, min_y, pos);
++        true
++    }
++
++    /// Fills the layer of the chunk at `pos`, whose bottom is at `min_y`.
++    pub fn fill<T: GenerationCache>(&self, chunk: &mut T, min_y: i8, pos: BlockPos) {
+         let y = min_y as i32 + self.height;
+         for dx in 0..16 {
+             for dz in 0..16 {
+@@ -27,6 +33,5 @@ impl FillLayerFeature {
+                 }
+             }
+         }
+-        true
+     }
+ }
+diff --git a/crates/pumpkin-world/src/generation/generator/biome_finder.rs b/crates/pumpkin-world/src/generation/generator/biome_finder.rs
+index 350346abf..d8784ba19 100644
+--- a/crates/pumpkin-world/src/generation/generator/biome_finder.rs
++++ b/crates/pumpkin-world/src/generation/generator/biome_finder.rs
+@@ -264,6 +264,7 @@ mod test {
+             Dimension::OVERWORLD,
+             Vec::new(),
+             "minecraft:plains".to_string(),
++            crate::generation::generator::FlatDecoration::default(),
+         )));
+ 
+         let origin = BlockPos::new(17, 64, -3);
+diff --git a/crates/pumpkin-world/src/generation/generator/flat.rs b/crates/pumpkin-world/src/generation/generator/flat.rs
+index 370532afb..4eed2fcbe 100644
+--- a/crates/pumpkin-world/src/generation/generator/flat.rs
++++ b/crates/pumpkin-world/src/generation/generator/flat.rs
+@@ -1,59 +1,90 @@
+-use super::FlatLayer;
++use super::{FlatDecoration, FlatLayer};
++use crate::chunk::ChunkHeightmapType;
+ use crate::chunk_system::StagedChunkEnum;
+ use crate::generation::Seed;
++use crate::generation::feature::features::fill_layer::FillLayerFeature;
+ use crate::generation::positions::chunk_pos::{start_block_x, start_block_z};
+ use crate::generation::proto_chunk::ProtoChunk;
+-use pumpkin_data::Block;
++use pumpkin_data::chunk::Biome;
+ use pumpkin_data::dimension::Dimension;
++use pumpkin_data::placed_feature::PlacedFeature;
++use pumpkin_data::structures::GenerationStep;
++use pumpkin_data::{Block, BlockState};
++
++/// A decoration of a flat world, in the order vanilla places it within its step.
++pub(crate) enum FlatFeature {
++    Placed(PlacedFeature),
++    /// A layer that does not block motion, placed after the terrain like vanilla does.
++    FillLayer(FillLayerFeature),
++}
+ 
+ pub struct FlatGenerator {
+     pub seed: u64,
+     pub dimension: Dimension,
+     pub layers: Vec<FlatLayer>,
+     pub biome: String,
++    /// The terrain, bottom up; `None` for the layers placed as [`FlatFeature::FillLayer`].
++    terrain: Vec<Option<&'static BlockState>>,
++    feature_steps: Vec<Vec<FlatFeature>>,
+ }
+ 
+ impl FlatGenerator {
+     #[must_use]
+-    pub const fn new(
++    pub fn new(
+         seed: Seed,
+         dimension: Dimension,
+         layers: Vec<FlatLayer>,
+         biome: String,
++        decoration: FlatDecoration,
+     ) -> Self {
++        let states: Vec<&'static BlockState> = layers
++            .iter()
++            .flat_map(|layer| {
++                let state = Block::from_name(&layer.block)
++                    .map_or(Block::AIR.default_state, |block| block.default_state);
++                std::iter::repeat_n(state, layer.height.max(0) as usize)
++            })
++            .take(dimension.height as usize)
++            .collect();
++        let feature_steps = feature_steps(&states, biome_by_name(&biome), decoration);
++        let terrain = states
++            .into_iter()
++            .map(|state| {
++                ChunkHeightmapType::MotionBlocking
++                    .is_opaque(state)
++                    .then_some(state)
++            })
++            .collect();
+         Self {
+             seed: seed.0,
+             dimension,
+             layers,
+             biome,
++            terrain,
++            feature_steps,
+         }
+     }
+ 
++    /// Decorations per generation step, indexed like vanilla's decoration seeds.
++    #[must_use]
++    pub(crate) fn feature_steps(&self) -> &[Vec<FlatFeature>] {
++        &self.feature_steps
++    }
++
+     pub fn step_to_biomes(&self, chunk: &mut ProtoChunk) {
+-        let clean_biome = self.biome.strip_prefix("minecraft:").unwrap_or(&self.biome);
+-        let biome_id = pumpkin_data::chunk::Biome::from_name(clean_biome)
+-            .map_or(pumpkin_data::chunk::Biome::PLAINS.id, |b| b.id);
+-        chunk.flat_biome_map.fill(biome_id);
++        chunk.flat_biome_map.fill(biome_by_name(&self.biome).id);
+         chunk.stage = StagedChunkEnum::Biomes;
+     }
+ 
+     pub fn step_to_noise(&self, chunk: &mut ProtoChunk) {
+         let start_x = start_block_x(chunk.x);
+         let start_z = start_block_z(chunk.z);
+-        for x in 0..16 {
+-            for z in 0..16 {
+-                let mut current_y = chunk.bottom_y() as i32;
+-                for layer in &self.layers {
+-                    let block = Block::from_name(&layer.block);
+-                    let state = block.map_or(Block::AIR.default_state, |b| b.default_state);
+-                    for _ in 0..layer.height {
+-                        if current_y < chunk.bottom_y() as i32 + chunk.height() as i32 {
+-                            chunk.set_block_state(start_x + x, current_y, start_z + z, state);
+-                            current_y += 1;
+-                        } else {
+-                            break;
+-                        }
+-                    }
++        let bottom_y = chunk.bottom_y() as i32;
++        for (y, state) in (bottom_y..).zip(&self.terrain) {
++            let Some(state) = state else { continue };
++            for x in 0..16 {
++                for z in 0..16 {
++                    chunk.set_block_state(start_x + x, y, start_z + z, state);
+                 }
+             }
+         }
+@@ -69,3 +100,150 @@ impl FlatGenerator {
+         chunk.stage = StagedChunkEnum::Carvers;
+     }
+ }
++
++fn biome_by_name(name: &str) -> &'static Biome {
++    Biome::from_name(name.strip_prefix("minecraft:").unwrap_or(name)).unwrap_or(&Biome::PLAINS)
++}
++
++/// Vanilla `FlatLevelGeneratorSettings.adjustGenerationSettings` for the world's own biome.
++fn feature_steps(
++    layers: &[&'static BlockState],
++    biome: &'static Biome,
++    FlatDecoration { features, lakes }: FlatDecoration,
++) -> Vec<Vec<FlatFeature>> {
++    const STEPS: usize = GenerationStep::TopLayerModification.ordinal() + 1;
++    let mut steps: Vec<Vec<FlatFeature>> = (0..STEPS).map(|_| Vec::new()).collect();
++
++    if lakes {
++        steps[GenerationStep::Lakes.ordinal()].extend([
++            FlatFeature::Placed(PlacedFeature::LakeLavaUnderground),
++            FlatFeature::Placed(PlacedFeature::LakeLavaSurface),
++        ]);
++    }
++
++    // Vanilla `voidGen`: a world made only of air is decorated only in the void biome.
++    let void_gen = layers.iter().all(|state| state.is_air());
++    if features && (!void_gen || biome.id == Biome::THE_VOID.id) {
++        for (step, placed) in biome.features.iter().enumerate().take(STEPS) {
++            let skipped = step == GenerationStep::UndergroundStructures.ordinal()
++                || step == GenerationStep::SurfaceStructures.ordinal()
++                || (lakes && step == GenerationStep::Lakes.ordinal());
++            if !skipped {
++                steps[step].extend(placed.iter().copied().map(FlatFeature::Placed));
++            }
++        }
++    }
++
++    for (height, &state) in layers.iter().enumerate() {
++        if !ChunkHeightmapType::MotionBlocking.is_opaque(state) {
++            steps[GenerationStep::TopLayerModification.ordinal()].push(FlatFeature::FillLayer(
++                FillLayerFeature {
++                    height: height as i32,
++                    state,
++                },
++            ));
++        }
++    }
++    steps
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn layer(block: &str, height: i32) -> FlatLayer {
++        FlatLayer {
++            block: block.to_string(),
++            height,
++        }
++    }
++
++    fn placed(generator: &FlatGenerator, step: GenerationStep) -> Vec<PlacedFeature> {
++        generator.feature_steps()[step.ordinal()]
++            .iter()
++            .filter_map(|feature| match feature {
++                FlatFeature::Placed(placed) => Some(*placed),
++                FlatFeature::FillLayer(_) => None,
++            })
++            .collect()
++    }
++
++    fn flat(layers: Vec<FlatLayer>, biome: &str, features: bool, lakes: bool) -> FlatGenerator {
++        FlatGenerator::new(
++            Seed(0),
++            Dimension::OVERWORLD,
++            layers,
++            biome.to_string(),
++            FlatDecoration { features, lakes },
++        )
++    }
++
++    #[test]
++    fn the_void_preset_places_the_start_platform() {
++        let the_void = flat(
++            vec![layer("minecraft:air", 1)],
++            "minecraft:the_void",
++            true,
++            false,
++        );
++
++        assert_eq!(
++            placed(&the_void, GenerationStep::TopLayerModification),
++            vec![PlacedFeature::VoidStartPlatform]
++        );
++        // The air layer turns into a fill-layer decoration, as in vanilla.
++        assert!(the_void.terrain.iter().all(Option::is_none));
++    }
++
++    #[test]
++    fn a_world_of_air_only_decorates_the_void_biome() {
++        let air_plains = flat(
++            vec![layer("minecraft:air", 1)],
++            "minecraft:plains",
++            true,
++            false,
++        );
++
++        assert!(placed(&air_plains, GenerationStep::VegetalDecoration).is_empty());
++    }
++
++    #[test]
++    fn decorations_skip_structures_and_add_lakes_first() {
++        let plains = flat(
++            vec![layer("minecraft:stone", 3)],
++            "minecraft:plains",
++            true,
++            true,
++        );
++
++        assert_eq!(
++            placed(&plains, GenerationStep::Lakes),
++            vec![
++                PlacedFeature::LakeLavaUnderground,
++                PlacedFeature::LakeLavaSurface
++            ]
++        );
++        assert!(placed(&plains, GenerationStep::SurfaceStructures).is_empty());
++        assert_eq!(
++            placed(&plains, GenerationStep::VegetalDecoration),
++            Biome::PLAINS.features[GenerationStep::VegetalDecoration.ordinal()]
++        );
++    }
++
++    #[test]
++    fn without_features_only_non_solid_layers_are_decorations() {
++        let snowy = flat(
++            vec![layer("minecraft:stone", 1), layer("minecraft:snow", 1)],
++            "minecraft:snowy_plains",
++            false,
++            false,
++        );
++        let top = &snowy.feature_steps()[GenerationStep::TopLayerModification.ordinal()];
++
++        assert!(matches!(
++            top.as_slice(),
++            [FlatFeature::FillLayer(FillLayerFeature { height: 1, .. })]
++        ));
++        assert!(snowy.terrain[0].is_some() && snowy.terrain[1].is_none());
++    }
++}
+diff --git a/crates/pumpkin-world/src/generation/generator/mod.rs b/crates/pumpkin-world/src/generation/generator/mod.rs
+index 9bece4bea..3fb097d13 100644
+--- a/crates/pumpkin-world/src/generation/generator/mod.rs
++++ b/crates/pumpkin-world/src/generation/generator/mod.rs
+@@ -25,6 +25,13 @@ use crate::generation::proto_chunk::ProtoChunk;
+ 
+ pub mod flat;
+ 
++/// The `features` and `lakes` switches of flat world settings.
++#[derive(Clone, Copy, Default)]
++pub struct FlatDecoration {
++    pub features: bool,
++    pub lakes: bool,
++}
++
+ #[derive(Clone, Debug)]
+ pub struct FlatLayer {
+     pub block: String,
+diff --git a/crates/pumpkin-world/src/generation/mod.rs b/crates/pumpkin-world/src/generation/mod.rs
+index 01a1dcac8..6305985b9 100644
+--- a/crates/pumpkin-world/src/generation/mod.rs
++++ b/crates/pumpkin-world/src/generation/mod.rs
+@@ -54,6 +54,7 @@ pub fn get_world_gen_with_settings(
+         generator_settings,
+         None,
+         None,
++        generator::FlatDecoration::default(),
+     )
+ }
+ 
+@@ -68,10 +69,17 @@ pub fn get_world_gen_with_all_settings(
+     generator_settings: Option<&str>,
+     biome_source: Option<&crate::world_info::BiomeSource>,
+     structure_overrides: Option<&[String]>,
++    flat_decoration: generator::FlatDecoration,
+ ) -> Box<generator::WorldGenerator> {
+     if is_flat {
+         Box::new(generator::WorldGenerator::Flat(Box::new(
+-            generator::flat::FlatGenerator::new(seed, dimension, flat_layers, flat_biome),
++            generator::flat::FlatGenerator::new(
++                seed,
++                dimension,
++                flat_layers,
++                flat_biome,
++                flat_decoration,
++            ),
+         )))
+     } else {
+         Box::new(generator::WorldGenerator::Noise(Box::new(
+@@ -86,6 +94,70 @@ pub fn get_world_gen_with_all_settings(
+     }
+ }
+ 
++/// Builds the generator a world's `world_gen_settings` give `dimension`, or the vanilla one
++/// when they have none for it.
++#[must_use]
++pub fn world_generator_for(
++    settings: Option<&crate::world_info::WorldGenSettings>,
++    dimension: Dimension,
++    seed: Seed,
++) -> Box<generator::WorldGenerator> {
++    let mut is_flat = false;
++    let mut flat_layers = Vec::new();
++    let mut flat_biome = "minecraft:plains".to_string();
++    let mut generator_settings_name: Option<String> = None;
++    let mut biome_source: Option<crate::world_info::BiomeSource> = None;
++    let mut structure_overrides: Option<Vec<String>> = None;
++    let mut flat_decoration = generator::FlatDecoration::default();
++
++    if let Some(wgs) = settings
++        && let Some(dim_settings) = wgs.dimensions.get(dimension.minecraft_name)
++    {
++        biome_source.clone_from(&dim_settings.generator.biome_source);
++
++        if dim_settings.generator.generator_type == "minecraft:flat" {
++            is_flat = true;
++            let flat_settings = dim_settings
++                .generator
++                .settings
++                .as_ref()
++                .and_then(crate::world_info::GeneratorSettings::as_flat_settings)
++                .or_else(|| {
++                    crate::world_info::FlatLevelGeneratorPreset::from_name("classic_flat")
++                        .map(|p| p.settings)
++                });
++            if let Some(flat_settings) = flat_settings {
++                flat_layers = flat_settings.to_flat_layers();
++                structure_overrides = flat_settings.structure_overrides_vec();
++                flat_decoration = generator::FlatDecoration {
++                    features: flat_settings.features,
++                    lakes: flat_settings.lakes,
++                };
++                flat_biome = flat_settings.biome;
++            }
++        } else if let Some(crate::world_info::GeneratorSettings::Reference(s)) =
++            &dim_settings.generator.settings
++        {
++            generator_settings_name = Some(s.clone());
++        }
++        if !wgs.generate_structures {
++            structure_overrides = Some(Vec::new());
++        }
++    }
++
++    get_world_gen_with_all_settings(
++        seed,
++        dimension,
++        is_flat,
++        flat_layers,
++        flat_biome,
++        generator_settings_name.as_deref(),
++        biome_source.as_ref(),
++        structure_overrides.as_deref(),
++        flat_decoration,
++    )
++}
++
+ pub struct GlobalRandomConfig {
+     pub seed: u64,
+     pub legacy_random_source: bool,
+diff --git a/crates/pumpkin-world/src/generation/proto_chunk.rs b/crates/pumpkin-world/src/generation/proto_chunk.rs
+index c191d5a08..6dbd683c2 100644
+--- a/crates/pumpkin-world/src/generation/proto_chunk.rs
++++ b/crates/pumpkin-world/src/generation/proto_chunk.rs
+@@ -39,6 +39,7 @@ use crate::chunk::format::LightContainer;
+ use crate::chunk::palette::BlockPalette;
+ use crate::chunk::{ChunkData, ChunkHeightmapType, ChunkLight};
+ use crate::chunk_system::{StagedChunkEnum, generation_cache::SurfaceBiomeNeighborhood};
++use crate::generation::generator::flat::{FlatFeature, FlatGenerator};
+ use crate::generation::height_limit::HeightLimitView;
+ use crate::generation::noise::aquifer_sampler::{FluidLevel, FluidLevelSamplerImpl};
+ use crate::generation::noise::perlin::DoublePerlinNoiseSampler;
+@@ -1331,6 +1332,60 @@ impl ProtoChunk {
+         cache.get_center_chunk_mut().stage = StagedChunkEnum::Features;
+     }
+ 
++    /// Vanilla `ChunkGenerator.applyBiomeDecoration` for a flat world: its only biome's
++    /// decorations come from [`FlatGenerator::feature_steps`], and it has no structures.
++    pub fn generate_flat_features<T: GenerationCache>(
++        cache: &mut T,
++        block_registry: &dyn WorldPortalExt,
++        flat: &FlatGenerator,
++    ) {
++        let (center_x, center_z, min_y, generation_min_y, generation_height) = {
++            let chunk = cache.get_center_chunk();
++            (
++                chunk.x,
++                chunk.z,
++                chunk.bottom_y() as i32,
++                chunk.generation_bottom_y(),
++                chunk.generation_height(),
++            )
++        };
++        let start_block_x = chunk_pos::start_block_x(center_x);
++        let start_block_z = chunk_pos::start_block_z(center_z);
++        let origin_pos = BlockPos::new(start_block_x, min_y, start_block_z);
++        let population_seed =
++            WorldgenRandom::get_population_seed(flat.seed, start_block_x, start_block_z);
++
++        for (step, features) in flat.feature_steps().iter().enumerate() {
++            for (index, feature) in features.iter().enumerate() {
++                match feature {
++                    FlatFeature::Placed(feature_enum) => {
++                        let Some(feature) = PLACED_FEATURES.get(feature_enum) else {
++                            continue;
++                        };
++                        let decorator_seed =
++                            get_decorator_seed(population_seed, index as u64, step as u64);
++                        let mut random =
++                            RandomGenerator::Worldgen(WorldgenRandom::from_seed(decorator_seed));
++                        feature.generate(
++                            cache,
++                            block_registry,
++                            generation_min_y,
++                            generation_height,
++                            *feature_enum,
++                            &mut random,
++                            origin_pos,
++                        );
++                    }
++                    FlatFeature::FillLayer(layer) => {
++                        layer.fill(cache, generation_min_y, origin_pos);
++                    }
++                }
++            }
++        }
++
++        cache.get_center_chunk_mut().stage = StagedChunkEnum::Features;
++    }
++
+     fn generate_structure_step<T: GenerationCache>(
+         cache: &mut T,
+         block_registry: &dyn WorldPortalExt,
+diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
+index dce4c3410..96bd67752 100644
+--- a/crates/pumpkin-world/src/level.rs
++++ b/crates/pumpkin-world/src/level.rs
+@@ -10,7 +10,6 @@ use crate::{
+         },
+         palette::has_random_ticking_fluid,
+     },
+-    generation::get_world_gen_with_all_settings,
+     tick::{OrderedTick, ScheduledTick, TickPriority},
+     world::WorldPortalExt,
+ };
+@@ -191,53 +190,14 @@ impl Level {
+ 
+         let main_folder = &level_folder.root_folder;
+ 
+-        let mut is_flat = false;
+-        let mut flat_layers = Vec::new();
+-        let mut flat_biome = "minecraft:plains".to_string();
+-        let mut generator_settings_name: Option<String> = None;
+-        let mut biome_source: Option<crate::world_info::BiomeSource> = None;
+-        let mut structure_overrides: Option<Vec<String>> = None;
+-
+-        if let Some(wgs) = crate::world_info::data_files::read_world_gen_settings(main_folder)
+-            && let Some(dim_settings) = wgs.dimensions.get(dimension.minecraft_name)
+-        {
+-            biome_source.clone_from(&dim_settings.generator.biome_source);
+-
+-            if dim_settings.generator.generator_type == "minecraft:flat" {
+-                is_flat = true;
+-                let flat_settings = dim_settings
+-                    .generator
+-                    .settings
+-                    .as_ref()
+-                    .and_then(crate::world_info::GeneratorSettings::as_flat_settings)
+-                    .or_else(|| {
+-                        crate::world_info::FlatLevelGeneratorPreset::from_name("classic_flat")
+-                            .map(|p| p.settings)
+-                    });
+-                if let Some(flat_settings) = flat_settings {
+-                    flat_layers = flat_settings.to_flat_layers();
+-                    structure_overrides = flat_settings.structure_overrides_vec();
+-                    flat_biome = flat_settings.biome;
+-                }
+-            } else if let Some(crate::world_info::GeneratorSettings::Reference(s)) =
+-                &dim_settings.generator.settings
+-            {
+-                generator_settings_name = Some(s.clone());
+-            }
+-        }
+-
+         let dim_min_y = dimension.min_y;
+         let dim_height = dimension.height;
+         let seed = Seed(seed as u64);
+-        let world_gen: Arc<WorldGenerator> = Arc::from(get_world_gen_with_all_settings(
+-            seed,
++        let world_settings = crate::world_info::data_files::read_world_gen_settings(main_folder);
++        let world_gen: Arc<WorldGenerator> = Arc::from(crate::generation::world_generator_for(
++            world_settings.as_ref(),
+             dimension,
+-            is_flat,
+-            flat_layers,
+-            flat_biome,
+-            generator_settings_name.as_deref(),
+-            biome_source.as_ref(),
+-            structure_overrides.as_deref(),
++            seed,
+         ));
+         if let Some(cache) = world_gen.global_structure_cache() {
+             cache.ensure_strongholds_generated();
+diff --git a/crates/pumpkin-world/src/world_info/data_files.rs b/crates/pumpkin-world/src/world_info/data_files.rs
+index 243acb1a0..f1977c221 100644
+--- a/crates/pumpkin-world/src/world_info/data_files.rs
++++ b/crates/pumpkin-world/src/world_info/data_files.rs
+@@ -54,12 +54,6 @@ pub struct WorldGenSettingsData {
+     pub data_version: i32,
+     #[serde(rename = "bonus_chest", default)]
+     pub bonus_chest: bool,
+-    #[serde(rename = "generate_structures", default = "default_true")]
+-    pub generate_structures: bool,
+-}
+-
+-const fn default_true() -> bool {
+-    true
+ }
+ 
+ impl WorldGenSettingsData {
+@@ -69,7 +63,6 @@ impl WorldGenSettingsData {
+             settings,
+             data_version,
+             bonus_chest: false,
+-            generate_structures: true,
+         }
+     }
+ }
+@@ -323,7 +316,11 @@ fn read_world_gen_settings_file(path: &Path) -> Option<WorldGenSettings> {
+                         }
+                     }
+                 }
+-                Some(WorldGenSettings { seed, dimensions })
++                Some(WorldGenSettings {
++                    seed,
++                    generate_structures: c.get_bool("generate_structures").unwrap_or(true),
++                    dimensions,
++                })
+             }
+             Err(e) => {
+                 warn!("Failed to deserialize {}: {e}", path.display());
+@@ -360,7 +357,7 @@ pub fn write_world_gen_settings(
+     let mut inner = NbtCompound::new();
+     inner.put_int("DataVersion", data_version);
+     inner.put_long("seed", settings.seed);
+-    inner.put_bool("generate_structures", true);
++    inner.put_bool("generate_structures", settings.generate_structures);
+     inner.put_bool("bonus_chest", false);
+ 
+     let mut dims_comp = NbtCompound::new();
+diff --git a/crates/pumpkin-world/src/world_info/mod.rs b/crates/pumpkin-world/src/world_info/mod.rs
+index d3cb60068..c881c2f40 100644
+--- a/crates/pumpkin-world/src/world_info/mod.rs
++++ b/crates/pumpkin-world/src/world_info/mod.rs
+@@ -160,10 +160,17 @@ fn default_world_version_series() -> String {
+ pub struct WorldGenSettings {
+     // the numerical seed of the world
+     pub seed: i64,
++    /// Vanilla `generate-structures`; `false` turns every structure off.
++    #[serde(default = "default_true")]
++    pub generate_structures: bool,
+     #[serde(default)]
+     pub dimensions: Dimensions,
+ }
+ 
++const fn default_true() -> bool {
++    true
++}
++
+ impl Default for WorldGenSettings {
+     fn default() -> Self {
+         // Use seed 0 as placeholder; actual seed comes from config or world_gen_settings.dat
+@@ -307,6 +314,8 @@ const fn default_layer_height() -> i32 {
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+ pub struct FlatPresetSettings {
++    /// Optional in vanilla, which falls back to plains.
++    #[serde(default = "default_flat_biome")]
+     pub biome: String,
+     #[serde(default, deserialize_with = "deserialize_bool_from_byte")]
+     pub features: bool,
+@@ -318,6 +327,10 @@ pub struct FlatPresetSettings {
+     pub structure_overrides: Option<StructureOverrides>,
+ }
+ 
++fn default_flat_biome() -> String {
++    "minecraft:plains".to_string()
++}
++
+ /// Vanilla has no boolean type in NBT, so it writes booleans as bytes (0 or 1),
+ /// and the NBT to JSON conversion turns them into numbers. Accept both forms.
+ fn deserialize_bool_from_byte<'de, D>(deserializer: D) -> Result<bool, D::Error>
+@@ -477,6 +490,7 @@ impl WorldGenSettings {
+             Self {
+                 dimensions,
+                 seed: seed.0 as i64,
++                generate_structures: true,
+             }
+         })
+     }
+@@ -486,6 +500,7 @@ impl WorldGenSettings {
+         Self {
+             dimensions: preset.dimensions.clone(),
+             seed: seed.0 as i64,
++            generate_structures: true,
+         }
+     }
+ 
+@@ -559,24 +574,69 @@ impl LevelData {
+         }
+     }
+ 
++    /// A new world as vanilla's `level-type`, `generator-settings` and `generate-structures`
++    /// server properties describe it (`DedicatedServerProperties.WorldDimensionData`).
+     #[must_use]
+-    pub fn default_with_preset(seed: Seed, preset_name: &str) -> Self {
+-        let mut data = Self::default(seed);
+-        if let Some(wgs) = WorldGenSettings::from_preset_name(preset_name, seed) {
+-            data.world_gen_settings = wgs;
+-        }
+-        data
+-    }
+-
+-    #[must_use]
+-    pub fn from_world_generator(
++    pub fn for_new_world(
+         seed: Seed,
+-        generator: &crate::generation::generator::VanillaGenerator,
++        level_type: &str,
++        generator_settings: &str,
++        generate_structures: bool,
+     ) -> Self {
++        let level_type = level_type.to_lowercase();
++        let preset_name = match level_type.as_str() {
++            "default" => "minecraft:normal",
++            "largebiomes" => "minecraft:large_biomes",
++            name => name,
++        };
++        let mut settings = match WorldGenSettings::from_preset_name(preset_name, seed) {
++            Some(settings) if !is_debug_preset(preset_name) => settings,
++            Some(_) => {
++                warn!("Level type {level_type} is not supported, defaulting to minecraft:normal");
++                WorldGenSettings::new(seed)
++            }
++            None => {
++                warn!("Failed to parse level-type {level_type}, defaulting to minecraft:normal");
++                WorldGenSettings::new(seed)
++            }
++        };
++        if let Some(overworld) = settings.dimensions.get_mut("minecraft:overworld") {
++            if overworld.generator.generator_type == "minecraft:flat"
++                && let Some(flat) = parse_flat_settings(generator_settings)
++            {
++                overworld.generator.settings = Some(GeneratorSettings::Compound(flat));
++            } else if let Some(BiomeSource::Fixed { biome, .. }) =
++                &mut overworld.generator.biome_source
++                && let Some(chosen) = parse_single_biome(generator_settings)
++            {
++                *biome = chosen;
++            }
++        }
++        settings.generate_structures = generate_structures;
++
+         let mut data = Self::default(seed);
+-        let spawn_pos = generator.find_spawn_position();
+-        data.spawn_x = spawn_pos.0.x;
+-        data.spawn_z = spawn_pos.0.z;
++        data.world_gen_settings = settings;
++        let generator = crate::generation::world_generator_for(
++            Some(&data.world_gen_settings),
++            pumpkin_data::dimension::Dimension::OVERWORLD,
++            seed,
++        );
++        match &*generator {
++            // Vanilla `MinecraftServer.setInitialSpawn`: a flat world spawns in the middle of
++            // chunk (0, 0), at `FlatLevelSource.getSpawnHeight`.
++            crate::generation::generator::WorldGenerator::Flat(flat) => {
++                let dimension = &flat.dimension;
++                let layers: i32 = flat.layers.iter().map(|layer| layer.height.max(0)).sum();
++                data.spawn_x = 8;
++                data.spawn_y = dimension.min_y + layers.min(dimension.height);
++                data.spawn_z = 8;
++            }
++            generator => {
++                let spawn_pos = generator.find_spawn_position();
++                data.spawn_x = spawn_pos.0.x;
++                data.spawn_z = spawn_pos.0.z;
++            }
++        }
+         data
+     }
+ 
+@@ -586,6 +646,51 @@ impl LevelData {
+     }
+ }
+ 
++fn is_debug_preset(preset_name: &str) -> bool {
++    preset_name
++        .strip_prefix("minecraft:")
++        .unwrap_or(preset_name)
++        == "debug_all_block_states"
++}
++
++/// Pumpkin's extension for `single_biome_surface`, whose biome vanilla's server properties
++/// cannot choose: `generator-settings` may name it as `{"biome": "minecraft:desert"}`.
++fn parse_single_biome(generator_settings: &str) -> Option<String> {
++    let trimmed = generator_settings.trim();
++    if trimmed.is_empty() || trimmed == "{}" {
++        return None;
++    }
++    let biome = serde_json::from_str::<serde_json::Value>(trimmed)
++        .ok()
++        .and_then(|json| json.get("biome")?.as_str().map(str::to_owned));
++    let known = biome.as_deref().is_some_and(|biome| {
++        pumpkin_data::biome::Biome::from_name(biome.strip_prefix("minecraft:").unwrap_or(biome))
++            .is_some()
++    });
++    if !known {
++        warn!("Failed to read a known biome from generator-settings, keeping the preset's");
++        return None;
++    }
++    biome
++}
++
++/// Vanilla parses `generator-settings` as flat settings and keeps the preset's when that fails.
++fn parse_flat_settings(generator_settings: &str) -> Option<serde_json::Value> {
++    // Vanilla's default for the property.
++    if generator_settings.trim().is_empty() || generator_settings.trim() == "{}" {
++        return None;
++    }
++    let parsed = serde_json::from_str::<serde_json::Value>(generator_settings)
++        .and_then(|json| serde_json::from_value::<FlatPresetSettings>(json.clone()).map(|_| json));
++    match parsed {
++        Ok(json) => Some(json),
++        Err(error) => {
++            warn!("Failed to parse generator-settings, keeping the preset's: {error}");
++            None
++        }
++    }
++}
++
+ #[derive(Error, Debug)]
+ pub enum WorldInfoError {
+     #[error("I/O error: {0}")]
+@@ -610,6 +715,114 @@ pub enum WorldInfoError {
+ mod tests {
+     use super::*;
+ 
++    fn overworld_generator(data: &LevelData) -> &Generator {
++        &data.world_gen_settings.dimensions["minecraft:overworld"].generator
++    }
++
++    #[test]
++    fn new_worlds_resolve_level_types_like_vanilla() {
++        for (level_type, noise_settings) in [
++            ("minecraft:normal", "minecraft:overworld"),
++            ("Default", "minecraft:overworld"),
++            ("largebiomes", "minecraft:large_biomes"),
++            ("amplified", "minecraft:amplified"),
++            ("minecraft:debug_all_block_states", "minecraft:overworld"),
++            ("nonsense", "minecraft:overworld"),
++        ] {
++            let data = LevelData::for_new_world(Seed(1), level_type, "{}", true);
++            let generator = overworld_generator(&data);
++
++            assert_eq!(generator.generator_type, "minecraft:noise", "{level_type}");
++            assert_eq!(
++                generator.settings,
++                Some(GeneratorSettings::Reference(noise_settings.to_string())),
++                "{level_type}"
++            );
++        }
++        let flat = LevelData::for_new_world(Seed(1), "flat", "{}", true);
++        assert_eq!(overworld_generator(&flat).generator_type, "minecraft:flat");
++    }
++
++    #[test]
++    fn a_new_single_biome_world_takes_its_biome_from_generator_settings() {
++        let biome_of = |generator_settings| {
++            let data =
++                LevelData::for_new_world(Seed(1), "single_biome_surface", generator_settings, true);
++            match &overworld_generator(&data).biome_source {
++                Some(BiomeSource::Fixed { biome, .. }) => biome.clone(),
++                other => panic!("expected a fixed biome source, got {other:?}"),
++            }
++        };
++        assert_eq!(biome_of("{}"), "minecraft:plains");
++        assert_eq!(
++            biome_of(r#"{"biome": "minecraft:cherry_grove"}"#),
++            "minecraft:cherry_grove"
++        );
++        assert_eq!(
++            biome_of(r#"{"biome": "minecraft:nonsense"}"#),
++            "minecraft:plains"
++        );
++        assert_eq!(biome_of("not json"), "minecraft:plains");
++    }
++
++    #[test]
++    fn a_new_flat_world_uses_generator_settings_and_spawns_in_chunk_zero() {
++        let the_void = r#"{"layers": [{"block": "minecraft:air", "height": 1}], "biome": "minecraft:the_void", "features": true}"#;
++        let data = LevelData::for_new_world(Seed(1), "minecraft:flat", the_void, true);
++
++        let settings = overworld_generator(&data)
++            .settings
++            .as_ref()
++            .and_then(GeneratorSettings::as_flat_settings)
++            .unwrap();
++        assert_eq!(settings.biome, "minecraft:the_void");
++        assert!(settings.features);
++        let min_y = pumpkin_data::dimension::Dimension::OVERWORLD.min_y;
++        assert_eq!(
++            (data.spawn_x, data.spawn_y, data.spawn_z),
++            (8, min_y + 1, 8)
++        );
++    }
++
++    #[test]
++    fn generator_settings_without_a_biome_use_plains() {
++        let layers = r#"{"layers": [{"block": "minecraft:bedrock", "height": 1}]}"#;
++        let data = LevelData::for_new_world(Seed(1), "flat", layers, true);
++        let settings = overworld_generator(&data)
++            .settings
++            .as_ref()
++            .and_then(GeneratorSettings::as_flat_settings)
++            .unwrap();
++
++        assert_eq!(settings.biome, "minecraft:plains");
++        assert_eq!(settings.layers.len(), 1);
++        assert_eq!(settings.layers[0].block, "minecraft:bedrock");
++    }
++
++    #[test]
++    fn invalid_generator_settings_keep_the_flat_preset() {
++        let data = LevelData::for_new_world(Seed(1), "flat", "not json", true);
++        let settings = overworld_generator(&data)
++            .settings
++            .as_ref()
++            .and_then(GeneratorSettings::as_flat_settings)
++            .unwrap();
++
++        assert_eq!(settings.biome, "minecraft:plains");
++    }
++
++    #[test]
++    fn generate_structures_is_saved_with_the_world() {
++        let temp_dir = tempfile::TempDir::new().unwrap();
++        let data = LevelData::for_new_world(Seed(1), "minecraft:normal", "{}", false);
++
++        data_files::write_world_gen_settings(temp_dir.path(), &data.world_gen_settings, 4903)
++            .unwrap();
++
++        let read = data_files::read_world_gen_settings(temp_dir.path()).unwrap();
++        assert!(!read.generate_structures);
++    }
++
+     #[test]
+     fn world_presets_parse() {
+         let preset_names = [

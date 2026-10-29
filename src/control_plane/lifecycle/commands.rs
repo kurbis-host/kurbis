@@ -4,6 +4,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::contracts::lifecycle::ResetMode;
+use crate::contracts::world::WorldGeneration;
 use crate::model::{DesiredState, ObservedState, ServerRecord, SnapshotReason};
 
 use super::{Lifecycle, bail};
@@ -104,6 +105,7 @@ pub enum LifecycleCommand {
     Reset {
         mode: ResetMode,
         full_reset_settings: serde_json::Value,
+        world: WorldGeneration,
     },
     Delete,
     Restore {
@@ -269,8 +271,9 @@ impl Lifecycle {
             LifecycleCommand::Reset {
                 mode,
                 full_reset_settings,
+                world,
             } => {
-                self.request_reset_for_actor(actor, server_id, mode, full_reset_settings)
+                self.request_reset_for_actor(actor, server_id, mode, full_reset_settings, world)
                     .await
             }
             LifecycleCommand::Delete => self.request_delete_for_actor(actor, server_id).await,

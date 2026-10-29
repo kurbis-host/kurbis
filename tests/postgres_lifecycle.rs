@@ -1203,6 +1203,9 @@ async fn queue_drain_snapshot_cannot_restart_a_cancelled_or_deleted_server() {
 #[path = "lifecycle/operation_completion.rs"]
 mod operation_completion;
 
+#[path = "lifecycle/world_generation.rs"]
+mod world_generation;
+
 #[tokio::test]
 async fn a_join_restarts_a_failed_server_with_growing_spacing_and_owners_are_never_held_back() {
     let _serial = DB_TEST_LOCK.lock().await;
