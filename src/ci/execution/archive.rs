@@ -382,11 +382,6 @@ pub fn unpack_source_archive(bytes: &[u8]) -> Result<SourceWorkspace, ArchiveErr
             }
         }
     }
-    if !source.join("Cargo.toml").is_file() {
-        return Err(ArchiveError::Invalid(
-            "source archive does not have a root Cargo.toml".into(),
-        ));
-    }
     Ok(SourceWorkspace {
         temporary,
         source,
@@ -717,6 +712,42 @@ mod tests {
             )
             .unwrap(),
             b"pub fn trusted_source() {}"
+        );
+    }
+
+    #[test]
+    fn a_submodule_without_its_own_cargo_manifest_merges() {
+        // pumpkin-plugin-wit holds only WIT files and licences, no Cargo.toml.
+        let primary = archive(&[
+            ("Pumpkin/", tar::EntryType::Directory, b""),
+            (
+                "Pumpkin/Cargo.toml",
+                tar::EntryType::Regular,
+                b"[workspace]",
+            ),
+        ]);
+        let submodule = archive(&[
+            (
+                "pumpkin-plugin-wit-1ad73ff/",
+                tar::EntryType::Directory,
+                b"",
+            ),
+            (
+                "pumpkin-plugin-wit-1ad73ff/v0.1/world.wit",
+                tar::EntryType::Regular,
+                b"package pumpkin:plugin@0.1.0;",
+            ),
+        ]);
+        let mut workspace = unpack_source_archive(&primary).unwrap();
+        merge_source_submodule(&mut workspace, "crates/pumpkin-plugin-wit", &submodule).unwrap();
+        assert_eq!(
+            fs::read(
+                workspace
+                    .path()
+                    .join("crates/pumpkin-plugin-wit/v0.1/world.wit")
+            )
+            .unwrap(),
+            b"package pumpkin:plugin@0.1.0;"
         );
     }
 

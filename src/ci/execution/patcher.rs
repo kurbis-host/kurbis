@@ -185,6 +185,11 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
             merge_source_submodule(&mut workspace, path, archive).map_err(archive_error)?;
         }
         let root = workspace.path();
+        if !root.join("Cargo.toml").is_file() {
+            return Err(archive_error(ArchiveError::Invalid(
+                "source archive does not have a root Cargo.toml".into(),
+            )));
+        }
         let init = git_command(root)
             .arg("init")
             .arg("--quiet")
@@ -354,6 +359,26 @@ mod tests {
             storage.failure_class(),
             crate::ci::CiBuildFailureClass::Transient
         );
+    }
+
+    #[tokio::test]
+    async fn a_source_without_a_root_cargo_manifest_is_a_permanent_failure() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("README.md"), b"not a crate").unwrap();
+        let bundle = super::super::archive::encode_source_bundle(
+            &pack_source_archive(source.path()).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let error = CheckedInPumpkinPatcher
+            .apply(bundle, &checked_in_patch_fingerprint())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.failure_class(),
+            crate::ci::CiBuildFailureClass::Permanent
+        );
+        assert!(error.to_string().contains("root Cargo.toml"), "{error}");
     }
 
     #[tokio::test]
