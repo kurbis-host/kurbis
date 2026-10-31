@@ -68,10 +68,21 @@ The result is recorded in `/srv/kurbis/deployed-release.json` on the host.
 ## Things to know
 
 - **The worker has its own Docker daemon.** It starts servers on the rootless
-  daemon named by `DOCKER_HOST` in `/srv/kurbis/worker.env`. Images built by a
+  daemon named by `DOCKER_HOST` in `/srv/kurbis/worker.env`. Every release
+  installs it as the systemd user unit
+  `/etc/systemd/user/kurbis-worker-docker.service` (run only by the account
+  that owns the socket, which has linger on so the daemon starts at boot) and
+  keeps its images in `/srv/kurbis-data/worker-docker`. Nothing of it lives in
+  that account's home: a cleanup there on 2026-10-29 removed the daemon, and
+  after the next reboot no server could start for two days. Images built by a
   release live in the host's main daemon, so the release copies the Pumpkin
   image and the runtime API proxy image across. A worker that reports
-  "No such image" is missing that copy.
+  "No such image" is missing that copy, and `docker system prune -a` in the
+  main daemon deletes the release's Pumpkin image; release again to rebuild
+  it.
+- **Nobody is told about a dead worker unless `ALERT_NTFY_URL` is set** in
+  Dokploy; the control plane then pushes to that ntfy topic when no worker
+  has been live for three minutes.
 - **Dokploy auto-deploy stays off.** A plain Dokploy deploy has no Pumpkin
   images for its commit and no matching worker, and fails when Compose tries
   to pull `melon-pumpkin:waiting-<sha>`.

@@ -32,6 +32,8 @@ RECORD = Path("/srv/kurbis/deployed-release.json")
 WORKER = Path("/srv/kurbis-hoster/target/release/worker")
 WORKER_ENV = Path("/srv/kurbis/worker.env")
 WORKER_SERVICE = "kurbis-worker.service"
+WORKER_DAEMON_UNIT = Path("/etc/systemd/user/kurbis-worker-docker.service")
+WORKER_DOCKER_ROOT = Path("/srv/kurbis-data/worker-docker")
 PUMPKIN_ARTIFACTS = ("pumpkin", "kurbis-control.wasm")
 # One worker process must stay up this long, heartbeating, to count as started.
 WORKER_SETTLE_SECONDS = 40
@@ -92,6 +94,69 @@ def worker_setting(name: str) -> str | None:
     return values[0] if values else None
 
 
+def worker_daemon_unit(user: str) -> str:
+    """The systemd user unit running the worker's rootless Docker daemon.
+
+    It is installed for every user manager but runs only in `user`'s, and it
+    keeps its images under WORKER_DOCKER_ROOT, so nothing in that account's
+    home is needed: a cleanup there once removed the daemon and its images,
+    and after the next reboot no server could start for two days.
+    """
+    return f"""[Unit]
+Description=Rootless Docker daemon for the Kurbis worker
+ConditionUser={user}
+
+[Service]
+Environment=PATH=/usr/bin:/sbin:/usr/sbin:/bin
+ExecStart=/usr/bin/dockerd-rootless.sh --iptables=false --data-root {WORKER_DOCKER_ROOT}
+ExecReload=/bin/kill -s HUP $MAINPID
+Type=notify
+NotifyAccess=all
+Restart=always
+RestartSec=2
+TimeoutSec=0
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def provision_worker_daemon(host: str) -> None:
+    """Install and start the worker's rootless Docker daemon and wait for its socket."""
+    match = re.fullmatch(r"unix:///run/user/(\d+)/docker\.sock", host)
+    if not match:
+        raise Failure(f"worker DOCKER_HOST {host} is not a rootless daemon socket under /run/user")
+    uid = int(match.group(1))
+    user = run(["id", "-nu", str(uid)])
+    WORKER_DOCKER_ROOT.mkdir(mode=0o700, exist_ok=True)
+    os.chown(WORKER_DOCKER_ROOT, uid, int(run(["id", "-g", str(uid)])))
+    unit = WORKER_DAEMON_UNIT.read_text(encoding="utf-8") if WORKER_DAEMON_UNIT.exists() else None
+    if unit != worker_daemon_unit(user):
+        WORKER_DAEMON_UNIT.write_text(worker_daemon_unit(user), encoding="utf-8")
+    # Linger starts the user manager, and with it the daemon, at boot.
+    run(["loginctl", "enable-linger", user])
+    run(["systemctl", "--global", "enable", WORKER_DAEMON_UNIT.name])
+    manager = ["runuser", "-u", user, "--", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+               f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus", "systemctl", "--user"]
+    run([*manager, "daemon-reload"])
+    if unit != worker_daemon_unit(user):
+        run([*manager, "restart", WORKER_DAEMON_UNIT.name])
+    else:
+        run([*manager, "start", WORKER_DAEMON_UNIT.name])
+    deadline = time.monotonic() + 60
+    while subprocess.run(["docker", "--host", host, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         check=False).returncode:
+        if time.monotonic() > deadline:
+            raise Failure("the worker's rootless Docker daemon did not start")
+        time.sleep(2)
+
+
 def publish_to_worker(image: str) -> None:
     """Copy an image into the Docker daemon the worker starts runtimes on.
 
@@ -101,6 +166,7 @@ def publish_to_worker(image: str) -> None:
     host = worker_setting("DOCKER_HOST")
     if not host:
         return
+    provision_worker_daemon(host)
     image_id = run(["docker", "image", "inspect", image, "--format", "{{.Id}}"])
     saved = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     loaded = subprocess.run(["docker", "--host", host, "load"], stdin=saved.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)

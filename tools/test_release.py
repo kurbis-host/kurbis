@@ -106,15 +106,44 @@ class ReleaseTests(unittest.TestCase):
                 calls.append(command)
                 return "sha256:image"
             with patch.object(host, "WORKER_ENV", environment), patch.object(host, "run", side_effect=run), \
+                 patch.object(host, "provision_worker_daemon") as provision, \
                  patch.object(host.subprocess, "Popen", return_value=saved) as save, \
                  patch.object(host.subprocess, "run", return_value=loaded) as load:
                 environment.write_text("export PUMPKIN_IMAGE=x\n", encoding="utf-8")
                 host.publish_to_worker("melon-pumpkin:host-control-x")
                 save.assert_not_called()
+                provision.assert_not_called()
                 environment.write_text("export DOCKER_HOST=unix:///run/user/1800/docker.sock\n", encoding="utf-8")
                 host.publish_to_worker("melon-pumpkin:host-control-x")
+                provision.assert_called_with("unix:///run/user/1800/docker.sock")
                 self.assertEqual(load.call_args.args[0], ["docker", "--host", "unix:///run/user/1800/docker.sock", "load"])
                 self.assertEqual(calls[-1][:3], ["docker", "--host", "unix:///run/user/1800/docker.sock"])
+
+    def test_the_worker_daemon_is_provisioned_outside_any_home_and_starts_at_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unit, root = Path(directory) / "kurbis-worker-docker.service", Path(directory) / "worker-docker"
+            calls = []
+            def run(command, **_):
+                calls.append(command)
+                return {"-nu": "ci-e2e", "-g": "1800"}.get(command[1], "")
+            up = type("Up", (), {"returncode": 0})()
+            with patch.object(host, "WORKER_DAEMON_UNIT", unit), patch.object(host, "WORKER_DOCKER_ROOT", root), \
+                 patch.object(host, "run", side_effect=run), patch.object(host.os, "chown") as chown, \
+                 patch.object(host.subprocess, "run", return_value=up):
+                host.provision_worker_daemon("unix:///run/user/1800/docker.sock")
+                chown.assert_called_once_with(root, 1800, 1800)
+                text = unit.read_text(encoding="utf-8")
+                self.assertIn("ConditionUser=ci-e2e", text)
+                self.assertIn(f"--data-root {root}", text)
+                self.assertIn(["loginctl", "enable-linger", "ci-e2e"], calls)
+                self.assertIn(["systemctl", "--global", "enable", unit.name], calls)
+                # A new unit restarts the daemon; an unchanged one only makes sure it runs.
+                self.assertEqual(calls[-1][-2:], ["restart", unit.name])
+                calls.clear()
+                host.provision_worker_daemon("unix:///run/user/1800/docker.sock")
+                self.assertEqual(calls[-1][-2:], ["start", unit.name])
+            with self.assertRaisesRegex(host.Failure, "not a rootless daemon socket"):
+                host.provision_worker_daemon("unix:///var/run/docker.sock")
 
     def test_canary_reports_why_a_server_did_not_come_online(self):
         server = "3cdbfa7d-ca8f-4baf-abc0-410dc30d18ae"
