@@ -30,7 +30,7 @@ index f3fa8f445..4276d0376 100644
              op_permission_level: PermissionLvl::Four,
              allow_nether: true,
 diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
-index f0a193ef9..307c4a185 100644
+index 3963a2719..a44838175 100644
 --- a/crates/pumpkin-core/src/server/mod.rs
 +++ b/crates/pumpkin-core/src/server/mod.rs
 @@ -26,7 +26,6 @@ use pumpkin_data::dimension::Dimension;
@@ -41,7 +41,7 @@ index f0a193ef9..307c4a185 100644
  use pumpkin_world::world::WorldPortalExt;
  use tracing::{debug, error, info, warn};
  
-@@ -193,16 +192,17 @@ impl Server {
+@@ -204,16 +203,17 @@ impl Server {
              }
              Err(WorldInfoError::InfoNotFound) => {
                  warn!(
@@ -65,10 +65,10 @@ index f0a193ef9..307c4a185 100644
                  default_data
              }
 diff --git a/crates/pumpkin-world/src/chunk_system/generation.rs b/crates/pumpkin-world/src/chunk_system/generation.rs
-index 42b53e837..73c1bb10d 100644
+index be8bfbf30..0f73d372e 100644
 --- a/crates/pumpkin-world/src/chunk_system/generation.rs
 +++ b/crates/pumpkin-world/src/chunk_system/generation.rs
-@@ -183,6 +183,64 @@ mod tests {
+@@ -233,6 +233,64 @@ mod tests {
          }
      }
  
@@ -134,10 +134,10 @@ index 42b53e837..73c1bb10d 100644
      fn generate_chunk_should_return() {
          let dimension = Dimension::OVERWORLD;
 diff --git a/crates/pumpkin-world/src/chunk_system/generation_cache.rs b/crates/pumpkin-world/src/chunk_system/generation_cache.rs
-index f564c8fcf..d204b6acb 100644
+index c837aefae..771f0950d 100644
 --- a/crates/pumpkin-world/src/chunk_system/generation_cache.rs
 +++ b/crates/pumpkin-world/src/chunk_system/generation_cache.rs
-@@ -703,8 +703,8 @@ impl Cache {
+@@ -710,8 +710,8 @@ impl Cache {
                          &noise_gen.random_config,
                      );
                  }
@@ -452,7 +452,7 @@ index 370532afb..4eed2fcbe 100644
 +    }
 +}
 diff --git a/crates/pumpkin-world/src/generation/generator/mod.rs b/crates/pumpkin-world/src/generation/generator/mod.rs
-index 9bece4bea..3fb097d13 100644
+index b9254a295..d9a3311ab 100644
 --- a/crates/pumpkin-world/src/generation/generator/mod.rs
 +++ b/crates/pumpkin-world/src/generation/generator/mod.rs
 @@ -25,6 +25,13 @@ use crate::generation::proto_chunk::ProtoChunk;
@@ -572,7 +572,7 @@ index 01a1dcac8..6305985b9 100644
      pub seed: u64,
      pub legacy_random_source: bool,
 diff --git a/crates/pumpkin-world/src/generation/proto_chunk.rs b/crates/pumpkin-world/src/generation/proto_chunk.rs
-index c191d5a08..6dbd683c2 100644
+index 35d53abe6..9d0bac8db 100644
 --- a/crates/pumpkin-world/src/generation/proto_chunk.rs
 +++ b/crates/pumpkin-world/src/generation/proto_chunk.rs
 @@ -39,6 +39,7 @@ use crate::chunk::format::LightContainer;
@@ -583,7 +583,7 @@ index c191d5a08..6dbd683c2 100644
  use crate::generation::height_limit::HeightLimitView;
  use crate::generation::noise::aquifer_sampler::{FluidLevel, FluidLevelSamplerImpl};
  use crate::generation::noise::perlin::DoublePerlinNoiseSampler;
-@@ -1331,6 +1332,60 @@ impl ProtoChunk {
+@@ -1392,6 +1393,60 @@ impl ProtoChunk {
          cache.get_center_chunk_mut().stage = StagedChunkEnum::Features;
      }
  
@@ -645,7 +645,7 @@ index c191d5a08..6dbd683c2 100644
          cache: &mut T,
          block_registry: &dyn WorldPortalExt,
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
-index dce4c3410..96bd67752 100644
+index 56642fb8e..5604bf15e 100644
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
 @@ -10,7 +10,6 @@ use crate::{
@@ -653,10 +653,10 @@ index dce4c3410..96bd67752 100644
          palette::has_random_ticking_fluid,
      },
 -    generation::get_world_gen_with_all_settings,
-     tick::{OrderedTick, ScheduledTick, TickPriority},
+     tick::{OrderedTick, ScheduledTick, TickPriority, order},
      world::WorldPortalExt,
  };
-@@ -191,53 +190,14 @@ impl Level {
+@@ -192,53 +191,14 @@ impl Level {
  
          let main_folder = &level_folder.root_folder;
  

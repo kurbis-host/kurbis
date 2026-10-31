@@ -2,8 +2,8 @@
 
 The hosted runtime builds Pumpkin directly on the local host with
 `tools/build_pumpkin_native.sh`, which serializes Rust compilation behind the shared host-memory admission gate; local development does not use Docker. The
-source pin is Pumpkin `0.2.0+26.3-26.51`, which speaks Java protocol 777 and
-Bedrock 1.26.51/protocol 2193.
+source pin is Pumpkin `0.2.1+26.3-26.60`, which speaks Java protocol 777 and
+Bedrock 1.26.60/protocol 2225.
 
 The checked-in integration adds the authenticated Unix host-control socket
 used by workers for player state, messages, transfers, saves, whitelist and
@@ -15,7 +15,7 @@ return write failures so the worker can avoid marking an incomplete recovery
 point as complete. `tools/protocol/verify_java_263.py` exercises real protocol
 777 logins, transfers, commands, inventory, and reconnect persistence.
 
-Bedrock 1.26.51 uses NetherNet, whose signaling requests use HTTPS and exchange
+Bedrock 1.26.60 uses NetherNet, whose signaling requests use HTTPS and exchange
 complete SDP offers and answers. At the pinned Pumpkin revision, the HTTP
 signaling listener was a plain Axum service on the same port as UDP status/ICE;
 it could not complete the TLS handshake required by current clients. Kurbis now
@@ -39,4 +39,4 @@ Build with Rust 1.98.1, Git, CMake, and a C/C++ compiler:
 tools/build_pumpkin_native.sh debug
 ```
 
-The build script manages ignored output/native-pumpkin/source, applies world-types.patch, host-control.patch, copies host_control.rs, builds the Kurbis control plugin for `wasm32-wasip2`, and writes Pumpkin under output/native-pumpkin/target/debug/pumpkin. Docker image builds also package the plugin and install it into each server's mounted plugin directory. Keep the included GPL-3.0 license with distributed Pumpkin source or binaries.
+The build script manages ignored output/native-pumpkin/source, applies world-types.patch, host-control.patch, snapshot-barrier.patch and nethernet-gateway.patch in that order (every hunk carries context, so a patch that no longer fits fails instead of landing in the wrong place), copies host_control.rs, builds the Kurbis control plugin for `wasm32-wasip2`, and writes Pumpkin under output/native-pumpkin/target/debug/pumpkin. Docker image builds also package the plugin and install it into each server's mounted plugin directory. Keep the included GPL-3.0 license with distributed Pumpkin source or binaries.

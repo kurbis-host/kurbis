@@ -1,5 +1,5 @@
 diff --git a/crates/pumpkin-core/src/command/mod.rs b/crates/pumpkin-core/src/command/mod.rs
-index 7db7c79..d48aca6 100644
+index 7db7c7991..d48aca6a7 100644
 --- a/crates/pumpkin-core/src/command/mod.rs
 +++ b/crates/pumpkin-core/src/command/mod.rs
 @@ -107,6 +107,8 @@ pub fn set_broadcast_console_to_ops(value: bool) {
@@ -146,10 +146,10 @@ index 7db7c79..d48aca6 100644
                  let (world, spawn_point) = Self::get_world_and_spawn_point(server);
                  CommandSource::new(
 diff --git a/crates/pumpkin-core/src/entity/player.rs b/crates/pumpkin-core/src/entity/player.rs
-index 790f152..f856c1f 100644
+index 5a1d832c3..edacf2a3b 100644
 --- a/crates/pumpkin-core/src/entity/player.rs
 +++ b/crates/pumpkin-core/src/entity/player.rs
-@@ -406,6 +406,8 @@ pub type HeldChunkTickets = (Vector2<i32>, Option<i8>, Option<i8>);
+@@ -409,6 +409,8 @@ pub type HeldChunkTickets = (Vector2<i32>, Option<i8>, Option<i8>);
  
  #[repr(C)]
  pub struct Player {
@@ -158,7 +158,7 @@ index 790f152..f856c1f 100644
      /// The underlying living entity object that represents the player.
      pub living_entity: LivingEntity,
      /// The player's game profile information, including their username and UUID.
-@@ -728,6 +730,7 @@ impl Player {
+@@ -761,6 +763,7 @@ impl Player {
          let initially_loaded = !supports_player_loaded;
  
          Self {
@@ -167,10 +167,10 @@ index 790f152..f856c1f 100644
              config: ArcSwap::new(Arc::new(config)),
              advancements: Arc::new(Mutex::new(
 diff --git a/crates/pumpkin-core/src/lib.rs b/crates/pumpkin-core/src/lib.rs
-index c91d676..d878e74 100644
+index df761455b..ca1438ff6 100644
 --- a/crates/pumpkin-core/src/lib.rs
 +++ b/crates/pumpkin-core/src/lib.rs
-@@ -476,6 +476,9 @@ impl PumpkinServer {
+@@ -544,6 +544,9 @@ impl PumpkinServer {
              .fire(&self.server, &mut ServerLoadEvent::new(LoadType::Startup))
              .await;
  
@@ -181,10 +181,10 @@ index c91d676..d878e74 100644
          self.server.management_hub.broadcast_server_started();
  
 diff --git a/crates/pumpkin-core/src/net/bedrock/login/login.rs b/crates/pumpkin-core/src/net/bedrock/login/login.rs
-index 9203349..4cbe843 100644
+index 679f9e053..e015e5ea3 100644
 --- a/crates/pumpkin-core/src/net/bedrock/login/login.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/login/login.rs
-@@ -61,6 +61,26 @@ impl BedrockClient {
+@@ -63,6 +63,26 @@ impl BedrockClient {
              pumpkin_auth::jwt::extract_oidc_token_player_claims(&auth_payload.token)?
          };
  
@@ -212,10 +212,10 @@ index 9203349..4cbe843 100644
              LoginError::InvalidTokenFormat(serde_json::Error::custom(
                  "raw_token is not valid UTF-8",
 diff --git a/crates/pumpkin-core/src/net/bedrock/mod.rs b/crates/pumpkin-core/src/net/bedrock/mod.rs
-index ac5d1c8..35e4145 100644
+index f653a4c1d..0b8343939 100644
 --- a/crates/pumpkin-core/src/net/bedrock/mod.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/mod.rs
-@@ -101,6 +101,7 @@ pub struct BedrockClient {
+@@ -113,6 +113,7 @@ pub struct BedrockClient {
      pub player: ArcSwap<Option<Arc<Player>>>,
      pub version: AtomicCell<BedrockMinecraftVersion>,
      pub client_data: ArcSwap<Option<Arc<ClientData>>>,
@@ -223,7 +223,7 @@ index ac5d1c8..35e4145 100644
      /// All Bedrock clients
      /// This list is used to remove the client if the connection gets closed
      pub be_clients: Arc<Mutex<HashMap<SocketAddr, Arc<Self>>>>,
-@@ -152,6 +153,7 @@ impl BedrockClient {
+@@ -165,6 +166,7 @@ impl BedrockClient {
              address,
              version: AtomicCell::new(BedrockMinecraftVersion::Unknown),
              client_data: ArcSwap::new(Arc::new(None)),
@@ -232,7 +232,7 @@ index ac5d1c8..35e4145 100644
              network_writer: Arc::new(RwLock::new(BedrockBatchEncoder::new())),
              network_reader: Mutex::new(BedrockBatchDecoder::new()),
 diff --git a/crates/pumpkin-core/src/net/mod.rs b/crates/pumpkin-core/src/net/mod.rs
-index a5701c4..c3d20b6 100644
+index a5701c407..c3d20b6e0 100644
 --- a/crates/pumpkin-core/src/net/mod.rs
 +++ b/crates/pumpkin-core/src/net/mod.rs
 @@ -31,6 +31,8 @@ use thiserror::Error;
@@ -245,7 +245,7 @@ index a5701c4..c3d20b6 100644
  pub mod chunk_sender;
  pub use chunk_sender::ChunkSender;
 diff --git a/crates/pumpkin-core/src/plugin/mod.rs b/crates/pumpkin-core/src/plugin/mod.rs
-index b51b6ca..1bba116 100644
+index 22e470eca..a35a0157d 100644
 --- a/crates/pumpkin-core/src/plugin/mod.rs
 +++ b/crates/pumpkin-core/src/plugin/mod.rs
 @@ -350,7 +350,7 @@ impl PluginManager {
@@ -391,7 +391,7 @@ index b51b6ca..1bba116 100644
      pub async fn wait_for_plugin(&self, plugin_name: &str) -> Result<(), ManagerError> {
          loop {
 diff --git a/crates/pumpkin-core/src/server/connection_cache.rs b/crates/pumpkin-core/src/server/connection_cache.rs
-index 1d194ef..17efb57 100644
+index 1d194ef32..17efb5726 100644
 --- a/crates/pumpkin-core/src/server/connection_cache.rs
 +++ b/crates/pumpkin-core/src/server/connection_cache.rs
 @@ -52,7 +52,12 @@ impl Default for CachedBranding {
@@ -409,10 +409,10 @@ index 1d194ef..17efb57 100644
          let brand = Self::BRAND.as_bytes();
          let len = brand.len();
 diff --git a/crates/pumpkin-core/src/server/mod.rs b/crates/pumpkin-core/src/server/mod.rs
-index f0a193e..0726751 100644
+index a44838175..0e3267fd1 100644
 --- a/crates/pumpkin-core/src/server/mod.rs
 +++ b/crates/pumpkin-core/src/server/mod.rs
-@@ -45,7 +45,7 @@ use rsa::RsaPublicKey;
+@@ -44,7 +44,7 @@ use rsa::RsaPublicKey;
  use std::fs;
  use std::net::IpAddr;
  use std::sync::Arc;
@@ -430,7 +430,7 @@ index f0a193e..0726751 100644
      pub recipe_manager: Arc<recipe::RecipeManager>,
      pub datapack_manager: Arc<crate::data::datapack::DatapackManager>,
      pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
-@@ -286,6 +288,7 @@ impl Server {
+@@ -314,6 +316,7 @@ impl Server {
              plugin_manager: Arc::new(PluginManager::new(plugin_loaders)),
              permission_manager,
              container_id: 0.into(),
@@ -438,7 +438,7 @@ index f0a193e..0726751 100644
              recipe_manager: Arc::new(recipe::RecipeManager::new()),
              datapack_manager: Arc::new(crate::data::datapack::DatapackManager::new()),
              enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
-@@ -607,7 +610,10 @@ impl Server {
+@@ -639,7 +642,10 @@ impl Server {
          }
  
          for world in self.worlds.load().iter() {
@@ -450,16 +450,16 @@ index f0a193e..0726751 100644
          }
  
          self.management_hub.broadcast_server_saved();
-@@ -706,6 +712,8 @@ impl Server {
-             'after: {
-                 player.screen_handler_sync_handler.store_player(player.clone());
-                 world.add_player(&player).is_ok().then(|| {
-+                    self.player_activity_revision
-+                        .fetch_add(1, Ordering::Release);
+@@ -753,6 +759,8 @@ impl Server {
+                     player.kick(DisconnectReason::Shutdown, &TextComponent::text("Server stopped"));
+                     return None;
+                 }
++                self.player_activity_revision
++                    .fetch_add(1, Ordering::Release);
+                 Some({
                      {
                          let mut user_cache = self
-                             .data
-@@ -744,6 +752,8 @@ impl Server {
+@@ -792,6 +800,8 @@ impl Server {
      }
  
      pub fn remove_player(&self, player: &Player) {
@@ -469,10 +469,10 @@ index f0a193e..0726751 100644
              Some(player.gameprofile.id),
              Some(player.gameprofile.name.clone()),
 diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
-index 238888f..5aad586 100644
+index a5f946060..386b44979 100644
 --- a/crates/pumpkin-core/src/world/mod.rs
 +++ b/crates/pumpkin-core/src/world/mod.rs
-@@ -6933,6 +6933,20 @@ impl World {
+@@ -7190,6 +7190,20 @@ impl World {
          }
      }
  
@@ -494,7 +494,7 @@ index 238888f..5aad586 100644
          let mut custom_data = self
              .custom_data
 diff --git a/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs b/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
-index ddf1531..5655dbe 100644
+index ddf153145..5655dbe25 100644
 --- a/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
 +++ b/crates/pumpkin-wasm-host-v0_1/src/commands/mod.rs
 @@ -283,7 +283,8 @@ impl pumpkin::plugin::command::HostCommandSender for PluginHostState {
@@ -508,7 +508,7 @@ index ddf1531..5655dbe 100644
                  Ok(CommandSenderType::Player(self.add(player)?))
              }
 diff --git a/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs b/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
-index 7cfaf7f..62d67aa 100644
+index 7cfaf7fc0..62d67aa29 100644
 --- a/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
 +++ b/crates/pumpkin-wasm-host-v0_2/src/commands/mod.rs
 @@ -283,7 +283,8 @@ impl pumpkin::plugin::command::HostCommandSender for PluginHostState {
@@ -522,7 +522,7 @@ index 7cfaf7f..62d67aa 100644
                  Ok(CommandSenderType::Player(self.add(player)?))
              }
 diff --git a/crates/pumpkin-world/src/chunk/io/file_manager.rs b/crates/pumpkin-world/src/chunk/io/file_manager.rs
-index adf1ce8..caed947 100644
+index adf1ce88b..caed947c8 100644
 --- a/crates/pumpkin-world/src/chunk/io/file_manager.rs
 +++ b/crates/pumpkin-world/src/chunk/io/file_manager.rs
 @@ -351,25 +351,33 @@ impl<R: RegionFile, D: SingleChunkDataSerializer> ChunkFileManager<R, D> {
@@ -643,7 +643,7 @@ index adf1ce8..caed947 100644
 +    }
  }
 diff --git a/crates/pumpkin-world/src/chunk/io/mod.rs b/crates/pumpkin-world/src/chunk/io/mod.rs
-index e25f377..d5412f6 100644
+index e25f377d1..d5412f642 100644
 --- a/crates/pumpkin-world/src/chunk/io/mod.rs
 +++ b/crates/pumpkin-world/src/chunk/io/mod.rs
 @@ -79,8 +79,9 @@ where
@@ -659,11 +659,11 @@ index e25f377..d5412f6 100644
  
  /// One open region file (32x32 chunks) of a storage format.
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
-index dce4c34..c8b92a3 100644
+index 5604bf15e..29f9a390a 100644
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
-@@ -372,6 +372,39 @@ impl Level {
-         self.tasks.spawn(task)
+@@ -342,6 +342,39 @@ impl Level {
+         }
      }
  
 +    /// Await serialization and disk writes, including regions kept hot by watchers.
@@ -702,7 +702,7 @@ index dce4c34..c8b92a3 100644
      pub async fn shutdown(&self) {
          let world_id = self.level_folder.root_folder.display();
          info!("Saving level ({})...", world_id);
-@@ -436,9 +469,13 @@ impl Level {
+@@ -406,9 +439,13 @@ impl Level {
          self.write_entity_chunks(chunks_to_write).await;
  
          info!("Flushing chunk data to disk for {}...", world_id);

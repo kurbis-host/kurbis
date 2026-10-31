@@ -17,7 +17,7 @@ python3 verify_java_263.py --edition java --port PORT --address HOSTNAME --outpu
 node verify.mjs --edition java --port PORT --address HOSTNAME --output RESULT.json
 ```
 
-The client uses no npm dependencies. Bedrock 1.26.51 uses NetherNet; the pinned
+The client uses no npm dependencies. Bedrock 1.26.60 uses NetherNet; the pinned
 Pumpkin signaling endpoint currently returns plain HTTP to clients that begin
 with TLS, so Bedrock login is not covered by this verifier. See
 [Pumpkin issue #3738](https://github.com/Pumpkin-MC/Pumpkin/issues/3738).

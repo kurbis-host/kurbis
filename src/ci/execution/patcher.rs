@@ -100,7 +100,6 @@ impl CheckedInPumpkinPatcher {
         root: &Path,
         filename: &str,
         patch: &[u8],
-        zero_context: bool,
     ) -> Result<(), BuildPipelineError> {
         let patch_path = root.join(filename);
         tokio::fs::write(&patch_path, patch)
@@ -111,12 +110,8 @@ impl CheckedInPumpkinPatcher {
                     format!("could not stage {filename}: {error}"),
                 )
             })?;
-        let mut check = git_command(root);
-        check.arg("apply");
-        if zero_context {
-            check.arg("--unidiff-zero");
-        }
-        let check_output = check
+        let check_output = git_command(root)
+            .arg("apply")
             .arg("--check")
             .arg(&patch_path)
             .output()
@@ -140,17 +135,17 @@ impl CheckedInPumpkinPatcher {
                 ),
             ));
         }
-        let mut apply = git_command(root);
-        apply.arg("apply");
-        if zero_context {
-            apply.arg("--unidiff-zero");
-        }
-        let output = apply.arg(&patch_path).output().await.map_err(|error| {
-            BuildPipelineError::transient(
-                crate::ci::CiBuildStage::Patching,
-                format!("could not apply {filename}: {error}"),
-            )
-        })?;
+        let output = git_command(root)
+            .arg("apply")
+            .arg(&patch_path)
+            .output()
+            .await
+            .map_err(|error| {
+                BuildPipelineError::transient(
+                    crate::ci::CiBuildStage::Patching,
+                    format!("could not apply {filename}: {error}"),
+                )
+            })?;
         tokio::fs::remove_file(patch_path).await.ok();
         if !output.status.success() {
             return Err(BuildPipelineError::process_failure(
@@ -208,16 +203,10 @@ impl crate::ci::PatchApplier for CheckedInPumpkinPatcher {
                 format!("git init failed: {}", bounded_output(&init.stderr)),
             ));
         }
-        Self::apply_patch(root, "world-types.patch", WORLD_TYPES_PATCH, false).await?;
-        Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH, false).await?;
-        Self::apply_patch(
-            root,
-            "snapshot-barrier.patch",
-            SNAPSHOT_BARRIER_PATCH,
-            false,
-        )
-        .await?;
-        Self::apply_patch(root, "nethernet-gateway.patch", NETHERNET_PATCH, true).await?;
+        Self::apply_patch(root, "world-types.patch", WORLD_TYPES_PATCH).await?;
+        Self::apply_patch(root, "host-control.patch", HOST_CONTROL_PATCH).await?;
+        Self::apply_patch(root, "snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH).await?;
+        Self::apply_patch(root, "nethernet-gateway.patch", NETHERNET_PATCH).await?;
 
         let host_control = root.join("crates/pumpkin-core/src/net/host_control.rs");
         if let Some(parent) = host_control.parent() {
@@ -325,22 +314,25 @@ mod tests {
         assert!(fingerprinted.contains(&"trusted-plugin/src/ai/mod.rs".to_owned()));
     }
 
-    /// `--unidiff-zero` trusts the line numbers of a hunk without context, so
-    /// a lockfile hunk applied after upstream added packages above it lands
-    /// inside another package and `cargo --locked` then refuses the build.
+    /// A hunk without context is placed by line number alone, so on a pull
+    /// request based on another upstream commit it lands inside unrelated code
+    /// instead of failing to apply.
     #[test]
-    fn manifest_hunks_in_the_gateway_patch_carry_context() {
-        let patch = String::from_utf8(NETHERNET_PATCH.to_vec()).unwrap();
-        let mut manifest = false;
-        for line in patch.lines() {
-            if let Some(file) = line.strip_prefix("diff --git a/") {
-                manifest = file.ends_with("Cargo.lock") || file.ends_with("Cargo.toml");
-            } else if manifest && line.starts_with("@@ ") {
-                let old_range = line.split_whitespace().nth(1).unwrap();
-                assert!(
-                    !old_range.ends_with(",0") && old_range.contains(','),
-                    "manifest hunk without context: {line}"
-                );
+    fn every_patch_hunk_carries_context() {
+        for (name, patch) in [
+            ("world-types.patch", WORLD_TYPES_PATCH),
+            ("host-control.patch", HOST_CONTROL_PATCH),
+            ("snapshot-barrier.patch", SNAPSHOT_BARRIER_PATCH),
+            ("nethernet-gateway.patch", NETHERNET_PATCH),
+        ] {
+            for line in String::from_utf8(patch.to_vec()).unwrap().lines() {
+                if line.starts_with("@@ ") {
+                    let old_range = line.split_whitespace().nth(1).unwrap();
+                    assert!(
+                        !old_range.ends_with(",0") && old_range.contains(','),
+                        "{name} has a hunk without context: {line}"
+                    );
+                }
             }
         }
     }

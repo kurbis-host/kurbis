@@ -1,65 +1,85 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index adca24b..cf7b267 100644
+index 956632499..3ac9035cb 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -3223,6 +3223,7 @@ dependencies = [
-  "rayon",
-  "reqwest",
+@@ -3072,2 +3072,3 @@ dependencies = [
   "rsa",
 + "rtc",
   "rustc-hash",
-  "rustc_version_runtime",
-  "rustls",
 diff --git a/crates/pumpkin-config/src/networking/bedrock.rs b/crates/pumpkin-config/src/networking/bedrock.rs
-index 9e93679..3f2106b 100644
+index 9e9367944..b6af4c426 100644
 --- a/crates/pumpkin-config/src/networking/bedrock.rs
 +++ b/crates/pumpkin-config/src/networking/bedrock.rs
-@@ -27 +27 @@ pub struct NetherNetConfig {
+@@ -24,11 +24,15 @@ pub struct BedrockAuthenticationConfig {
+ pub struct NetherNetConfig {
+     /// Whether clients may connect using `NetherNet`.
+     pub enabled: bool,
 -    /// TCP signaling and shared UDP status/ICE address.
-+    /// UDP server-list status and ICE address.
-@@ -28,0 +29,2 @@ pub struct NetherNetConfig {
++    /// UDP ICE address, which also answers server-list pings.
+     pub address: SocketAddr,
 +    /// Private plaintext HTTP signaling address behind the Kurbis TLS gateway.
 +    pub signal_address: SocketAddr,
-@@ -31,0 +34,2 @@ pub struct NetherNetConfig {
+     /// Optional public IP advertised when the ICE address is behind NAT.
+     #[serde(with = "optional_ip")]
+     pub external_ip: Option<IpAddr>,
 +    /// Optional public UDP port advertised for direct ICE.
 +    pub external_port: Option<u16>,
-@@ -73,0 +78 @@ impl Default for NetherNetConfig {
+     /// PKCS#8 P-384 identity key retained across restarts for Trust On First Use.
+     pub identity_key: PathBuf,
+     /// Optional ICE server URLs. Use `external_ip` for NAT with the single-port UDP mux.
+@@ -71,7 +75,9 @@ impl Default for NetherNetConfig {
+         Self {
+             enabled: true,
+             address,
 +            signal_address: address,
-@@ -74,0 +80 @@ impl Default for NetherNetConfig {
+             external_ip: None,
 +            external_port: None,
-@@ -99,0 +106,2 @@ mod tests {
+             identity_key: "nethernet-key.der".into(),
+             stun_servers: Vec::new(),
+         }
+@@ -97,6 +103,8 @@ mod tests {
+     fn empty_external_ip_uses_automatic_detection() {
+         let config: NetherNetConfig = toml::from_str("external_ip = \"\"").unwrap();
+         assert_eq!(config.external_ip, None);
 +        assert_eq!(config.external_port, None);
 +        assert_eq!(config.signal_address.port(), config.address.port());
-@@ -109 +117,2 @@ mod tests {
+         assert!(
+             toml::to_string(&config)
+                 .unwrap()
+@@ -106,8 +114,10 @@ mod tests {
+ 
+     #[test]
+     fn explicit_external_ip_is_preserved() {
 -        let config: NetherNetConfig = toml::from_str("external_ip = \"203.0.113.7\"").unwrap();
 +        let config: NetherNetConfig =
 +            toml::from_str("external_ip = \"203.0.113.7\"\nexternal_port = 19132").unwrap();
-@@ -110,0 +120 @@ mod tests {
+         assert_eq!(config.external_ip.unwrap().to_string(), "203.0.113.7");
 +        assert_eq!(config.external_port, Some(19132));
+     }
+ }
+ 
 diff --git a/crates/pumpkin-core/Cargo.toml b/crates/pumpkin-core/Cargo.toml
-index 88d16b5..79af2ff 100644
+index 14c7a7239..cc1e8c161 100644
 --- a/crates/pumpkin-core/Cargo.toml
 +++ b/crates/pumpkin-core/Cargo.toml
-@@ -103,6 +103,8 @@ flate2.workspace = true
- axum = { workspace = true, features = ["ws"] }
- subtle.workspace = true
+@@ -100,2 +100,4 @@ subtle.workspace = true
  webrtc.workspace = true
 +# Only for MulticastDnsMode, which webrtc does not re-export.
 +rtc = { version = "0.21.1", default-features = false }
  async-trait.workspace = true
- 
- ordered-float.workspace = true
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
-index 43adfd8..d914c79 100644
+index fc1201df0..b4e75ab83 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/endpoint.rs
-@@ -1 +1,4 @@
+@@ -1,2 +1,5 @@
 -use std::{net::SocketAddr, sync::Arc};
 +use std::{
 +    net::{IpAddr, SocketAddr},
 +    sync::Arc,
 +};
-@@ -33,0 +37,49 @@ const MAX_SDP_SIZE: usize = 1 << 20;
+ 
+@@ -33,2 +36,51 @@ const MAX_SDP_SIZE: usize = 1 << 20;
+ 
 +fn configured_external_ip(
 +    configured: Option<IpAddr>,
 +    environment: Option<&str>,
@@ -109,11 +129,15 @@ index 43adfd8..d914c79 100644
 +    Ok(port)
 +}
 +
-@@ -48,2 +100 @@ impl NetherNetListener {
+ /// Accepts Bedrock `NetherNet` connections negotiated through Mojang's HTTP endpoint.
+@@ -47,4 +99,3 @@ impl NetherNetListener {
+         let config = &server.advanced_config.networking.bedrock.nethernet;
 -        let address = config.address;
 -        let listener = TcpListener::bind(address).await?;
 +        let listener = TcpListener::bind(config.signal_address).await?;
-@@ -52,0 +104,17 @@ impl NetherNetListener {
+         let local_addr = listener.local_addr()?;
+@@ -60,2 +111,19 @@ impl NetherNetListener {
+         let ice_local_addr = ice_router.public_addr();
 +        let external_ip_env = match std::env::var("PUMPKIN_NETHERNET_EXTERNAL_IP") {
 +            Ok(value) => Some(value),
 +            Err(std::env::VarError::NotPresent) => None,
@@ -131,14 +155,20 @@ index 43adfd8..d914c79 100644
 +        };
 +        let external_port =
 +            configured_external_port(config.external_port, external_port_env.as_deref())?;
-@@ -62 +130,2 @@ impl NetherNetListener {
+         let (incoming, receiver) = mpsc::channel(128);
+@@ -69,3 +137,4 @@ impl NetherNetListener {
+             ice_local_addr,
 -            external_ip: config.external_ip,
 +            external_ip,
 +            external_port,
-@@ -72 +141 @@ impl NetherNetListener {
+             ice_router,
+@@ -84,3 +153,3 @@ impl NetherNetListener {
+ 
 -        match NetherNetDiscovery::bind(local_addr, server.server_guid).await {
 +        match NetherNetDiscovery::bind(ice_local_addr, server.server_guid).await {
-@@ -123,0 +193,40 @@ impl NetherNetListener {
+             Ok(discovery) => {
+@@ -137,2 +206,42 @@ impl NetherNetListener {
+ 
 +#[cfg(test)]
 +mod gateway_config_tests {
 +    use super::{configured_external_ip, configured_external_port};
@@ -179,18 +209,24 @@ index 43adfd8..d914c79 100644
 +    }
 +}
 +
+ async fn unknown_request(ConnectInfo(address): ConnectInfo<SocketAddr>, uri: Uri) -> Response {
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
-index 677b992..b174d8d 100644
+index 3256ce0e3..04c132322 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/peer.rs
-@@ -7,0 +8 @@ use async_trait::async_trait;
+@@ -7,2 +7,3 @@ use std::{
+ use async_trait::async_trait;
 +use rtc::ice::mdns::MulticastDnsMode;
-@@ -149 +150,3 @@ async fn negotiate_inner(
+ use tokio::sync::{Mutex, mpsc};
+@@ -154,3 +155,5 @@ async fn negotiate_inner(
+                 advertised_ip,
 -                state.ice_router.public_addr().port(),
 +                state
 +                    .external_port
 +                    .unwrap_or_else(|| state.ice_router.public_addr().port()),
-@@ -200 +203,6 @@ async fn build_peer(
+             )?;
+@@ -211,3 +214,8 @@ async fn build_peer(
+     };
 -    let mut setting_engine_builder = SettingEngineBuilder::default();
 +    // A server never resolves `.local` candidates, and webrtc's default mDNS
 +    // socket joins 224.0.0.251 on the default route's interface. A container
@@ -198,9 +234,12 @@ index 677b992..b174d8d 100644
 +    // whole negotiation.
 +    let mut setting_engine_builder =
 +        SettingEngineBuilder::default().with_multicast_dns_mode(MulticastDnsMode::Disabled);
+     if direct_ip && let Some(external_ip) = advertised_ip {
 diff --git a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
-index 998cf00..ba97245 100644
+index 7ae430d30..fb4a627db 100644
 --- a/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
 +++ b/crates/pumpkin-core/src/net/bedrock/nethernet/state.rs
-@@ -22,0 +23 @@ pub(super) struct NetherNetState {
+@@ -23,2 +23,3 @@ pub(super) struct NetherNetState {
+     pub(super) external_ip: Option<IpAddr>,
 +    pub(super) external_port: Option<u16>,
+     pub(super) ice_router: Arc<IceRouter>,

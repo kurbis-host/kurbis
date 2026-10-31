@@ -16,10 +16,8 @@ git -C "$destination" fetch --quiet --depth=1 origin "$(cat "$integration/REVISI
 git -C "$destination" reset --quiet --hard FETCH_HEAD
 git -C "$destination" clean --quiet -fdx
 git -C "$destination" submodule update --quiet --init --recursive --depth=1
-for patch in world-types host-control snapshot-barrier; do
+for patch in world-types host-control snapshot-barrier nethernet-gateway; do
     git -C "$destination" apply --check "$integration/$patch.patch"
     git -C "$destination" apply "$integration/$patch.patch"
 done
-git -C "$destination" apply --unidiff-zero --check "$integration/nethernet-gateway.patch"
-git -C "$destination" apply --unidiff-zero "$integration/nethernet-gateway.patch"
 cp "$integration/host_control.rs" "$destination/crates/pumpkin-core/src/net/host_control.rs"
