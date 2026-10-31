@@ -51,6 +51,9 @@ x-control-plane-environment: &control-plane-environment
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
   S3_SECRET_KEY: ${S3_SECRET_KEY:-}
   S3_ALLOW_HTTP: ${S3_ALLOW_HTTP:-false}
+  # An ntfy topic told when no worker has been live for three minutes.
+  ALERT_NTFY_URL: ${ALERT_NTFY_URL:-}
+  ALERT_NTFY_TOKEN: ${ALERT_NTFY_TOKEN:-}
   # The in-game AI assistant is offered only when AI_PROVIDER is set.
   # Blank AI settings keep the control plane's defaults.
   AI_PROVIDER: ${AI_PROVIDER:-}

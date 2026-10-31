@@ -10,8 +10,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 mod ai;
+mod alerts;
 
 pub use ai::{AiConfig, AiModelEntry, AiProvider, parse_usd_micros};
+pub use alerts::AlertConfig;
 
 #[derive(Clone)]
 pub struct CommonConfig {

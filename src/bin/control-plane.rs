@@ -9,10 +9,13 @@ use kurbis_hoster::{
         GitHubRateLimitGuard, GitHubSourceControl, ObjectArtifactCache, POLL_INTERVAL_SECONDS,
         PollError, bubblewrap_pipeline, docker_pipeline, remote_bubblewrap_pipeline_ready,
     },
-    config::{AiConfig, CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig},
+    config::{
+        AiConfig, AlertConfig, CiBuilderBackend, CiConfig, ControlPlaneConfig, ObjectStoreConfig,
+    },
     control_plane::supervision::{Supervisor, SupervisorConfig, SupervisorRegistry, WorkerError},
     control_plane::{
         ai::{AiGateway, check_provider},
+        alerts::WorkerAlerts,
         api::{AppState, router},
         lifecycle::Lifecycle,
         maintenance::{CiPreviewMaintenance, WorkerMaintenance},
@@ -122,6 +125,20 @@ async fn main() -> Result<()> {
             }
         },
     );
+    match AlertConfig::from_env()? {
+        Some(alert_config) => {
+            let alerts = WorkerAlerts::new(pool.clone(), alert_config)?;
+            workers.spawn(
+                "worker-alerts",
+                SupervisorConfig::optional(std::time::Duration::from_secs(30)),
+                move || {
+                    let alerts = alerts.clone();
+                    async move { alerts.run_once().await.map_err(WorkerError::retryable) }
+                },
+            );
+        }
+        None => tracing::warn!("ALERT_NTFY_URL is not set; nobody is told when no worker is live"),
+    }
     // The landing page's graphs and the operator dashboard's history: the service and each
     // running server sampled once a minute, and today's roll-up. Checked more often than
     // that, so each minute is sampled near its start; a minute already sampled is left alone.

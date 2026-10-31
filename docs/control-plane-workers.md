@@ -11,6 +11,9 @@ same binary. Those responsibilities have separate internal seams:
 - `ci-poller:<repository-id>` polls source control and drives the durable CI
   build queue.
 - `ci-github-webhook` is optional and drains signed webhook deliveries.
+- `worker-alerts` is optional and runs only when `ALERT_NTFY_URL` is set. It
+  tells that ntfy topic when every worker has been silent for three minutes,
+  and again when one is back.
 - `ai-jobs` is optional and runs only when `AI_PROVIDER` is set. It
   claims queued in-game AI requests, calls the model with the call's
   worst-case cost reserved against the server and account budgets, records

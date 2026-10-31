@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod alerts;
 pub mod api;
 pub mod auth;
 pub mod identity;
